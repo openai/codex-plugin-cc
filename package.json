@@ -1,0 +1,20 @@
+{
+  "name": "@openai/codex-plugin-cc",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Use Codex from Claude Code to review code or delegate tasks.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "scripts": {
+    "prebuild": "mkdir -p plugins/codex/.generated/app-server-types && codex app-server generate-ts --out plugins/codex/.generated/app-server-types",
+    "build": "tsc -p tsconfig.app-server.json",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "typescript": "^6.0.2"
+  }
+}
