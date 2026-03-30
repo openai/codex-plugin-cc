@@ -2,8 +2,9 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { fileURLToPath } from "node:url";
 
-const ROOT = "/Users/dkundel/code/codex-plugin";
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 
 function read(relativePath) {
@@ -205,4 +206,29 @@ test("setup command can offer Codex install and still points users to codex logi
   assert.match(readme, /offer to install Codex for you/i);
   assert.match(readme, /\/codex:setup --enable-review-gate/);
   assert.match(readme, /\/codex:setup --disable-review-gate/);
+});
+
+test("repo is installable as a Gemini CLI extension with codex command wrappers", () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, "gemini-extension.json"), "utf8"));
+  assert.equal(manifest.name, "codex-companion");
+  assert.match(manifest.description, /Gemini CLI/i);
+
+  const commandDir = path.join(ROOT, "commands", "codex");
+  const commandFiles = fs.readdirSync(commandDir).sort();
+  assert.deepEqual(commandFiles, [
+    "adversarial-review.toml",
+    "cancel.toml",
+    "result.toml",
+    "review.toml",
+    "setup.toml",
+    "status.toml"
+  ]);
+
+  for (const file of commandFiles) {
+    const source = fs.readFileSync(path.join(commandDir, file), "utf8");
+    assert.match(source, /gemini-command\.mjs/);
+    assert.match(source, /\$\{extensionPath\}/);
+    assert.match(source, /\$\{workspacePath\}/);
+    assert.match(source, /return its stdout verbatim with no additional commentary/i);
+  }
 });

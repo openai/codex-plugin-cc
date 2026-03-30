@@ -1,0 +1,5 @@
+{
+  "name": "codex-companion",
+  "version": "1.0.0",
+  "description": "Run local Codex review commands from inside Gemini CLI."
+}

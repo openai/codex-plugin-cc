@@ -1,0 +1,6 @@
+description = "Cancel a local Codex background run for the current workspace and return the output verbatim."
+prompt = """
+Run the local Codex cancel command for the current workspace and return its stdout verbatim with no additional commentary.
+
+!{node "${extensionPath}${/}plugins${/}codex${/}scripts${/}gemini-command.mjs" cancel "${workspacePath}" {{args}}}
+"""

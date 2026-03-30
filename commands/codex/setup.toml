@@ -1,0 +1,6 @@
+description = "Check whether the local Codex CLI is ready for review commands and return the output verbatim."
+prompt = """
+Run the local Codex setup command and return its stdout verbatim with no additional commentary.
+
+!{node "${extensionPath}${/}plugins${/}codex${/}scripts${/}gemini-command.mjs" setup "${workspacePath}" {{args}}}
+"""

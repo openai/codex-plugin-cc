@@ -1,5 +1,7 @@
 # Codex plugin for Claude Code
 
+This repository can also be installed as a Gemini CLI extension so Gemini users can trigger the same local Codex review flows from inside Gemini.
+
 Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex.
 
 This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
@@ -65,6 +67,26 @@ One simple first run is:
 /codex:status
 /codex:result
 ```
+
+## Gemini CLI Extension
+
+If you use Gemini CLI, you can install this repository as a Gemini extension and run the local Codex review helpers from inside Gemini:
+
+```bash
+gemini extensions link /path/to/codex-plugin-cc
+```
+
+Then restart Gemini and use:
+
+```text
+/codex:setup
+/codex:review
+/codex:adversarial-review focus on rollback and failure handling
+/codex:status
+/codex:result
+```
+
+These Gemini commands shell into the same local `plugins/codex/scripts/codex-companion.mjs` runtime used by the Claude Code plugin, so they still require a working local Codex CLI login.
 
 ## Usage
 

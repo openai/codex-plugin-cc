@@ -3,15 +3,17 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
-const ROOT = "/Users/dkundel/code/codex-plugin";
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
+const GEMINI_WRAPPER = path.join(PLUGIN_ROOT, "scripts", "gemini-command.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
 
@@ -43,10 +45,51 @@ test("setup reports ready when fake codex is installed and authenticated", () =>
   assert.equal(payload.sessionRuntime.mode, "direct");
 });
 
+test("gemini wrapper forwards review requests into codex-companion for the target workspace", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 1;\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 2;\n");
+
+  const result = run("node", [GEMINI_WRAPPER, "review", repo], {
+    cwd: ROOT,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Reviewed uncommitted changes/);
+  assert.match(result.stdout, /No material issues found/);
+});
+
+test("gemini wrapper preserves raw slash-command arguments as a single forwarded string", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 1;\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 2;\n");
+
+  const result = run("node", [GEMINI_WRAPPER, "review", repo, "--base main"], {
+    cwd: ROOT,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Reviewed changes against main/);
+});
+
 test("setup is ready without npm when Codex is already installed and authenticated", () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
-  fs.symlinkSync(process.execPath, path.join(binDir, "node"));
+  fs.copyFileSync(process.execPath, path.join(binDir, path.basename(process.execPath)));
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
     cwd: ROOT,

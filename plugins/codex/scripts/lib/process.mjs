@@ -1,18 +1,113 @@
-import { spawnSync } from "node:child_process";
+import path from "node:path";
+import { spawn, spawnSync } from "node:child_process";
 import process from "node:process";
 
+function quoteCmdArg(value) {
+  const text = String(value ?? "");
+  if (!text) {
+    return '""';
+  }
+  const escaped = text.replace(/"/g, '""');
+  return /[\s"&()^<>|]/.test(escaped) ? `"${escaped}"` : escaped;
+}
+
+function buildCmdCommandLine(command, args = []) {
+  return [quoteCmdArg(command), ...args.map((arg) => quoteCmdArg(arg))].join(" ");
+}
+
+function rankWindowsCommandCandidate(candidate) {
+  switch (path.extname(candidate).toLowerCase()) {
+    case ".cmd":
+      return 0;
+    case ".bat":
+      return 1;
+    case ".exe":
+      return 2;
+    case ".com":
+      return 3;
+    case ".ps1":
+      return 4;
+    default:
+      return 10;
+  }
+}
+
+function resolveWindowsCommand(command, env) {
+  if (/[\\/]/.test(command) || path.isAbsolute(command)) {
+    return { command, wrapper: null };
+  }
+
+  const whereResult = spawnSync("where.exe", [command], {
+    env,
+    encoding: "utf8",
+    windowsHide: true
+  });
+
+  if (whereResult.error || whereResult.status !== 0) {
+    return { command, wrapper: null };
+  }
+
+  const candidates = whereResult.stdout
+    .split(/\r?\n/)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .sort((left, right) => rankWindowsCommandCandidate(left) - rankWindowsCommandCandidate(right));
+
+  const resolved = candidates[0] ?? command;
+  const extension = path.extname(resolved).toLowerCase();
+  return {
+    command: resolved,
+    wrapper: extension === ".cmd" || extension === ".bat" ? "cmd" : null
+  };
+}
+
+function prepareCommand(command, args = [], env = process.env) {
+  if (process.platform !== "win32") {
+    return { command, args, windowsHide: false };
+  }
+
+  const resolved = resolveWindowsCommand(command, env);
+  if (resolved.wrapper === "cmd") {
+    return {
+      command: process.env.ComSpec || "cmd.exe",
+      args: ["/d", "/s", "/c", buildCmdCommandLine(resolved.command, args)],
+      windowsHide: true
+    };
+  }
+
+  return {
+    command: resolved.command,
+    args,
+    windowsHide: true
+  };
+}
+
+export function spawnCommand(command, args = [], options = {}) {
+  const prepared = prepareCommand(command, args, options.env);
+  return spawn(prepared.command, prepared.args, {
+    cwd: options.cwd,
+    env: options.env,
+    stdio: options.stdio ?? "pipe",
+    detached: options.detached ?? false,
+    windowsHide: options.windowsHide ?? prepared.windowsHide
+  });
+}
+
 export function runCommand(command, args = [], options = {}) {
-  const result = spawnSync(command, args, {
+  const prepared = prepareCommand(command, args, options.env);
+  const result = spawnSync(prepared.command, prepared.args, {
     cwd: options.cwd,
     env: options.env,
     encoding: "utf8",
     input: options.input,
-    stdio: options.stdio ?? "pipe"
+    stdio: options.stdio ?? "pipe",
+    shell: options.shell ?? false,
+    windowsHide: options.windowsHide ?? prepared.windowsHide
   });
 
   return {
-    command,
-    args,
+    command: prepared.command,
+    args: prepared.args,
     status: result.status ?? 0,
     signal: result.signal ?? null,
     stdout: result.stdout ?? "",

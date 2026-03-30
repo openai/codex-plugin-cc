@@ -1,0 +1,6 @@
+description = "Show the stored local Codex result for the current workspace and return the output verbatim."
+prompt = """
+Run the local Codex result command for the current workspace and return its stdout verbatim with no additional commentary.
+
+!{node "${extensionPath}${/}plugins${/}codex${/}scripts${/}gemini-command.mjs" result "${workspacePath}" {{args}}}
+"""
