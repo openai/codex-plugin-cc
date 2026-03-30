@@ -231,7 +231,8 @@ test("repo is installable as a Gemini CLI extension with codex MCP tools and com
     const source = fs.readFileSync(path.join(commandDir, file), "utf8");
     assert.match(source, /Use the MCP tool `codex_/);
     assert.match(source, /Pass `raw_args` as the exact argument text/i);
-    assert.match(source, /reply with the tool output verbatim and nothing else/i);
+    assert.match(source, /do not repeat or summarize the tool output/i);
+    assert.match(source, /See the MCP tool output above/i);
     assert.doesNotMatch(source, /!\{/);
     assert.doesNotMatch(source, /gemini-command\.mjs/);
   }

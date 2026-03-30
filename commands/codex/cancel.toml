@@ -1,9 +1,11 @@
-description = "Cancel a local Codex background run for the current workspace and return the output verbatim."
+description = "Cancel a local Codex background run for the current workspace."
 prompt = """
 Use the MCP tool `codex_cancel` exactly once.
 
 Pass `raw_args` as the exact argument text from this slash command: `{{args}}`.
 
-After the tool returns, reply with the tool output verbatim and nothing else.
+After the tool returns successfully, do not repeat or summarize the tool output.
+Reply with exactly: `Codex cancel complete. See the MCP tool output above.`
+If the tool fails, reply with exactly: `Codex cancel failed. See the MCP tool output above.`
 Do not use `run_shell_command`.
 """
