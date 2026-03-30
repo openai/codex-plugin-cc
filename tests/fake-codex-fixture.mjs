@@ -1,10 +1,11 @@
 import path from "node:path";
+import process from "node:process";
 
 import { writeExecutable } from "./helpers.mjs";
 
 export function installFakeCodex(binDir, behavior = "review-ok") {
   const statePath = path.join(binDir, "fake-codex-state.json");
-  const scriptPath = path.join(binDir, "codex");
+  const scriptPath = process.platform === "win32" ? path.join(binDir, "codex-bin.js") : path.join(binDir, "codex");
   const source = `#!/usr/bin/env node
 const fs = require("node:fs");
 const path = require("node:path");
@@ -506,12 +507,29 @@ rl.on("line", (line) => {
   }
 });
 `;
+  if (process.platform === "win32") {
+    writeExecutable(scriptPath, source);
+    writeExecutable(
+      path.join(binDir, "codex"),
+      `#!/bin/sh\nbasedir=$(dirname "$(echo "$0" | sed -e 's,\\\\,/,g')")\nexec node "$basedir/codex-bin.js" "$@"\n`
+    );
+    writeExecutable(
+      path.join(binDir, "codex.cmd"),
+      `@echo off\r\n"${process.execPath}" "%~dp0\\codex-bin.js" %*\r\n`
+    );
+    writeExecutable(
+      path.join(binDir, "codex.ps1"),
+      `#!/usr/bin/env pwsh\r\n$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent\r\n& "${process.execPath}" "$basedir/codex-bin.js" $args\r\nexit $LASTEXITCODE\r\n`
+    );
+    return;
+  }
+
   writeExecutable(scriptPath, source);
 }
 
 export function buildEnv(binDir) {
   return {
     ...process.env,
-    PATH: `${binDir}:${process.env.PATH}`
+    PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}`
   };
 }

@@ -1,0 +1,14 @@
+{
+  "name": "codex-companion",
+  "version": "1.0.0",
+  "description": "Run local Codex review commands from inside Gemini CLI.",
+  "mcpServers": {
+    "codex-companion": {
+      "command": "node",
+      "args": [
+        "${extensionPath}${/}plugins${/}codex${/}scripts${/}gemini-mcp-server.mjs"
+      ],
+      "cwd": "${workspacePath}"
+    }
+  }
+}

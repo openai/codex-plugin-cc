@@ -1,0 +1,12 @@
+description = "Run a local adversarial Codex review against the current workspace."
+prompt = """
+Use the MCP tool `codex_adversarial_review` exactly once.
+
+Pass `raw_args` as the exact argument text from this slash command: `{{args}}`.
+
+After the tool returns successfully, do not repeat or summarize the tool output.
+Reply with exactly: `Codex adversarial review complete. See the MCP tool output above.`
+If the tool fails, reply with exactly: `Codex adversarial review failed. See the MCP tool output above.`
+Do not use `run_shell_command`.
+Do not perform your own review.
+"""

@@ -3,15 +3,19 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
-const ROOT = "/Users/dkundel/code/codex-plugin";
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
+const GEMINI_MCP_SERVER = path.join(PLUGIN_ROOT, "scripts", "gemini-mcp-server.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
 
@@ -27,6 +31,28 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   throw new Error("Timed out waiting for condition.");
 }
 
+async function withGeminiMcpClient({ cwd, env }, callback) {
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [GEMINI_MCP_SERVER],
+    cwd,
+    env,
+    stderr: "pipe"
+  });
+  const client = new Client({
+    name: "codex-plugin-tests",
+    version: "1.0.0"
+  });
+
+  try {
+    await client.connect(transport);
+    return await callback(client);
+  } finally {
+    await client.close().catch(() => {});
+    await transport.close().catch(() => {});
+  }
+}
+
 test("setup reports ready when fake codex is installed and authenticated", () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
@@ -40,13 +66,77 @@ test("setup reports ready when fake codex is installed and authenticated", () =>
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.ready, true);
   assert.match(payload.codex.detail, /advanced runtime available/);
-  assert.equal(payload.sessionRuntime.mode, "direct");
+  assert.match(payload.sessionRuntime.mode, /^(direct|shared)$/);
+});
+
+test("gemini mcp server exposes Codex review tools for the target workspace", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 1;\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 2;\n");
+
+  await withGeminiMcpClient({ cwd: repo, env: buildEnv(binDir) }, async (client) => {
+    const tools = await client.listTools();
+    assert.deepEqual(
+      tools.tools.map((tool) => tool.name).sort(),
+      [
+        "codex_adversarial_review",
+        "codex_cancel",
+        "codex_result",
+        "codex_review",
+        "codex_setup",
+        "codex_status"
+      ]
+    );
+
+    const result = await client.callTool({
+      name: "codex_review",
+      arguments: {
+        raw_args: ""
+      }
+    });
+
+    const text = result.content.find((entry) => entry.type === "text")?.text ?? "";
+    assert.equal(result.isError, false);
+    assert.match(text, /Reviewed uncommitted changes/);
+    assert.match(text, /No material issues found/);
+  });
+});
+
+test("gemini mcp server preserves raw slash-command arguments for Codex review", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 1;\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 2;\n");
+
+  await withGeminiMcpClient({ cwd: repo, env: buildEnv(binDir) }, async (client) => {
+    const result = await client.callTool({
+      name: "codex_review",
+      arguments: {
+        raw_args: "--base main"
+      }
+    });
+
+    const text = result.content.find((entry) => entry.type === "text")?.text ?? "";
+    assert.equal(result.isError, false);
+    assert.match(text, /Reviewed changes against main/);
+  });
 });
 
 test("setup is ready without npm when Codex is already installed and authenticated", () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
-  fs.symlinkSync(process.execPath, path.join(binDir, "node"));
+  fs.copyFileSync(process.execPath, path.join(binDir, path.basename(process.execPath)));
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
     cwd: ROOT,

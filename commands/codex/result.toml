@@ -1,0 +1,11 @@
+description = "Show the stored local Codex result for the current workspace."
+prompt = """
+Use the MCP tool `codex_result` exactly once.
+
+Pass `raw_args` as the exact argument text from this slash command: `{{args}}`.
+
+After the tool returns successfully, do not repeat or summarize the tool output.
+Reply with exactly: `Codex result complete. See the MCP tool output above.`
+If the tool fails, reply with exactly: `Codex result failed. See the MCP tool output above.`
+Do not use `run_shell_command`.
+"""

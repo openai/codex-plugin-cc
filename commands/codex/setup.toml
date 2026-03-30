@@ -1,0 +1,11 @@
+description = "Check whether the local Codex CLI is ready for review commands."
+prompt = """
+Use the MCP tool `codex_setup` exactly once.
+
+Pass `raw_args` as the exact argument text from this slash command: `{{args}}`.
+
+After the tool returns successfully, do not repeat or summarize the tool output.
+Reply with exactly: `Codex setup complete. See the MCP tool output above.`
+If the tool fails, reply with exactly: `Codex setup failed. See the MCP tool output above.`
+Do not use `run_shell_command`.
+"""
