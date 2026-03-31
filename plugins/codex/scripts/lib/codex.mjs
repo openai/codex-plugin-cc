@@ -701,6 +701,34 @@ export function getCodexLoginStatus(cwd) {
     };
   }
 
+  // On macOS, `codex login status` can panic when run inside a sandboxed
+  // environment (e.g. Claude Code) because the Rust `system-configuration`
+  // crate attempts to access SCDynamicStore to update PATH.  When the sandbox
+  // blocks that access, `SCDynamicStoreCreate` returns NULL and the crate
+  // panics with "Attempted to create a NULL object."
+  //
+  // To avoid this, try reading ~/.codex/auth.json directly first.  The file
+  // is written by `codex login` and contains the tokens that prove the user
+  // has already authenticated.  Only fall back to the binary call if the file
+  // is missing or unreadable.
+  try {
+    const home = process.env.HOME || process.env.USERPROFILE || "";
+    if (home) {
+      const authData = readJsonFile(`${home}/.codex/auth.json`);
+      const tokens = authData.tokens;
+      if (tokens && typeof tokens === "object" && tokens.access_token) {
+        const mode = authData.auth_mode || "api-key";
+        const label = mode === "chatgpt" ? "Logged in using ChatGPT" : `Logged in (${mode})`;
+        return { available: true, loggedIn: true, detail: label };
+      }
+      if (authData.OPENAI_API_KEY) {
+        return { available: true, loggedIn: true, detail: "Logged in using API key" };
+      }
+    }
+  } catch (_) {
+    // auth.json missing or unparseable — fall through to binary check.
+  }
+
   const result = runCommand("codex", ["login", "status"], { cwd });
   if (result.error) {
     return {
