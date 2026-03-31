@@ -240,7 +240,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     if (this.proc && !this.proc.killed) {
       this.proc.stdin.end();
       setTimeout(() => {
-        if (this.proc && !this.proc.killed) {
+        if (this.proc && !this.proc.killed && this.proc.exitCode === null) {
           // On Windows with shell: true, the direct child is cmd.exe.
           // Use terminateProcessTree to kill the entire tree including
           // the grandchild node process.
