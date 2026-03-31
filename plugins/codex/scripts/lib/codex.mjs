@@ -701,6 +701,24 @@ export function getCodexLoginStatus(cwd) {
     };
   }
 
+  if (process.env.OPENAI_API_KEY) {
+    return {
+      available: true,
+      loggedIn: true,
+      detail: "authenticated via OPENAI_API_KEY"
+    };
+  }
+
+  const configPath = `${process.env.HOME || process.env.USERPROFILE}/.codex/config.toml`;
+  const grep = runCommand("grep", ["-m1", "^model_provider", configPath]);
+  if (grep.status === 0 && !/=\s*"openai"/.test(grep.stdout)) {
+    return {
+      available: true,
+      loggedIn: true,
+      detail: "authenticated via custom model provider"
+    };
+  }
+
   const result = runCommand("codex", ["login", "status"], { cwd });
   if (result.error) {
     return {
