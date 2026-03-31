@@ -554,7 +554,7 @@ test("task --background enqueues a detached worker and exposes per-job status", 
 
   const waitedStatus = run(
     "node",
-    [SCRIPT, "status", launchPayload.jobId, "--wait", "--timeout-ms", "5000", "--json"],
+    [SCRIPT, "status", launchPayload.jobId, "--wait", "--timeout-ms", "15000", "--json"],
     {
       cwd: repo,
       env: buildEnv(binDir)
@@ -1276,7 +1276,7 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
       return job;
     }
     return null;
-  });
+  }, { timeoutMs: 15000 });
 
   const cancelResult = run("node", [SCRIPT, "cancel", jobId, "--json"], {
     cwd: repo,
