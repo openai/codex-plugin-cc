@@ -1,7 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import { runCommand, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+
+test("runCommand does not crash with ENOBUFS on large stdout", () => {
+  // Generate output larger than Node's default 1 MB maxBuffer.
+  // Uses Node itself for cross-platform compatibility (no `seq` on Windows).
+  const result = runCommand(process.execPath, [
+    "-e",
+    "for(let i=0;i<200000;i++) process.stdout.write(i+'\\n')"
+  ]);
+  assert.equal(result.error, null, "should not error with ENOBUFS");
+  assert.equal(result.status, 0);
+  assert.ok(result.stdout.length > 1_000_000, "stdout should exceed 1 MB");
+});
 
 test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;
