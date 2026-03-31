@@ -34,7 +34,7 @@
  *   onProgress: ProgressReporter | null
  * }} TurnCaptureState
  */
-import { readJsonFile } from "./fs.mjs";
+import { readJsonFile, safeReadFile } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable, runCommand } from "./process.mjs";
@@ -710,8 +710,9 @@ export function getCodexLoginStatus(cwd) {
   }
 
   const configPath = `${process.env.HOME || process.env.USERPROFILE}/.codex/config.toml`;
-  const grep = runCommand("grep", ["-m1", "^model_provider", configPath]);
-  if (grep.status === 0 && !/=\s*"openai"/.test(grep.stdout)) {
+  const configContent = safeReadFile(configPath);
+  const providerMatch = configContent.match(/^model_provider\s*=\s*["']?([^"'\s\r\n]+)["']?/m);
+  if (providerMatch && providerMatch[1] !== "openai") {
     return {
       available: true,
       loggedIn: true,
