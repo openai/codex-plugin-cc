@@ -2,7 +2,7 @@
 description: Delegate investigation, an explicit fix request, or follow-up rescue work to the Codex rescue subagent
 argument-hint: "[--background|--wait] [--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [what Codex should investigate, solve, or continue]"
 context: fork
-allowed-tools: Bash(node:*)
+allowed-tools: Bash(node:*), AskUserQuestion
 ---
 
 Route this request to the `codex:codex-rescue` subagent.
