@@ -188,7 +188,8 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     this.proc = spawn("codex", ["app-server"], {
       cwd: this.cwd,
       env: this.options.env,
-      stdio: ["pipe", "pipe", "pipe"]
+      stdio: ["pipe", "pipe", "pipe"],
+      shell: process.platform === "win32"
     });
 
     this.proc.stdout.setEncoding("utf8");
