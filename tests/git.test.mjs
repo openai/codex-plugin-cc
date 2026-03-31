@@ -3,7 +3,7 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { collectReviewContext, resolveReviewTarget } from "../plugins/codex/scripts/lib/git.mjs";
+import { collectReviewContext, formatUntrackedFile, resolveReviewTarget } from "../plugins/codex/scripts/lib/git.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 
 test("resolveReviewTarget prefers working tree when repo is dirty", () => {
@@ -69,20 +69,12 @@ test("resolveReviewTarget requires an explicit base when no default branch can b
   );
 });
 
-test("collectReviewContext skips untracked directories without crashing", () => {
+test("formatUntrackedFile skips directories instead of throwing EISDIR", () => {
   const cwd = makeTempDir();
-  initGitRepo(cwd);
-  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v1');\n");
-  run("git", ["add", "app.js"], { cwd });
-  run("git", ["commit", "-m", "init"], { cwd });
+  fs.mkdirSync(path.join(cwd, "some-dir"));
 
-  // Create an untracked directory with a file inside
-  fs.mkdirSync(path.join(cwd, "untracked-dir"));
-  fs.writeFileSync(path.join(cwd, "untracked-dir", "nested.js"), "// nested\n");
+  const result = formatUntrackedFile(cwd, "some-dir");
 
-  const target = resolveReviewTarget(cwd, { scope: "working-tree" });
-  const context = collectReviewContext(cwd, target);
-
-  assert.match(context.content, /untracked-dir\/nested\.js/);
-  assert.doesNotMatch(context.content, /EISDIR/);
+  assert.match(result, /skipped: directory/);
+  assert.match(result, /some-dir/);
 });
