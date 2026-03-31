@@ -4,7 +4,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
-const ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 
 function read(relativePath) {
