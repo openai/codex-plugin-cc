@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Codex plugins to use in Claude Code for delegation and code review.",
-    "version": "1.0.0"
+    "version": "1.0.1"
   },
   "plugins": [
     {
       "name": "codex",
       "description": "Use Codex from Claude Code to review code or delegate tasks.",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "author": {
         "name": "OpenAI"
       },
