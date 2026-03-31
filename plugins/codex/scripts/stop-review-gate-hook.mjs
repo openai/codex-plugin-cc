@@ -14,8 +14,6 @@ import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 const STOP_REVIEW_TIMEOUT_MS = 15 * 60 * 1000;
-const DEFAULT_COOLDOWN_MINUTES = null;
-const DEFAULT_MAX_PER_SESSION = null;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
@@ -52,10 +50,11 @@ function countSessionStopReviews(jobs) {
     (job) =>
       job.jobClass === "review" &&
       job.title === "Codex Stop Gate Review" &&
-      (job.status === "completed" || job.status === "running" || job.status === "queued")
+      job.status === "completed"
   ).length;
 }
 
+// Expects jobs pre-sorted newest-first (via sortJobsNewestFirst from caller).
 function findLastStopReviewTime(jobs) {
   const stopReview = jobs.find(
     (job) =>
@@ -67,7 +66,7 @@ function findLastStopReviewTime(jobs) {
 }
 
 function checkThrottleLimits(config, jobs) {
-  const maxPerSession = config.stopReviewGateMaxPerSession ?? DEFAULT_MAX_PER_SESSION;
+  const maxPerSession = config.stopReviewGateMaxPerSession ?? null;
   if (maxPerSession != null && maxPerSession > 0) {
     const count = countSessionStopReviews(jobs);
     if (count >= maxPerSession) {
@@ -75,7 +74,7 @@ function checkThrottleLimits(config, jobs) {
     }
   }
 
-  const cooldownMinutes = config.stopReviewGateCooldownMinutes ?? DEFAULT_COOLDOWN_MINUTES;
+  const cooldownMinutes = config.stopReviewGateCooldownMinutes ?? null;
   if (cooldownMinutes != null && cooldownMinutes > 0) {
     const lastTime = findLastStopReviewTime(jobs);
     if (lastTime != null) {

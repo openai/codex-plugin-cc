@@ -248,8 +248,8 @@ function handleSetup(argv) {
 
   if (options["review-gate-cooldown"] != null) {
     const cooldown = options["review-gate-cooldown"] === "off" ? null : Number(options["review-gate-cooldown"]);
-    if (cooldown !== null && (Number.isNaN(cooldown) || cooldown < 1)) {
-      throw new Error(`--review-gate-cooldown must be a positive number (minutes) or "off".`);
+    if (cooldown !== null && (!Number.isInteger(cooldown) || cooldown < 1)) {
+      throw new Error(`--review-gate-cooldown must be a positive integer (minutes) or "off".`);
     }
     setConfig(workspaceRoot, "stopReviewGateCooldownMinutes", cooldown);
     actionsTaken.push(
