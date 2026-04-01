@@ -380,7 +380,7 @@ async function executeReviewRun(request) {
   const result = await runAppServerTurn(context.repoRoot, {
     prompt,
     model: request.model,
-    sandbox: "read-only",
+    sandbox: "readOnly",
     outputSchema: readOutputSchema(REVIEW_SCHEMA),
     onProgress: request.onProgress
   });
@@ -457,7 +457,7 @@ async function executeTaskRun(request) {
     defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
     model: request.model,
     effort: request.effort,
-    sandbox: request.write ? "workspace-write" : "read-only",
+    sandbox: request.write ? "workspaceWrite" : "readOnly",
     onProgress: request.onProgress,
     persistThread: true,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
