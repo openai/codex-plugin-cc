@@ -289,7 +289,6 @@ If you only use Claude Code today and have not used Codex yet, you will also nee
 No. This plugin delegates through your local [Codex CLI](https://developers.openai.com/codex/cli/) and [Codex app server](https://developers.openai.com/codex/app-server/) on the same machine.
 
 That means:
-
 - it uses the same Codex install you would use directly
 - it uses the same local authentication state
 - it uses the same repository checkout and machine-local environment
