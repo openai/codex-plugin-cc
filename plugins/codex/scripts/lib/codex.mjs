@@ -692,6 +692,12 @@ export function getSessionRuntimeStatus(env = process.env, cwd = process.cwd()) 
   };
 }
 
+function isProjectTrusted(globalConfig, workspaceRoot) {
+  const escaped = workspaceRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`\\[projects\\."${escaped}"\\][\\s\\S]*?trust_level\\s*=\\s*["']?trusted`);
+  return re.test(globalConfig);
+}
+
 export function getCodexLoginStatus(cwd) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
@@ -711,9 +717,12 @@ export function getCodexLoginStatus(cwd) {
   }
 
   const providerRe = /^\s*model_provider\s*=\s*["']?([^"'\s\r\n]+)["']?/m;
-  const globalConfig = safeReadFile(`${process.env.HOME || process.env.USERPROFILE}/.codex/config.toml`);
+  const globalConfigPath = `${process.env.HOME || process.env.USERPROFILE}/.codex/config.toml`;
+  const globalConfig = safeReadFile(globalConfigPath);
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const projectConfig = safeReadFile(`${workspaceRoot}/.codex/config.toml`);
+  const projectConfig = isProjectTrusted(globalConfig, workspaceRoot)
+    ? safeReadFile(`${workspaceRoot}/.codex/config.toml`)
+    : "";
   const providerMatch = projectConfig.match(providerRe) || globalConfig.match(providerRe);
   if (providerMatch && providerMatch[1] !== "openai") {
     return {
