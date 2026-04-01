@@ -1,4 +1,6 @@
+import fs from "node:fs";
 import path from "node:path";
+import process from "node:process";
 
 import { writeExecutable } from "./helpers.mjs";
 
@@ -465,7 +467,7 @@ rl.on("line", (line) => {
 	              }
 	            }
 	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
-	          }, 400);
+	          }, 5000);
 	          interruptibleTurns.set(turnId, { threadId: thread.id, timer });
 	        } else if (BEHAVIOR === "slow-task") {
 	          emitTurnCompletedLater(thread.id, turnId, items, 400);
@@ -507,11 +509,19 @@ rl.on("line", (line) => {
 });
 `;
   writeExecutable(scriptPath, source);
+
+  // On Windows, npm global binaries are invoked via .cmd wrappers.
+  // Create a codex.cmd so the fake binary is discoverable by spawn with shell: true.
+  if (process.platform === "win32") {
+    const cmdWrapper = `@echo off\r\nnode "%~dp0codex" %*\r\n`;
+    fs.writeFileSync(path.join(binDir, "codex.cmd"), cmdWrapper, { encoding: "utf8" });
+  }
 }
 
 export function buildEnv(binDir) {
+  const sep = process.platform === "win32" ? ";" : ":";
   return {
     ...process.env,
-    PATH: `${binDir}:${process.env.PATH}`
+    PATH: `${binDir}${sep}${process.env.PATH}`
   };
 }

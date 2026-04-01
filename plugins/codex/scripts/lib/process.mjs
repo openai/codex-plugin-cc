@@ -8,7 +8,8 @@ export function runCommand(command, args = [], options = {}) {
     encoding: "utf8",
     input: options.input,
     stdio: options.stdio ?? "pipe",
-    shell: process.platform === "win32"
+    shell: process.platform === "win32",
+    windowsHide: true
   });
 
   return {

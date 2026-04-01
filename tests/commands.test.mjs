@@ -2,8 +2,9 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { fileURLToPath } from "node:url";
 
-const ROOT = "/Users/dkundel/code/codex-plugin";
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 
 function read(relativePath) {
@@ -89,6 +90,7 @@ test("rescue command absorbs continue semantics", () => {
   const runtimeSkill = read("skills/codex-cli-runtime/SKILL.md");
 
   assert.match(rescue, /The final user-visible response must be Codex's output verbatim/i);
+  assert.match(rescue, /allowed-tools:\s*Bash\(node:\*\),\s*AskUserQuestion/);
   assert.match(rescue, /--background\|--wait/);
   assert.match(rescue, /--resume\|--fresh/);
   assert.match(rescue, /--model <model\|spark>/);

@@ -3,13 +3,14 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
-const ROOT = "/Users/dkundel/code/codex-plugin";
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
@@ -553,7 +554,7 @@ test("task --background enqueues a detached worker and exposes per-job status", 
 
   const waitedStatus = run(
     "node",
-    [SCRIPT, "status", launchPayload.jobId, "--wait", "--timeout-ms", "5000", "--json"],
+    [SCRIPT, "status", launchPayload.jobId, "--wait", "--timeout-ms", "15000", "--json"],
     {
       cwd: repo,
       env: buildEnv(binDir)
@@ -1275,7 +1276,7 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
       return job;
     }
     return null;
-  });
+  }, { timeoutMs: 15000 });
 
   const cancelResult = run("node", [SCRIPT, "cancel", jobId, "--json"], {
     cwd: repo,

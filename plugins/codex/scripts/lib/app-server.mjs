@@ -14,6 +14,7 @@ import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession } from "./broker-lifecycle.mjs";
+import { terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
@@ -188,7 +189,9 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     this.proc = spawn("codex", ["app-server"], {
       cwd: this.cwd,
       env: this.options.env,
-      stdio: ["pipe", "pipe", "pipe"]
+      stdio: ["pipe", "pipe", "pipe"],
+      shell: process.platform === "win32",
+      windowsHide: true
     });
 
     this.proc.stdout.setEncoding("utf8");
@@ -237,8 +240,20 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     if (this.proc && !this.proc.killed) {
       this.proc.stdin.end();
       setTimeout(() => {
-        if (this.proc && !this.proc.killed) {
-          this.proc.kill("SIGTERM");
+        if (this.proc && !this.proc.killed && this.proc.exitCode === null) {
+          // On Windows with shell: true, the direct child is cmd.exe.
+          // Use terminateProcessTree to kill the entire tree including
+          // the grandchild node process.
+          if (process.platform === "win32") {
+            try {
+              terminateProcessTree(this.proc.pid);
+            } catch {
+              // Best-effort cleanup inside an unref'd timer — swallow errors
+              // to avoid crashing the host process during shutdown.
+            }
+          } else {
+            this.proc.kill("SIGTERM");
+          }
         }
       }, 50).unref?.();
     }
