@@ -709,9 +709,10 @@ export function getCodexLoginStatus(cwd) {
     };
   }
 
-  const configPath = `${process.env.HOME || process.env.USERPROFILE}/.codex/config.toml`;
-  const configContent = safeReadFile(configPath);
-  const providerMatch = configContent.match(/^model_provider\s*=\s*["']?([^"'\s\r\n]+)["']?/m);
+  const providerRe = /^model_provider\s*=\s*["']?([^"'\s\r\n]+)["']?/m;
+  const globalConfig = safeReadFile(`${process.env.HOME || process.env.USERPROFILE}/.codex/config.toml`);
+  const projectConfig = safeReadFile(`${cwd}/.codex/config.toml`);
+  const providerMatch = projectConfig.match(providerRe) || globalConfig.match(providerRe);
   if (providerMatch && providerMatch[1] !== "openai") {
     return {
       available: true,
