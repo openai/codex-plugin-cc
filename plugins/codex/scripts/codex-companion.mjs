@@ -905,7 +905,41 @@ async function handleCancel(argv) {
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
-  const { workspaceRoot, job } = resolveCancelableJob(cwd, reference);
+  const sessionId = process.env[SESSION_ID_ENV] ?? null;
+    
+  let workspaceRoot, jobSelection;
+    
+  if (!reference && sessionId) {
+    workspaceRoot = resolveWorkspaceRoot(cwd);
+    const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+    
+    const activeSessionJobs = jobs.filter(
+      (job) =>
+        (job.status === "queued" || job.status === "running") &&
+        job.sessionId != null &&
+        job.sessionId === sessionId
+       );
+    
+      if (activeSessionJobs.length === 0) {
+        throw new Error("No active Codex jobs found for this session.");
+      }
+    
+      if (activeSessionJobs.length > 1) {
+        throw new Error(
+          "Multiple Codex jobs are active for this session; specify a job ID to cancel."
+        );
+      }
+    
+      jobSelection = resolveCancelableJob(cwd, activeSessionJobs[0].id);
+      workspaceRoot = jobSelection.workspaceRoot;
+    } else {
+      jobSelection = resolveCancelableJob(cwd, reference);
+      workspaceRoot = jobSelection.workspaceRoot;
+    }
+    
+    const { job } = jobSelection;
+    
+    
   const existing = readStoredJob(workspaceRoot, job.id) ?? {};
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
