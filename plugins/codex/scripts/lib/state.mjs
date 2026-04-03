@@ -50,11 +50,18 @@ export function resolveStateDir(cwd) {
     if (!fs.existsSync(path.join(primaryDir, STATE_FILE_NAME)) && fs.existsSync(path.join(fallbackDir, STATE_FILE_NAME))) {
       fs.cpSync(fallbackDir, primaryDir, { recursive: true });
       // Rewrite logFile paths in migrated state.json so they point to the
-      // new persistent location instead of the old tmpdir.
+      // new persistent location instead of the old tmpdir.  Replace both
+      // raw paths and JSON-escaped paths (backslashes doubled on Windows).
       const migratedStateFile = path.join(primaryDir, STATE_FILE_NAME);
       try {
-        const raw = fs.readFileSync(migratedStateFile, "utf8");
-        const updated = raw.replaceAll(fallbackDir, primaryDir);
+        let updated = fs.readFileSync(migratedStateFile, "utf8");
+        const raw = updated;
+        updated = updated.replaceAll(fallbackDir, primaryDir);
+        const escapedFallback = fallbackDir.replaceAll("\\", "\\\\");
+        const escapedPrimary = primaryDir.replaceAll("\\", "\\\\");
+        if (escapedFallback !== fallbackDir) {
+          updated = updated.replaceAll(escapedFallback, escapedPrimary);
+        }
         if (updated !== raw) {
           fs.writeFileSync(migratedStateFile, updated, "utf8");
         }
