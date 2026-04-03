@@ -49,6 +49,18 @@ export function resolveStateDir(cwd) {
     // future reads/writes use the plugin data dir and state survives tmp cleanup.
     if (!fs.existsSync(path.join(primaryDir, STATE_FILE_NAME)) && fs.existsSync(path.join(fallbackDir, STATE_FILE_NAME))) {
       fs.cpSync(fallbackDir, primaryDir, { recursive: true });
+      // Rewrite logFile paths in migrated state.json so they point to the
+      // new persistent location instead of the old tmpdir.
+      const migratedStateFile = path.join(primaryDir, STATE_FILE_NAME);
+      try {
+        const raw = fs.readFileSync(migratedStateFile, "utf8");
+        const updated = raw.replaceAll(fallbackDir, primaryDir);
+        if (updated !== raw) {
+          fs.writeFileSync(migratedStateFile, updated, "utf8");
+        }
+      } catch {
+        // Non-fatal: state still works, just with stale log paths
+      }
     }
     return primaryDir;
   }
