@@ -133,9 +133,25 @@ function formatSection(title, body) {
   return [`## ${title}`, "", body.trim() ? body.trim() : "(none)", ""].join("\n");
 }
 
+function listUntrackedFiles(cwd, relativePath) {
+  const files = gitChecked(cwd, ["ls-files", "--others", "--exclude-standard", relativePath]).stdout.trim().split("\n").filter(Boolean);
+  if (files.length === 1 && files[0] === relativePath) {
+    const absolutePath = path.join(cwd, relativePath);
+    return gitChecked(absolutePath, ["ls-files", "--others", "--exclude-standard"]).stdout.trim().split("\n").filter(Boolean).map((file) => path.join(relativePath, file));
+  }
+  return files;
+}
+
 function formatUntrackedFile(cwd, relativePath) {
   const absolutePath = path.join(cwd, relativePath);
-  const stat = fs.statSync(absolutePath);
+  const lstat = fs.lstatSync(absolutePath);
+  if (lstat.isSymbolicLink() && fs.statSync(absolutePath).isDirectory()) {
+    return `### ${relativePath}\n(skipped: symlinked directory)`;
+  }
+  if (lstat.isDirectory()) {
+    return listUntrackedFiles(cwd, relativePath).map((file) => formatUntrackedFile(cwd, file)).join("\n\n");
+  }
+  const stat = lstat.isSymbolicLink() ? fs.statSync(absolutePath) : lstat;
   if (stat.size > MAX_UNTRACKED_BYTES) {
     return `### ${relativePath}\n(skipped: ${stat.size} bytes exceeds ${MAX_UNTRACKED_BYTES} byte limit)`;
   }

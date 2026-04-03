@@ -55,6 +55,27 @@ test("resolveReviewTarget honors explicit base overrides", () => {
   assert.equal(target.baseRef, "main");
 });
 
+test("collectReviewContext includes files inside untracked directories", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log(1);\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+
+  fs.mkdirSync(path.join(cwd, "newdir", "sub"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, "newdir", "a.txt"), "hello a");
+  fs.writeFileSync(path.join(cwd, "newdir", "sub", "b.txt"), "hello b");
+
+  const target = resolveReviewTarget(cwd, {});
+  const ctx = collectReviewContext(cwd, target);
+
+  assert.equal(ctx.mode, "working-tree");
+  assert.match(ctx.content, /newdir\/a\.txt/);
+  assert.match(ctx.content, /newdir\/sub\/b\.txt/);
+  assert.match(ctx.content, /hello a/);
+  assert.match(ctx.content, /hello b/);
+});
+
 test("resolveReviewTarget requires an explicit base when no default branch can be inferred", () => {
   const cwd = makeTempDir();
   initGitRepo(cwd);
