@@ -49,24 +49,32 @@ export function resolveStateDir(cwd) {
     // future reads/writes use the plugin data dir and state survives tmp cleanup.
     if (!fs.existsSync(path.join(primaryDir, STATE_FILE_NAME)) && fs.existsSync(path.join(fallbackDir, STATE_FILE_NAME))) {
       fs.cpSync(fallbackDir, primaryDir, { recursive: true });
-      // Rewrite logFile paths in migrated state.json so they point to the
-      // new persistent location instead of the old tmpdir.  Replace both
-      // raw paths and JSON-escaped paths (backslashes doubled on Windows).
-      const migratedStateFile = path.join(primaryDir, STATE_FILE_NAME);
-      try {
-        let updated = fs.readFileSync(migratedStateFile, "utf8");
-        const raw = updated;
-        updated = updated.replaceAll(fallbackDir, primaryDir);
-        const escapedFallback = fallbackDir.replaceAll("\\", "\\\\");
-        const escapedPrimary = primaryDir.replaceAll("\\", "\\\\");
-        if (escapedFallback !== fallbackDir) {
-          updated = updated.replaceAll(escapedFallback, escapedPrimary);
+      // Rewrite paths in all migrated JSON files (state.json + jobs/*.json)
+      // so logFile and other references point to the persistent location.
+      // Replace both raw paths and JSON-escaped paths (backslashes on Windows).
+      const escapedFallback = fallbackDir.replaceAll("\\", "\\\\");
+      const escapedPrimary = primaryDir.replaceAll("\\", "\\\\");
+      const rewritePaths = (filePath) => {
+        try {
+          let updated = fs.readFileSync(filePath, "utf8");
+          const original = updated;
+          updated = updated.replaceAll(fallbackDir, primaryDir);
+          if (escapedFallback !== fallbackDir) {
+            updated = updated.replaceAll(escapedFallback, escapedPrimary);
+          }
+          if (updated !== original) {
+            fs.writeFileSync(filePath, updated, "utf8");
+          }
+        } catch { /* non-fatal */ }
+      };
+      rewritePaths(path.join(primaryDir, STATE_FILE_NAME));
+      const jobsDir = path.join(primaryDir, JOBS_DIR_NAME);
+      if (fs.existsSync(jobsDir)) {
+        for (const entry of fs.readdirSync(jobsDir)) {
+          if (entry.endsWith(".json")) {
+            rewritePaths(path.join(jobsDir, entry));
+          }
         }
-        if (updated !== raw) {
-          fs.writeFileSync(migratedStateFile, updated, "utf8");
-        }
-      } catch {
-        // Non-fatal: state still works, just with stale log paths
       }
     }
     return primaryDir;
