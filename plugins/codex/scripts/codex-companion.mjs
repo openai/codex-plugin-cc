@@ -2,6 +2,7 @@
 
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -77,6 +78,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
+      "  node scripts/codex-companion.mjs plan-review [--wait|--background] [--plan <name>] [--model <model>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -701,6 +703,136 @@ async function handleReview(argv) {
   });
 }
 
+function findPlanFile(planName) {
+  const plansDir = path.join(os.homedir(), ".claude", "plans");
+  if (!fs.existsSync(plansDir)) {
+    throw new Error("No Claude Code plans directory found at ~/.claude/plans/.");
+  }
+
+  if (planName) {
+    const candidate = planName.endsWith(".md") ? planName : `${planName}.md`;
+    const planPath = path.join(plansDir, candidate);
+    if (!fs.existsSync(planPath)) {
+      throw new Error(`Plan not found: ${candidate}`);
+    }
+    return { name: candidate.replace(/\.md$/, ""), path: planPath };
+  }
+
+  const files = fs.readdirSync(plansDir)
+    .filter((f) => f.endsWith(".md"))
+    .map((f) => {
+      const fullPath = path.join(plansDir, f);
+      const stat = fs.statSync(fullPath);
+      return { name: f.replace(/\.md$/, ""), path: fullPath, mtime: stat.mtimeMs };
+    })
+    .sort((a, b) => b.mtime - a.mtime);
+
+  if (files.length === 0) {
+    throw new Error("No plan files found in ~/.claude/plans/.");
+  }
+
+  return files[0];
+}
+
+function buildPlanReviewPrompt(planContent, planName, focusText) {
+  const template = loadPromptTemplate(ROOT_DIR, "plan-review");
+  return interpolateTemplate(template, {
+    PLAN_NAME: planName,
+    USER_FOCUS: focusText || "No extra focus provided.",
+    PLAN_CONTENT: planContent
+  });
+}
+
+async function executePlanReviewRun(request) {
+  ensureCodexReady(request.cwd);
+
+  const planFile = findPlanFile(request.planName);
+  const planContent = fs.readFileSync(planFile.path, "utf8");
+  const workspaceRoot = resolveWorkspaceRoot(request.cwd);
+  const focusText = request.focusText?.trim() ?? "";
+  const reviewName = "Plan Review";
+
+  const prompt = buildPlanReviewPrompt(planContent, planFile.name, focusText);
+  const result = await runAppServerTurn(workspaceRoot, {
+    prompt,
+    model: request.model,
+    sandbox: "read-only",
+    outputSchema: readOutputSchema(REVIEW_SCHEMA),
+    onProgress: request.onProgress
+  });
+  const parsed = parseStructuredOutput(result.finalMessage, {
+    status: result.status,
+    failureMessage: result.error?.message ?? result.stderr
+  });
+  const payload = {
+    review: reviewName,
+    plan: { name: planFile.name, path: planFile.path },
+    threadId: result.threadId,
+    codex: {
+      status: result.status,
+      stderr: result.stderr,
+      stdout: result.finalMessage,
+      reasoning: result.reasoningSummary
+    },
+    result: parsed.parsed,
+    rawOutput: parsed.rawOutput,
+    parseError: parsed.parseError,
+    reasoningSummary: result.reasoningSummary
+  };
+
+  return {
+    exitStatus: result.status,
+    threadId: result.threadId,
+    turnId: result.turnId,
+    payload,
+    rendered: renderReviewResult(parsed, {
+      reviewLabel: reviewName,
+      targetLabel: `plan: ${planFile.name}`,
+      reasoningSummary: result.reasoningSummary
+    }),
+    summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
+    jobTitle: `Codex ${reviewName}`,
+    jobClass: "review",
+    targetLabel: `plan: ${planFile.name}`
+  };
+}
+
+async function handlePlanReview(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["plan", "model", "cwd"],
+    booleanOptions: ["json", "background", "wait"],
+    aliasMap: {
+      m: "model"
+    }
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveCommandWorkspace(options);
+  const focusText = positionals.join(" ").trim();
+
+  const planFile = findPlanFile(options.plan ?? null);
+  const job = createCompanionJob({
+    prefix: "review",
+    kind: "plan-review",
+    title: "Codex Plan Review",
+    workspaceRoot,
+    jobClass: "review",
+    summary: `Plan Review: ${planFile.name}`
+  });
+  await runForegroundCommand(
+    job,
+    (progress) =>
+      executePlanReviewRun({
+        cwd,
+        model: options.model,
+        planName: options.plan ?? null,
+        focusText,
+        onProgress: progress
+      }),
+    { json: options.json }
+  );
+}
+
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "cwd", "prompt-file"],
@@ -976,6 +1108,9 @@ async function main() {
       await handleReviewCommand(argv, {
         reviewName: "Adversarial Review"
       });
+      break;
+    case "plan-review":
+      await handlePlanReview(argv);
       break;
     case "task":
       await handleTask(argv);
