@@ -19,11 +19,41 @@ const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
 function readHookInput() {
-  const raw = fs.readFileSync(0, "utf8").trim();
-  if (!raw) {
-    return {};
+  const MAX_RETRIES = 50;
+  const RETRY_DELAY_MS = 10;
+  const canAtomicsSleep =
+    typeof SharedArrayBuffer === "function" &&
+    typeof Atomics !== "undefined" &&
+    typeof Atomics.wait === "function";
+  const sleepBuffer = canAtomicsSleep ? new Int32Array(new SharedArrayBuffer(4)) : null;
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      const raw = fs.readFileSync(0, "utf8").trim();
+      if (!raw) {
+        return {};
+      }
+      return JSON.parse(raw);
+    } catch (err) {
+      if (err?.code === "EAGAIN" && attempt < MAX_RETRIES - 1) {
+        if (sleepBuffer) {
+          Atomics.wait(sleepBuffer, 0, 0, RETRY_DELAY_MS);
+        } else {
+          const start = Date.now();
+          while (Date.now() - start < RETRY_DELAY_MS) {
+            // Busy-wait fallback when Atomics.wait is unavailable.
+          }
+        }
+        continue;
+      }
+      if (err?.code === "EAGAIN") {
+        return {};
+      }
+      throw err;
+    }
   }
-  return JSON.parse(raw);
+
+  return {};
 }
 
 function emitDecision(payload) {
