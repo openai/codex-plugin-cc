@@ -53,7 +53,10 @@ function readHookInput() {
     } catch (err) {
       if (err?.code === "EAGAIN") {
         consecutiveEagain++;
-        if (consecutiveEagain >= MAX_RETRIES) {
+        // Only give up if no data has arrived yet. Once chunks contain
+        // partial data, keep retrying to avoid feeding truncated JSON
+        // to JSON.parse.
+        if (consecutiveEagain >= MAX_RETRIES && chunks.length === 0) {
           break;
         }
         sleepSync(RETRY_DELAY_MS);
