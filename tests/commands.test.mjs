@@ -74,6 +74,7 @@ test("continue is not exposed as a user-facing command", () => {
   const commandFiles = fs.readdirSync(path.join(PLUGIN_ROOT, "commands")).sort();
   assert.deepEqual(commandFiles, [
     "adversarial-review.md",
+    "agent-team.md",
     "cancel.md",
     "rescue.md",
     "result.md",
@@ -193,6 +194,27 @@ test("hooks keep session-end cleanup and stop gating enabled", () => {
   assert.match(source, /SessionEnd/);
   assert.match(source, /stop-review-gate-hook\.mjs/);
   assert.match(source, /session-lifecycle-hook\.mjs/);
+});
+
+test("agent-team command spawns Codex agents in tmux split panes", () => {
+  const source = read("commands/agent-team.md");
+  const skill = read("skills/agent-team/SKILL.md");
+
+  assert.match(source, /tmux split panes/i);
+  assert.match(source, /codex --dangerously-bypass-approvals-and-sandbox/);
+  assert.match(source, /codex-companion\.mjs" agent-team --json \$ARGUMENTS/);
+  assert.match(source, /tmux send-keys/);
+  assert.match(source, /tmux capture-pane/);
+  assert.match(source, /agent-team-kill/);
+  assert.match(source, /allowed-tools:\s*Bash\(node:\*\)/);
+  assert.match(source, /one owner per file/i);
+  assert.match(source, /one task at a time per agent/i);
+  assert.match(skill, /user-invocable:\s*false/);
+  assert.match(skill, /tmux send-keys/);
+  assert.match(skill, /tmux capture-pane/);
+  assert.match(skill, /file conflict/i);
+  assert.match(skill, /one owner per file/i);
+  assert.match(skill, /codex auto-compacts/i);
 });
 
 test("setup command can offer Codex install and still points users to codex login", () => {
