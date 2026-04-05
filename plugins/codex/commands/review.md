@@ -40,27 +40,19 @@ Argument handling:
 - If the user needs custom review instructions or more adversarial framing, they should use `/codex:adversarial-review`.
 
 Foreground flow:
-- Get the repo root (falls back to "global" outside a git repo):
+- Run the review. The node wrapper streams output in real-time, creates `~/.codex` if needed, saves output only on success, and propagates the exit code:
 ```bash
-git rev-parse --show-toplevel 2>/dev/null || echo "global"
-```
-- Create `~/.codex` and compute the save path. Substitute `<REPO_ROOT>` with the output of the previous step:
-```bash
-node -e "const c=require('crypto'),os=require('os'),fs=require('fs'),root=process.argv[1];const h=root&&root!=='global'?c.createHash('md5').update(root).digest('hex'):'global';const d=os.homedir()+'/.codex';fs.mkdirSync(d,{recursive:true});console.log(d+'/last-review-'+h+'.md');" "<REPO_ROOT>"
-```
-- Run, piping output to both the terminal and the save path. Substitute `<SAVE_PATH>` with the node output above:
-```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" review "$ARGUMENTS" | tee "<SAVE_PATH>"
+node -e "const {spawn,spawnSync:ss}=require('child_process'),os=require('os'),fs=require('fs'),c=require('crypto'),path=require('path');let t;try{t=ss('git',['rev-parse','--show-toplevel'],{encoding:'utf8'}).stdout.trim()}catch(e){t=''};const h=t?c.createHash('md5').update(t).digest('hex'):'global';const d=os.homedir()+'/.codex';fs.mkdirSync(d,{recursive:true});const args=process.argv.slice(2).filter(Boolean);const child=spawn(process.execPath,[path.resolve(process.env.CLAUDE_PLUGIN_ROOT,'scripts/codex-companion.mjs'),'review',...args],{stdio:['inherit','pipe','inherit'],env:process.env});const chunks=[];child.stdout.on('data',chunk=>{process.stdout.write(chunk);chunks.push(chunk)});child.on('close',code=>{if(code===0)fs.writeFileSync(path.join(d,'last-review-'+h+'.md'),Buffer.concat(chunks));process.exit(code??1)});" -- "$ARGUMENTS"
 ```
 - Return the command stdout verbatim, exactly as-is.
 - Do not paraphrase, summarize, or add commentary before or after it.
 - Do not fix any issues mentioned in the review output.
 
 Background flow:
-- Launch the review with `Bash` in the background. The node wrapper uses the same hash logic as the foreground flow, creates `~/.codex` if needed, saves output only on success, and propagates the exit code:
+- Launch the review with `Bash` in the background. Same streaming node wrapper as the foreground flow:
 ```typescript
 Bash({
-  command: `node -e "const {spawnSync:sp}=require('child_process'),os=require('os'),fs=require('fs'),c=require('crypto'),path=require('path');let t;try{t=sp('git',['rev-parse','--show-toplevel'],{encoding:'utf8'}).stdout.trim()}catch(e){t=''};const h=t?c.createHash('md5').update(t).digest('hex'):'global';const d=os.homedir()+'/.codex';fs.mkdirSync(d,{recursive:true});const args=process.argv.slice(2).filter(Boolean);const r=sp(process.execPath,[path.resolve(process.env.CLAUDE_PLUGIN_ROOT,'scripts/codex-companion.mjs'),'review',...args],{stdio:['inherit','pipe','inherit'],env:process.env});const out=r.stdout?r.stdout.toString():'';process.stdout.write(out);if(r.status===0)fs.writeFileSync(path.join(d,'last-review-'+h+'.md'),out);process.exit(r.status??1);" -- "$ARGUMENTS"`,
+  command: `node -e "const {spawn,spawnSync:ss}=require('child_process'),os=require('os'),fs=require('fs'),c=require('crypto'),path=require('path');let t;try{t=ss('git',['rev-parse','--show-toplevel'],{encoding:'utf8'}).stdout.trim()}catch(e){t=''};const h=t?c.createHash('md5').update(t).digest('hex'):'global';const d=os.homedir()+'/.codex';fs.mkdirSync(d,{recursive:true});const args=process.argv.slice(2).filter(Boolean);const child=spawn(process.execPath,[path.resolve(process.env.CLAUDE_PLUGIN_ROOT,'scripts/codex-companion.mjs'),'review',...args],{stdio:['inherit','pipe','inherit'],env:process.env});const chunks=[];child.stdout.on('data',chunk=>{process.stdout.write(chunk);chunks.push(chunk)});child.on('close',code=>{if(code===0)fs.writeFileSync(path.join(d,'last-review-'+h+'.md'),Buffer.concat(chunks));process.exit(code??1)});" -- "$ARGUMENTS"`,
   description: "Codex review",
   run_in_background: true
 })
