@@ -3,14 +3,15 @@ import process from "node:process";
 
 export function runCommand(command, args = [], options = {}) {
   const result = spawnSync(command, args, {
-    cwd: options.cwd,
-    env: options.env,
-    encoding: "utf8",
-    input: options.input,
-    stdio: options.stdio ?? "pipe",
-    shell: process.platform === "win32",
-    windowsHide: true
-  });
+  cwd: options.cwd,
+  env: options.env,
+  encoding: "utf8",
+  input: options.input,
+  stdio: options.stdio ?? "pipe",
+  shell: process.platform === "win32",
+  windowsHide: true,
+  maxBuffer: options.maxBuffer ?? 50 * 1024 * 1024
+}));
 
   return {
     command,
