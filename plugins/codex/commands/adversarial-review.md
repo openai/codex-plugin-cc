@@ -62,10 +62,10 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" adversarial-review "$AR
 - Do not fix any issues mentioned in the review output.
 
 Background flow:
-- Launch the review with `Bash` in the background:
+- Launch the review with `Bash` in the background. The node wrapper uses the same hash logic as the foreground flow, creates `~/.codex` if needed, saves output only on success, and propagates the exit code:
 ```typescript
 Bash({
-  command: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" adversarial-review "$ARGUMENTS"`,
+  command: `node -e "const {spawnSync:sp}=require('child_process'),os=require('os'),fs=require('fs'),c=require('crypto'),path=require('path');let t;try{t=sp('git',['rev-parse','--show-toplevel'],{encoding:'utf8'}).stdout.trim()}catch(e){t=''};const h=t?c.createHash('md5').update(t).digest('hex'):'global';const d=os.homedir()+'/.codex';fs.mkdirSync(d,{recursive:true});const args=process.argv.slice(2).filter(Boolean);const r=sp(process.execPath,[path.resolve(process.env.CLAUDE_PLUGIN_ROOT,'scripts/codex-companion.mjs'),'adversarial-review',...args],{stdio:['inherit','pipe','inherit'],env:process.env});const out=r.stdout?r.stdout.toString():'';process.stdout.write(out);if(r.status===0)fs.writeFileSync(path.join(d,'last-review-'+h+'.md'),out);process.exit(r.status??1);" -- "$ARGUMENTS"`,
   description: "Codex adversarial review",
   run_in_background: true
 })
