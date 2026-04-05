@@ -445,6 +445,97 @@ export function renderStoredJobResult(job, storedJob) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
+function formatPercent(value) {
+  if (typeof value !== "number" || Number.isNaN(value)) {
+    return "unknown";
+  }
+  return `${Math.round(value)}%`;
+}
+
+function formatResetTime(resetAt) {
+  if (!resetAt) {
+    return "";
+  }
+  try {
+    const date = new Date(resetAt);
+    return ` (resets ${date.toLocaleDateString("en-US", { day: "numeric", month: "short" })}, ${date.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false })})`;
+  } catch {
+    return "";
+  }
+}
+
+function renderRateLimitWindow(label, window) {
+  if (!window) {
+    return null;
+  }
+  const usedPercent = typeof window.used_percent === "number" ? window.used_percent : null;
+  const remaining = usedPercent != null ? formatPercent(100 - usedPercent) : "unknown";
+  const reset = formatResetTime(window.reset_at);
+  return `- ${label}: ${remaining} left${reset}`;
+}
+
+export function renderUsageReport(report) {
+  if (!report.ok) {
+    return `# Codex Usage\n\nError: ${report.error}\n`;
+  }
+
+  const data = report.data ?? {};
+  const planType = report.planType ?? data.plan_type ?? "unknown";
+  const lines = [
+    "# Codex Usage",
+    "",
+    `Plan: ${planType}`
+  ];
+
+  const rateLimit = data.rate_limit;
+  const codeReviewLimit = data.code_review_rate_limit;
+  const credits = data.credits;
+
+  const limitLines = [];
+
+  if (rateLimit) {
+    const primary = renderRateLimitWindow("Primary limit", rateLimit.primary_window);
+    if (primary) {
+      limitLines.push(primary);
+    }
+    const secondary = renderRateLimitWindow("Weekly limit", rateLimit.secondary_window);
+    if (secondary) {
+      limitLines.push(secondary);
+    }
+  }
+
+  if (codeReviewLimit) {
+    const reviewPrimary = renderRateLimitWindow("Code review limit", codeReviewLimit.primary_window);
+    if (reviewPrimary) {
+      limitLines.push(reviewPrimary);
+    }
+    const reviewSecondary = renderRateLimitWindow("Code review weekly limit", codeReviewLimit.secondary_window);
+    if (reviewSecondary) {
+      limitLines.push(reviewSecondary);
+    }
+  }
+
+  if (limitLines.length > 0) {
+    lines.push("", "Limits:");
+    lines.push(...limitLines);
+  }
+
+  if (credits) {
+    lines.push("");
+    if (credits.unlimited) {
+      lines.push("Credits: unlimited");
+    } else if (credits.has_credits && credits.balance != null) {
+      lines.push(`Credits: $${credits.balance.toFixed(2)} remaining`);
+    } else if (credits.has_credits) {
+      lines.push("Credits: available");
+    } else {
+      lines.push("Credits: none");
+    }
+  }
+
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
 export function renderCancelReport(job) {
   const lines = [
     "# Codex Cancel",

@@ -10,6 +10,7 @@ import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import {
     buildPersistentTaskThreadName,
     DEFAULT_CONTINUE_PROMPT,
+    fetchCodexUsage,
     findLatestTaskThread,
     getCodexAvailability,
     getCodexLoginStatus,
@@ -59,7 +60,8 @@ import {
   renderJobStatusReport,
   renderSetupReport,
   renderStatusReport,
-  renderTaskResult
+  renderTaskResult,
+  renderUsageReport
 } from "./lib/render.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -80,7 +82,8 @@ function printUsage() {
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
-      "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
+      "  node scripts/codex-companion.mjs cancel [job-id] [--json]",
+      "  node scripts/codex-companion.mjs usage [--json]"
     ].join("\n")
   );
 }
@@ -958,6 +961,15 @@ async function handleCancel(argv) {
   outputCommandResult(payload, renderCancelReport(nextJob), options.json);
 }
 
+async function handleUsage(argv) {
+  const { options } = parseCommandInput(argv, {
+    booleanOptions: ["json"]
+  });
+
+  const report = await fetchCodexUsage();
+  outputResult(options.json ? report : renderUsageReport(report), options.json);
+}
+
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (!subcommand || subcommand === "help" || subcommand === "--help") {
@@ -994,6 +1006,9 @@ async function main() {
       break;
     case "cancel":
       await handleCancel(argv);
+      break;
+    case "usage":
+      await handleUsage(argv);
       break;
     default:
       throw new Error(`Unknown subcommand: ${subcommand}`);

@@ -34,6 +34,9 @@
  *   onProgress: ProgressReporter | null
  * }} TurnCaptureState
  */
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { readJsonFile } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
@@ -948,6 +951,90 @@ export function parseStructuredOutput(rawOutput, fallback = {}) {
 
 export function readOutputSchema(schemaPath) {
   return readJsonFile(schemaPath);
+}
+
+const CODEX_USAGE_API_URL = "https://api.openai.com/v1/codex/usage";
+
+function resolveCodexAuthPath() {
+  return path.join(os.homedir(), ".codex", "auth.json");
+}
+
+function readCodexAuth() {
+  const authPath = resolveCodexAuthPath();
+  if (!fs.existsSync(authPath)) {
+    return null;
+  }
+  try {
+    return readJsonFile(authPath);
+  } catch {
+    return null;
+  }
+}
+
+function extractAccessToken(auth) {
+  if (!auth) {
+    return null;
+  }
+  const token = auth.tokens?.access_token ?? auth.OPENAI_API_KEY ?? null;
+  return typeof token === "string" && token.trim() ? token.trim() : null;
+}
+
+export async function fetchCodexUsage() {
+  const auth = readCodexAuth();
+  if (!auth) {
+    return {
+      ok: false,
+      error: "Codex auth.json not found. Run `!codex login` first."
+    };
+  }
+
+  const token = extractAccessToken(auth);
+  if (!token) {
+    return {
+      ok: false,
+      error: "No access token found in auth.json. Run `!codex login` to re-authenticate."
+    };
+  }
+
+  try {
+    const response = await fetch(CODEX_USAGE_API_URL, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json"
+      }
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      return {
+        ok: false,
+        error: `Usage API returned ${response.status}${body ? `: ${body}` : ""}`
+      };
+    }
+
+    const data = await response.json();
+    return {
+      ok: true,
+      data,
+      planType: auth.tokens?.id_token ? decodePlanType(auth.tokens.id_token) : null
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: `Failed to fetch usage: ${error.message}`
+    };
+  }
+}
+
+function decodePlanType(idToken) {
+  try {
+    const payload = JSON.parse(
+      Buffer.from(idToken.split(".")[1], "base64url").toString("utf8")
+    );
+    return payload["https://api.openai.com/auth"]?.chatgpt_plan_type ?? null;
+  } catch {
+    return null;
+  }
 }
 
 export { DEFAULT_CONTINUE_PROMPT, TASK_THREAD_PREFIX };
