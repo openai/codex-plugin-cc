@@ -463,3 +463,21 @@ export function renderCancelReport(job) {
 
   return `${lines.join("\n").trimEnd()}\n`;
 }
+
+export function renderAgentTeamResult(result) {
+  const lines = [
+    "# Codex Agent Team",
+    "",
+    `Spawned ${result.agents.length} agent(s):`,
+    ""
+  ];
+
+  for (const agent of result.agents) {
+    lines.push(`- ${agent.name} (${agent.color}) pane ${agent.paneId}`);
+  }
+
+  lines.push("");
+  lines.push("Codex is booting (~10s). Wait, then send tasks to each pane.");
+
+  return `${lines.join("\n").trimEnd()}\n`;
+}

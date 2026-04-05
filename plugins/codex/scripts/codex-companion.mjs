@@ -50,8 +50,10 @@ import {
   runTrackedJob,
   SESSION_ID_ENV
 } from "./lib/tracked-jobs.mjs";
+import { spawnAgentTeam, killAllAgents } from "./lib/tmux-team.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
+  renderAgentTeamResult,
   renderNativeReviewResult,
   renderReviewResult,
   renderStoredJobResult,
@@ -80,7 +82,9 @@ function printUsage() {
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
-      "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
+      "  node scripts/codex-companion.mjs cancel [job-id] [--json]",
+      "  node scripts/codex-companion.mjs agent-team [<count>] [--names <name1,name2,...>] [--json]",
+      "  node scripts/codex-companion.mjs agent-team-kill <paneId1>,<paneId2>,... [--json]"
     ].join("\n")
   );
 }
@@ -958,6 +962,51 @@ async function handleCancel(argv) {
   outputCommandResult(payload, renderCancelReport(nextJob), options.json);
 }
 
+async function handleAgentTeam(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["count", "names", "cwd"],
+    booleanOptions: ["json"]
+  });
+
+  const countArg = positionals[0] || options.count;
+  const count = Math.max(1, Math.min(8, Number(countArg) || 3));
+  const cwd = resolveCommandCwd(options);
+  const names = options.names
+    ? options.names.split(",").map((n) => n.trim()).filter(Boolean)
+    : undefined;
+
+  const result = await spawnAgentTeam(count, { cwd, names });
+  const payload = {
+    count: result.agents.length,
+    leaderPaneId: result.leaderPaneId,
+    windowTarget: result.windowTarget,
+    cwd: result.cwd,
+    agents: result.agents.map((a) => ({
+      name: a.name,
+      paneId: a.paneId,
+      color: a.color
+    }))
+  };
+
+  outputCommandResult(payload, renderAgentTeamResult(payload), options.json);
+}
+
+function handleAgentTeamKill(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    booleanOptions: ["json"]
+  });
+
+  const paneIds = positionals.flatMap((p) => p.split(",")).filter(Boolean);
+  if (paneIds.length === 0) {
+    throw new Error("Provide one or more pane IDs to kill.");
+  }
+
+  const killed = killAllAgents(paneIds);
+  const payload = { killed, total: paneIds.length };
+  const rendered = `Killed ${killed} of ${paneIds.length} agent pane(s).\n`;
+  outputCommandResult(payload, rendered, options.json);
+}
+
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (!subcommand || subcommand === "help" || subcommand === "--help") {
@@ -994,6 +1043,12 @@ async function main() {
       break;
     case "cancel":
       await handleCancel(argv);
+      break;
+    case "agent-team":
+      await handleAgentTeam(argv);
+      break;
+    case "agent-team-kill":
+      handleAgentTeamKill(argv);
       break;
     default:
       throw new Error(`Unknown subcommand: ${subcommand}`);
