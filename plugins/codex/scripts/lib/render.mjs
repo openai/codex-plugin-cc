@@ -525,7 +525,8 @@ export function renderUsageReport(report) {
     if (credits.unlimited) {
       lines.push("Credits: unlimited");
     } else if (credits.has_credits && credits.balance != null) {
-      lines.push(`Credits: $${credits.balance.toFixed(2)} remaining`);
+      const balance = Number(credits.balance);
+      lines.push(Number.isFinite(balance) ? `Credits: $${balance.toFixed(2)} remaining` : "Credits: available");
     } else if (credits.has_credits) {
       lines.push("Credits: available");
     } else {

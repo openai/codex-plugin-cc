@@ -142,6 +142,21 @@ test("renderUsageReport handles unlimited credits", () => {
   assert.match(output, /Credits: unlimited/);
 });
 
+test("renderUsageReport handles string credit balance without throwing", () => {
+  const output = renderUsageReport({
+    ok: true,
+    data: {
+      credits: {
+        has_credits: true,
+        unlimited: false,
+        balance: "42.5"
+      }
+    }
+  });
+
+  assert.match(output, /Credits: \$42\.50 remaining/);
+});
+
 test("renderUsageReport prefers API plan_type over JWT-decoded planType", () => {
   const output = renderUsageReport({
     ok: true,
