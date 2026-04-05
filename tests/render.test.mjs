@@ -142,12 +142,23 @@ test("renderUsageReport handles unlimited credits", () => {
   assert.match(output, /Credits: unlimited/);
 });
 
-test("renderUsageReport falls back to data.plan_type when planType is missing", () => {
+test("renderUsageReport prefers API plan_type over JWT-decoded planType", () => {
   const output = renderUsageReport({
     ok: true,
+    planType: "plus",
     data: {
-      plan_type: "team"
+      plan_type: "pro"
     }
+  });
+
+  assert.match(output, /Plan: pro/);
+});
+
+test("renderUsageReport falls back to JWT planType when API plan_type is missing", () => {
+  const output = renderUsageReport({
+    ok: true,
+    planType: "team",
+    data: {}
   });
 
   assert.match(output, /Plan: team/);

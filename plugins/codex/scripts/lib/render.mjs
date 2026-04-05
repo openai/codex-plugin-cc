@@ -480,7 +480,7 @@ export function renderUsageReport(report) {
   }
 
   const data = report.data ?? {};
-  const planType = report.planType ?? data.plan_type ?? "unknown";
+  const planType = data.plan_type ?? report.planType ?? "unknown";
   const lines = [
     "# Codex Usage",
     "",
