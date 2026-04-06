@@ -2,13 +2,16 @@ import { spawnSync } from "node:child_process";
 import process from "node:process";
 
 export function runCommand(command, args = [], options = {}) {
-  const result = spawnSync(command, args, {
+  const platform = options.platform ?? process.platform;
+  const spawnSyncImpl = options.spawnSyncImpl ?? spawnSync;
+
+  const result = spawnSyncImpl(command, args, {
     cwd: options.cwd,
     env: options.env,
     encoding: "utf8",
     input: options.input,
     stdio: options.stdio ?? "pipe",
-    shell: process.platform === "win32",
+    shell: options.shell ?? platform === "win32",
     windowsHide: true
   });
 

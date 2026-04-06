@@ -1,7 +1,52 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import { runCommand, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+
+test("runCommand enables shell on Windows for PATH-resolved commands", () => {
+  let captured = null;
+
+  const result = runCommand("codex", ["--version"], {
+    platform: "win32",
+    spawnSyncImpl(command, args, options) {
+      captured = { command, args, options };
+      return {
+        status: 0,
+        signal: null,
+        stdout: "codex-cli 0.0.0",
+        stderr: "",
+        error: null
+      };
+    }
+  });
+
+  assert.equal(captured.command, "codex");
+  assert.deepEqual(captured.args, ["--version"]);
+  assert.equal(captured.options.shell, true);
+  assert.equal(result.status, 0);
+});
+
+test("runCommand does not force shell on non-Windows platforms", () => {
+  let captured = null;
+
+  runCommand("codex", ["--version"], {
+    platform: "linux",
+    spawnSyncImpl(command, args, options) {
+      captured = { command, args, options };
+      return {
+        status: 0,
+        signal: null,
+        stdout: "codex-cli 0.0.0",
+        stderr: "",
+        error: null
+      };
+    }
+  });
+
+  assert.equal(captured.command, "codex");
+  assert.deepEqual(captured.args, ["--version"]);
+  assert.equal(captured.options.shell, false);
+});
 
 test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;
