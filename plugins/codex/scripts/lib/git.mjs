@@ -200,6 +200,73 @@ function collectBranchContext(cwd, baseRef) {
   };
 }
 
+export function createWorktree(repoRoot) {
+  const ts = Date.now();
+  const worktreesDir = path.join(repoRoot, ".worktrees");
+  fs.mkdirSync(worktreesDir, { recursive: true });
+
+  // Ensure .worktrees/ is excluded from the target repo without modifying tracked files.
+  // Use git rev-parse to resolve the real git dir (handles linked worktrees where .git is a file).
+  const rawGitDir = gitChecked(repoRoot, ["rev-parse", "--git-dir"]).stdout.trim();
+  const gitDir = path.resolve(repoRoot, rawGitDir);
+  const excludePath = path.join(gitDir, "info", "exclude");
+  const excludeContent = fs.existsSync(excludePath) ? fs.readFileSync(excludePath, "utf8") : "";
+  if (!excludeContent.includes(".worktrees")) {
+    fs.mkdirSync(path.dirname(excludePath), { recursive: true });
+    fs.appendFileSync(excludePath, `${excludeContent.endsWith("\n") || !excludeContent ? "" : "\n"}.worktrees/\n`);
+  }
+
+  const worktreePath = path.join(worktreesDir, `codex-${ts}`);
+  const branch = `codex/${ts}`;
+  const baseCommit = gitChecked(repoRoot, ["rev-parse", "HEAD"]).stdout.trim();
+  gitChecked(repoRoot, ["worktree", "add", worktreePath, "-b", branch]);
+  return { worktreePath, branch, repoRoot, baseCommit, timestamp: ts };
+}
+
+export function removeWorktree(repoRoot, worktreePath) {
+  const result = git(repoRoot, ["worktree", "remove", "--force", worktreePath]);
+  if (result.status !== 0 && !result.stderr.includes("is not a working tree")) {
+    throw new Error(`Failed to remove worktree: ${result.stderr.trim()}`);
+  }
+}
+
+export function deleteWorktreeBranch(repoRoot, branch) {
+  git(repoRoot, ["branch", "-D", branch]);
+}
+
+export function getWorktreeDiff(worktreePath, baseCommit) {
+  git(worktreePath, ["add", "-A"]);
+  const result = git(worktreePath, ["diff", "--cached", baseCommit, "--stat"]);
+  if (result.status !== 0 || !result.stdout.trim()) {
+    return { stat: "", patch: "" };
+  }
+  const stat = result.stdout.trim();
+  const patchResult = gitChecked(worktreePath, ["diff", "--cached", baseCommit]);
+  return { stat, patch: patchResult.stdout };
+}
+
+export function applyWorktreePatch(repoRoot, worktreePath, baseCommit) {
+  git(worktreePath, ["add", "-A"]);
+  const patchResult = git(worktreePath, ["diff", "--cached", baseCommit]);
+  if (patchResult.status !== 0 || !patchResult.stdout.trim()) {
+    return { applied: false, detail: "No changes to apply." };
+  }
+  const patchPath = path.join(
+    repoRoot,
+    ".codex-worktree-" + Date.now() + "-" + Math.random().toString(16).slice(2) + ".patch"
+  );
+  try {
+    fs.writeFileSync(patchPath, patchResult.stdout, "utf8");
+    const applyResult = git(repoRoot, ["apply", "--index", patchPath]);
+    if (applyResult.status !== 0) {
+      return { applied: false, detail: applyResult.stderr.trim() || "Patch apply failed (conflicts?)." };
+    }
+    return { applied: true, detail: "Changes applied and staged." };
+  } finally {
+    fs.rmSync(patchPath, { force: true });
+  }
+}
+
 export function collectReviewContext(cwd, target) {
   const repoRoot = getRepoRoot(cwd);
   const state = getWorkingTreeState(cwd);

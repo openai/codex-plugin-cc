@@ -12,6 +12,8 @@ export function runCommand(command, args = [], options = {}) {
     windowsHide: true
   });
 
+  const succeeded = result.status === 0 && result.signal === null;
+
   return {
     command,
     args,
@@ -19,7 +21,7 @@ export function runCommand(command, args = [], options = {}) {
     signal: result.signal ?? null,
     stdout: result.stdout ?? "",
     stderr: result.stderr ?? "",
-    error: result.error ?? null
+    error: succeeded ? null : result.error ?? null
   };
 }
 

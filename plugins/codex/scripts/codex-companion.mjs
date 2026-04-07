@@ -21,7 +21,8 @@ import {
     runAppServerTurn
   } from "./lib/codex.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
-import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
+import { collectReviewContext, ensureGitRepository, getRepoRoot, resolveReviewTarget } from "./lib/git.mjs";
+import { createWorktreeSession, diffWorktreeSession, cleanupWorktreeSession } from "./lib/worktree.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
@@ -59,7 +60,9 @@ import {
   renderJobStatusReport,
   renderSetupReport,
   renderStatusReport,
-  renderTaskResult
+  renderTaskResult,
+  renderWorktreeTaskResult,
+  renderWorktreeCleanupResult
 } from "./lib/render.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -77,7 +80,8 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--worktree] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs worktree-cleanup <job-id> --action <keep|discard> [--cwd <path>]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
@@ -429,6 +433,7 @@ async function executeReviewRun(request) {
 
 async function executeTaskRun(request) {
   const workspaceRoot = resolveWorkspaceRoot(request.cwd);
+  const stateRoot = request.stateRoot ? resolveWorkspaceRoot(request.stateRoot) : workspaceRoot;
   ensureCodexReady(request.cwd);
 
   const taskMetadata = buildTaskRunMetadata({
@@ -438,7 +443,7 @@ async function executeTaskRun(request) {
 
   let resumeThreadId = null;
   if (request.resumeLast) {
-    const latestThread = await resolveLatestTrackedTaskThread(workspaceRoot, {
+    const latestThread = await resolveLatestTrackedTaskThread(stateRoot, {
       excludeJobId: request.jobId
     });
     if (!latestThread) {
@@ -496,6 +501,33 @@ async function executeTaskRun(request) {
     jobClass: "task",
     write: Boolean(request.write)
   };
+}
+
+async function executeTaskRunWithWorktree(request) {
+  ensureGitRepository(request.cwd);
+  const session = createWorktreeSession(request.cwd);
+
+  try {
+    const execution = await executeTaskRun({
+      ...request,
+      cwd: session.worktreePath,
+      stateRoot: request.cwd
+    });
+
+    const diff = diffWorktreeSession(session);
+    const rendered = renderWorktreeTaskResult(execution, session, diff, { jobId: request.jobId });
+    return {
+      ...execution,
+      rendered,
+      payload: {
+        ...execution.payload,
+        worktreeSession: session
+      }
+    };
+  } catch (error) {
+    cleanupWorktreeSession(session, { keep: false });
+    throw error;
+  }
 }
 
 function buildReviewJobMetadata(reviewName, target) {
@@ -570,13 +602,14 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, worktree, resumeLast, jobId }) {
   return {
     cwd,
     model,
     effort,
     prompt,
     write,
+    worktree,
     resumeLast,
     jobId
   };
@@ -704,7 +737,7 @@ async function handleReview(argv) {
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    booleanOptions: ["json", "write", "worktree", "resume-last", "resume", "fresh", "background"],
     aliasMap: {
       m: "model"
     }
@@ -722,10 +755,13 @@ async function handleTask(argv) {
     throw new Error("Choose either --resume/--resume-last or --fresh.");
   }
   const write = Boolean(options.write);
+  const worktree = Boolean(options.worktree);
   const taskMetadata = buildTaskRunMetadata({
     prompt,
     resumeLast
   });
+
+  const runTask = write && worktree ? executeTaskRunWithWorktree : executeTaskRun;
 
   if (options.background) {
     ensureCodexReady(cwd);
@@ -738,6 +774,7 @@ async function handleTask(argv) {
       effort,
       prompt,
       write,
+      worktree,
       resumeLast,
       jobId: job.id
     });
@@ -750,12 +787,13 @@ async function handleTask(argv) {
   await runForegroundCommand(
     job,
     (progress) =>
-      executeTaskRun({
+      runTask({
         cwd,
         model,
         effort,
         prompt,
         write,
+        worktree,
         resumeLast,
         jobId: job.id,
         onProgress: progress
@@ -794,6 +832,7 @@ async function handleTaskWorker(argv) {
       logFile: storedJob.logFile ?? null
     }
   );
+  const runTask = request.write && request.worktree ? executeTaskRunWithWorktree : executeTaskRun;
   await runTrackedJob(
     {
       ...storedJob,
@@ -801,7 +840,7 @@ async function handleTaskWorker(argv) {
       logFile
     },
     () =>
-      executeTaskRun({
+      runTask({
         ...request,
         onProgress: progress
       }),
@@ -958,6 +997,39 @@ async function handleCancel(argv) {
   outputCommandResult(payload, renderCancelReport(nextJob), options.json);
 }
 
+function handleWorktreeCleanup(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["action", "cwd"],
+    booleanOptions: ["json"]
+  });
+
+  const action = options.action;
+  if (action !== "keep" && action !== "discard") {
+    throw new Error("Required: --action keep or --action discard.");
+  }
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveCommandWorkspace(options);
+  const jobId = positionals[0];
+  if (!jobId) {
+    throw new Error("Required: job ID as positional argument.");
+  }
+
+  const storedJob = readStoredJob(workspaceRoot, jobId);
+  if (!storedJob) {
+    throw new Error(`No stored job found for ${jobId}.`);
+  }
+
+  const session = storedJob.result?.worktreeSession ?? storedJob.payload?.worktreeSession;
+  if (!session || !session.worktreePath || !session.branch || !session.repoRoot) {
+    throw new Error(`Job ${jobId} does not have worktree session data. Was it run with --worktree?`);
+  }
+
+  const result = cleanupWorktreeSession(session, { keep: action === "keep" });
+  const rendered = renderWorktreeCleanupResult(action, result, session);
+  outputCommandResult({ jobId, action, result, session }, rendered, options.json);
+}
+
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (!subcommand || subcommand === "help" || subcommand === "--help") {
@@ -994,6 +1066,9 @@ async function main() {
       break;
     case "cancel":
       await handleCancel(argv);
+      break;
+    case "worktree-cleanup":
+      handleWorktreeCleanup(argv);
       break;
     default:
       throw new Error(`Unknown subcommand: ${subcommand}`);
