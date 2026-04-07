@@ -68,3 +68,36 @@ test("resolveReviewTarget requires an explicit base when no default branch can b
     /Unable to detect the repository default branch\. Pass --base <ref> or use --scope working-tree\./
   );
 });
+
+test("collectReviewContext skips untracked directories in working tree review", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v1');\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+
+  const nestedRepoDir = path.join(cwd, ".claude", "worktrees", "agent-test");
+  fs.mkdirSync(nestedRepoDir, { recursive: true });
+  initGitRepo(nestedRepoDir);
+
+  const target = resolveReviewTarget(cwd, { scope: "working-tree" });
+  const context = collectReviewContext(cwd, target);
+
+  assert.match(context.content, /### \.claude\/worktrees\/agent-test\/\n\(skipped: directory\)/);
+});
+
+test("collectReviewContext skips broken untracked symlinks instead of crashing", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v1');\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.symlinkSync("missing-target", path.join(cwd, "broken-link"));
+
+  const target = resolveReviewTarget(cwd, {});
+  const context = collectReviewContext(cwd, target);
+
+  assert.equal(target.mode, "working-tree");
+  assert.match(context.content, /### broken-link/);
+  assert.match(context.content, /skipped: broken symlink or unreadable file/i);
+});

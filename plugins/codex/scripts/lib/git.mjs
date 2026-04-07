@@ -135,12 +135,25 @@ function formatSection(title, body) {
 
 function formatUntrackedFile(cwd, relativePath) {
   const absolutePath = path.join(cwd, relativePath);
-  const stat = fs.statSync(absolutePath);
+  let stat;
+  try {
+    stat = fs.statSync(absolutePath);
+  } catch {
+    return `### ${relativePath}\n(skipped: broken symlink or unreadable file)`;
+  }
+  if (stat.isDirectory()) {
+    return `### ${relativePath}\n(skipped: directory)`;
+  }
   if (stat.size > MAX_UNTRACKED_BYTES) {
     return `### ${relativePath}\n(skipped: ${stat.size} bytes exceeds ${MAX_UNTRACKED_BYTES} byte limit)`;
   }
 
-  const buffer = fs.readFileSync(absolutePath);
+  let buffer;
+  try {
+    buffer = fs.readFileSync(absolutePath);
+  } catch {
+    return `### ${relativePath}\n(skipped: broken symlink or unreadable file)`;
+  }
   if (!isProbablyText(buffer)) {
     return `### ${relativePath}\n(skipped: binary file)`;
   }
