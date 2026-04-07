@@ -21,29 +21,41 @@ const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 
 function readHookInput() {
   // Claude Code may invoke hooks with stdin as a non-blocking pipe, which
-  // causes fs.readFileSync(0) to throw EAGAIN. Retry with a small delay to
-  // allow the pipe to become readable. See: https://github.com/openai/codex-plugin-cc/issues/120
+  // causes read() to throw EAGAIN before EOF. We read stdin in chunks,
+  // accumulating across EAGAIN retries so partial reads are not lost.
+  // See: https://github.com/openai/codex-plugin-cc/issues/120
   const MAX_RETRIES = 20;
   const RETRY_DELAY_MS = 10;
   const sleepBuf = new Int32Array(new SharedArrayBuffer(4));
+  const chunks = [];
+  const buf = Buffer.alloc(65536);
+  let eagainCount = 0;
 
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+  for (;;) {
+    let n;
     try {
-      const raw = fs.readFileSync(0, "utf8").trim();
-      return raw ? JSON.parse(raw) : {};
+      n = fs.readSync(0, buf, 0, buf.length, null);
     } catch (err) {
       if (err.code !== "EAGAIN") {
         throw err;
       }
-      if (attempt === MAX_RETRIES) {
+      if (eagainCount >= MAX_RETRIES) {
         // Gracefully degrade: session_id won't be set in CLAUDE_ENV_FILE,
         // but the hook succeeds instead of surfacing a startup error.
-        return {};
+        break;
       }
+      eagainCount++;
       Atomics.wait(sleepBuf, 0, 0, RETRY_DELAY_MS);
+      continue;
     }
+    if (n === 0) {
+      break; // EOF
+    }
+    chunks.push(Buffer.from(buf.subarray(0, n)));
   }
-  return {};
+
+  const raw = Buffer.concat(chunks).toString("utf8").trim();
+  return raw ? JSON.parse(raw) : {};
 }
 
 function shellEscape(value) {
