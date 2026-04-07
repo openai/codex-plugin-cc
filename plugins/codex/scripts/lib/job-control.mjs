@@ -19,6 +19,19 @@ function buildDeadPidError(job) {
 }
 
 function markDeadPidJobFailed(workspaceRoot, job) {
+  const expectedPid = Number.isFinite(job.pid) ? job.pid : null;
+  const latestStoredJob = readStoredJob(workspaceRoot, job.id) ?? job;
+
+  // Re-check against the latest persisted state to avoid racing a legitimate completion.
+  if (!isActiveJob(latestStoredJob)) {
+    return latestStoredJob;
+  }
+
+  // Only fail the same tracked process; a different PID means a newer run won the race.
+  if (!Number.isFinite(latestStoredJob.pid) || latestStoredJob.pid !== expectedPid) {
+    return latestStoredJob;
+  }
+
   const completedAt = nowIso();
   const errorMessage = buildDeadPidError(job);
   const failedPatch = {
@@ -28,9 +41,8 @@ function markDeadPidJobFailed(workspaceRoot, job) {
     completedAt,
     errorMessage
   };
-  const storedJob = readStoredJob(workspaceRoot, job.id) ?? job;
   writeJobFile(workspaceRoot, job.id, {
-    ...storedJob,
+    ...latestStoredJob,
     ...failedPatch
   });
   upsertJob(workspaceRoot, {

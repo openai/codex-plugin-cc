@@ -1041,6 +1041,81 @@ test("status --wait marks dead-pid jobs failed instead of timing out", () => {
   assert.match(fs.readFileSync(logFile, "utf8"), /Failed: Tracked Codex process 9999999 exited before writing a final status\./);
 });
 
+test("status dead-pid reconciliation does not downgrade a concurrently completed job", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const stalePid = 9_999_998;
+  const logFile = path.join(jobsDir, "task-race.log");
+  const jobFile = path.join(jobsDir, "task-race.json");
+  fs.writeFileSync(logFile, "[2026-03-18T15:30:00.000Z] Starting Codex Task.\n", "utf8");
+
+  // Persisted job already completed while index still shows a stale running state.
+  fs.writeFileSync(
+    jobFile,
+    JSON.stringify(
+      {
+        id: "task-race",
+        status: "completed",
+        title: "Codex Task",
+        pid: null,
+        completedAt: "2026-03-18T15:31:00.000Z",
+        rendered: "Handled the requested task.\n",
+        logFile
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
+
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "task-race",
+            status: "running",
+            title: "Codex Task",
+            jobClass: "task",
+            summary: "Investigate flaky test",
+            pid: stalePid,
+            logFile,
+            createdAt: "2026-03-18T15:30:00.000Z",
+            startedAt: "2026-03-18T15:30:01.000Z",
+            updatedAt: "2026-03-18T15:30:02.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "status", "task-race", "--wait", "--timeout-ms", "25", "--json"], {
+    cwd: workspace
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.job.id, "task-race");
+  assert.equal(payload.job.status, "completed");
+  assert.equal(payload.waitTimedOut, false);
+  assert.match(payload.job.rendered ?? "", /Handled the requested task\./);
+
+  const stored = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  assert.equal(stored.status, "completed");
+  assert.equal(stored.pid, null);
+  assert.equal(stored.errorMessage, undefined);
+  assert.doesNotMatch(fs.readFileSync(logFile, "utf8"), /Tracked Codex process .* exited before writing a final status\./);
+});
+
 test("result returns the stored output for the latest finished job by default", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
