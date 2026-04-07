@@ -19,11 +19,28 @@ const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
 function readHookInput() {
-  const raw = fs.readFileSync(0, "utf8").trim();
-  if (!raw) {
-    return {};
+  // Claude Code may invoke hooks with stdin as a non-blocking pipe, which
+  // causes fs.readFileSync(0) to throw EAGAIN. Retry with a small delay to
+  // allow the pipe to become readable. See: https://github.com/openai/codex-plugin-cc/issues/120
+  const MAX_RETRIES = 20;
+  const RETRY_DELAY_MS = 10;
+  const sleepBuf = new Int32Array(new SharedArrayBuffer(4));
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const raw = fs.readFileSync(0, "utf8").trim();
+      return raw ? JSON.parse(raw) : {};
+    } catch (err) {
+      if (err.code !== "EAGAIN") {
+        throw err;
+      }
+      if (attempt === MAX_RETRIES) {
+        return {};
+      }
+      Atomics.wait(sleepBuf, 0, 0, RETRY_DELAY_MS);
+    }
   }
-  return JSON.parse(raw);
+  return {};
 }
 
 function emitDecision(payload) {
