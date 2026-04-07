@@ -42,7 +42,7 @@ function readHookInput() {
       if (eagainCount >= MAX_RETRIES) {
         // Gracefully degrade: session_id won't be set in CLAUDE_ENV_FILE,
         // but the hook succeeds instead of surfacing a startup error.
-        break;
+        return {};
       }
       eagainCount++;
       Atomics.wait(sleepBuf, 0, 0, RETRY_DELAY_MS);

@@ -39,7 +39,7 @@ function readHookInput() {
         throw err;
       }
       if (eagainCount >= MAX_RETRIES) {
-        break;
+        return {};
       }
       eagainCount++;
       Atomics.wait(sleepBuf, 0, 0, RETRY_DELAY_MS);
