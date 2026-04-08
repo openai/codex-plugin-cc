@@ -259,7 +259,7 @@ If you want to change the default reasoning effort or the default model that get
 
 ```toml
 model = "gpt-5.4-mini"
-model_reasoning_effort = "xhigh"
+model_reasoning_effort = "high"
 ```
 
 Your configuration will be picked up based on:
