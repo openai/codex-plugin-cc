@@ -188,7 +188,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   async initialize() {
     this.proc = spawn("codex", ["app-server"], {
       cwd: this.cwd,
-      env: this.options.env,
+      env: this.options.env ?? process.env,
       stdio: ["pipe", "pipe", "pipe"],
       shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
       windowsHide: true
