@@ -1471,6 +1471,109 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
   assert.match(fs.readFileSync(logFile, "utf8"), /Cancelled by user/);
 });
 
+test("cancel without a job id ignores active jobs from other Claude sessions", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const logFile = path.join(jobsDir, "task-other.log");
+  fs.writeFileSync(logFile, "", "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "task-other",
+            status: "running",
+            title: "Codex Task",
+            jobClass: "task",
+            sessionId: "sess-other",
+            summary: "Other session run",
+            updatedAt: "2026-03-24T20:05:00.000Z",
+            logFile
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const env = {
+    ...process.env,
+    CODEX_COMPANION_SESSION_ID: "sess-current"
+  };
+  const status = run("node", [SCRIPT, "status", "--json"], {
+    cwd: workspace,
+    env
+  });
+  assert.equal(status.status, 0, status.stderr);
+  assert.deepEqual(JSON.parse(status.stdout).running, []);
+
+  const cancel = run("node", [SCRIPT, "cancel", "--json"], {
+    cwd: workspace,
+    env
+  });
+  assert.equal(cancel.status, 1);
+  assert.match(cancel.stderr, /No active Codex jobs to cancel for this session\./);
+
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(state.jobs[0].status, "running");
+});
+
+test("cancel with a job id can still target an active job from another Claude session", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const logFile = path.join(jobsDir, "task-other.log");
+  fs.writeFileSync(logFile, "", "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "task-other",
+            status: "running",
+            title: "Codex Task",
+            jobClass: "task",
+            sessionId: "sess-other",
+            summary: "Other session run",
+            updatedAt: "2026-03-24T20:05:00.000Z",
+            logFile
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const env = {
+    ...process.env,
+    CODEX_COMPANION_SESSION_ID: "sess-current"
+  };
+  const cancel = run("node", [SCRIPT, "cancel", "task-other", "--json"], {
+    cwd: workspace,
+    env
+  });
+  assert.equal(cancel.status, 0, cancel.stderr);
+  assert.equal(JSON.parse(cancel.stdout).jobId, "task-other");
+
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(state.jobs[0].status, "cancelled");
+});
+
 test("cancel sends turn interrupt to the shared app-server before killing a brokered task", async () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
