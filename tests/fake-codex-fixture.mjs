@@ -63,6 +63,54 @@ function buildTurn(id, status = "inProgress", error = null) {
   return { id, status, items: [], error };
 }
 
+function buildAccountReadResult() {
+  switch (BEHAVIOR) {
+    case "logged-out":
+    case "refreshable-auth":
+    case "auth-run-fails":
+      return { account: null, requiresOpenaiAuth: true };
+    case "provider-no-auth":
+    case "env-key-provider":
+      return { account: null, requiresOpenaiAuth: false };
+    case "api-key-account-only":
+      return { account: { type: "apiKey" }, requiresOpenaiAuth: true };
+    default:
+      return {
+        account: { type: "chatgpt", email: "test@example.com", planType: "plus" },
+        requiresOpenaiAuth: true
+      };
+  }
+}
+
+function buildConfigReadResult() {
+  switch (BEHAVIOR) {
+    case "provider-no-auth":
+      return {
+        config: { model_provider: "ollama" },
+        origins: {}
+      };
+    case "env-key-provider":
+      return {
+        config: {
+          model_provider: "openai-custom",
+          model_providers: {
+            "openai-custom": {
+              name: "OpenAI custom",
+              env_key: "OPENAI_API_KEY",
+              requires_openai_auth: false
+            }
+          }
+        },
+        origins: {}
+      };
+    default:
+      return {
+        config: { model_provider: "openai" },
+        origins: {}
+      };
+  }
+}
+
 function send(message) {
   process.stdout.write(JSON.stringify(message) + "\\n");
 }
@@ -193,7 +241,7 @@ if (args[0] === "app-server" && args[1] === "--help") {
   process.exit(0);
 }
 if (args[0] === "login" && args[1] === "status") {
-  if (BEHAVIOR === "logged-out") {
+  if (BEHAVIOR === "logged-out" || BEHAVIOR === "refreshable-auth" || BEHAVIOR === "auth-run-fails" || BEHAVIOR === "provider-no-auth" || BEHAVIOR === "env-key-provider" || BEHAVIOR === "api-key-account-only") {
     console.error("not authenticated");
     process.exit(1);
   }
@@ -230,7 +278,21 @@ rl.on("line", (line) => {
       case "initialized":
         break;
 
+      case "account/read":
+        send({ id: message.id, result: buildAccountReadResult() });
+        break;
+
+      case "config/read":
+        if (BEHAVIOR === "config-read-fails") {
+          throw new Error("config/read failed for cwd");
+        }
+        send({ id: message.id, result: buildConfigReadResult() });
+        break;
+
       case "thread/start": {
+        if (BEHAVIOR === "auth-run-fails") {
+          throw new Error("authentication expired; run codex login");
+        }
         if (requiresExperimental("persistExtendedHistory", message, state) || requiresExperimental("persistFullHistory", message, state)) {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
