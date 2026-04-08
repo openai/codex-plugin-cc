@@ -11,8 +11,8 @@ import {
     buildPersistentTaskThreadName,
     DEFAULT_CONTINUE_PROMPT,
     findLatestTaskThread,
+    getCodexAuthStatus,
     getCodexAvailability,
-    getCodexLoginStatus,
     getSessionRuntimeStatus,
     interruptAppServerTurn,
     parseStructuredOutput,
@@ -177,19 +177,19 @@ function firstMeaningfulLine(text, fallback) {
   return line ?? fallback;
 }
 
-function buildSetupReport(cwd, actionsTaken = []) {
+async function buildSetupReport(cwd, actionsTaken = []) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const nodeStatus = binaryAvailable("node", ["--version"], { cwd });
   const npmStatus = binaryAvailable("npm", ["--version"], { cwd });
   const codexStatus = getCodexAvailability(cwd);
-  const authStatus = getCodexLoginStatus(cwd);
+  const authStatus = await getCodexAuthStatus(cwd);
   const config = getConfig(workspaceRoot);
 
   const nextSteps = [];
   if (!codexStatus.available) {
     nextSteps.push("Install Codex with `npm install -g @openai/codex`.");
   }
-  if (codexStatus.available && !authStatus.loggedIn) {
+  if (codexStatus.available && !authStatus.loggedIn && authStatus.requiresOpenaiAuth) {
     nextSteps.push("Run `!codex login`.");
     nextSteps.push("If browser login is blocked, retry with `!codex login --device-auth` or `!codex login --with-api-key`.");
   }
@@ -210,7 +210,7 @@ function buildSetupReport(cwd, actionsTaken = []) {
   };
 }
 
-function handleSetup(argv) {
+async function handleSetup(argv) {
   const { options } = parseCommandInput(argv, {
     valueOptions: ["cwd"],
     booleanOptions: ["json", "enable-review-gate", "disable-review-gate"]
@@ -232,7 +232,7 @@ function handleSetup(argv) {
     actionsTaken.push(`Disabled the stop-time review gate for ${workspaceRoot}.`);
   }
 
-  const finalReport = buildSetupReport(cwd, actionsTaken);
+  const finalReport = await buildSetupReport(cwd, actionsTaken);
   outputResult(options.json ? finalReport : renderSetupReport(finalReport), options.json);
 }
 
@@ -242,17 +242,15 @@ function buildAdversarialReviewPrompt(context, focusText) {
     REVIEW_KIND: "Adversarial Review",
     TARGET_LABEL: context.target.label,
     USER_FOCUS: focusText || "No extra focus provided.",
+    REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
     REVIEW_INPUT: context.content
   });
 }
 
-function ensureCodexReady(cwd) {
-  const authStatus = getCodexLoginStatus(cwd);
-  if (!authStatus.available) {
+function ensureCodexAvailable(cwd) {
+  const availability = getCodexAvailability(cwd);
+  if (!availability.available) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
-  }
-  if (!authStatus.loggedIn) {
-    throw new Error("Codex CLI is not authenticated. Run `!codex login` and retry.");
   }
 }
 
@@ -341,22 +339,28 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
 
 async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const sessionId = getCurrentClaudeSessionId();
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
-  const activeTask = jobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
+  const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
+  const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
   if (activeTask) {
     throw new Error(`Task ${activeTask.id} is still running. Use /codex:status before continuing it.`);
   }
 
-  const trackedTask = jobs.find((job) => job.jobClass === "task" && job.status === "completed" && job.threadId);
+  const trackedTask = findLatestResumableTaskJob(visibleJobs);
   if (trackedTask) {
     return { id: trackedTask.threadId };
+  }
+
+  if (sessionId) {
+    return null;
   }
 
   return findLatestTaskThread(workspaceRoot);
 }
 
 async function executeReviewRun(request) {
-  ensureCodexReady(request.cwd);
+  ensureCodexAvailable(request.cwd);
   ensureGitRepository(request.cwd);
 
   const target = resolveReviewTarget(request.cwd, {
@@ -460,7 +464,7 @@ async function executeReviewRun(request) {
 
 async function executeTaskRun(request) {
   const workspaceRoot = resolveWorkspaceRoot(request.cwd);
-  ensureCodexReady(request.cwd);
+  ensureCodexAvailable(request.cwd);
 
   const taskMetadata = buildTaskRunMetadata({
     prompt: request.prompt,
@@ -759,7 +763,7 @@ async function handleTask(argv) {
   });
 
   if (options.background) {
-    ensureCodexReady(cwd);
+    ensureCodexAvailable(cwd);
     requireTaskRequest(prompt, resumeLast);
 
     const job = buildTaskJob(workspaceRoot, taskMetadata, write);
@@ -900,17 +904,9 @@ function handleTaskResumeCandidate(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const sessionId = process.env[SESSION_ID_ENV] ?? null;
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
-  const candidate =
-    jobs.find(
-      (job) =>
-        job.jobClass === "task" &&
-        job.threadId &&
-        job.status !== "queued" &&
-        job.status !== "running" &&
-        (!sessionId || job.sessionId === sessionId)
-    ) ?? null;
+  const sessionId = getCurrentClaudeSessionId();
+  const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
+  const candidate = findLatestResumableTaskJob(jobs);
 
   const payload = {
     available: Boolean(candidate),
@@ -943,7 +939,7 @@ async function handleCancel(argv) {
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
-  const { workspaceRoot, job } = resolveCancelableJob(cwd, reference);
+  const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
   const existing = readStoredJob(workspaceRoot, job.id) ?? {};
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
@@ -1005,7 +1001,7 @@ async function main() {
 
   switch (subcommand) {
     case "setup":
-      handleSetup(argv);
+      await handleSetup(argv);
       break;
     case "review":
       await handleReview(argv);

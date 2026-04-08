@@ -6,7 +6,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { getCodexLoginStatus } from "./lib/codex.mjs";
+import { getCodexAvailability } from "./lib/codex.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { getConfig, listJobs } from "./lib/state.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
@@ -57,13 +57,13 @@ function buildStopReviewPrompt(input = {}) {
 }
 
 function buildSetupNote(cwd) {
-  const authStatus = getCodexLoginStatus(cwd);
-  if (authStatus.available && authStatus.loggedIn) {
+  const availability = getCodexAvailability(cwd);
+  if (availability.available) {
     return null;
   }
 
-  const detail = authStatus.detail ? ` ${authStatus.detail}.` : "";
-  return `Codex is not set up for the review gate.${detail} Run /codex:setup and, if needed, !codex login.`;
+  const detail = availability.detail ? ` ${availability.detail}.` : "";
+  return `Codex is not set up for the review gate.${detail} Run /codex:setup.`;
 }
 
 function parseStopReviewOutput(rawOutput) {
@@ -175,4 +175,10 @@ function main() {
   logNote(runningTaskNote);
 }
 
-main();
+try {
+  main();
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  process.stderr.write(`${message}\n`);
+  process.exitCode = 1;
+}

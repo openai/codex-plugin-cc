@@ -37,7 +37,7 @@
 import { readJsonFile } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
-import { binaryAvailable, runCommand } from "./process.mjs";
+import { binaryAvailable } from "./process.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
@@ -639,7 +639,16 @@ async function startThread(client, cwd, options = {}) {
   const response = await client.request("thread/start", buildThreadParams(cwd, options));
   const threadId = response.thread.id;
   if (options.threadName) {
-    await client.request("thread/name/set", { threadId, name: options.threadName });
+    try {
+      await client.request("thread/name/set", { threadId, name: options.threadName });
+    } catch (err) {
+      // Only suppress "unknown variant/method" errors from older CLI versions
+      // that don't support thread/name/set. Rethrow auth, network, or server errors.
+      const msg = String(err?.message ?? err ?? "");
+      if (!msg.includes("unknown variant") && !msg.includes("unknown method")) {
+        throw err;
+      }
+    }
   }
   return response;
 }
@@ -650,6 +659,134 @@ async function resumeThread(client, threadId, cwd, options = {}) {
 
 function buildResultStatus(turnState) {
   return turnState.finalTurn?.status === "completed" ? 0 : 1;
+}
+
+const BUILTIN_PROVIDER_LABELS = new Map([
+  ["openai", "OpenAI"],
+  ["ollama", "Ollama"],
+  ["lmstudio", "LM Studio"]
+]);
+
+function normalizeProviderId(value) {
+  const providerId = typeof value === "string" ? value.trim() : "";
+  return providerId || null;
+}
+
+function formatProviderLabel(providerId, providerConfig = null) {
+  const configuredName = typeof providerConfig?.name === "string" ? providerConfig.name.trim() : "";
+  if (configuredName) {
+    return configuredName;
+  }
+  if (!providerId) {
+    return "The active provider";
+  }
+  return BUILTIN_PROVIDER_LABELS.get(providerId) ?? providerId;
+}
+
+function buildAuthStatus(fields = {}) {
+  return {
+    available: true,
+    loggedIn: false,
+    detail: "not authenticated",
+    source: "unknown",
+    authMethod: null,
+    verified: null,
+    requiresOpenaiAuth: null,
+    provider: null,
+    ...fields
+  };
+}
+
+function resolveProviderConfig(configResponse) {
+  const config = configResponse?.config;
+  if (!config || typeof config !== "object") {
+    return {
+      providerId: null,
+      providerConfig: null
+    };
+  }
+
+  const providerId = normalizeProviderId(config.model_provider);
+  const providers =
+    config.model_providers && typeof config.model_providers === "object" && !Array.isArray(config.model_providers)
+      ? config.model_providers
+      : null;
+  const providerConfig =
+    providerId && providers?.[providerId] && typeof providers[providerId] === "object" ? providers[providerId] : null;
+
+  return {
+    providerId,
+    providerConfig
+  };
+}
+
+function buildAppServerAuthStatus(accountResponse, configResponse) {
+  const account = accountResponse?.account ?? null;
+  const requiresOpenaiAuth =
+    typeof accountResponse?.requiresOpenaiAuth === "boolean" ? accountResponse.requiresOpenaiAuth : null;
+  const { providerId, providerConfig } = resolveProviderConfig(configResponse);
+  const providerLabel = formatProviderLabel(providerId, providerConfig);
+
+  if (account?.type === "chatgpt") {
+    const email = typeof account.email === "string" && account.email.trim() ? account.email.trim() : null;
+    return buildAuthStatus({
+      loggedIn: true,
+      detail: email ? `ChatGPT login active for ${email}` : "ChatGPT login active",
+      source: "app-server",
+      authMethod: "chatgpt",
+      verified: true,
+      requiresOpenaiAuth,
+      provider: providerId
+    });
+  }
+
+  if (account?.type === "apiKey") {
+    return buildAuthStatus({
+      loggedIn: true,
+      detail: "API key configured (unverified)",
+      source: "app-server",
+      authMethod: "apiKey",
+      verified: false,
+      requiresOpenaiAuth,
+      provider: providerId
+    });
+  }
+
+  if (requiresOpenaiAuth === false) {
+    return buildAuthStatus({
+      loggedIn: true,
+      detail: `${providerLabel} is configured and does not require OpenAI authentication`,
+      source: "app-server",
+      requiresOpenaiAuth,
+      provider: providerId
+    });
+  }
+
+  return buildAuthStatus({
+    loggedIn: false,
+    detail: `${providerLabel} requires OpenAI authentication`,
+    source: "app-server",
+    requiresOpenaiAuth,
+    provider: providerId
+  });
+}
+
+async function getCodexAuthStatusFromClient(client, cwd) {
+  try {
+    const accountResponse = await client.request("account/read", { refreshToken: false });
+    const configResponse = await client.request("config/read", {
+      includeLayers: false,
+      cwd
+    });
+
+    return buildAppServerAuthStatus(accountResponse, configResponse);
+  } catch (error) {
+    return buildAuthStatus({
+      loggedIn: false,
+      detail: error instanceof Error ? error.message : String(error),
+      source: "app-server"
+    });
+  }
 }
 
 export function getCodexAvailability(cwd) {
@@ -691,38 +828,39 @@ export function getSessionRuntimeStatus(env = process.env, cwd = process.cwd()) 
   };
 }
 
-export function getCodexLoginStatus(cwd) {
+export async function getCodexAuthStatus(cwd, options = {}) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
     return {
       available: false,
       loggedIn: false,
-      detail: availability.detail
+      detail: availability.detail,
+      source: "availability",
+      authMethod: null,
+      verified: null,
+      requiresOpenaiAuth: null,
+      provider: null
     };
   }
 
-  const result = runCommand("codex", ["login", "status"], { cwd });
-  if (result.error) {
-    return {
-      available: true,
+  let client = null;
+  try {
+    client = await CodexAppServerClient.connect(cwd, {
+      env: options.env,
+      reuseExistingBroker: true
+    });
+    return await getCodexAuthStatusFromClient(client, cwd);
+  } catch (error) {
+    return buildAuthStatus({
       loggedIn: false,
-      detail: result.error.message
-    };
+      detail: error instanceof Error ? error.message : String(error),
+      source: "app-server"
+    });
+  } finally {
+    if (client) {
+      await client.close().catch(() => {});
+    }
   }
-
-  if (result.status === 0) {
-    return {
-      available: true,
-      loggedIn: true,
-      detail: result.stdout.trim() || "authenticated"
-    };
-  }
-
-  return {
-    available: true,
-    loggedIn: false,
-    detail: result.stderr.trim() || result.stdout.trim() || "not authenticated"
-  };
 }
 
 export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
@@ -745,12 +883,9 @@ export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
     };
   }
 
-  const brokerEndpoint = process.env[BROKER_ENDPOINT_ENV] ?? loadBrokerSession(cwd)?.endpoint ?? null;
   let client = null;
   try {
-    client = brokerEndpoint
-      ? await CodexAppServerClient.connect(cwd, { brokerEndpoint })
-      : await CodexAppServerClient.connect(cwd, { disableBroker: true });
+    client = await CodexAppServerClient.connect(cwd, { reuseExistingBroker: true });
     await client.request("turn/interrupt", { threadId, turnId });
     return {
       attempted: true,
