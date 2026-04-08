@@ -273,6 +273,33 @@ test("adversarial review accepts the same base-branch targeting as review", () =
   assert.match(result.stdout, /Missing empty-state guard/);
 });
 
+test("adversarial review asks Codex to inspect larger diffs itself", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  for (const name of ["a.js", "b.js", "c.js"]) {
+    fs.writeFileSync(path.join(repo, "src", name), `export const value = "${name}-v1";\n`);
+  }
+  run("git", ["add", "src/a.js", "src/b.js", "src/c.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "a.js"), 'export const value = "PROMPT_SELF_COLLECT_A";\n');
+  fs.writeFileSync(path.join(repo, "src", "b.js"), 'export const value = "PROMPT_SELF_COLLECT_B";\n');
+  fs.writeFileSync(path.join(repo, "src", "c.js"), 'export const value = "PROMPT_SELF_COLLECT_C";\n');
+
+  const result = run("node", [SCRIPT, "adversarial-review"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.match(state.lastTurnStart.prompt, /lightweight summary/i);
+  assert.match(state.lastTurnStart.prompt, /read-only git commands/i);
+  assert.doesNotMatch(state.lastTurnStart.prompt, /PROMPT_SELF_COLLECT_[ABC]/);
+});
+
 test("review includes reasoning output when the app server returns it", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
