@@ -639,7 +639,16 @@ async function startThread(client, cwd, options = {}) {
   const response = await client.request("thread/start", buildThreadParams(cwd, options));
   const threadId = response.thread.id;
   if (options.threadName) {
-    await client.request("thread/name/set", { threadId, name: options.threadName });
+    try {
+      await client.request("thread/name/set", { threadId, name: options.threadName });
+    } catch (err) {
+      // Only suppress "unknown variant/method" errors from older CLI versions
+      // that don't support thread/name/set. Rethrow auth, network, or server errors.
+      const msg = String(err?.message ?? err ?? "");
+      if (!msg.includes("unknown variant") && !msg.includes("unknown method")) {
+        throw err;
+      }
+    }
   }
   return response;
 }
