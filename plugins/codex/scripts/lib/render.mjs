@@ -164,6 +164,9 @@ function pushJobDetails(lines, job, options = {}) {
       lines.push(`    ${line}`);
     }
   }
+  if (job.errorMessage && job.status === "failed") {
+    lines.push(`  Error: ${job.errorMessage}`);
+  }
 }
 
 function appendReasoningSection(lines, reasoningSummary) {
@@ -389,8 +392,13 @@ export function renderJobStatusReport(job, options = {}) {
   });
 
   if (options.waitTimedOut && Number.isFinite(options.timeoutMs)) {
+    const timeoutSeconds = Math.max(0, Math.ceil(options.timeoutMs / 1000));
     lines.push("");
-    lines.push(`Wait timed out after ${options.timeoutMs}ms while ${job.id} remained ${job.status}.`);
+    if (job.errorMessage) {
+      lines.push(`Job ${job.id} failed: ${job.errorMessage}`);
+    } else {
+      lines.push(`Job ${job.id} timed out after ${timeoutSeconds}s (still running).`);
+    }
   }
 
   return `${lines.join("\n").trimEnd()}\n`;

@@ -291,11 +291,29 @@ function isActiveJobStatus(status) {
   return status === "queued" || status === "running";
 }
 
+function normalizeTrackedPid(pid) {
+  const numeric = Number(pid);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
+}
+
+function reconcileDeadPidDuringWait(cwd, reference, snapshot) {
+  const trackedPid = normalizeTrackedPid(snapshot.job.pid);
+  if (!isActiveJobStatus(snapshot.job.status) || trackedPid == null || isProcessAlive(trackedPid)) {
+    return snapshot;
+  }
+  try {
+    markDeadPidJobFailed(snapshot.workspaceRoot, snapshot.job.id, trackedPid);
+  } catch {
+    // Never let reconciliation errors crash the poll loop.
+  }
+  return buildSingleJobSnapshot(cwd, reference);
+}
+
 async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
   const timeoutMs = Math.max(0, Number(options.timeoutMs) || DEFAULT_STATUS_WAIT_TIMEOUT_MS);
   const pollIntervalMs = Math.max(100, Number(options.pollIntervalMs) || DEFAULT_STATUS_POLL_INTERVAL_MS);
   const deadline = Date.now() + timeoutMs;
-  let snapshot = buildSingleJobSnapshot(cwd, reference);
+  let snapshot = reconcileDeadPidDuringWait(cwd, reference, buildSingleJobSnapshot(cwd, reference));
 
   while (isActiveJobStatus(snapshot.job.status) && Date.now() < deadline) {
     await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));

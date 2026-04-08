@@ -963,7 +963,6 @@ test("status --wait times out cleanly when a job is still active", () => {
   assert.equal(payload.job.id, "task-live");
   assert.equal(payload.job.status, "running");
   assert.equal(payload.waitTimedOut, true);
-});
 
 test("status --wait marks dead-pid jobs failed instead of timing out", () => {
   const workspace = makeTempDir();
