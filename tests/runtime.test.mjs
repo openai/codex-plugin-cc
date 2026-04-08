@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
-import { loadBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -2097,4 +2097,27 @@ test("status reports shared session runtime when a lazy broker is active", () =>
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Session runtime: shared session/);
+});
+
+test("setup and status honor --cwd when reading shared session runtime", () => {
+  const targetWorkspace = makeTempDir();
+  const invocationWorkspace = makeTempDir();
+
+  saveBrokerSession(targetWorkspace, {
+    endpoint: "unix:/tmp/fake-broker.sock"
+  });
+
+  const status = run("node", [SCRIPT, "status", "--cwd", targetWorkspace], {
+    cwd: invocationWorkspace
+  });
+  assert.equal(status.status, 0, status.stderr);
+  assert.match(status.stdout, /Session runtime: shared session/);
+
+  const setup = run("node", [SCRIPT, "setup", "--cwd", targetWorkspace, "--json"], {
+    cwd: invocationWorkspace
+  });
+  assert.equal(setup.status, 0, setup.stderr);
+  const payload = JSON.parse(setup.stdout);
+  assert.equal(payload.sessionRuntime.mode, "shared");
+  assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
 });
