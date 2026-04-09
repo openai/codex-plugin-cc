@@ -7,6 +7,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { getCodexAvailability } from "./lib/codex.mjs";
+import { sanitizeChildEnv } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { getConfig, listJobs } from "./lib/state.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
@@ -99,7 +100,7 @@ function runStopReview(cwd, input = {}) {
   const scriptPath = path.join(SCRIPT_DIR, "codex-companion.mjs");
   const prompt = buildStopReviewPrompt(input);
   const childEnv = {
-    ...process.env,
+    ...sanitizeChildEnv(process.env),
     ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {})
   };
   const result = spawnSync(process.execPath, [scriptPath, "task", "--json", prompt], {
