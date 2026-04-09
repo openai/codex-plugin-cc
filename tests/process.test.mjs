@@ -1,12 +1,33 @@
+import fs from "node:fs";
+import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 
 import {
   runCommand,
   sanitizeChildEnv,
   terminateProcessTree
 } from "../plugins/codex/scripts/lib/process.mjs";
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const SCRIPT_ROOT = path.join(ROOT, "plugins", "codex", "scripts");
+
+function listScriptFiles(dir) {
+  const files = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...listScriptFiles(fullPath));
+      continue;
+    }
+    if (entry.isFile() && fullPath.endsWith(".mjs")) {
+      files.push(fullPath);
+    }
+  }
+  return files.sort();
+}
 
 test("sanitizeChildEnv strips routing env and cargo target overrides", () => {
   const env = sanitizeChildEnv({
@@ -152,6 +173,40 @@ test("runCommand sanitizes inherited process env when env is omitted", () => {
     } else {
       process.env.CARGO_TARGET_DIR = originalTarget;
     }
+  }
+});
+
+test("all production spawn sites are covered by the sanitizer contract", () => {
+  const expectedSpawnFiles = [
+    "codex-companion.mjs",
+    "lib/app-server.mjs",
+    "lib/broker-lifecycle.mjs",
+    "lib/process.mjs",
+    "stop-review-gate-hook.mjs"
+  ];
+
+  const spawnFiles = listScriptFiles(SCRIPT_ROOT)
+    .filter((file) => /\bspawn(?:Sync)?\(/.test(fs.readFileSync(file, "utf8")))
+    .map((file) => path.relative(SCRIPT_ROOT, file))
+    .sort();
+
+  assert.deepEqual(spawnFiles, expectedSpawnFiles);
+
+  for (const relativePath of spawnFiles) {
+    const source = fs.readFileSync(path.join(SCRIPT_ROOT, relativePath), "utf8");
+    if (relativePath === "lib/process.mjs") {
+      assert.match(source, /env:\s*sanitizeChildEnv\(options\.env \?\? process\.env\)/);
+      continue;
+    }
+
+    if (relativePath === "stop-review-gate-hook.mjs") {
+      assert.match(source, /const childEnv = \{\s*\.\.\.sanitizeChildEnv\(process\.env\)/s);
+      assert.match(source, /env:\s*childEnv/);
+      continue;
+    }
+
+    assert.match(source, /sanitizeChildEnv/);
+    assert.match(source, /env:\s*sanitizeChildEnv\(/);
   }
 });
 
