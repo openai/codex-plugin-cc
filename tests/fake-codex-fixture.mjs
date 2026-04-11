@@ -169,6 +169,10 @@ function structuredReviewPayload(prompt) {
 }
 
 function taskPayload(prompt, resume) {
+  if (BEHAVIOR === "empty-stdout") {
+    return "";
+  }
+
   if (prompt.includes("<task>") && prompt.includes("Only review the work from the previous Claude turn.")) {
     if (BEHAVIOR === "adversarial-clean") {
       return "ALLOW: No blocking issues found in the previous turn.";
