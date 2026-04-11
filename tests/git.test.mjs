@@ -199,3 +199,45 @@ test("collectTestCommandContext ignores symlinked test directories outside the r
 
   assert.throws(() => collectTestCommandContext(cwd), /No test layout detected/i);
 });
+
+test("collectTestCommandContext ignores symlinked guidance files outside the repo", () => {
+  const cwd = makeTempDir();
+  const externalDir = makeTempDir();
+  initGitRepo(cwd);
+  fs.mkdirSync(path.join(cwd, "src"));
+  fs.mkdirSync(path.join(cwd, "tests"));
+  fs.writeFileSync(path.join(cwd, "src", "app.js"), "export const value = 1;\n");
+  fs.writeFileSync(path.join(cwd, "tests", "app.test.mjs"), "import test from 'node:test';\n");
+  fs.writeFileSync(path.join(externalDir, "README.md"), "# external guidance\n");
+  fs.symlinkSync(path.join(externalDir, "README.md"), path.join(cwd, "README.md"));
+  run("git", ["add", "README.md", "src/app.js", "tests/app.test.mjs"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "src", "app.js"), "export const value = 2;\n");
+
+  assert.throws(
+    () => collectTestCommandContext(cwd),
+    /No project guidance found: expected at least one of CLAUDE\.md, AGENTS\.md, README\.md\./i
+  );
+});
+
+test("collectTestCommandContext matches javascript test stems by boundary", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.mkdirSync(path.join(cwd, "src"));
+  fs.mkdirSync(path.join(cwd, "tests"));
+  fs.writeFileSync(path.join(cwd, "README.md"), "# Sample project\n");
+  fs.writeFileSync(path.join(cwd, "src", "id.js"), "export const id = 1;\n");
+  fs.writeFileSync(path.join(cwd, "tests", "userid.test.js"), "test('userid', () => {});\n");
+  run("git", ["add", "README.md", "src/id.js", "tests/userid.test.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "src", "id.js"), "export const id = 2;\n");
+
+  const context = collectTestCommandContext(cwd);
+
+  assert.deepEqual(context.testPlanEntries, [
+    {
+      sourcePath: "src/id.js",
+      targets: [{ path: "tests/id.test.js", action: "create" }]
+    }
+  ]);
+});

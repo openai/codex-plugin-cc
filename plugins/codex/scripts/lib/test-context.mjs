@@ -28,17 +28,24 @@ const TEST_COMMAND_PATTERNS = [
   /\bgo\s+test(?:\s+[^\n`]+)?/gi
 ];
 
+function isPathWithinRoot(rootPath, targetPath) {
+  const relative = path.relative(rootPath, targetPath);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
 function walkRepoFiles(rootDir, options = {}) {
   const maxDepth = Number.isInteger(options.maxDepth) ? options.maxDepth : Number.POSITIVE_INFINITY;
   const results = [];
   const queue = [{ absoluteDir: rootDir, relativeDir: "", depth: 0 }];
   const visitedDirectories = new Set();
+  let rootRealPath;
 
   try {
-    visitedDirectories.add(fs.realpathSync.native(rootDir));
+    rootRealPath = fs.realpathSync.native(rootDir);
   } catch {
-    visitedDirectories.add(rootDir);
+    rootRealPath = rootDir;
   }
+  visitedDirectories.add(rootRealPath);
 
   while (queue.length > 0) {
     const current = queue.shift();
@@ -69,10 +76,15 @@ function walkRepoFiles(rootDir, options = {}) {
         continue;
       }
       if (entry.isSymbolicLink()) {
+        let realPath;
         let stat;
         try {
+          realPath = fs.realpathSync.native(absolutePath);
           stat = fs.statSync(absolutePath);
         } catch {
+          continue;
+        }
+        if (!isPathWithinRoot(rootRealPath, realPath)) {
           continue;
         }
         if (stat.isFile()) {
@@ -173,6 +185,10 @@ function fileStem(relativePath) {
   return extension ? baseName.slice(0, -extension.length) : baseName;
 }
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function inferPreferredJavascriptTestExtension(testFiles) {
   const counts = new Map();
   for (const file of testFiles) {
@@ -191,21 +207,23 @@ function buildTestFileCandidates(relativePath, testFiles, primaryLocations) {
   const normalized = relativePath.replace(/\\/g, "/");
   const baseName = path.basename(normalized).toLowerCase();
   const stem = fileStem(normalized);
+  const loweredStem = stem.toLowerCase();
   const extension = extnamePreservingDeclaration(normalized).toLowerCase();
   const dirName = path.posix.dirname(normalized);
+  const exactJavascriptTestPattern = new RegExp(`^${escapeRegExp(loweredStem)}\\.(?:test|spec)\\.`);
 
   const directMatches = testFiles.filter((candidate) => {
     const candidateBaseName = path.basename(candidate).toLowerCase();
     if (candidateBaseName === baseName) {
       return true;
     }
-    if (candidateBaseName.includes(`${stem.toLowerCase()}.test.`) || candidateBaseName.includes(`${stem.toLowerCase()}.spec.`)) {
+    if (exactJavascriptTestPattern.test(candidateBaseName)) {
       return true;
     }
-    if (candidateBaseName === `test_${stem.toLowerCase()}.py`) {
+    if (candidateBaseName === `test_${loweredStem}.py`) {
       return true;
     }
-    if (candidateBaseName === `${stem.toLowerCase()}_test.go`) {
+    if (candidateBaseName === `${loweredStem}_test.go`) {
       return true;
     }
     return false;
