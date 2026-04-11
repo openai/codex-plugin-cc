@@ -206,9 +206,14 @@ function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function inferPreferredJavascriptTestExtension(testFiles) {
+function inferPreferredJavascriptTestExtension(testFiles, options = {}) {
+  const scopeRoots = Array.isArray(options.scopeRoots) ? options.scopeRoots.filter(Boolean) : [];
+  const scopedFiles =
+    scopeRoots.length === 0
+      ? testFiles
+      : testFiles.filter((file) => scopeRoots.some((root) => file === root || file.startsWith(`${root}/`)));
   const counts = new Map();
-  for (const file of testFiles) {
+  for (const file of scopedFiles) {
     const baseName = path.basename(file).toLowerCase();
     if (!baseName.includes(".test.") && !baseName.includes(".spec.")) {
       continue;
@@ -347,7 +352,7 @@ function buildTestFileCandidates(relativePath, testFiles, primaryLocations) {
     if (!preferredRoot) {
       return [];
     }
-    const preferredExtension = inferPreferredJavascriptTestExtension(testFiles) || extension || ".js";
+    const preferredExtension = inferPreferredJavascriptTestExtension(testFiles, { scopeRoots: [preferredRoot] }) || extension || ".js";
     const strippedParts = relativeDirUnderSourceRoot(normalized);
     const candidateDir = path.posix.join(preferredRoot, ...strippedParts);
     return [{ path: path.posix.join(candidateDir, `${stem}.test${preferredExtension}`), action: "create" }];

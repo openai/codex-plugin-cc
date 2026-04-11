@@ -373,3 +373,29 @@ test("collectTestCommandContext fails closed when no package-local test root mat
 
   assert.throws(() => collectTestCommandContext(cwd), /Unable to infer test targets from changed files/i);
 });
+
+test("collectTestCommandContext infers JS test extensions from the selected package root", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.mkdirSync(path.join(cwd, "packages", "a", "src"), { recursive: true });
+  fs.mkdirSync(path.join(cwd, "packages", "a", "tests"), { recursive: true });
+  fs.mkdirSync(path.join(cwd, "packages", "b", "src"), { recursive: true });
+  fs.mkdirSync(path.join(cwd, "packages", "b", "tests"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, "README.md"), "# mixed conventions\n");
+  fs.writeFileSync(path.join(cwd, "packages", "a", "tests", "alpha.test.ts"), "test('alpha', () => {});\n");
+  fs.writeFileSync(path.join(cwd, "packages", "a", "tests", "beta.test.ts"), "test('beta', () => {});\n");
+  fs.writeFileSync(path.join(cwd, "packages", "b", "tests", "existing.test.js"), "test('existing', () => {});\n");
+  fs.writeFileSync(path.join(cwd, "packages", "b", "src", "new.js"), "export const value = 1;\n");
+  run("git", ["add", "."], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "packages", "b", "src", "new.js"), "export const value = 2;\n");
+
+  const context = collectTestCommandContext(cwd);
+
+  assert.deepEqual(context.testPlanEntries, [
+    {
+      sourcePath: "packages/b/src/new.js",
+      targets: [{ path: "packages/b/tests/new.test.js", action: "create" }]
+    }
+  ]);
+});
