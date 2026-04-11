@@ -5,6 +5,8 @@ import { collectReviewContext, getRepoRoot, resolveReviewTarget } from "./git.mj
 
 const GUIDANCE_PREFERENCE = ["claude.md", "agents.md", "readme.md"];
 const GUIDANCE_LIMIT_BYTES = 24 * 1024;
+const GUIDANCE_TOTAL_LIMIT_BYTES = 48 * 1024;
+const GUIDANCE_MAX_FILES = 6;
 const MAX_GUIDANCE_DEPTH = 3;
 const TEST_COMMAND_LIMIT = 6;
 const WALK_SKIP_DIRS = new Set([
@@ -116,7 +118,8 @@ function readTrimmedFile(repoRoot, relativePath, maxBytes = GUIDANCE_LIMIT_BYTES
 function guidanceSortKey(relativePath) {
   const baseName = path.basename(relativePath).toLowerCase();
   const preferenceIndex = GUIDANCE_PREFERENCE.indexOf(baseName);
-  return [preferenceIndex === -1 ? GUIDANCE_PREFERENCE.length : preferenceIndex, relativePath];
+  const depth = relativePath.split("/").length - 1;
+  return [preferenceIndex === -1 ? GUIDANCE_PREFERENCE.length : preferenceIndex, depth, relativePath];
 }
 
 function collectGuidanceFiles(repoRoot) {
@@ -124,15 +127,29 @@ function collectGuidanceFiles(repoRoot) {
   const matches = repoFiles
     .filter((relativePath) => GUIDANCE_PREFERENCE.includes(path.basename(relativePath).toLowerCase()))
     .sort((left, right) => {
-      const [leftIndex, leftPath] = guidanceSortKey(left);
-      const [rightIndex, rightPath] = guidanceSortKey(right);
-      return leftIndex - rightIndex || leftPath.localeCompare(rightPath);
+      const [leftIndex, leftDepth, leftPath] = guidanceSortKey(left);
+      const [rightIndex, rightDepth, rightPath] = guidanceSortKey(right);
+      return leftIndex - rightIndex || leftDepth - rightDepth || leftPath.localeCompare(rightPath);
     });
+  const guidanceFiles = [];
+  let totalBytes = 0;
+  for (const relativePath of matches) {
+    if (guidanceFiles.length >= GUIDANCE_MAX_FILES) {
+      break;
+    }
+    const content = readTrimmedFile(repoRoot, relativePath);
+    const contentBytes = Buffer.byteLength(content, "utf8");
+    if (guidanceFiles.length > 0 && totalBytes + contentBytes > GUIDANCE_TOTAL_LIMIT_BYTES) {
+      continue;
+    }
+    guidanceFiles.push({
+      path: relativePath,
+      content
+    });
+    totalBytes += contentBytes;
+  }
 
-  return matches.map((relativePath) => ({
-    path: relativePath,
-    content: readTrimmedFile(repoRoot, relativePath)
-  }));
+  return guidanceFiles;
 }
 
 function isTestFile(relativePath) {

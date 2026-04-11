@@ -328,3 +328,31 @@ test("collectTestCommandContext preserves source subdirectories for new Python t
     }
   ]);
 });
+
+test("collectTestCommandContext caps guidance files in large monorepos", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.mkdirSync(path.join(cwd, "src"));
+  fs.mkdirSync(path.join(cwd, "tests"));
+  fs.writeFileSync(path.join(cwd, "AGENTS.md"), "# root agents\n");
+  fs.writeFileSync(path.join(cwd, "README.md"), "# root readme\n");
+  fs.writeFileSync(path.join(cwd, "src", "app.js"), "export const value = 1;\n");
+  fs.writeFileSync(path.join(cwd, "tests", "app.test.js"), "test('app', () => {});\n");
+  for (let index = 0; index < 10; index += 1) {
+    const packageDir = path.join(cwd, "packages", `pkg-${index}`);
+    fs.mkdirSync(packageDir, { recursive: true });
+    fs.writeFileSync(path.join(packageDir, "README.md"), `# package ${index}\n${"docs\n".repeat(1024)}`);
+  }
+  run("git", ["add", "."], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "src", "app.js"), "export const value = 2;\n");
+
+  const context = collectTestCommandContext(cwd);
+
+  assert.ok(context.guidanceFiles.length < 12);
+  assert.deepEqual(
+    context.guidanceFiles.slice(0, 2).map((file) => file.path),
+    ["AGENTS.md", "README.md"]
+  );
+  assert.ok(!context.guidanceFiles.some((file) => file.path === "packages/pkg-9/README.md"));
+});

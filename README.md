@@ -153,6 +153,9 @@ By default, Codex should:
 - update or create the matching tests
 - avoid modifying production code by default
 
+Implementation and maintenance notes for `/codex:test` live in
+[`docs/codex-test-design.md`](./docs/codex-test-design.md).
+
 ### `/codex:rescue`
 
 Hands a task to Codex through the `codex:codex-rescue` subagent.
