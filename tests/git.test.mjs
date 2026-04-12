@@ -399,3 +399,45 @@ test("collectTestCommandContext infers JS test extensions from the selected pack
     }
   ]);
 });
+
+test("collectTestCommandContext builds JS test paths relative to the selected test root", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.mkdirSync(path.join(cwd, "packages", "b", "tests"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, "README.md"), "# package layout without src\n");
+  fs.writeFileSync(path.join(cwd, "packages", "b", "tests", "existing.test.js"), "test('existing', () => {});\n");
+  fs.writeFileSync(path.join(cwd, "packages", "b", "new.js"), "export const value = 1;\n");
+  run("git", ["add", "."], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "packages", "b", "new.js"), "export const value = 2;\n");
+
+  const context = collectTestCommandContext(cwd);
+
+  assert.deepEqual(context.testPlanEntries, [
+    {
+      sourcePath: "packages/b/new.js",
+      targets: [{ path: "packages/b/tests/new.test.js", action: "create" }]
+    }
+  ]);
+});
+
+test("collectTestCommandContext builds Python test paths relative to the selected test root", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.mkdirSync(path.join(cwd, "packages", "b", "tests"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, "README.md"), "# python package layout without src\n");
+  fs.writeFileSync(path.join(cwd, "packages", "b", "tests", "test_existing.py"), "def test_existing():\n    assert True\n");
+  fs.writeFileSync(path.join(cwd, "packages", "b", "foo.py"), "VALUE = 1\n");
+  run("git", ["add", "."], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "packages", "b", "foo.py"), "VALUE = 2\n");
+
+  const context = collectTestCommandContext(cwd);
+
+  assert.deepEqual(context.testPlanEntries, [
+    {
+      sourcePath: "packages/b/foo.py",
+      targets: [{ path: "packages/b/tests/test_foo.py", action: "create" }]
+    }
+  ]);
+});

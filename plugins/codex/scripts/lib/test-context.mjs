@@ -282,18 +282,21 @@ function rankPrimaryLocationsForSource(relativePath, primaryLocations) {
     .map((location) => location.location);
 }
 
-function relativeDirUnderSourceRoot(relativePath) {
+function relativeDirWithinSelectedTestRoot(relativePath, preferredRoot) {
   const normalized = relativePath.replace(/\\/g, "/");
   const dirName = path.posix.dirname(normalized);
   if (dirName === ".") {
     return [];
   }
   const dirParts = dirName.split("/");
-  const sourceRootIndex = dirParts.findIndex((part) => SOURCE_ROOT_NAMES.has(part.toLowerCase()));
+  const scopeParts = preferredRoot ? getPrimaryLocationScopeParts(preferredRoot) : [];
+  const relativeToScope =
+    scopeParts.length > 0 && scopeParts.every((part, index) => dirParts[index] === part) ? dirParts.slice(scopeParts.length) : dirParts;
+  const sourceRootIndex = relativeToScope.findIndex((part) => SOURCE_ROOT_NAMES.has(part.toLowerCase()));
   if (sourceRootIndex >= 0) {
-    return dirParts.slice(sourceRootIndex + 1);
+    return relativeToScope.slice(sourceRootIndex + 1);
   }
-  return dirParts;
+  return relativeToScope;
 }
 
 function buildTestFileCandidates(relativePath, testFiles, primaryLocations) {
@@ -343,7 +346,7 @@ function buildTestFileCandidates(relativePath, testFiles, primaryLocations) {
     if (!preferredRoot) {
       return [];
     }
-    const strippedParts = relativeDirUnderSourceRoot(normalized);
+    const strippedParts = relativeDirWithinSelectedTestRoot(normalized, preferredRoot);
     return [{ path: path.posix.join(preferredRoot, ...strippedParts, `test_${stem}.py`), action: "create" }];
   }
 
@@ -353,7 +356,7 @@ function buildTestFileCandidates(relativePath, testFiles, primaryLocations) {
       return [];
     }
     const preferredExtension = inferPreferredJavascriptTestExtension(testFiles, { scopeRoots: [preferredRoot] }) || extension || ".js";
-    const strippedParts = relativeDirUnderSourceRoot(normalized);
+    const strippedParts = relativeDirWithinSelectedTestRoot(normalized, preferredRoot);
     const candidateDir = path.posix.join(preferredRoot, ...strippedParts);
     return [{ path: path.posix.join(candidateDir, `${stem}.test${preferredExtension}`), action: "create" }];
   }
