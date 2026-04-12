@@ -23,7 +23,15 @@ import {
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
-import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
+import {
+  loadPromptTemplate,
+  interpolateTemplate,
+  detectReviewDomain,
+  getChallengeFocusAreas,
+  getDiffDepth,
+  getDepthInstructions,
+  getReviewDomainLabel
+} from "./lib/prompts.mjs";
 import {
   generateJobId,
   getConfig,
@@ -77,6 +85,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
+      "  node scripts/codex-companion.mjs challenge [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -246,6 +255,37 @@ function buildAdversarialReviewPrompt(context, focusText) {
   });
 }
 
+function countDiffLines(context) {
+  const content = context.content ?? "";
+  const lines = content.split("\n");
+  let count = 0;
+  for (const line of lines) {
+    if (line.startsWith("+") && !line.startsWith("+++")) count++;
+    if (line.startsWith("-") && !line.startsWith("---")) count++;
+  }
+  // Fallback: if no diff markers found, estimate from total content lines
+  return count > 0 ? count : Math.floor(lines.length / 3);
+}
+
+function buildChallengeReviewPrompt(context) {
+  const domain = detectReviewDomain(context.changedFiles ?? []);
+  const diffLines = countDiffLines(context);
+  const depth = getDiffDepth(diffLines);
+  const focusAreas = getChallengeFocusAreas(domain, depth);
+  const depthInstructions = getDepthInstructions(depth, diffLines);
+  const domainLabel = getReviewDomainLabel(domain);
+
+  const template = loadPromptTemplate(ROOT_DIR, "challenge");
+  return interpolateTemplate(template, {
+    REVIEW_DOMAIN: domainLabel,
+    TARGET_LABEL: context.target.label,
+    FOCUS_AREAS: focusAreas,
+    DEPTH_INSTRUCTIONS: depthInstructions,
+    REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
+    REVIEW_INPUT: context.content
+  });
+}
+
 function ensureCodexAvailable(cwd) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
@@ -404,7 +444,9 @@ async function executeReviewRun(request) {
   }
 
   const context = collectReviewContext(request.cwd, target);
-  const prompt = buildAdversarialReviewPrompt(context, focusText);
+  const prompt = request.buildPrompt
+    ? request.buildPrompt(context)
+    : buildAdversarialReviewPrompt(context, focusText);
   const result = await runAppServerTurn(context.repoRoot, {
     prompt,
     model: request.model,
@@ -527,8 +569,13 @@ async function executeTaskRun(request) {
 }
 
 function buildReviewJobMetadata(reviewName, target) {
+  const kindMap = {
+    "Adversarial Review": "adversarial-review",
+    "Challenge": "challenge",
+    "Review": "review"
+  };
   return {
-    kind: reviewName === "Adversarial Review" ? "adversarial-review" : "review",
+    kind: kindMap[reviewName] ?? "review",
     title: reviewName === "Review" ? "Codex Review" : `Codex ${reviewName}`,
     summary: `${reviewName} ${target.label}`
   };
@@ -716,6 +763,7 @@ async function handleReviewCommand(argv, config) {
         model: options.model,
         focusText,
         reviewName: config.reviewName,
+        buildPrompt: config.buildPrompt ?? null,
         onProgress: progress
       }),
     { json: options.json }
@@ -726,6 +774,13 @@ async function handleReview(argv) {
   return handleReviewCommand(argv, {
     reviewName: "Review",
     validateRequest: validateNativeReviewRequest
+  });
+}
+
+async function handleChallenge(argv) {
+  return handleReviewCommand(argv, {
+    reviewName: "Challenge",
+    buildPrompt: buildChallengeReviewPrompt
   });
 }
 
@@ -996,6 +1051,9 @@ async function main() {
       await handleReviewCommand(argv, {
         reviewName: "Adversarial Review"
       });
+      break;
+    case "challenge":
+      await handleChallenge(argv);
       break;
     case "task":
       await handleTask(argv);
