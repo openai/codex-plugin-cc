@@ -86,7 +86,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs challenge [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
+      "  node scripts/codex-companion.mjs challenge [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--specialist]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -804,10 +804,82 @@ async function handleReview(argv) {
 }
 
 async function handleChallenge(argv) {
-  return handleReviewCommand(argv, {
-    reviewName: "Challenge",
-    buildPrompt: buildChallengeReviewPrompt
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["base", "scope", "model", "cwd"],
+    booleanOptions: ["json", "background", "wait", "specialist"],
+    aliasMap: { m: "model" }
   });
+
+  if (!options.specialist) {
+    return handleReviewCommand(argv, {
+      reviewName: "Challenge",
+      buildPrompt: buildChallengeReviewPrompt
+    });
+  }
+
+  // Specialist fan-out: runs 5 parallel domain-focused reviews
+  const { runFanOut } = await import("./lib/fan-out.mjs");
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveCommandWorkspace(options);
+  const reviewedCommit = getHeadCommit(cwd);
+
+  ensureCodexAvailable(cwd);
+  ensureGitRepository(cwd);
+
+  const target = resolveReviewTarget(cwd, {
+    base: options.base,
+    scope: options.scope
+  });
+  const context = collectReviewContext(cwd, target);
+  const basePrompt = buildChallengeReviewPrompt(context);
+
+  const job = createCompanionJob({
+    prefix: "review",
+    kind: "challenge",
+    title: "Codex Specialist Review",
+    workspaceRoot,
+    jobClass: "review",
+    summary: `Specialist fan-out ${target.label}`
+  });
+
+  const execution = await runForegroundCommand(
+    job,
+    async () => {
+      const fanOut = await runFanOut(context.repoRoot, basePrompt, {
+        model: options.model ?? null
+      });
+      return {
+        exitStatus: fanOut.failedCount >= 3 ? 1 : 0,
+        payload: {
+          review: "Specialist Review",
+          target,
+          result: {
+            verdict: fanOut.verdict,
+            findings: fanOut.allFindings
+          }
+        },
+        rendered: fanOut.rendered,
+        summary: `Specialist review: ${fanOut.verdict}`,
+        jobTitle: "Codex Specialist Review",
+        jobClass: "review"
+      };
+    },
+    { json: options.json }
+  );
+
+  const verdict = execution?.payload?.result?.verdict ?? null;
+  if (verdict) {
+    try {
+      writeVerdictFile(workspaceRoot, {
+        verdict,
+        mode: "challenge-specialist",
+        commit: reviewedCommit
+      });
+    } catch {
+      // Best-effort
+    }
+  }
 }
 
 async function handleTask(argv) {

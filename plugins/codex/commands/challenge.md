@@ -1,6 +1,6 @@
 ---
 description: Run a context-aware Codex challenge review that auto-detects infrastructure vs application code and scales depth by diff size
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]'
+argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--specialist]'
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
@@ -40,6 +40,7 @@ Argument handling:
 - `/codex:challenge` uses the same review target selection as `/codex:review`.
 - It supports working-tree review, branch review, and `--base <ref>`.
 - It does not support custom focus text. The focus areas are auto-selected based on file types in the diff.
+- If `--specialist` is present, the companion script runs 5 parallel domain-focused reviews (security, reliability, cost, blast-radius, operability) and merges the results. This uses ~5x the tokens of a single review. Always runs in the foreground since it manages its own parallelism. When `--specialist` is passed, do not ask about foreground vs background -- always run in the foreground.
 
 Foreground flow:
 - Run:
