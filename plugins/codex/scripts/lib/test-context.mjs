@@ -256,6 +256,14 @@ function getPrimaryLocationScopeParts(location) {
   return parts.slice(0, -1);
 }
 
+function isExplicitTestDirectoryLocation(location) {
+  const normalized = location.replace(/\\/g, "/");
+  if (normalized === ".") {
+    return false;
+  }
+  return normalized.split("/").some((part) => TEST_DIR_NAMES.has(part.toLowerCase()));
+}
+
 function rankPrimaryLocationsForSource(relativePath, primaryLocations) {
   const normalized = relativePath.replace(/\\/g, "/");
   const sourceDir = path.posix.dirname(normalized);
@@ -270,13 +278,15 @@ function rankPrimaryLocationsForSource(relativePath, primaryLocations) {
         location,
         scopeParts,
         sharedPrefixLength,
-        scopeMatchesSource
+        scopeMatchesSource,
+        explicitTestDirectory: isExplicitTestDirectoryLocation(location)
       };
     })
     .sort((left, right) => {
       return (
         Number(right.scopeMatchesSource) - Number(left.scopeMatchesSource) ||
         right.sharedPrefixLength - left.sharedPrefixLength ||
+        Number(right.explicitTestDirectory) - Number(left.explicitTestDirectory) ||
         right.scopeParts.length - left.scopeParts.length ||
         left.location.localeCompare(right.location)
       );
@@ -293,6 +303,7 @@ function rankPrimaryLocationsForSource(relativePath, primaryLocations) {
       (location) =>
         location.scopeMatchesSource === best.scopeMatchesSource &&
         location.sharedPrefixLength === best.sharedPrefixLength &&
+        location.explicitTestDirectory === best.explicitTestDirectory &&
         location.scopeParts.length === best.scopeParts.length
     )
     .map((location) => location.location);

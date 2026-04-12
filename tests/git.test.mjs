@@ -504,3 +504,26 @@ test("collectTestCommandContext accepts repo-root test files as a valid layout",
     }
   ]);
 });
+
+test("collectTestCommandContext prefers explicit test directories over repo-root test files on ties", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.mkdirSync(path.join(cwd, "src"), { recursive: true });
+  fs.mkdirSync(path.join(cwd, "tests"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, "README.md"), "# mixed root layout\n");
+  fs.writeFileSync(path.join(cwd, "foo.test.js"), "test('foo', () => {});\n");
+  fs.writeFileSync(path.join(cwd, "tests", "existing.test.js"), "test('existing', () => {});\n");
+  fs.writeFileSync(path.join(cwd, "src", "new.js"), "export const value = 1;\n");
+  run("git", ["add", "."], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "src", "new.js"), "export const value = 2;\n");
+
+  const context = collectTestCommandContext(cwd);
+
+  assert.deepEqual(context.testPlanEntries, [
+    {
+      sourcePath: "src/new.js",
+      targets: [{ path: "tests/new.test.js", action: "create" }]
+    }
+  ]);
+});
