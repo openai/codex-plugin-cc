@@ -1,49 +1,59 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up rescue work to the Codex rescue subagent
-argument-hint: "[--background|--wait] [--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [what Codex should investigate, solve, or continue]"
+argument-hint: "[--wait] [--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [what Codex should investigate, solve, or continue]"
 context: fork
 allowed-tools: Bash(node:*), AskUserQuestion
 ---
 
-Route this request to the `codex:codex-rescue` subagent.
-The final user-visible response must be Codex's output verbatim.
+Run a Codex rescue task. Defaults to background.
 
 Raw user request:
 $ARGUMENTS
 
-Execution mode:
+## Resume check (foreground, fast)
 
-- If the request includes `--background`, run the `codex:codex-rescue` subagent in the background.
-- If the request includes `--wait`, run the `codex:codex-rescue` subagent in the foreground.
-- If neither flag is present, default to background.
-- `--background` and `--wait` are execution flags for Claude Code. Do not forward them to `task`, and do not treat them as part of the natural-language task text.
-- `--model` and `--effort` are runtime-selection flags. Preserve them for the forwarded `task` call, but do not treat them as part of the natural-language task text.
-- If the request includes `--resume`, do not ask whether to continue. The user already chose.
-- If the request includes `--fresh`, do not ask whether to continue. The user already chose.
-- Otherwise, before starting Codex, check for a resumable rescue thread from this Claude session by running:
+If `--resume` or `--fresh` is in the request, skip this step.
+
+Otherwise, check for a resumable thread:
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task-resume-candidate --json
 ```
 
-- If that helper reports `available: true`, use `AskUserQuestion` exactly once to ask whether to continue the current Codex thread or start a new one.
-- The two choices must be:
-  - `Continue current Codex thread`
-  - `Start a new Codex thread`
-- If the user is clearly giving a follow-up instruction such as "continue", "keep going", "resume", "apply the top fix", or "dig deeper", put `Continue current Codex thread (Recommended)` first.
-- Otherwise put `Start a new Codex thread (Recommended)` first.
-- If the user chooses continue, add `--resume` before routing to the subagent.
-- If the user chooses a new thread, add `--fresh` before routing to the subagent.
-- If the helper reports `available: false`, do not ask. Route normally.
+- If `available: true`: use `AskUserQuestion` once with choices `Continue current Codex thread` / `Start a new Codex thread`. Add `--resume` or `--fresh` based on choice.
+- If `available: false`: continue without asking.
 
-Operating rules:
+If the user did not supply a task description, use `AskUserQuestion` to ask what Codex should investigate or fix.
 
-- The subagent is a thin forwarder only. It should use one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task ...` and return that command's stdout as-is.
-- Return the Codex companion stdout verbatim to the user.
-- Do not paraphrase, summarize, rewrite, or add commentary before or after it.
-- Do not ask the subagent to inspect files, monitor progress, poll `/codex:status`, fetch `/codex:result`, call `/codex:cancel`, summarize output, or do follow-up work of its own.
-- Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort.
-- Leave the model unset unless the user explicitly asks for one. If they ask for `spark`, map it to `gpt-5.3-codex-spark`.
-- Leave `--resume` and `--fresh` in the forwarded request. The subagent handles that routing when it builds the `task` command.
-- If the helper reports that Codex is missing or unauthenticated, stop and tell the user to run `/codex:setup`.
-- If the user did not supply a request, ask what Codex should investigate or fix.
+## Execution
+
+Build the task command arguments: strip `--wait` from the forwarded args (it's an execution flag, not a Codex flag). Preserve `--resume`, `--fresh`, `--model`, `--effort` for the companion call.
+
+- `--model`: leave unset unless user asks. Map `spark` to `gpt-5.3-codex-spark`.
+- `--effort`: leave unset unless user asks.
+
+**If `--wait` is in the request**: run in the foreground.
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task [flags] "the task description"
+```
+
+Return stdout verbatim.
+
+**Otherwise (default)**: launch in background immediately.
+
+```typescript
+Bash({
+  command: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task [flags] "the task description"`,
+  description: "Codex rescue task",
+  run_in_background: true
+})
+```
+
+After launching, respond with only: "Codex rescue task running in background."
+
+## Rules
+
+- Return Codex companion stdout verbatim. Do not paraphrase, summarize, or add commentary.
+- Do not ask the subagent to inspect files, monitor progress, or do follow-up work.
+- If the helper reports Codex is missing or unauthenticated, tell user to run `/codex:setup`.
