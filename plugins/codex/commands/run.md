@@ -1,7 +1,7 @@
 ---
 description: Auto-detect what to review and run the appropriate Codex command
 argument-hint: '[--wait|--background] [--base <ref>]'
-allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
+allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*)
 ---
 
 Smart router that detects what to review and dispatches to the right Codex command.
@@ -77,12 +77,7 @@ Apply the first matching rule:
 
 - If `$ARGUMENTS` includes `--wait`, run in foreground. Do not ask.
 - If `$ARGUMENTS` includes `--background`, run in background. Do not ask.
-- Otherwise, estimate the review size from the git commands above:
-  - If clearly tiny (1-2 files, small shortstat), recommend waiting.
-  - Otherwise, recommend background.
-  - Use `AskUserQuestion` exactly once with two options, recommended first with `(Recommended)` suffix:
-    - `Wait for results`
-    - `Run in background`
+- Otherwise, default to background. Do not ask.
 
 Extract `--wait`, `--background`, and `--base <ref>` from `$ARGUMENTS` and pass them through as `$EXTRA_FLAGS`. Do not pass them twice.
 
