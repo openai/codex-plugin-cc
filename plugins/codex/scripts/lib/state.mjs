@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import process from "node:process";
 
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -14,6 +15,94 @@ const MAX_JOBS = 50;
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function isProcessAlive(pidValue) {
+  const pid = Number(pidValue);
+  if (!Number.isFinite(pid) || pid <= 0) {
+    return false;
+  }
+
+  try {
+    process.kill(Math.trunc(pid), 0);
+    return true;
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "EPERM") {
+      return true;
+    }
+    return false;
+  }
+}
+
+function normalizePid(pidValue) {
+  const pid = Number(pidValue);
+  if (!Number.isFinite(pid) || pid <= 0) {
+    return null;
+  }
+  return Math.trunc(pid);
+}
+
+function appendStaleJobLog(job, message) {
+  if (!job?.logFile) {
+    return;
+  }
+  try {
+    fs.appendFileSync(job.logFile, `[${nowIso()}] ${message}\n`, "utf8");
+  } catch {
+    // Best-effort logging; status reconciliation should not fail on log write errors.
+  }
+}
+
+function reconcileRunningJobs(cwd, jobs) {
+  const completedAt = nowIso();
+  let changed = false;
+
+  const nextJobs = jobs.map((job) => {
+    if (job?.status !== "running") {
+      return job;
+    }
+    const pid = normalizePid(job.pid);
+    if (pid == null) {
+      return job;
+    }
+    if (isProcessAlive(pid)) {
+      return job;
+    }
+
+    changed = true;
+    const reason = `process ${pid} is not running`;
+    const errorMessage = `Codex job ended unexpectedly (${reason}); auto-reconciled as failed.`;
+    const nextJob = {
+      ...job,
+      status: "failed",
+      phase: "failed",
+      pid: null,
+      completedAt,
+      errorMessage,
+      updatedAt: completedAt
+    };
+
+    appendStaleJobLog(job, `Detected stale running job (${reason}). Marked as failed automatically.`);
+    const jobFile = resolveJobFile(cwd, job.id);
+    if (fs.existsSync(jobFile)) {
+      try {
+        const stored = readJobFile(jobFile);
+        writeJobFile(cwd, job.id, {
+          ...stored,
+          ...nextJob
+        });
+      } catch {
+        // Ignore malformed on-disk job files; state reconciliation still proceeds.
+      }
+    }
+
+    return nextJob;
+  });
+
+  return {
+    changed,
+    jobs: nextJobs
+  };
 }
 
 function defaultState() {
@@ -147,7 +236,15 @@ export function upsertJob(cwd, jobPatch) {
 }
 
 export function listJobs(cwd) {
-  return loadState(cwd).jobs;
+  const state = loadState(cwd);
+  const reconciled = reconcileRunningJobs(cwd, state.jobs ?? []);
+  if (reconciled.changed) {
+    saveState(cwd, {
+      ...state,
+      jobs: reconciled.jobs
+    });
+  }
+  return reconciled.jobs;
 }
 
 export function setConfig(cwd, key, value) {
