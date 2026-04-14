@@ -186,8 +186,9 @@ test("model invocation policy: review is user-only, other commands are model-inv
   assert.doesNotMatch(result, /disable-model-invocation:\s*true/);
   assert.doesNotMatch(status, /disable-model-invocation:\s*true/);
 
-  // adversarial-review has explicit guardrail against proactive invocation
+  // commands with side effects have explicit guardrails against proactive invocation
   assert.match(adversarialReview, /Only run this command when the user has explicitly asked/i);
+  assert.match(cancel, /Only cancel a job when the user has explicitly asked/i);
 });
 
 test("internal docs use task terminology for rescue runs", () => {
