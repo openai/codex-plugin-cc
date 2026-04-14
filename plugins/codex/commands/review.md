@@ -32,15 +32,16 @@ Execution mode rules:
 - Otherwise (no `--wait` / `--background` / `--ask`), auto-decide without asking: tiny → foreground, non-tiny → background. This keeps `/codex:review` runnable unattended inside multi-step plans. Users who want the old prompt can pass `--ask`; users who want to force a mode can pass `--wait` or `--background`.
 
 Argument handling:
-- Preserve the user's arguments exactly, with one exception: strip `--ask` before passing to the companion script. `--ask` is a Claude-side flag that only controls whether to prompt the user; the companion does not know about it and would reject it as unsupported focus text.
-- Do not strip `--wait` or `--background` yourself.
+- Preserve the user's arguments exactly.
+- Do not strip `--wait`, `--background`, or `--ask` yourself.
 - Do not add extra review instructions or rewrite the user's intent.
 - The companion script parses `--wait` and `--background`, but Claude Code's `Bash(..., run_in_background: true)` is what actually detaches the run.
+- The companion script also accepts `--ask` as a no-op boolean so it can be safely forwarded in `$ARGUMENTS`. Only Claude's prompt logic above consumes it.
 - `/codex:review` is native-review only. It does not support staged-only review, unstaged-only review, or extra focus text.
 - If the user needs custom review instructions or more adversarial framing, they should use `/codex:adversarial-review`.
 
 Foreground flow:
-- Run (with `--ask` removed from the argument string if present):
+- Run:
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" review "$ARGUMENTS"
 ```
@@ -48,7 +49,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" review "$ARGUMENTS"
 - Do not paraphrase, summarize, or add commentary before or after it.
 - Do not fix any issues mentioned in the review output.
 
-Background flow (with `--ask` removed from the argument string if present):
+Background flow:
 - Launch the review with `Bash` in the background:
 ```typescript
 Bash({
