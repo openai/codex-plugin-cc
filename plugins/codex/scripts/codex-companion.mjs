@@ -747,7 +747,11 @@ async function handleTask(argv) {
   const effort = normalizeReasoningEffort(options.effort);
   const prompt = readTaskPrompt(cwd, options, positionals);
 
-  const resumeId = typeof options["resume-id"] === "string" ? options["resume-id"] : null;
+  const rawResumeId = typeof options["resume-id"] === "string" ? options["resume-id"] : null;
+  if (rawResumeId && rawResumeId.startsWith("-")) {
+    throw new Error(`Invalid --resume-id value: "${rawResumeId}". Provide a thread ID, not a flag.`);
+  }
+  const resumeId = rawResumeId;
   const resumeLast = Boolean(options["resume-last"] || options.resume);
   const fresh = Boolean(options.fresh);
   if ((resumeLast || resumeId) && fresh) {
