@@ -533,6 +533,52 @@ rl.on("line", (line) => {
 	          interruptibleTurns.set(turnId, { threadId: thread.id, timer });
 	        } else if (BEHAVIOR === "slow-task") {
 	          emitTurnCompletedLater(thread.id, turnId, items, 400);
+	        } else if (BEHAVIOR === "disconnect-before-completion") {
+	          // Reproduces the real-world Codex CLI exit path: plan-phase
+	          // agentMessage (phase !== "final_answer") is emitted, then the
+	          // server disconnects without ever sending turn/completed or a
+	          // final_answer agentMessage. Neither existing captureTurn
+	          // resolution path (turn/completed notification OR finalAnswerSeen
+	          // inferred timer) fires → captureTurn hangs indefinitely.
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          send({
+	            method: "item/completed",
+	            params: {
+	              threadId: thread.id,
+	              turnId,
+	              item: {
+	                type: "agentMessage",
+	                id: "msg_" + turnId,
+	                text: "I'm going to inspect the target and return a verdict.",
+	                phase: "plan"
+	              }
+	            }
+	          });
+	          // Flush stdout then disconnect cleanly, matching observed upstream
+	          // exit mode (exit 0 via IPC EOF; no protocol-level error).
+	          process.stdout.write("", () => process.exit(0));
+	        } else if (BEHAVIOR === "final-answer-then-exit") {
+	          // The captureTurn watchdog must distinguish "disconnected with
+	          // authoritative completion signal" (success) from "disconnected
+	          // with no terminal signal" (failure). Emit a completed
+	          // final_answer agentMessage and then exit before sending
+	          // turn/completed — this is the success-path race the watchdog
+	          // must preserve instead of demoting to failed.
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          send({
+	            method: "item/completed",
+	            params: {
+	              threadId: thread.id,
+	              turnId,
+	              item: {
+	                type: "agentMessage",
+	                id: "msg_" + turnId,
+	                text: payload,
+	                phase: "final_answer"
+	              }
+	            }
+	          });
+	          process.stdout.write("", () => process.exit(0));
 	        } else {
 	          emitTurnCompleted(thread.id, turnId, items);
 	        }

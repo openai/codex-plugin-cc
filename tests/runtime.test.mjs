@@ -1,13 +1,20 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
-import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import {
+  loadBrokerSession,
+  saveBrokerSession,
+  sendBrokerShutdown,
+  waitForBrokerEndpoint
+} from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { createBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -298,6 +305,131 @@ test("adversarial review asks Codex to inspect larger diffs itself", () => {
   assert.match(state.lastTurnStart.prompt, /lightweight summary/i);
   assert.match(state.lastTurnStart.prompt, /read-only git commands/i);
   assert.doesNotMatch(state.lastTurnStart.prompt, /PROMPT_SELF_COLLECT_[ABC]/);
+});
+
+test("adversarial review resolves when app-server disconnects before turn/completed", () => {
+  // Regression: Codex CLI can exit cleanly (token limit / rate limit / internal
+  // error) after emitting a non-final_answer agentMessage but before sending
+  // turn/completed. Neither existing captureTurn resolution path fires — the
+  // Promise hangs and the companion script exits via IPC EOF without writing a
+  // final verdict, leaving a zombie job record.
+  //
+  // Observed in the wild on 2026-04-18 (MeeePtt favorites-fix commit). A passing
+  // test asserts captureTurn can handle "app-server closed unexpectedly".
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "disconnect-before-completion");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  // Explicit 10s timeout guards against the hang on unfixed code — without
+  // this, the test would block until node --test's outer limit and report
+  // "hung" instead of "disconnected".
+  const result = spawnSync("node", [SCRIPT, "adversarial-review"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    encoding: "utf8",
+    timeout: 10_000
+  });
+
+  assert.notEqual(result.signal, "SIGTERM",
+    `adversarial-review hung after app-server disconnect (stdout=${result.stdout}, stderr=${result.stderr})`);
+  assert.notEqual(result.status, 0,
+    "adversarial-review must surface disconnect as non-zero exit");
+  assert.match(
+    `${result.stdout}\n${result.stderr}`,
+    /disconnect|closed|unexpectedly/i,
+    "rendered output should mention the disconnect"
+  );
+});
+
+test("adversarial review preserves final_answer when app-server exits before turn/completed", () => {
+  // Companion to the disconnect-before-completion test: when the
+  // app-server emits a completed final_answer agentMessage and then exits
+  // cleanly (no turn/completed notification), the captureTurn watchdog
+  // must NOT demote the successful turn to failed. `finalAnswerSeen` is
+  // the authoritative "work finished" signal — the disconnect is just
+  // Codex closing the door, not a failure.
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "final-answer-then-exit");
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0];\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0].id;\n");
+
+  const result = spawnSync("node", [SCRIPT, "adversarial-review"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    encoding: "utf8",
+    timeout: 10_000
+  });
+
+  assert.notEqual(result.signal, "SIGTERM",
+    `adversarial-review hung after final_answer + exit (stderr=${result.stderr})`);
+  assert.equal(result.status, 0,
+    `final_answer before disconnect must stay exit 0 (stdout=${result.stdout}, stderr=${result.stderr})`);
+  assert.match(
+    result.stdout,
+    /Missing empty-state guard/,
+    "structured findings from the final_answer payload must survive the disconnect"
+  );
+});
+
+test("broker exits cleanly on broker/shutdown without tripping the upstream-exit watchdog", async () => {
+  // Guards against a regression introduced while fixing the
+  // "disconnect-before-completion" hang: the upstream-exit watchdog added
+  // to app-server-broker.mjs listens on appClient.exitPromise, which is
+  // resolved both by Codex CLI crashes AND by shutdown()'s own
+  // appClient.close(). Without an `isShuttingDown` guard the watchdog
+  // re-enters shutdown() during broker/shutdown (or SIGTERM/SIGINT) and
+  // races the intentional process.exit(0) with process.exit(1).
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const cwd = makeTempDir();
+
+  // Spawn the broker directly (not detached) so the test can observe its
+  // real exit code — the shared-broker lifecycle normally detaches the
+  // process which hides exit code from supervisors.
+  const brokerScript = path.join(PLUGIN_ROOT, "scripts", "app-server-broker.mjs");
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "broker-test-"));
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const pidFile = path.join(sessionDir, "broker.pid");
+
+  const broker = spawn(
+    "node",
+    [brokerScript, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile],
+    { env: buildEnv(binDir), stdio: ["ignore", "pipe", "pipe"] }
+  );
+
+  const exited = new Promise((resolve) => {
+    broker.on("exit", (code, signal) => resolve({ code, signal }));
+  });
+
+  try {
+    const ready = await waitForBrokerEndpoint(endpoint, 5_000);
+    assert.ok(ready, "broker should become reachable");
+
+    await sendBrokerShutdown(endpoint);
+    const { code, signal } = await exited;
+
+    assert.equal(signal, null, "broker should exit without a signal");
+    assert.equal(
+      code,
+      0,
+      "broker/shutdown must return exit 0 — non-zero indicates the upstream-exit watchdog tripped during graceful teardown"
+    );
+  } finally {
+    if (broker.exitCode === null && broker.signalCode === null) {
+      broker.kill("SIGKILL");
+    }
+    fs.rmSync(sessionDir, { recursive: true, force: true });
+  }
 });
 
 test("review includes reasoning output when the app server returns it", () => {

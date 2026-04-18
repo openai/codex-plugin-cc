@@ -575,6 +575,51 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     applyTurnNotification(state, message);
   });
 
+  // Resolve captureTurn when the app-server disconnects before sending a
+  // terminal signal. The existing resolution paths both require server
+  // cooperation: (a) a `turn/completed` notification, or (b) a final_answer
+  // phase agentMessage that arms `scheduleInferredCompletion`. Neither fires
+  // when the Codex CLI exits mid-turn (rate limit, OOM, internal error) —
+  // observed in 2026-04-18 adversarial-review runs where the CLI emitted a
+  // plan-phase agentMessage, ran tool calls, then exited cleanly via IPC EOF.
+  // Without this watchdog, `state.completion` hangs, the companion script
+  // exits via its own IPC close handling, and runTrackedJob's try/catch is
+  // never reached — leaving a zombie job and no final verdict.
+  //
+  // Success preservation: if a `final_answer` agentMessage already arrived
+  // AND no subagent work is outstanding, the turn is authoritatively
+  // complete — the disconnect is just Codex closing the door behind a
+  // successful response. Mirror `scheduleInferredCompletion`'s success
+  // semantics (same flag, same pending-work check) without waiting for
+  // its 250ms debounce, which can't help a dead socket. Only when no
+  // terminal signal was captured do we synthesize a `failed` turn.
+  client.exitPromise.then(() => {
+    if (state.completed) {
+      return;
+    }
+    const hasFinalAnswer =
+      state.finalAnswerSeen &&
+      state.pendingCollaborations.size === 0 &&
+      state.activeSubagentTurns.size === 0;
+    if (hasFinalAnswer) {
+      completeTurn(state, null, { inferred: true });
+      return;
+    }
+    state.error = state.error ?? client.exitError ?? {
+      message: "codex app-server disconnected before the turn completed."
+    };
+    emitProgress(
+      state.onProgress,
+      "App-server disconnected before turn/completed; marking turn as failed.",
+      "failed"
+    );
+    completeTurn(
+      state,
+      { id: state.turnId ?? "disconnected-turn", status: "failed" },
+      { inferred: true }
+    );
+  });
+
   try {
     const response = await startRequest();
     options.onResponse?.(response, state);
