@@ -59,7 +59,8 @@ import {
   renderJobStatusReport,
   renderSetupReport,
   renderStatusReport,
-  renderTaskResult
+  renderTaskResult,
+  renderUsageReport
 } from "./lib/render.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -80,7 +81,8 @@ function printUsage() {
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
-      "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
+      "  node scripts/codex-companion.mjs cancel [job-id] [--json]",
+      "  node scripts/codex-companion.mjs usage [--json]"
     ].join("\n")
   );
 }
@@ -978,6 +980,56 @@ async function handleCancel(argv) {
   outputCommandResult(payload, renderCancelReport(nextJob), options.json);
 }
 
+async function handleUsage(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  ensureCodexReady(cwd);
+
+  const codexHome = process.env.CODEX_HOME || path.join(process.env.HOME || process.env.USERPROFILE || "", ".codex");
+  const authFile = path.join(codexHome, "auth.json");
+
+  if (!fs.existsSync(authFile)) {
+    throw new Error("Codex auth file not found. Run `!codex login` and retry.");
+  }
+
+  let auth;
+  try {
+    auth = JSON.parse(fs.readFileSync(authFile, "utf8"));
+  } catch {
+    throw new Error("Codex auth file is corrupted. Delete ~/.codex/auth.json and run `!codex login`.");
+  }
+  const tokens = auth.tokens ?? {};
+  const accessToken = tokens.access_token ?? "";
+  const accountId = tokens.account_id ?? "";
+
+  if (!accessToken) {
+    throw new Error("No access token found. Run `!codex login` and retry.");
+  }
+
+  const url = "https://chatgpt.com/backend-api/wham/usage";
+  const res = await fetch(url, {
+    headers: {
+      "Authorization": `Bearer ${accessToken}`,
+      "ChatGPT-Account-Id": accountId,
+      "User-Agent": "codex-cli"
+    }
+  });
+
+  if (!res.ok) {
+    const hint = res.status === 401 || res.status === 403
+      ? " Your token may have expired. Run `!codex login` and retry."
+      : "";
+    throw new Error(`Usage API request failed: ${res.status} ${res.statusText}.${hint}`);
+  }
+
+  const payload = await res.json();
+  outputCommandResult(payload, renderUsageReport(payload), options.json);
+}
+
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (!subcommand || subcommand === "help" || subcommand === "--help") {
@@ -1014,6 +1066,9 @@ async function main() {
       break;
     case "cancel":
       await handleCancel(argv);
+      break;
+    case "usage":
+      await handleUsage(argv);
       break;
     default:
       throw new Error(`Unknown subcommand: ${subcommand}`);

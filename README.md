@@ -202,6 +202,23 @@ Examples:
 /codex:cancel task-abc123
 ```
 
+### `/codex:usage`
+
+Shows your current Codex rate limits and account plan.
+
+Examples:
+
+```bash
+/codex:usage
+/codex:usage --json
+```
+
+Use it to:
+
+- check how much of your 5h or weekly limit remains
+- see your current plan type
+- check code review limits
+
 ### `/codex:setup`
 
 Checks whether Codex is installed and authenticated.

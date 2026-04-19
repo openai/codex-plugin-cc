@@ -463,3 +463,88 @@ export function renderCancelReport(job) {
 
   return `${lines.join("\n").trimEnd()}\n`;
 }
+
+function formatUsageWindow(window, label) {
+  if (!window) {
+    return null;
+  }
+  const used = window.used_percent ?? 0;
+  const remaining = Math.max(0, Math.round(100 - used));
+  const secs = window.limit_window_seconds;
+  const resetAt = window.reset_at;
+
+  let windowLabel = "unknown";
+  if (secs >= 604800) {
+    windowLabel = "Weekly";
+  } else if (secs >= 86400) {
+    windowLabel = `${Math.floor(secs / 86400)}d`;
+  } else if (secs >= 3600) {
+    windowLabel = `${Math.floor(secs / 3600)}h`;
+  } else {
+    windowLabel = `${Math.floor(secs / 60)}m`;
+  }
+
+  let resetStr = "unknown";
+  if (resetAt) {
+    const resetDate = new Date(resetAt * 1000);
+    resetStr = resetDate.toLocaleString("en-GB", {
+      hour: "2-digit",
+      minute: "2-digit",
+      day: "numeric",
+      month: "short"
+    });
+  }
+
+  return `- ${label}${windowLabel} limit: ${remaining}% left (resets ${resetStr})`;
+}
+
+export function renderUsageReport(data) {
+  const lines = [
+    "# Codex Usage",
+    ""
+  ];
+
+  const plan = data.plan_type ?? "unknown";
+  lines.push(`Plan: ${plan.charAt(0).toUpperCase() + plan.slice(1)}`);
+
+  const rl = data.rate_limit ?? {};
+  if (rl.allowed === false) {
+    lines.push("");
+    lines.push("Status: not allowed");
+  }
+
+  lines.push("");
+  lines.push("Limits:");
+
+  const primary = formatUsageWindow(rl.primary_window, "");
+  const secondary = formatUsageWindow(rl.secondary_window, "");
+  if (primary) {
+    lines.push(primary);
+  }
+  if (secondary) {
+    lines.push(secondary);
+  }
+  if (rl.limit_reached) {
+    lines.push("- WARNING: Rate limit reached!");
+  }
+
+  const cr = data.code_review_rate_limit ?? {};
+  const crPrimary = formatUsageWindow(cr.primary_window, "Code review ");
+  if (crPrimary) {
+    lines.push(crPrimary);
+  }
+
+  const credits = data.credits ?? {};
+  if (credits.unlimited) {
+    lines.push("- Credits: Unlimited");
+  } else if (credits.has_credits && credits.balance && credits.balance !== "0") {
+    const balance = Math.round(Number(credits.balance)) || credits.balance;
+    lines.push(`- Credits: ${balance}`);
+  }
+
+  if (data.spend_control?.reached) {
+    lines.push("- WARNING: Spend control limit reached!");
+  }
+
+  return `${lines.join("\n").trimEnd()}\n`;
+}
