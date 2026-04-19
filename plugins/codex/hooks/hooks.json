@@ -10,6 +10,15 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/auto-patch-agents-hook.mjs\"",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "SessionEnd": [
