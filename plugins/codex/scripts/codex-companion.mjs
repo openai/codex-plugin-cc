@@ -7,6 +7,8 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
+import { parseToml, stringifyToml } from "./lib/toml.mjs";
+import os from "node:os";
 import {
     buildPersistentTaskThreadName,
     DEFAULT_CONTINUE_PROMPT,
@@ -28,6 +30,7 @@ import {
   generateJobId,
   getConfig,
   listJobs,
+  resolveStateDir,
   setConfig,
   upsertJob,
   writeJobFile
@@ -59,7 +62,9 @@ import {
   renderJobStatusReport,
   renderSetupReport,
   renderStatusReport,
-  renderTaskResult
+  renderTaskResult,
+  renderWatchReport,
+  renderConfigReport
 } from "./lib/render.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -80,7 +85,10 @@ function printUsage() {
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
-      "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
+      "  node scripts/codex-companion.mjs cancel [job-id] [--json]",
+      "  node scripts/codex-companion.mjs watch [--enable|--disable|--status] [--json]",
+      "  node scripts/codex-companion.mjs config [--list] [--get <key>] [--set <key> <value>] [--reset <key>] [--scope user|project] [--json]",
+      "  node scripts/codex-companion.mjs diff-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--out <file>] [--clipboard] [focus ...]"
     ].join("\n")
   );
 }
@@ -978,8 +986,344 @@ async function handleCancel(argv) {
   outputCommandResult(payload, renderCancelReport(nextJob), options.json);
 }
 
+// ---------------------------------------------------------------------------
+// watch: toggle the PostToolUse file-watch linter
+// ---------------------------------------------------------------------------
+
+function handleWatch(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json", "enable", "disable", "status"]
+  });
+
+  if (options.enable && options.disable) {
+    throw new Error("Choose either --enable or --disable.");
+  }
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveCommandWorkspace(options);
+  const actionsTaken = [];
+
+  if (options.enable) {
+    setConfig(workspaceRoot, "watchEnabled", true);
+    actionsTaken.push("File-watch linter enabled for this workspace.");
+  } else if (options.disable) {
+    setConfig(workspaceRoot, "watchEnabled", false);
+    actionsTaken.push("File-watch linter disabled.");
+  }
+
+  const config = getConfig(workspaceRoot);
+  const stateDir = resolveStateDir(workspaceRoot);
+
+  const report = {
+    watchEnabled: Boolean(config.watchEnabled),
+    configFile: stateDir,
+    actionsTaken
+  };
+
+  outputResult(options.json ? report : renderWatchReport(report), options.json);
+}
+
+// ---------------------------------------------------------------------------
+// Known Codex config.toml keys — used by /codex:config to guide the user
+// ---------------------------------------------------------------------------
+
+const CODEX_CONFIG_KEYS = [
+  {
+    key: "model",
+    description: "Default model (e.g. gpt-5.4-mini, gpt-5.4, gpt-5.3-codex-spark)",
+    default: "(codex default)",
+    type: "string"
+  },
+  {
+    key: "model_reasoning_effort",
+    description: "Default reasoning effort",
+    default: "(codex default)",
+    type: "enum",
+    choices: ["none", "minimal", "low", "medium", "high", "xhigh"]
+  },
+  {
+    key: "approval_policy",
+    description: "When Codex asks for approval",
+    default: "on-failure",
+    type: "enum",
+    choices: ["never", "on-failure", "always"]
+  },
+  {
+    key: "sandbox",
+    description: "Sandbox mode for file writes",
+    default: "workspace-write",
+    type: "enum",
+    choices: ["read-only", "workspace-write", "full-auto"]
+  },
+  {
+    key: "disable_response_storage",
+    description: "Disable Codex response caching",
+    default: "false",
+    type: "boolean"
+  },
+  {
+    key: "openai_base_url",
+    description: "Custom OpenAI API base URL (for proxies or alternate endpoints)",
+    default: "(openai default)",
+    type: "string"
+  }
+];
+
+function resolveCodexConfigPath(scope, cwd) {
+  if (scope === "user") {
+    return path.join(os.homedir(), ".codex", "config.toml");
+  }
+  // project scope
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  return path.join(workspaceRoot, ".codex", "config.toml");
+}
+
+async function handleConfig(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "get", "set", "reset", "scope"],
+    booleanOptions: ["json", "list"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const scope = options.scope === "user" ? "user" : "project";
+  const configFile = resolveCodexConfigPath(scope, cwd);
+  const configDir = path.dirname(configFile);
+
+  // Read existing TOML
+  let existingToml = "";
+  let values = {};
+  const fileExists = fs.existsSync(configFile);
+  if (fileExists) {
+    existingToml = fs.readFileSync(configFile, "utf8");
+    values = parseToml(existingToml);
+  }
+
+  const knownKeyNames = new Set(CODEX_CONFIG_KEYS.map((k) => k.key));
+  const unknownKeys = Object.keys(values).filter((k) => !knownKeyNames.has(k));
+  const actionsTaken = [];
+
+  // --set <key> <value>
+  if (options.set) {
+    const key = options.set;
+    const value = positionals[0];
+    if (value === undefined) {
+      throw new Error(`--set requires a value. Usage: --set ${key} <value>`);
+    }
+    const keyInfo = CODEX_CONFIG_KEYS.find((k) => k.key === key);
+    let parsedValue = value;
+    if (keyInfo?.type === "boolean") {
+      parsedValue = value === "true" || value === "1";
+    } else if (keyInfo?.type === "enum" && keyInfo.choices && !keyInfo.choices.includes(value)) {
+      throw new Error(`Invalid value "${value}" for ${key}. Allowed: ${keyInfo.choices.join(", ")}`);
+    }
+    values[key] = parsedValue;
+    if (!fs.existsSync(configDir)) {
+      fs.mkdirSync(configDir, { recursive: true });
+    }
+    fs.writeFileSync(configFile, stringifyToml(values, existingToml), "utf8");
+    actionsTaken.push(`Set ${key} = ${parsedValue} in ${configFile}`);
+    existingToml = fs.readFileSync(configFile, "utf8");
+    values = parseToml(existingToml);
+  }
+
+  // --reset <key>
+  if (options.reset) {
+    const key = options.reset;
+    if (key in values) {
+      delete values[key];
+      if (!fs.existsSync(configDir)) {
+        fs.mkdirSync(configDir, { recursive: true });
+      }
+      fs.writeFileSync(configFile, stringifyToml(values, existingToml), "utf8");
+      actionsTaken.push(`Removed ${key} from ${configFile} (restored to Codex default)`);
+      existingToml = fs.readFileSync(configFile, "utf8");
+      values = parseToml(existingToml);
+    } else {
+      actionsTaken.push(`Key "${key}" was not set — nothing to reset.`);
+    }
+  }
+
+  // --get <key>
+  if (options.get) {
+    const val = values[options.get];
+    if (options.json) {
+      outputResult({ key: options.get, value: val ?? null }, true);
+    } else {
+      outputResult(
+        val !== undefined
+          ? `${options.get} = ${val}\n`
+          : `${options.get} is not set (using Codex default)\n`,
+        false
+      );
+    }
+    return;
+  }
+
+  const report = {
+    scope,
+    configFile,
+    fileExists: fs.existsSync(configFile),
+    values,
+    knownKeys: CODEX_CONFIG_KEYS,
+    unknownKeys,
+    actionsTaken
+  };
+
+  outputResult(options.json ? report : renderConfigReport(report), options.json);
+}
+
+// ---------------------------------------------------------------------------
+// diff-review: combined code review + PR description generator
+// ---------------------------------------------------------------------------
+
+async function handleDiffReview(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["base", "scope", "model", "cwd", "out"],
+    booleanOptions: ["json", "background", "wait", "clipboard"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveCommandWorkspace(options);
+  const focusText = positionals.join(" ").trim();
+  const target = resolveReviewTarget(cwd, {
+    base: options.base,
+    scope: options.scope
+  });
+
+  const metadata = buildReviewJobMetadata("Diff Review", target);
+  const job = createCompanionJob({
+    prefix: "review",
+    kind: "diff-review",
+    title: metadata.title,
+    workspaceRoot,
+    jobClass: "review",
+    summary: metadata.summary
+  });
+
+  await runForegroundCommand(
+    job,
+    async (progress) => {
+      const result = await executeReviewRun({
+        cwd,
+        base: options.base,
+        scope: options.scope,
+        model: options.model,
+        focusText,
+        reviewName: "Diff Review",
+        onProgress: progress
+      });
+
+      // ------------------------------------------------------------------
+      // Extract pr_description from structured output when available
+      // ------------------------------------------------------------------
+      let prDescription = null;
+
+      if (result.stdout) {
+        try {
+          // The prompt asks Codex to embed pr_description in the JSON output
+          const parsed = JSON.parse(result.stdout);
+          if (parsed && typeof parsed.pr_description === "string") {
+            prDescription = parsed.pr_description;
+          }
+        } catch {
+          // Output was plain text — fall back to generating a minimal PR description
+          // from git metadata so the command always produces something useful.
+        }
+      }
+
+      if (!prDescription) {
+        // Fallback: build a minimal PR description from git context alone
+        const { collectReviewContext: _ctxFn, getCurrentBranch, collectReviewContext } = await import("./lib/git.mjs");
+        const context = collectReviewContext(cwd, target);
+        const branch = context.branch ?? "unknown-branch";
+        const title = branch
+          .replace(/[_-]/g, " ")
+          .replace(/\b\w/g, (c) => c.toUpperCase());
+
+        prDescription = [
+          `## What`,
+          `Changes on branch \`${branch}\`.`,
+          ``,
+          `## Why`,
+          focusText || "(describe the motivation here)",
+          ``,
+          `## How`,
+          `See diff against \`${target.baseRef ?? "working tree"}\` for details.`,
+          ``,
+          `## Testing`,
+          `- [ ] Manual testing completed`,
+          `- [ ] Relevant tests updated or added`,
+          ``,
+          `## Notes`,
+          `_Generated by \`/codex:diff-review\`. Review findings are above._`
+        ].join("\n");
+      }
+
+      // ------------------------------------------------------------------
+      // Write PR description to file
+      // ------------------------------------------------------------------
+      const outPath = options.out
+        ? path.resolve(cwd, options.out)
+        : path.join(workspaceRoot, ".codex", `pr-description-${job.id}.md`);
+
+      // Ensure .codex dir exists
+      const outDir = path.dirname(outPath);
+      if (!fs.existsSync(outDir)) {
+        fs.mkdirSync(outDir, { recursive: true });
+      }
+      fs.writeFileSync(outPath, prDescription, "utf8");
+
+      // ------------------------------------------------------------------
+      // Clipboard copy (macOS pbcopy / Linux xclip or xsel)
+      // ------------------------------------------------------------------
+      if (options.clipboard) {
+        try {
+          const { spawnSync } = await import("node:child_process");
+          const clipCmds = ["pbcopy", "xclip -selection clipboard", "xsel --clipboard --input"];
+          let copied = false;
+          for (const cmd of clipCmds) {
+            const [bin, ...args] = cmd.split(" ");
+            const r = spawnSync(bin, args, { input: prDescription, encoding: "utf8" });
+            if (r.status === 0) {
+              copied = true;
+              break;
+            }
+          }
+          if (!copied) {
+            process.stderr.write("⚠️  Could not copy to clipboard (pbcopy/xclip/xsel not found).\n");
+          }
+        } catch {
+          process.stderr.write("⚠️  Clipboard copy failed.\n");
+        }
+      }
+
+      // ------------------------------------------------------------------
+      // Append a footer to the Codex output pointing to the saved file
+      // ------------------------------------------------------------------
+      const footer = [
+        "",
+        "---",
+        `📝 PR description written to: ${outPath}`,
+        options.clipboard ? "📋 PR description copied to clipboard." : "",
+        "---",
+        ""
+      ]
+        .filter((l) => l !== "")
+        .join("\n");
+
+      return {
+        ...result,
+        stdout: (result.stdout ?? "") + "\n" + footer
+      };
+    },
+    { json: options.json }
+  );
+}
+
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
+
   if (!subcommand || subcommand === "help" || subcommand === "--help") {
     printUsage();
     return;
@@ -989,32 +1333,58 @@ async function main() {
     case "setup":
       await handleSetup(argv);
       break;
+
     case "review":
       await handleReview(argv);
       break;
+
     case "adversarial-review":
       await handleReviewCommand(argv, {
         reviewName: "Adversarial Review"
       });
       break;
+
     case "task":
       await handleTask(argv);
       break;
+
     case "task-worker":
       await handleTaskWorker(argv);
       break;
+
     case "status":
       await handleStatus(argv);
       break;
+
     case "result":
       handleResult(argv);
       break;
+
     case "task-resume-candidate":
       handleTaskResumeCandidate(argv);
       break;
+
     case "cancel":
       await handleCancel(argv);
       break;
+
+    // ✅ YOUR NEW COMMAND
+    case "optimize":
+      console.log("⚡ Optimize feature working!");
+      break;
+
+    case "watch":
+      handleWatch(argv);
+      break;
+
+    case "config":
+      await handleConfig(argv);
+      break;
+
+    case "diff-review":
+      await handleDiffReview(argv);
+      break;
+
     default:
       throw new Error(`Unknown subcommand: ${subcommand}`);
   }

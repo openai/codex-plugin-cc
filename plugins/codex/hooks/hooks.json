@@ -1,5 +1,5 @@
 {
-  "description": "Optional stop-time review gate for Codex Companion.",
+  "description": "Hooks for Codex Companion: session lifecycle, optional stop-time review gate, and optional PostToolUse file-watch linter.",
   "hooks": {
     "SessionStart": [
       {
@@ -33,6 +33,20 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/post-tool-use-watch-hook.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
+}
+{
+  "codex:optimize": "scripts/codex-companion.mjs"
 }

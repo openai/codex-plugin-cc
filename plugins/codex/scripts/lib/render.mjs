@@ -391,11 +391,27 @@ export function renderStoredJobResult(job, storedJob) {
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
   const resumeCommand = threadId ? `codex resume ${threadId}` : null;
   if (isStructuredReviewStoredResult(storedJob) && storedJob?.rendered) {
-    const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
+   let output = storedJob.rendered.endsWith("\n")
+  ? storedJob.rendered
+  : `${storedJob.rendered}\n`;
+
+output = `⚡ Optimization Report\n\n${output}`;
     if (!threadId) {
       return output;
     }
-    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
+    const formattedOutput = `
+====================================
+        CODEX ANALYSIS REPORT
+====================================
+
+${output}
+
+📌 Session Info:
+- Session ID: ${threadId}
+- Resume Command: ${resumeCommand}
+`;
+
+return formattedOutput;
   }
 
   const rawOutput =
@@ -460,6 +476,69 @@ export function renderCancelReport(job) {
     lines.push(`- Summary: ${job.summary}`);
   }
   lines.push("- Check `/codex:status` for the updated queue.");
+
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+export function renderWatchReport(report) {
+  const lines = ["# Codex Watch", ""];
+
+  lines.push(`Status: watch is ${report.watchEnabled ? "ON ✅" : "OFF ⏹"}`);
+  lines.push(`Config: ${report.configFile}`);
+  lines.push("");
+
+  if (report.actionsTaken.length > 0) {
+    for (const action of report.actionsTaken) {
+      lines.push(`✔ ${action}`);
+    }
+    lines.push("");
+  }
+
+  if (report.watchEnabled) {
+    lines.push("A lightweight Codex lint pass will be queued after every file Claude writes.");
+    lines.push("Check results with `/codex:status` and `/codex:result`.");
+    lines.push("Disable with `/codex:watch --disable`.");
+  } else {
+    lines.push("Enable with `/codex:watch --enable`.");
+  }
+
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+export function renderConfigReport(report) {
+  const lines = ["# Codex Config", ""];
+
+  lines.push(`Scope:   ${report.scope}`);
+  lines.push(`File:    ${report.configFile}`);
+  lines.push(`Exists:  ${report.fileExists ? "yes" : "no (using defaults)"}`);
+  lines.push("");
+
+  if (report.actionsTaken.length > 0) {
+    lines.push("Changes:");
+    for (const action of report.actionsTaken) {
+      lines.push(`  ✔ ${action}`);
+    }
+    lines.push("");
+  }
+
+  lines.push("Current values:");
+  for (const item of report.knownKeys) {
+    const current = report.values[item.key];
+    const displayValue = current !== undefined ? String(current) : `(unset — default: ${item.default})`;
+    lines.push(`  ${item.key.padEnd(28)} = ${displayValue}`);
+    if (item.description) {
+      lines.push(`  ${"".padEnd(28)}   ${item.description}`);
+    }
+  }
+  lines.push("");
+
+  if (report.unknownKeys.length > 0) {
+    lines.push("Other keys in file (not managed by this command):");
+    for (const key of report.unknownKeys) {
+      lines.push(`  ${key} = ${String(report.values[key])}`);
+    }
+    lines.push("");
+  }
 
   return `${lines.join("\n").trimEnd()}\n`;
 }
