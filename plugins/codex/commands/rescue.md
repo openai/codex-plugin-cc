@@ -46,4 +46,15 @@ Operating rules:
 - Leave the model unset unless the user explicitly asks for one. If they ask for `spark`, map it to `gpt-5.3-codex-spark`.
 - Leave `--resume` and `--fresh` in the forwarded request. The subagent handles that routing when it builds the `task` command.
 - If the helper reports that Codex is missing or unauthenticated, stop and tell the user to run `/codex:setup`.
-- If the user did not supply a request, ask what Codex should investigate or fix.
+- If the user did not supply a request, check for a saved review from `/codex:review` or `/codex:adversarial-review`:
+```bash
+node -e "const {execSync:x}=require('child_process'),os=require('os'),fs=require('fs'),c=require('crypto');let t;try{t=x('git rev-parse --show-toplevel',{encoding:'utf8'}).trim()}catch(e){t=null};const h=t?c.createHash('md5').update(t).digest('hex'):'global';const p=os.homedir()+'/.codex/last-review-'+h+'.md';console.log(fs.existsSync(p)?'LAST_REVIEW_AVAILABLE':'NO_LAST_REVIEW');"
+```
+  - If `LAST_REVIEW_AVAILABLE`: use `AskUserQuestion` once with two options:
+    - `Fix issues from last review (Recommended)` — prepend the saved review content as context for the rescue task
+    - `Describe a new task` — ask what Codex should investigate or fix
+  - If the user chooses to fix from last review, read the review file with node and include it verbatim prefixed with: "The following issues were found in a prior Codex review. Please fix them:\n\n"
+```bash
+node -e "const {execSync:x}=require('child_process'),os=require('os'),fs=require('fs'),c=require('crypto');let t;try{t=x('git rev-parse --show-toplevel',{encoding:'utf8'}).trim()}catch(e){t=null};const h=t?c.createHash('md5').update(t).digest('hex'):'global';process.stdout.write(fs.readFileSync(os.homedir()+'/.codex/last-review-'+h+'.md','utf8'));"
+```
+  - If `NO_LAST_REVIEW`: ask what Codex should investigate or fix.
