@@ -34,6 +34,9 @@
  *   onProgress: ProgressReporter | null
  * }} TurnCaptureState
  */
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { readJsonFile } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
@@ -1083,6 +1086,95 @@ export function parseStructuredOutput(rawOutput, fallback = {}) {
 
 export function readOutputSchema(schemaPath) {
   return readJsonFile(schemaPath);
+}
+
+const CODEX_USAGE_API_URL = "https://api.openai.com/v1/codex/usage";
+
+function resolveCodexHome() {
+  return process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+}
+
+function resolveCodexAuthPath() {
+  return path.join(resolveCodexHome(), "auth.json");
+}
+
+function readCodexAuth() {
+  const authPath = resolveCodexAuthPath();
+  if (!fs.existsSync(authPath)) {
+    return null;
+  }
+  try {
+    return readJsonFile(authPath);
+  } catch {
+    return null;
+  }
+}
+
+function extractAccessToken(auth) {
+  if (!auth) {
+    return null;
+  }
+  const token = auth.tokens?.access_token ?? auth.OPENAI_API_KEY ?? null;
+  return typeof token === "string" && token.trim() ? token.trim() : null;
+}
+
+export async function fetchCodexUsage(cwd) {
+  const auth = readCodexAuth();
+  const token = extractAccessToken(auth);
+
+  if (!token) {
+    const loginStatus = getCodexLoginStatus(cwd ?? process.cwd());
+    if (loginStatus.loggedIn) {
+      return {
+        ok: false,
+        error: "Codex is authenticated via keychain or an external credential store, which `/codex:usage` cannot read directly yet. Check your usage at https://platform.openai.com/usage instead."
+      };
+    }
+    return {
+      ok: false,
+      error: "Codex is not authenticated. Run `!codex login` first."
+    };
+  }
+
+  try {
+    const response = await fetch(CODEX_USAGE_API_URL, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json"
+      }
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      return {
+        ok: false,
+        error: `Usage API returned ${response.status}${body ? `: ${body}` : ""}`
+      };
+    }
+
+    const data = await response.json();
+    return {
+      ok: true,
+      data,
+      planType: auth.tokens?.id_token ? decodePlanType(auth.tokens.id_token) : null
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: `Failed to fetch usage: ${error.message}`
+    };
+  }
+}
+
+function decodePlanType(idToken) {
+  try {
+    const payload = JSON.parse(
+      Buffer.from(idToken.split(".")[1], "base64url").toString("utf8")
+    );
+    return payload["https://api.openai.com/auth"]?.chatgpt_plan_type ?? null;
+  } catch {
+    return null;
+  }
 }
 
 export { DEFAULT_CONTINUE_PROMPT, TASK_THREAD_PREFIX };

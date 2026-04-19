@@ -79,7 +79,8 @@ test("continue is not exposed as a user-facing command", () => {
     "result.md",
     "review.md",
     "setup.md",
-    "status.md"
+    "status.md",
+    "usage.md"
   ]);
 });
 
@@ -202,6 +203,13 @@ test("hooks keep session-end cleanup and stop gating enabled", () => {
   assert.match(source, /SessionEnd/);
   assert.match(source, /stop-review-gate-hook\.mjs/);
   assert.match(source, /session-lifecycle-hook\.mjs/);
+});
+
+test("usage command is a deterministic entrypoint for rate limit display", () => {
+  const usage = read("commands/usage.md");
+  assert.match(usage, /disable-model-invocation:\s*true/);
+  assert.match(usage, /codex-companion\.mjs" usage \$ARGUMENTS/);
+  assert.match(usage, /rate limits/i);
 });
 
 test("setup command can offer Codex install and still points users to codex login", () => {
