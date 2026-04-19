@@ -26,6 +26,8 @@ Execution rules:
 Command selection:
 - Use exactly one `task` invocation per rescue handoff.
 - If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Strip it before calling `task`, and do not treat it as part of the natural-language task text.
+- Never set `run_in_background: true` on the `Bash` call that invokes `task`. The rescue subagent must wait for Codex to finish and return that stdout directly.
+- If the user wants background behavior, let Claude Code background the outer `codex:codex-rescue` subagent itself. Do not detach the inner `task` process.
 - If the forwarded request includes `--model`, normalize `spark` to `gpt-5.3-codex-spark` and pass it through to `task`.
 - If the forwarded request includes `--effort`, pass it through to `task`.
 - If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
