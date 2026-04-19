@@ -24,6 +24,7 @@ import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
+import { collectTestCommandContext } from "./lib/test-context.mjs";
 import {
   generateJobId,
   getConfig,
@@ -77,6 +78,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
+      "  node scripts/codex-companion.mjs test [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -246,6 +248,19 @@ function buildAdversarialReviewPrompt(context, focusText) {
   });
 }
 
+function buildWriteTestsPrompt(context) {
+  const template = loadPromptTemplate(ROOT_DIR, "write-tests");
+  return interpolateTemplate(template, {
+    TARGET_LABEL: context.target.label,
+    PROJECT_GUIDANCE: context.renderedGuidance,
+    DIFF_COLLECTION_GUIDANCE: context.reviewContext.collectionGuidance,
+    DIFF_CONTEXT: context.reviewContext.content,
+    TEST_LAYOUT: context.renderedTestLayout,
+    TEST_PLAN: context.renderedPlan,
+    SUGGESTED_TEST_COMMANDS: context.renderedSuggestedCommands
+  });
+}
+
 function ensureCodexAvailable(cwd) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
@@ -300,11 +315,15 @@ function filterJobsForCurrentClaudeSession(jobs) {
   return jobs.filter((job) => job.sessionId === sessionId);
 }
 
+function isResumableRescueTask(job) {
+  return job.jobClass === "task" && job.kind !== "test";
+}
+
 function findLatestResumableTaskJob(jobs) {
   return (
     jobs.find(
       (job) =>
-        job.jobClass === "task" &&
+        isResumableRescueTask(job) &&
         job.threadId &&
         job.status !== "queued" &&
         job.status !== "running"
@@ -335,7 +354,7 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const sessionId = getCurrentClaudeSessionId();
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
   const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
-  const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
+  const activeTask = visibleJobs.find((job) => isResumableRescueTask(job) && (job.status === "queued" || job.status === "running"));
   if (activeTask) {
     throw new Error(`Task ${activeTask.id} is still running. Use /codex:status before continuing it.`);
   }
@@ -526,6 +545,61 @@ async function executeTaskRun(request) {
   };
 }
 
+async function executeTestRun(request) {
+  ensureCodexAvailable(request.cwd);
+  ensureGitRepository(request.cwd);
+
+  const context = collectTestCommandContext(request.cwd, {
+    base: request.base,
+    scope: request.scope,
+    target: request.target
+  });
+  const prompt = buildWriteTestsPrompt(context);
+  const result = await runAppServerTurn(context.repoRoot, {
+    prompt,
+    model: request.model,
+    effort: request.effort,
+    sandbox: "workspace-write",
+    onProgress: request.onProgress,
+    persistThread: true,
+    threadName: buildPersistentTaskThreadName(`Write tests for ${context.target.label}`)
+  });
+
+  const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
+  const failureMessage = result.error?.message ?? result.stderr ?? "";
+  const rendered = renderTaskResult(
+    {
+      rawOutput,
+      failureMessage,
+      reasoningSummary: result.reasoningSummary
+    },
+    {
+      title: "Codex Test",
+      jobId: request.jobId ?? null,
+      write: true
+    }
+  );
+  const payload = {
+    status: result.status,
+    threadId: result.threadId,
+    rawOutput,
+    touchedFiles: result.touchedFiles,
+    reasoningSummary: result.reasoningSummary
+  };
+
+  return {
+    exitStatus: result.status,
+    threadId: result.threadId,
+    turnId: result.turnId,
+    payload,
+    rendered,
+    summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, "Codex Test finished.")),
+    jobTitle: "Codex Test",
+    jobClass: "task",
+    write: true
+  };
+}
+
 function buildReviewJobMetadata(reviewName, target) {
   return {
     kind: reviewName === "Adversarial Review" ? "adversarial-review" : "review",
@@ -558,6 +632,9 @@ function getJobKindLabel(kind, jobClass) {
   if (kind === "adversarial-review") {
     return "adversarial-review";
   }
+  if (kind === "test") {
+    return "test";
+  }
   return jobClass === "review" ? "review" : "rescue";
 }
 
@@ -586,28 +663,16 @@ function createTrackedProgress(job, options = {}) {
   };
 }
 
-function buildTaskJob(workspaceRoot, taskMetadata, write) {
+function buildTaskJob(workspaceRoot, taskMetadata, write, options = {}) {
   return createCompanionJob({
-    prefix: "task",
-    kind: "task",
+    prefix: options.prefix ?? "task",
+    kind: options.kind ?? "task",
     title: taskMetadata.title,
     workspaceRoot,
     jobClass: "task",
     summary: taskMetadata.summary,
     write
   });
-}
-
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
-  return {
-    cwd,
-    model,
-    effort,
-    prompt,
-    write,
-    resumeLast,
-    jobId
-  };
 }
 
 function readTaskPrompt(cwd, options, positionals) {
@@ -760,7 +825,7 @@ async function handleTask(argv) {
     requireTaskRequest(prompt, resumeLast);
 
     const job = buildTaskJob(workspaceRoot, taskMetadata, write);
-    const request = buildTaskRequest({
+    const request = {
       cwd,
       model,
       effort,
@@ -768,7 +833,7 @@ async function handleTask(argv) {
       write,
       resumeLast,
       jobId: job.id
-    });
+    };
     const { payload } = enqueueBackgroundTask(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
@@ -785,6 +850,70 @@ async function handleTask(argv) {
         prompt,
         write,
         resumeLast,
+        jobId: job.id,
+        onProgress: progress
+      }),
+    { json: options.json }
+  );
+}
+
+async function handleTest(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["base", "scope", "model", "effort", "cwd"],
+    booleanOptions: ["json", "background", "wait"],
+    aliasMap: {
+      m: "model"
+    }
+  });
+
+  if (positionals.length > 0) {
+    throw new Error("/codex:test does not accept extra focus text. Put repository-specific test guidance in project docs instead.");
+  }
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveCommandWorkspace(options);
+  const model = normalizeRequestedModel(options.model);
+  const effort = normalizeReasoningEffort(options.effort);
+  const target = resolveReviewTarget(cwd, {
+    base: options.base,
+    scope: options.scope
+  });
+  const taskMetadata = {
+    title: "Codex Test",
+    summary: `Write tests for ${target.label}`
+  };
+  const job = buildTaskJob(workspaceRoot, taskMetadata, true, {
+    prefix: "test",
+    kind: "test"
+  });
+
+  if (options.background) {
+    ensureCodexAvailable(cwd);
+    const request = {
+      kind: "test",
+      cwd,
+      base: options.base,
+      scope: options.scope,
+      target,
+      model,
+      effort,
+      jobId: job.id
+    };
+    const { payload } = enqueueBackgroundTask(cwd, job, request);
+    outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
+    return;
+  }
+
+  await runForegroundCommand(
+    job,
+    (progress) =>
+      executeTestRun({
+        cwd,
+        base: options.base,
+        scope: options.scope,
+        target,
+        model,
+        effort,
         jobId: job.id,
         onProgress: progress
       }),
@@ -828,11 +957,13 @@ async function handleTaskWorker(argv) {
       workspaceRoot,
       logFile
     },
-    () =>
-      executeTaskRun({
+    () => {
+      const runner = request.kind === "test" ? executeTestRun : executeTaskRun;
+      return runner({
         ...request,
         onProgress: progress
-      }),
+      });
+    },
     { logFile }
   );
 }
@@ -996,6 +1127,9 @@ async function main() {
       await handleReviewCommand(argv, {
         reviewName: "Adversarial Review"
       });
+      break;
+    case "test":
+      await handleTest(argv);
       break;
     case "task":
       await handleTask(argv);

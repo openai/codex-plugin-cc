@@ -211,6 +211,149 @@ test("task reports the actual Codex auth error when the run is rejected", () => 
   assert.match(result.stderr, /authentication expired; run codex login/);
 });
 
+test("test command fails closed when no project guidance files are available", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.mkdirSync(path.join(repo, "tests"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 1;\n");
+  fs.writeFileSync(path.join(repo, "tests", "app.test.mjs"), "export {};\n");
+  run("git", ["add", "src/app.js", "tests/app.test.mjs"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 2;\n");
+
+  const result = run("node", [SCRIPT, "test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /No project guidance found/i);
+  assert.match(result.stderr, /CLAUDE\.md, AGENTS\.md, README\.md/i);
+});
+
+test("test command fails closed when no test layout is detectable", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "README.md"), "# Sample project\n");
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 1;\n");
+  run("git", ["add", "README.md", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 2;\n");
+
+  const result = run("node", [SCRIPT, "test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /No test layout detected/i);
+});
+
+test("test command builds a strict prompt from project guidance, diff context, and inferred test targets", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.mkdirSync(path.join(repo, "tests"));
+  fs.writeFileSync(path.join(repo, "README.md"), "# Demo\n\nThis project demonstrates the plugin.\n");
+  fs.writeFileSync(path.join(repo, "CLAUDE.md"), "Always prefer focused regression tests.\n");
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export function getValue() { return 1; }\n");
+  fs.writeFileSync(path.join(repo, "tests", "app.test.mjs"), "import test from \"node:test\";\n");
+  run("git", ["add", "README.md", "CLAUDE.md", "src/app.js", "tests/app.test.mjs"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export function getValue(items) { return items[0].id; }\n");
+
+  const result = run("node", [SCRIPT, "test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Handled the requested task/);
+
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.match(state.lastTurnStart.prompt, /Author purpose:/);
+  assert.match(state.lastTurnStart.prompt, /Touched production files:/);
+  assert.match(state.lastTurnStart.prompt, /Detected test locations:/);
+  assert.match(state.lastTurnStart.prompt, /Planned test file changes:/);
+  assert.match(state.lastTurnStart.prompt, /README\.md/);
+  assert.match(state.lastTurnStart.prompt, /CLAUDE\.md/);
+  assert.match(state.lastTurnStart.prompt, /src\/app\.js/);
+  assert.match(state.lastTurnStart.prompt, /tests\/app\.test\.mjs/);
+  assert.match(state.lastTurnStart.prompt, /Do not modify production code by default/i);
+  assert.match(state.lastTurnStart.prompt, /If you believe a production code change is required, stop and explain why instead of editing it/i);
+});
+
+test("test command surfaces repository test commands in the prompt when it can infer them", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.mkdirSync(path.join(repo, "tests"));
+  fs.writeFileSync(path.join(repo, "README.md"), "# Demo\n\nRun `npm test` for the fast suite.\n");
+  fs.writeFileSync(path.join(repo, "CLAUDE.md"), "Prefer `make test-ci` before any full suite.\n");
+  fs.writeFileSync(path.join(repo, "Makefile"), "test:\n\tnpm test\n\ntest-ci:\n\tnode --test tests/*.test.mjs\n");
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export function getValue() { return 1; }\n");
+  fs.writeFileSync(path.join(repo, "tests", "app.test.mjs"), "import test from \"node:test\";\n");
+  run("git", ["add", "README.md", "CLAUDE.md", "Makefile", "src/app.js", "tests/app.test.mjs"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export function getValue(items) { return items[0].id; }\n");
+
+  const result = run("node", [SCRIPT, "test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.match(state.lastTurnStart.prompt, /<suggested_test_commands>/);
+  assert.match(state.lastTurnStart.prompt, /make test-ci/);
+  assert.match(state.lastTurnStart.prompt, /npm test/);
+});
+
+test("test command includes self-collect guidance when diff context is downgraded", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.mkdirSync(path.join(repo, "tests"));
+  for (const name of ["a.js", "b.js", "c.js"]) {
+    fs.writeFileSync(path.join(repo, "src", name), `export const value = "${name}-v1";\n`);
+    fs.writeFileSync(path.join(repo, "tests", `${name.replace(".js", ".test.mjs")}`), "import test from \"node:test\";\n");
+  }
+  fs.writeFileSync(path.join(repo, "README.md"), "# Demo\n");
+  run("git", ["add", "README.md", "src/a.js", "src/b.js", "src/c.js", "tests/a.test.mjs", "tests/b.test.mjs", "tests/c.test.mjs"], {
+    cwd: repo
+  });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "a.js"), 'export const value = "PROMPT_SELF_COLLECT_A";\n');
+  fs.writeFileSync(path.join(repo, "src", "b.js"), 'export const value = "PROMPT_SELF_COLLECT_B";\n');
+  fs.writeFileSync(path.join(repo, "src", "c.js"), 'export const value = "PROMPT_SELF_COLLECT_C";\n');
+
+  const result = run("node", [SCRIPT, "test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.match(state.lastTurnStart.prompt, /lightweight summary/i);
+  assert.match(state.lastTurnStart.prompt, /read-only git commands/i);
+  assert.doesNotMatch(state.lastTurnStart.prompt, /PROMPT_SELF_COLLECT_[ABC]/);
+});
+
 test("review accepts the quoted raw argument style for built-in base-branch review", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -434,6 +577,64 @@ test("task-resume-candidate returns the latest rescue thread from the current se
   assert.equal(payload.sessionId, "sess-current");
   assert.equal(payload.candidate.id, "task-current");
   assert.equal(payload.candidate.threadId, "thr_current");
+});
+
+test("task-resume-candidate ignores completed /codex:test jobs", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "test-current",
+            kind: "test",
+            status: "completed",
+            title: "Codex Test",
+            jobClass: "task",
+            sessionId: "sess-current",
+            threadId: "thr_test",
+            summary: "Write tests for working tree diff",
+            updatedAt: "2026-03-24T20:00:00.000Z"
+          },
+          {
+            id: "task-current",
+            kind: "task",
+            status: "completed",
+            title: "Codex Task",
+            jobClass: "task",
+            sessionId: "sess-current",
+            threadId: "thr_task",
+            summary: "Investigate flaky rescue thread",
+            updatedAt: "2026-03-24T19:55:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "task-resume-candidate", "--json"], {
+    cwd: workspace,
+    env: {
+      ...process.env,
+      CODEX_COMPANION_SESSION_ID: "sess-current"
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.available, true);
+  assert.equal(payload.candidate.id, "task-current");
+  assert.equal(payload.candidate.threadId, "thr_task");
 });
 
 test("task --resume-last does not resume a task from another Claude session", () => {
@@ -831,6 +1032,110 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.equal(resultPayload.job.id, launchPayload.jobId);
   assert.equal(resultPayload.job.status, "completed");
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
+});
+
+test("test --background enqueues a detached worker and exposes per-job status", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.mkdirSync(path.join(repo, "tests"));
+  fs.writeFileSync(path.join(repo, "README.md"), "# Demo\n");
+  fs.writeFileSync(path.join(repo, "CLAUDE.md"), "Prefer focused regression tests.\n");
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export function getValue() { return 1; }\n");
+  fs.writeFileSync(path.join(repo, "tests", "app.test.mjs"), "import test from \"node:test\";\n");
+  run("git", ["add", "README.md", "CLAUDE.md", "src/app.js", "tests/app.test.mjs"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export function getValue(items) { return items[0].id; }\n");
+
+  const launched = run("node", [SCRIPT, "test", "--background", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(launched.status, 0, launched.stderr);
+  const launchPayload = JSON.parse(launched.stdout);
+  assert.equal(launchPayload.status, "queued");
+  assert.match(launchPayload.jobId, /^test-/);
+
+  const waitedStatus = run(
+    "node",
+    [SCRIPT, "status", launchPayload.jobId, "--wait", "--timeout-ms", "15000", "--json"],
+    {
+      cwd: repo,
+      env: buildEnv(binDir)
+    }
+  );
+
+  assert.equal(waitedStatus.status, 0, waitedStatus.stderr);
+  const waitedPayload = JSON.parse(waitedStatus.stdout);
+  assert.equal(waitedPayload.job.id, launchPayload.jobId);
+  assert.equal(waitedPayload.job.status, "completed");
+
+  const resultPayload = await waitFor(() => {
+    const result = run("node", [SCRIPT, "result", launchPayload.jobId, "--json"], {
+      cwd: repo,
+      env: buildEnv(binDir)
+    });
+    if (result.status !== 0) {
+      return null;
+    }
+    return JSON.parse(result.stdout);
+  });
+
+  assert.equal(resultPayload.job.id, launchPayload.jobId);
+  assert.equal(resultPayload.job.status, "completed");
+  assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
+});
+
+test("task-worker routes test jobs to executeTestRun", () => {
+  const workspace = makeTempDir();
+  const repo = path.join(workspace, "repo");
+  const binDir = makeTempDir();
+  const jobsDir = path.join(resolveStateDir(workspace), "jobs");
+  installFakeCodex(binDir);
+  fs.mkdirSync(repo, { recursive: true });
+  fs.mkdirSync(jobsDir, { recursive: true });
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.mkdirSync(path.join(repo, "tests"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 1;\n");
+  fs.writeFileSync(path.join(repo, "tests", "app.test.mjs"), "import test from \"node:test\";\n");
+  run("git", ["add", "src/app.js", "tests/app.test.mjs"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 2;\n");
+
+  const jobId = "test-worker-job";
+  fs.writeFileSync(
+    path.join(jobsDir, `${jobId}.json`),
+    `${JSON.stringify(
+      {
+        id: jobId,
+        kind: "test",
+        jobClass: "task",
+        title: "Codex Test",
+        workspaceRoot: workspace,
+        request: {
+          kind: "test",
+          cwd: repo,
+          scope: "working-tree",
+          jobId
+        }
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "task-worker", "--cwd", workspace, "--job-id", jobId], {
+    cwd: workspace,
+    env: buildEnv(binDir)
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /No project guidance found/i);
 });
 
 test("review rejects focus text because it is native-review only", () => {

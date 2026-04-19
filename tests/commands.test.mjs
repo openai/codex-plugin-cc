@@ -70,6 +70,39 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /can still take extra focus text after the flags/i);
 });
 
+test("test command uses AskUserQuestion and background Bash while enforcing a test-only workflow", () => {
+  const source = read("commands/test.md");
+  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+
+  assert.match(source, /AskUserQuestion/);
+  assert.match(source, /\bBash\(/);
+  assert.match(source, /return Codex's output verbatim to the user/i);
+  assert.match(source, /test-only/i);
+  assert.match(source, /Do not modify production code by default/i);
+  assert.match(source, /Fail closed if the runtime cannot collect the required repository context/i);
+  const testPrompt = read("prompts/write-tests.md");
+  assert.match(testPrompt, /Do not delete existing tests unless the tested behavior is explicitly removed by this diff/i);
+  assert.match(testPrompt, /updated equivalent covering the same intent/i);
+  assert.match(source, /```bash/);
+  assert.match(source, /```typescript/);
+  assert.match(source, /test "\$ARGUMENTS"/);
+  assert.match(source, /\[--scope auto\|working-tree\|branch\]/);
+  assert.match(source, /--model <model\|spark>/);
+  assert.match(source, /--effort <none\|minimal\|low\|medium\|high\|xhigh>/);
+  assert.match(source, /run_in_background:\s*true/);
+  assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" test "\$ARGUMENTS"`/);
+  assert.match(source, /description:\s*"Codex test writing"/);
+  assert.match(source, /git status --short --untracked-files=all/);
+  assert.match(source, /git diff --shortstat/);
+  assert.match(source, /When in doubt, run the command instead of claiming there is no test work to do/i);
+  assert.match(source, /Claude Code's `Bash\(..., run_in_background: true\)` is what actually detaches the run/i);
+  assert.match(source, /\(Recommended\)/);
+
+  assert.match(readme, /### `\/codex:test`/);
+  assert.match(readme, /Codex writes the matching tests for the current diff/i);
+  assert.match(readme, /avoid modifying production code by default/i);
+});
+
 test("continue is not exposed as a user-facing command", () => {
   const commandFiles = fs.readdirSync(path.join(PLUGIN_ROOT, "commands")).sort();
   assert.deepEqual(commandFiles, [
@@ -79,7 +112,8 @@ test("continue is not exposed as a user-facing command", () => {
     "result.md",
     "review.md",
     "setup.md",
-    "status.md"
+    "status.md",
+    "test.md"
   ]);
 });
 

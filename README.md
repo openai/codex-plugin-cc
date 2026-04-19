@@ -11,6 +11,7 @@ they already have.
 
 - `/codex:review` for a normal read-only Codex review
 - `/codex:adversarial-review` for a steerable challenge review
+- `/codex:test` to delegate matching test updates for the current diff
 - `/codex:rescue`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work and manage background jobs
 
 ## Requirements
@@ -123,6 +124,38 @@ Examples:
 
 This command is read-only. It does not fix code.
 
+### `/codex:test`
+
+Runs a strict test-writing workflow for the current code changes.
+
+Use it when you want:
+
+- Codex writes the matching tests for the current diff
+- Claude to keep the implementation work while Codex writes the matching tests
+- Codex to inspect the current diff, infer the repository test layout, and add the smallest sufficient test coverage
+- Codex to avoid modifying production code by default
+
+This command fails closed if it cannot collect the required repository context first. It looks for project guidance such as `CLAUDE.md`, `AGENTS.md`, or `README.md`, inspects the current diff, infers likely test targets, and then asks Codex to write the tests.
+
+Examples:
+
+```bash
+/codex:test
+/codex:test --base main
+/codex:test --background
+/codex:test --model gpt-5.4-mini --effort high
+```
+
+By default, Codex should:
+
+- explain the author's apparent purpose for the change before editing
+- summarize the touched production files and detected test locations
+- update or create the matching tests
+- avoid modifying production code by default
+
+Implementation and maintenance notes for `/codex:test` live in
+[`docs/codex-test-design.md`](./docs/codex-test-design.md).
+
 ### `/codex:rescue`
 
 Hands a task to Codex through the `codex:codex-rescue` subagent.
@@ -227,6 +260,12 @@ When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted
 
 ```bash
 /codex:review
+```
+
+### Let Codex Add Tests
+
+```bash
+/codex:test
 ```
 
 ### Hand A Problem To Codex
