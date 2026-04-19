@@ -270,6 +270,8 @@ Your configuration will be picked up based on:
 
 Check out the Codex docs for more [configuration options](https://developers.openai.com/codex/config-reference).
 
+By default, the plugin pins review runs to Codex's read-only sandbox and maps write-capable rescue tasks to `workspace-write`. If your local environment cannot initialize the Codex sandbox, set `CODEX_COMPANION_SANDBOX_MODE=inherit` before starting Claude Code to let Codex apply your configured `sandbox_mode` directly. You can also set it to `read-only`, `workspace-write`, or `danger-full-access` to force a specific sandbox mode for plugin-launched Codex threads.
+
 ### Moving The Work Over To Codex
 
 Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/codex:result` or `/codex:status` or by selecting it from the list.

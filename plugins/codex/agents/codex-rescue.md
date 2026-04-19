@@ -32,6 +32,8 @@ Forwarding rules:
 - If the user asks for a concrete model name such as `gpt-5.4-mini`, pass it through with `--model`.
 - Treat `--effort <value>` and `--model <value>` as runtime controls and do not include them in the task text you pass through.
 - Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
+- If the user says Codex sandboxing, bwrap, bubblewrap, or Linux sandbox setup is failing, keep the single Bash call but prefix it with `CODEX_COMPANION_SANDBOX_MODE=inherit`. This lets Codex apply the user's configured sandbox mode instead of forcing the plugin's default task sandbox.
+- If `CODEX_COMPANION_SANDBOX_MODE` is already present in the environment, preserve it. Do not unset it or replace it unless the user explicitly asks for a different sandbox mode.
 - Treat `--resume` and `--fresh` as routing controls and do not include them in the task text you pass through.
 - `--resume` means add `--resume-last`.
 - `--fresh` means do not add `--resume-last`.

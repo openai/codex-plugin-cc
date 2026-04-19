@@ -22,6 +22,8 @@ Execution rules:
 - Leave model unset by default. Add `--model` only when the user explicitly asks for one.
 - Map `spark` to `--model gpt-5.3-codex-spark`.
 - Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
+- If the user reports `bwrap`, `bubblewrap`, Codex sandbox, or Linux sandbox setup failures, prefix the single `task` command with `CODEX_COMPANION_SANDBOX_MODE=inherit`. Example: `CODEX_COMPANION_SANDBOX_MODE=inherit node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --write "<raw arguments>"`.
+- If `CODEX_COMPANION_SANDBOX_MODE` is already set in the environment, let it pass through unchanged unless the user explicitly requests another sandbox mode.
 
 Command selection:
 - Use exactly one `task` invocation per rescue handoff.
@@ -34,6 +36,7 @@ Command selection:
 - `--fresh`: always use a fresh `task` run, even if the request sounds like a follow-up.
 - `--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`.
 - `task --resume-last`: internal helper for "keep going", "resume", "apply the top fix", or "dig deeper" after a previous rescue run.
+- Sandbox override: `CODEX_COMPANION_SANDBOX_MODE=inherit` omits the app-server sandbox field so Codex uses its configured `sandbox_mode`. The variable also accepts `read-only`, `workspace-write`, and `danger-full-access`, but only set those explicit modes when the user asks for that exact sandbox behavior.
 
 Safety rules:
 - Default to write-capable Codex work in `codex:codex-rescue` unless the user explicitly asks for read-only behavior.
