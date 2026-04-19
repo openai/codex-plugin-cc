@@ -5,7 +5,15 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
-import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import {
+  listJobs,
+  resolveJobFile,
+  resolveJobLogFile,
+  resolveStateDir,
+  resolveStateFile,
+  saveState,
+  writeJobFile
+} from "../plugins/codex/scripts/lib/state.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -102,4 +110,47 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
       .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
       .sort()
   );
+});
+
+test("listJobs auto-reconciles stale running jobs when pid is no longer alive", () => {
+  const workspace = makeTempDir();
+  const jobId = "task-stale-running";
+  const logFile = resolveJobLogFile(workspace, jobId);
+  const staleJob = {
+    id: jobId,
+    status: "running",
+    phase: "verifying",
+    pid: 999999,
+    logFile,
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    startedAt: "2026-01-01T00:00:00.000Z"
+  };
+
+  saveState(workspace, {
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [staleJob]
+  });
+  fs.writeFileSync(logFile, "[2026-01-01T00:00:01.000Z] Running command: fake\n", "utf8");
+  writeJobFile(workspace, jobId, staleJob);
+
+  const [job] = listJobs(workspace);
+
+  assert.equal(job.status, "failed");
+  assert.equal(job.phase, "failed");
+  assert.equal(job.pid, null);
+  assert.match(job.errorMessage, /auto-reconciled as failed/);
+  assert.ok(job.completedAt);
+
+  const persistedState = JSON.parse(fs.readFileSync(resolveStateFile(workspace), "utf8"));
+  assert.equal(persistedState.jobs[0].status, "failed");
+  assert.equal(persistedState.jobs[0].pid, null);
+
+  const persistedJob = JSON.parse(fs.readFileSync(resolveJobFile(workspace, jobId), "utf8"));
+  assert.equal(persistedJob.status, "failed");
+  assert.equal(persistedJob.pid, null);
+
+  const logTail = fs.readFileSync(logFile, "utf8");
+  assert.match(logTail, /Detected stale running job/);
 });
