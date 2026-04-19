@@ -54,7 +54,7 @@ function cleanCodexStderr(stderr) {
 
 /** @returns {ThreadStartParams} */
 function buildThreadParams(cwd, options = {}) {
-  return {
+  const params = {
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
@@ -63,17 +63,25 @@ function buildThreadParams(cwd, options = {}) {
     ephemeral: options.ephemeral ?? true,
     experimentalRawEvents: false
   };
+  if (options.serviceTier) {
+    params.serviceTier = options.serviceTier;
+  }
+  return params;
 }
 
 /** @returns {ThreadResumeParams} */
 function buildResumeParams(threadId, cwd, options = {}) {
-  return {
+  const params = {
     threadId,
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
     sandbox: options.sandbox ?? "read-only"
   };
+  if (options.serviceTier) {
+    params.serviceTier = options.serviceTier;
+  }
+  return params;
 }
 
 /** @returns {UserInput[]} */
@@ -975,6 +983,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       const response = await resumeThread(client, options.resumeThreadId, cwd, {
         model: options.model,
         sandbox: options.sandbox,
+        serviceTier: options.serviceTier,
         ephemeral: false
       });
       threadId = response.thread.id;
@@ -983,6 +992,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       const response = await startThread(client, cwd, {
         model: options.model,
         sandbox: options.sandbox,
+        serviceTier: options.serviceTier,
         ephemeral: options.persistThread ? false : true,
         threadName: options.persistThread ? options.threadName : options.threadName ?? null
       });
