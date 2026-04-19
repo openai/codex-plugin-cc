@@ -915,7 +915,7 @@ export async function runAppServerReview(cwd, options = {}) {
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
     const thread = await startThread(client, cwd, {
       model: options.model,
-      sandbox: "read-only",
+      sandbox: options.sandbox ?? "read-only",
       ephemeral: true,
       threadName: options.threadName
     });
