@@ -70,11 +70,34 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /can still take extra focus text after the flags/i);
 });
 
+test("plan review command uses AskUserQuestion and background Bash while staying review-only", () => {
+  const source = read("commands/plan-review.md");
+  assert.match(source, /AskUserQuestion/);
+  assert.match(source, /\bBash\(/);
+  assert.match(source, /Do not fix issues/i);
+  assert.match(source, /review-only/i);
+  assert.match(source, /return Codex's output verbatim to the user/i);
+  assert.match(source, /```bash/);
+  assert.match(source, /```typescript/);
+  assert.match(source, /plan-review "\$ARGUMENTS"/);
+  assert.match(source, /run_in_background:\s*true/);
+  assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" plan-review "\$ARGUMENTS"`/);
+  assert.match(source, /description:\s*"Codex plan review"/);
+  assert.match(source, /Do not call `BashOutput`/);
+  assert.match(source, /Return the command stdout verbatim, exactly as-is/i);
+  assert.match(source, /The companion script parses `--wait` and `--background`/i);
+  assert.match(source, /Claude Code's `Bash\(..., run_in_background: true\)` is what actually detaches the run/i);
+  assert.match(source, /\(Recommended\)/);
+  assert.match(source, /most recently modified plan/i);
+  assert.match(source, /~\/\.claude\/plans\//);
+});
+
 test("continue is not exposed as a user-facing command", () => {
   const commandFiles = fs.readdirSync(path.join(PLUGIN_ROOT, "commands")).sort();
   assert.deepEqual(commandFiles, [
     "adversarial-review.md",
     "cancel.md",
+    "plan-review.md",
     "rescue.md",
     "result.md",
     "review.md",

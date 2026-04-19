@@ -11,6 +11,7 @@ they already have.
 
 - `/codex:review` for a normal read-only Codex review
 - `/codex:adversarial-review` for a steerable challenge review
+- `/codex:plan-review` to validate a Claude Code plan against the codebase before implementation
 - `/codex:rescue`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work and manage background jobs
 
 ## Requirements
@@ -123,6 +124,32 @@ Examples:
 
 This command is read-only. It does not fix code.
 
+### `/codex:plan-review`
+
+Validates a **Claude Code plan** against the actual codebase before implementation begins.
+
+Codex searches the repository to verify the plan's claims, check for missed references, and identify risks. It automatically uses the most recently modified plan in `~/.claude/plans/`, or you can specify one with `--plan <name>`.
+
+It supports `--wait` and `--background`. Focus text after the flags gives Codex additional review guidance.
+
+Use it when you want:
+
+- to validate that a plan accounts for all relevant code references before starting work
+- a second opinion on whether the plan's exclusions and ordering are safe
+- to catch edge cases like database triggers, callbacks, or framework hooks the plan might miss
+
+Examples:
+
+```bash
+/codex:plan-review
+/codex:plan-review --background
+/codex:plan-review --plan my-refactor-plan
+/codex:plan-review include reference to the RFC at /tmp/rfc.md
+/codex:plan-review focus on data migration safety
+```
+
+This command is read-only. It does not fix code or modify the plan.
+
 ### `/codex:rescue`
 
 Hands a task to Codex through the `codex:codex-rescue` subagent.
@@ -227,6 +254,12 @@ When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted
 
 ```bash
 /codex:review
+```
+
+### Validate A Plan Before Implementing
+
+```bash
+/codex:plan-review
 ```
 
 ### Hand A Problem To Codex
