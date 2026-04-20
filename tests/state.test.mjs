@@ -9,11 +9,22 @@ import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, s
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
-  const stateDir = resolveStateDir(workspace);
+  const previousPluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
+  delete process.env.CLAUDE_PLUGIN_DATA;
 
-  assert.equal(stateDir.startsWith(os.tmpdir()), true);
-  assert.match(path.basename(stateDir), /.+-[a-f0-9]{16}$/);
-  assert.match(stateDir, new RegExp(`^${os.tmpdir().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  try {
+    const stateDir = resolveStateDir(workspace);
+
+    assert.equal(stateDir.startsWith(os.tmpdir()), true);
+    assert.match(path.basename(stateDir), /.+-[a-f0-9]{16}$/);
+    assert.match(stateDir, new RegExp(`^${os.tmpdir().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  } finally {
+    if (previousPluginDataDir == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
+    }
+  }
 });
 
 test("resolveStateDir uses CLAUDE_PLUGIN_DATA when it is provided", () => {
@@ -31,6 +42,39 @@ test("resolveStateDir uses CLAUDE_PLUGIN_DATA when it is provided", () => {
       stateDir,
       new RegExp(`^${path.join(pluginDataDir, "state").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`)
     );
+  } finally {
+    if (previousPluginDataDir == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
+    }
+  }
+});
+
+test("resolveStateDir migrates tmpdir state to plugin data dir", () => {
+  const workspace = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const previousPluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
+  delete process.env.CLAUDE_PLUGIN_DATA;
+
+  // Write state to the tmpdir fallback (simulates a Bash command without CLAUDE_PLUGIN_DATA)
+  const fallbackStateDir = resolveStateDir(workspace);
+  const fallbackStateFile = resolveStateFile(workspace);
+  fs.mkdirSync(fallbackStateDir, { recursive: true });
+  const stateContent = JSON.stringify({ version: 1, config: { stopReviewGate: true }, jobs: [] });
+  fs.writeFileSync(fallbackStateFile, `${stateContent}\n`, "utf8");
+
+  // Now set CLAUDE_PLUGIN_DATA (simulates a hook context)
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+
+  try {
+    const stateDir = resolveStateDir(workspace);
+    // Should return the plugin data path, not the fallback
+    assert.equal(stateDir.startsWith(path.join(pluginDataDir, "state")), true);
+    // State should have been migrated to the plugin data dir
+    assert.equal(fs.existsSync(path.join(stateDir, "state.json")), true);
+    const migrated = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+    assert.equal(migrated.config.stopReviewGate, true);
   } finally {
     if (previousPluginDataDir == null) {
       delete process.env.CLAUDE_PLUGIN_DATA;
