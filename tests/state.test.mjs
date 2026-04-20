@@ -41,65 +41,80 @@ test("resolveStateDir uses CLAUDE_PLUGIN_DATA when it is provided", () => {
 });
 
 test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", () => {
+  // Use CLAUDE_PLUGIN_DATA to ensure the state directory is rooted inside the
+  // isolated temp workspace rather than in the shared git-repo-derived path.
+  // Without this, resolveWorkspaceRoot() climbs to the git repo root and all
+  // test runs share the same state dir, causing spurious extra files.
   const workspace = makeTempDir();
-  const stateFile = resolveStateFile(workspace);
-  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+  const previousPluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = workspace;
 
-  const jobs = Array.from({ length: 51 }, (_, index) => {
-    const jobId = `job-${index}`;
-    const updatedAt = new Date(Date.UTC(2026, 0, 1, 0, index, 0)).toISOString();
-    const logFile = resolveJobLogFile(workspace, jobId);
-    const jobFile = resolveJobFile(workspace, jobId);
-    fs.writeFileSync(logFile, `log ${jobId}\n`, "utf8");
-    fs.writeFileSync(jobFile, JSON.stringify({ id: jobId, status: "completed" }, null, 2), "utf8");
-    return {
-      id: jobId,
-      status: "completed",
-      logFile,
-      updatedAt,
-      createdAt: updatedAt
-    };
-  });
+  try {
+    const stateFile = resolveStateFile(workspace);
+    fs.mkdirSync(path.dirname(stateFile), { recursive: true });
 
-  fs.writeFileSync(
-    stateFile,
-    `${JSON.stringify(
-      {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+    const jobs = Array.from({ length: 51 }, (_, index) => {
+      const jobId = `job-${index}`;
+      const updatedAt = new Date(Date.UTC(2026, 0, 1, 0, index, 0)).toISOString();
+      const logFile = resolveJobLogFile(workspace, jobId);
+      const jobFile = resolveJobFile(workspace, jobId);
+      fs.writeFileSync(logFile, `log ${jobId}\n`, "utf8");
+      fs.writeFileSync(jobFile, JSON.stringify({ id: jobId, status: "completed" }, null, 2), "utf8");
+      return {
+        id: jobId,
+        status: "completed",
+        logFile,
+        updatedAt,
+        createdAt: updatedAt
+      };
+    });
 
-  saveState(workspace, {
-    version: 1,
-    config: { stopReviewGate: false },
-    jobs
-  });
+    fs.writeFileSync(
+      stateFile,
+      `${JSON.stringify(
+        {
+          version: 1,
+          config: { stopReviewGate: false },
+          jobs
+        },
+        null,
+        2
+      )}\n`,
+      "utf8"
+    );
 
-  const prunedJobFile = resolveJobFile(workspace, "job-0");
-  const prunedLogFile = resolveJobLogFile(workspace, "job-0");
-  const retainedJobFile = resolveJobFile(workspace, "job-50");
-  const retainedLogFile = resolveJobLogFile(workspace, "job-50");
-  const jobsDir = path.dirname(prunedJobFile);
+    saveState(workspace, {
+      version: 1,
+      config: { stopReviewGate: false },
+      jobs
+    });
 
-  assert.equal(fs.existsSync(retainedJobFile), true);
-  assert.equal(fs.existsSync(retainedLogFile), true);
+    const prunedJobFile = resolveJobFile(workspace, "job-0");
+    const prunedLogFile = resolveJobLogFile(workspace, "job-0");
+    const retainedJobFile = resolveJobFile(workspace, "job-50");
+    const retainedLogFile = resolveJobLogFile(workspace, "job-50");
+    const jobsDir = path.dirname(prunedJobFile);
 
-  const savedState = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-  assert.equal(savedState.jobs.length, 50);
-  assert.deepEqual(
-    savedState.jobs.map((job) => job.id),
-    Array.from({ length: 50 }, (_, index) => `job-${50 - index}`)
-  );
-  assert.deepEqual(
-    fs.readdirSync(jobsDir).sort(),
-    Array.from({ length: 50 }, (_, index) => `job-${index + 1}`)
-      .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
-      .sort()
-  );
+    assert.equal(fs.existsSync(retainedJobFile), true);
+    assert.equal(fs.existsSync(retainedLogFile), true);
+
+    const savedState = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    assert.equal(savedState.jobs.length, 50);
+    assert.deepEqual(
+      savedState.jobs.map((job) => job.id),
+      Array.from({ length: 50 }, (_, index) => `job-${50 - index}`)
+    );
+    assert.deepEqual(
+      fs.readdirSync(jobsDir).sort(),
+      Array.from({ length: 50 }, (_, index) => `job-${index + 1}`)
+        .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
+        .sort()
+    );
+  } finally {
+    if (previousPluginDataDir == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
+    }
+  }
 });
