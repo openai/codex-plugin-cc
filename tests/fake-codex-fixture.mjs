@@ -383,24 +383,75 @@ rl.on("line", (line) => {
 	          prompt
 	        };
 	        saveState(state);
-	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
 
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)
           : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
-
-        if (
+        const usesSubagentFlow =
           BEHAVIOR === "with-subagent" ||
           BEHAVIOR === "with-late-subagent-message" ||
-          BEHAVIOR === "with-subagent-no-main-turn-completed"
-        ) {
-          const subThread = nextThread(state, thread.cwd, true);
-          const subThreadRecord = ensureThread(state, subThread.id);
-          subThreadRecord.name = "design-challenger";
+          BEHAVIOR === "with-subagent-no-main-turn-completed" ||
+          BEHAVIOR === "with-buffered-subagent";
+        const buffersSubagentLifecycle = BEHAVIOR === "with-buffered-subagent";
+
+        let bufferedSubThreadRecord = null;
+
+        if (buffersSubagentLifecycle) {
+          const bufferedSubThread = nextThread(state, thread.cwd, true);
+          bufferedSubThreadRecord = ensureThread(state, bufferedSubThread.id);
+          bufferedSubThreadRecord.name = "design-challenger";
+
+          const foreignThread = nextThread(state, thread.cwd, true);
+          const foreignThreadRecord = ensureThread(state, foreignThread.id);
+          foreignThreadRecord.name = "off-turn-agent";
           saveState(state);
+
+          const foreignTurnId = nextTurnId(state);
+
+          send({
+            method: "thread/started",
+            params: {
+              thread: { ...buildThread(foreignThreadRecord), name: "off-turn-agent", agentNickname: "off-turn-agent" }
+            }
+          });
+          send({
+            method: "item/completed",
+            params: {
+              threadId: foreignThread.id,
+              turnId: foreignTurnId,
+              item: {
+                type: "agentMessage",
+                id: "msg_" + foreignTurnId,
+                text: "Off-turn thread output should stay out of this capture.",
+                phase: "analysis"
+              }
+            }
+          });
+          send({
+            method: "thread/started",
+            params: {
+              thread: { ...buildThread(bufferedSubThreadRecord), name: "design-challenger", agentNickname: "design-challenger" }
+            }
+          });
+        }
+
+	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
+
+        if (usesSubagentFlow) {
+          const subThreadRecord =
+            bufferedSubThreadRecord ??
+            (() => {
+              const subThread = nextThread(state, thread.cwd, true);
+              const record = ensureThread(state, subThread.id);
+              record.name = "design-challenger";
+              saveState(state);
+              return record;
+            })();
           const subTurnId = nextTurnId(state);
 
-          send({ method: "thread/started", params: { thread: { ...buildThread(subThreadRecord), name: "design-challenger", agentNickname: "design-challenger" } } });
+          if (!buffersSubagentLifecycle) {
+            send({ method: "thread/started", params: { thread: { ...buildThread(subThreadRecord), name: "design-challenger", agentNickname: "design-challenger" } } });
+          }
           send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
           send({
             method: "item/started",
@@ -413,12 +464,12 @@ rl.on("line", (line) => {
                 tool: "wait",
                 status: "inProgress",
                 senderThreadId: thread.id,
-                receiverThreadIds: [subThread.id],
+                receiverThreadIds: [subThreadRecord.id],
                 prompt: "Challenge the implementation approach",
                 model: null,
                 reasoningEffort: null,
                 agentsStates: {
-                  [subThread.id]: { status: "inProgress", message: "Investigating design tradeoffs" }
+                  [subThreadRecord.id]: { status: "inProgress", message: "Investigating design tradeoffs" }
                 }
               }
             }
@@ -433,11 +484,11 @@ rl.on("line", (line) => {
               }
             });
           }
-          send({ method: "turn/started", params: { threadId: subThread.id, turn: buildTurn(subTurnId) } });
+          send({ method: "turn/started", params: { threadId: subThreadRecord.id, turn: buildTurn(subTurnId) } });
           send({
             method: "item/completed",
             params: {
-              threadId: subThread.id,
+              threadId: subThreadRecord.id,
               turnId: subTurnId,
               item: {
                 type: "reasoning",
@@ -450,7 +501,7 @@ rl.on("line", (line) => {
           send({
             method: "item/completed",
             params: {
-              threadId: subThread.id,
+              threadId: subThreadRecord.id,
               turnId: subTurnId,
               item: {
                 type: "agentMessage",
@@ -460,7 +511,7 @@ rl.on("line", (line) => {
               }
             }
           });
-          send({ method: "turn/completed", params: { threadId: subThread.id, turn: buildTurn(subTurnId, "completed") } });
+          send({ method: "turn/completed", params: { threadId: subThreadRecord.id, turn: buildTurn(subTurnId, "completed") } });
           send({
             method: "item/completed",
             params: {
@@ -472,12 +523,12 @@ rl.on("line", (line) => {
                 tool: "wait",
                 status: "completed",
                 senderThreadId: thread.id,
-                receiverThreadIds: [subThread.id],
+                receiverThreadIds: [subThreadRecord.id],
                 prompt: "Challenge the implementation approach",
                 model: null,
                 reasoningEffort: null,
                 agentsStates: {
-                  [subThread.id]: { status: "completed", message: "Finished" }
+                  [subThreadRecord.id]: { status: "completed", message: "Finished" }
                 }
               }
             }

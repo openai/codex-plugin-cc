@@ -15,6 +15,8 @@
  *   threadLabels: Map<string, string>,
  *   turnId: string | null,
  *   bufferedNotifications: AppServerNotification[],
+ *   pendingThreadLifecycleNotifications: AppServerNotification[],
+ *   drainingThreadLifecycleNotifications: boolean,
  *   completion: Promise<TurnCaptureState>,
  *   resolveCompletion: (state: TurnCaptureState) => void,
  *   rejectCompletion: (error: unknown) => void,
@@ -230,6 +232,8 @@ function registerThread(state, threadId, options = {}) {
   if (label) {
     state.threadLabels.set(threadId, label);
   }
+
+  drainPendingThreadLifecycleNotifications(state);
 }
 
 function describeStartedItem(state, item) {
@@ -310,6 +314,8 @@ function createTurnCaptureState(threadId, options = {}) {
     threadLabels: new Map(),
     turnId: null,
     bufferedNotifications: [],
+    pendingThreadLifecycleNotifications: [],
+    drainingThreadLifecycleNotifications: false,
     completion,
     resolveCompletion,
     rejectCompletion,
@@ -550,6 +556,81 @@ function applyTurnNotification(state, message) {
   }
 }
 
+function isThreadLifecycleNotification(message) {
+  return message.method === "thread/started" || message.method === "thread/name/updated";
+}
+
+function extractLifecycleThreadId(message) {
+  if (message.method === "thread/started") {
+    return message.params?.thread?.id ?? null;
+  }
+  if (message.method === "thread/name/updated") {
+    return message.params?.threadId ?? null;
+  }
+  return null;
+}
+
+function canApplyThreadLifecycleNotification(state, message) {
+  const threadId = extractLifecycleThreadId(message);
+  return Boolean(threadId && state.threadIds.has(threadId));
+}
+
+function drainPendingThreadLifecycleNotifications(state) {
+  if (state.drainingThreadLifecycleNotifications || state.pendingThreadLifecycleNotifications.length === 0) {
+    return;
+  }
+
+  state.drainingThreadLifecycleNotifications = true;
+  try {
+    const remaining = [];
+    for (const message of state.pendingThreadLifecycleNotifications) {
+      if (canApplyThreadLifecycleNotification(state, message)) {
+        applyTurnNotification(state, message);
+      } else {
+        remaining.push(message);
+      }
+    }
+    state.pendingThreadLifecycleNotifications = remaining;
+  } finally {
+    state.drainingThreadLifecycleNotifications = false;
+  }
+}
+
+function handleThreadLifecycleNotification(state, message) {
+  if (canApplyThreadLifecycleNotification(state, message)) {
+    applyTurnNotification(state, message);
+    return;
+  }
+
+  state.pendingThreadLifecycleNotifications.push(message);
+}
+
+function flushPendingThreadLifecycleNotifications(state, previousHandler) {
+  if (state.pendingThreadLifecycleNotifications.length === 0) {
+    return;
+  }
+
+  for (const message of state.pendingThreadLifecycleNotifications) {
+    if (previousHandler) {
+      previousHandler(message);
+    }
+  }
+  state.pendingThreadLifecycleNotifications.length = 0;
+}
+
+function replayBufferedNotifications(state, previousHandler) {
+  for (const message of state.bufferedNotifications) {
+    if (isThreadLifecycleNotification(message)) {
+      handleThreadLifecycleNotification(state, message);
+    } else if (belongsToTurn(state, message)) {
+      applyTurnNotification(state, message);
+    } else if (previousHandler) {
+      previousHandler(message);
+    }
+  }
+  state.bufferedNotifications.length = 0;
+}
+
 async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
@@ -560,16 +641,16 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       return;
     }
 
-    if (message.method === "thread/started" || message.method === "thread/name/updated") {
-      applyTurnNotification(state, message);
+    if (isThreadLifecycleNotification(message)) {
+      handleThreadLifecycleNotification(state, message);
       return;
     }
 
     if (!belongsToTurn(state, message)) {
-        if (previousHandler) {
-          previousHandler(message);
-        }
-        return;
+      if (previousHandler) {
+        previousHandler(message);
+      }
+      return;
     }
 
     applyTurnNotification(state, message);
@@ -582,16 +663,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     if (state.turnId) {
       state.threadTurnIds.set(state.threadId, state.turnId);
     }
-    for (const message of state.bufferedNotifications) {
-      if (belongsToTurn(state, message)) {
-        applyTurnNotification(state, message);
-      } else {
-        if (previousHandler) {
-          previousHandler(message);
-        }
-      }
-    }
-    state.bufferedNotifications.length = 0;
+    replayBufferedNotifications(state, previousHandler);
 
     if (response.turn?.status && response.turn.status !== "inProgress") {
       completeTurn(state, response.turn);
@@ -600,6 +672,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     return await state.completion;
   } finally {
     clearCompletionTimer(state);
+    flushPendingThreadLifecycleNotifications(state, previousHandler);
     client.setNotificationHandler(previousHandler ?? null);
   }
 }
