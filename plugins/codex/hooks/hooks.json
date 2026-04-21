@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-lifecycle-hook.mjs\" SessionStart",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/session-start-env.sh\"",
             "timeout": 5
           }
         ]
