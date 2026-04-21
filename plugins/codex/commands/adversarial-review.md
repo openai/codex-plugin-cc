@@ -1,7 +1,6 @@
 ---
 description: Run a Codex review that challenges the implementation approach and design choices
 argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [focus ...]'
-disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
 
@@ -17,6 +16,7 @@ Core constraint:
 - Do not fix issues, apply patches, or suggest that you are about to make changes.
 - Your only job is to run the review and return Codex's output verbatim to the user.
 - Keep the framing focused on whether the current approach is the right one, what assumptions it depends on, and where the design could fail under real-world conditions.
+- Only run this command when the user has explicitly asked for an adversarial Codex review — by slash command, by naming it in a message, or through another skill or workflow that clearly invokes it. Do not run it on your own initiative as a speculative quality check.
 
 Execution mode rules:
 - If the raw arguments include `--wait`, do not ask. Run in the foreground.

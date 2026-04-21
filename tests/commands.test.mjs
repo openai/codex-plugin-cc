@@ -173,12 +173,31 @@ test("result and cancel commands are exposed as deterministic runtime entrypoint
   const cancel = read("commands/cancel.md");
   const resultHandling = read("skills/codex-result-handling/SKILL.md");
 
-  assert.match(result, /disable-model-invocation:\s*true/);
   assert.match(result, /codex-companion\.mjs" result "\$ARGUMENTS"/);
-  assert.match(cancel, /disable-model-invocation:\s*true/);
   assert.match(cancel, /codex-companion\.mjs" cancel "\$ARGUMENTS"/);
   assert.match(resultHandling, /do not turn a failed or incomplete Codex run into a Claude-side implementation attempt/i);
   assert.match(resultHandling, /if Codex was never successfully invoked, do not generate a substitute answer at all/i);
+});
+
+test("model invocation policy: review is user-only, other commands are model-invokable", () => {
+  const review = read("commands/review.md");
+  const adversarialReview = read("commands/adversarial-review.md");
+  const cancel = read("commands/cancel.md");
+  const result = read("commands/result.md");
+  const status = read("commands/status.md");
+
+  // review is intentionally kept user-only to avoid proactive Codex spend
+  assert.match(review, /disable-model-invocation:\s*true/);
+
+  // other commands are model-invokable so Claude can route explicit user requests
+  assert.doesNotMatch(adversarialReview, /disable-model-invocation:\s*true/);
+  assert.doesNotMatch(cancel, /disable-model-invocation:\s*true/);
+  assert.doesNotMatch(result, /disable-model-invocation:\s*true/);
+  assert.doesNotMatch(status, /disable-model-invocation:\s*true/);
+
+  // commands with side effects have explicit guardrails against proactive invocation
+  assert.match(adversarialReview, /Only run this command when the user has explicitly asked/i);
+  assert.match(cancel, /Only cancel a job when the user has explicitly asked/i);
 });
 
 test("internal docs use task terminology for rescue runs", () => {
