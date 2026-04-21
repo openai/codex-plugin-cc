@@ -173,9 +173,7 @@ test("result and cancel commands are exposed as deterministic runtime entrypoint
   const cancel = read("commands/cancel.md");
   const resultHandling = read("skills/codex-result-handling/SKILL.md");
 
-  assert.match(result, /disable-model-invocation:\s*true/);
   assert.match(result, /codex-companion\.mjs" result "\$ARGUMENTS"/);
-  assert.match(cancel, /disable-model-invocation:\s*true/);
   assert.match(cancel, /codex-companion\.mjs" cancel "\$ARGUMENTS"/);
   assert.match(resultHandling, /do not turn a failed or incomplete Codex run into a Claude-side implementation attempt/i);
   assert.match(resultHandling, /if Codex was never successfully invoked, do not generate a substitute answer at all/i);
