@@ -18,7 +18,7 @@ const readline = require("node:readline");
 
 	function loadState() {
 	  if (!fs.existsSync(STATE_PATH)) {
-	    return { nextThreadId: 1, nextTurnId: 1, appServerStarts: 0, threads: [], capabilities: null, lastInterrupt: null };
+	    return { nextThreadId: 1, nextTurnId: 1, appServerStarts: 0, threads: [], capabilities: null, lastInitialize: null, lastInterrupt: null };
 	  }
 	  return JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
 	}
@@ -271,6 +271,7 @@ rl.on("line", (line) => {
     switch (message.method) {
       case "initialize":
         state.capabilities = message.params.capabilities || null;
+        state.lastInitialize = message.params || null;
         saveState(state);
         send({ id: message.id, result: { userAgent: "fake-codex-app-server" } });
         break;
