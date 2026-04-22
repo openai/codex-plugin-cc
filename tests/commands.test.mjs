@@ -11,20 +11,21 @@ function read(relativePath) {
   return fs.readFileSync(path.join(PLUGIN_ROOT, relativePath), "utf8");
 }
 
-test("review command uses AskUserQuestion and background Bash while staying review-only", () => {
+test("review command uses AskUserQuestion and Bash while staying review-only", () => {
   const source = read("commands/review.md");
   assert.match(source, /AskUserQuestion/);
   assert.match(source, /\bBash\(/);
   assert.match(source, /Do not fix issues/i);
   assert.match(source, /review-only/i);
   assert.match(source, /return Codex's output verbatim to the user/i);
-  assert.match(source, /```bash/);
   assert.match(source, /```typescript/);
   assert.match(source, /review "\$ARGUMENTS"/);
   assert.match(source, /\[--scope auto\|working-tree\|branch\]/);
   assert.match(source, /run_in_background:\s*true/);
   assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" review "\$ARGUMENTS"`/);
   assert.match(source, /description:\s*"Codex review"/);
+  assert.match(source, /timeout:\s*600000/);
+  assert.match(source, /default 120 s Bash cap/i);
   assert.match(source, /Do not call `BashOutput`/);
   assert.match(source, /Return the command stdout verbatim, exactly as-is/i);
   assert.match(source, /git status --short --untracked-files=all/);
@@ -39,20 +40,21 @@ test("review command uses AskUserQuestion and background Bash while staying revi
   assert.match(source, /does not support staged-only review, unstaged-only review, or extra focus text/i);
 });
 
-test("adversarial review command uses AskUserQuestion and background Bash while staying review-only", () => {
+test("adversarial review command uses AskUserQuestion and Bash while staying review-only", () => {
   const source = read("commands/adversarial-review.md");
   assert.match(source, /AskUserQuestion/);
   assert.match(source, /\bBash\(/);
   assert.match(source, /Do not fix issues/i);
   assert.match(source, /review-only/i);
   assert.match(source, /return Codex's output verbatim to the user/i);
-  assert.match(source, /```bash/);
   assert.match(source, /```typescript/);
   assert.match(source, /adversarial-review "\$ARGUMENTS"/);
   assert.match(source, /\[--scope auto\|working-tree\|branch\] \[focus \.\.\.\]/);
   assert.match(source, /run_in_background:\s*true/);
   assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" adversarial-review "\$ARGUMENTS"`/);
   assert.match(source, /description:\s*"Codex adversarial review"/);
+  assert.match(source, /timeout:\s*600000/);
+  assert.match(source, /default 120 s Bash cap/i);
   assert.match(source, /Do not call `BashOutput`/);
   assert.match(source, /Return the command stdout verbatim, exactly as-is/i);
   assert.match(source, /git status --short --untracked-files=all/);

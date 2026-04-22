@@ -583,7 +583,9 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       state.threadTurnIds.set(state.threadId, state.turnId);
     }
     for (const message of state.bufferedNotifications) {
-      if (belongsToTurn(state, message)) {
+      if (message.method === "thread/started" || message.method === "thread/name/updated") {
+        applyTurnNotification(state, message);
+      } else if (belongsToTurn(state, message)) {
         applyTurnNotification(state, message);
       } else {
         if (previousHandler) {

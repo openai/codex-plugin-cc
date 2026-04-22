@@ -45,9 +45,13 @@ Argument handling:
 - Unlike `/codex:review`, it can still take extra focus text after the flags.
 
 Foreground flow:
-- Run:
-```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" adversarial-review "$ARGUMENTS"
+- Launch the review with `Bash` in the foreground, setting `timeout` to 600000 (10 min — the maximum Claude Code allows) so large reviews don't hit the default 120 s Bash cap:
+```typescript
+Bash({
+  command: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" adversarial-review "$ARGUMENTS"`,
+  description: "Codex adversarial review",
+  timeout: 600000
+})
 ```
 - Return the command stdout verbatim, exactly as-is.
 - Do not paraphrase, summarize, or add commentary before or after it.
