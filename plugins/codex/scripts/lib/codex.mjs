@@ -597,7 +597,17 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       completeTurn(state, response.turn);
     }
 
-    return await state.completion;
+    // Race state.completion with client.exitPromise so a transport close after
+    // turn/start surfaces as a loud error instead of hanging indefinitely.
+    // Without this, a dropped app-server connection (after the turn/start RPC
+    // has already resolved, so handleExit() has no pending requests to reject)
+    // leaves captureTurn awaiting state.completion forever, producing a
+    // "Turn started → silence → manual cancel" pattern with no error surface.
+    const transportClosed = client.exitPromise.then(() => {
+      throw client.exitError
+        ?? new Error("codex app-server connection closed during active turn");
+    });
+    return await Promise.race([state.completion, transportClosed]);
   } finally {
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
