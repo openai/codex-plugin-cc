@@ -14,12 +14,16 @@ Core rules:
 - Prefer one clear task per Codex run. Split unrelated asks into separate runs.
 - Tell Codex what done looks like. Do not assume it will infer the desired end state.
 - Add explicit grounding and verification rules for any task where unsupported guesses would hurt quality.
+- Preserve host-provided operator context, output standards, permission policy,
+  model, and effort. Do not remove those controls while "tightening" the prompt.
 - Prefer better prompt contracts over raising reasoning or adding long natural-language explanations.
 - Use XML tags consistently so the prompt has stable internal structure.
 
 Default prompt recipe:
 - `<task>`: the concrete job and the relevant repository or failure context.
 - `<structured_output_contract>` or `<compact_output_contract>`: exact shape, ordering, and brevity requirements.
+- `<operator_context>`: host-provided local policy, output standard artifact,
+  permission boundary, and evidence path when present.
 - `<default_follow_through_policy>`: what Codex should do by default instead of asking routine questions.
 - `<verification_loop>` or `<completeness_contract>`: required for debugging, implementation, or risky fixes.
 - `<grounding_rules>` or `<citation_rules>`: required for review, research, or anything that could drift into unsupported claims.

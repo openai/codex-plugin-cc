@@ -181,3 +181,24 @@ test("collectReviewContext keeps untracked file content in lightweight working t
   assert.match(context.content, /## Untracked Files/);
   assert.match(context.content, /UNTRACKED_RISK_MARKER/);
 });
+
+test("collectReviewContext caps untracked file context for very large working trees", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v1');\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+
+  for (let index = 0; index < 205; index += 1) {
+    fs.writeFileSync(path.join(cwd, `untracked-${String(index).padStart(3, "0")}.txt`), `marker ${index}\n`);
+  }
+
+  const target = resolveReviewTarget(cwd, { scope: "working-tree" });
+  const context = collectReviewContext(cwd, target, { maxInlineFiles: 999 });
+
+  assert.match(context.content, /untracked-000\.txt/);
+  assert.match(context.content, /untracked-199\.txt/);
+  assert.doesNotMatch(context.content, /^### untracked-200\.txt/m);
+  assert.match(context.content, /skipped: 5 additional untracked path\(s\) exceed 200 path context limit/);
+  assert.doesNotMatch(context.content, /\?\? untracked-200\.txt/);
+});

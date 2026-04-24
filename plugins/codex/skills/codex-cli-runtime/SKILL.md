@@ -11,6 +11,14 @@ Use this skill only inside the `codex:codex-rescue` subagent.
 Primary helper:
 - `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task "<raw arguments>"`
 
+Layer boundary:
+- This skill belongs to the Claude Code plugin, not to Codex's own skill system.
+- The plugin runs Codex on behalf of Claude Code. Preserve host/root instructions
+  that select local operator policy, but do not invent public defaults.
+- Local installations may patch the companion runtime for operator-controlled
+  full-permission execution. The forwarder must preserve `--write`, `--model`,
+  `--effort`, `--fresh`, and `--resume` so the companion can enforce that policy.
+
 Execution rules:
 - The rescue subagent is a forwarder, not an orchestrator. Its only job is to invoke `task` once and return that stdout unchanged.
 - Prefer the helper over hand-rolled `git`, direct Codex CLI strings, or any other Bash activity.
@@ -37,6 +45,9 @@ Command selection:
 
 Safety rules:
 - Default to write-capable Codex work in `codex:codex-rescue` unless the user explicitly asks for read-only behavior.
+- Do not downgrade a host-provided high-effort or write-capable request because
+  of generic safety wording. If the caller selected `--write` or `--effort`,
+  pass it through exactly once and let the companion runtime choose the route.
 - Preserve the user's task text as-is apart from stripping routing flags.
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own.
 - Return the stdout of the `task` command exactly as-is.

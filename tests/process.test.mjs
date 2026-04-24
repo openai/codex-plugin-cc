@@ -1,7 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import { runCommand, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+
+test("runCommand captures output larger than Node's default spawnSync buffer", () => {
+  const result = runCommand(process.execPath, [
+    "-e",
+    "process.stdout.write('x'.repeat(1024 * 1024 + 1024));"
+  ]);
+
+  assert.equal(result.error, null);
+  assert.equal(result.status, 0);
+  assert.equal(result.stdout.length, 1024 * 1024 + 1024);
+});
 
 test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;
