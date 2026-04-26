@@ -250,6 +250,9 @@ test("adversarial review renders structured findings over app-server turn/start"
 
   assert.equal(result.status, 0);
   assert.match(result.stdout, /Missing empty-state guard/);
+  assert.match(result.stdout, /Blocker class: contract_or_evidence/);
+  assert.match(result.stdout, /Merge impact: follow_up_debt/);
+  assert.match(result.stdout, /Follow-up ticket: AET-413/);
 });
 
 test("adversarial review accepts the same base-branch targeting as review", () => {

@@ -33,7 +33,9 @@
           "line_start",
           "line_end",
           "confidence",
-          "recommendation"
+          "recommendation",
+          "blocker_class",
+          "merge_impact"
         ],
         "properties": {
           "severity": {
@@ -72,8 +74,48 @@
           },
           "recommendation": {
             "type": "string"
+          },
+          "blocker_class": {
+            "type": "string",
+            "enum": [
+              "runtime_or_behavioral_regression",
+              "trust_or_safety",
+              "contract_or_evidence",
+              "architecture_or_scope"
+            ]
+          },
+          "merge_impact": {
+            "type": "string",
+            "enum": [
+              "merge_blocker",
+              "follow_up_debt",
+              "non_blocking_polish"
+            ]
+          },
+          "follow_up_ticket": {
+            "type": "string",
+            "pattern": "^AET-[1-9][0-9]*$"
           }
-        }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "merge_impact": {
+                  "const": "follow_up_debt"
+                }
+              },
+              "required": [
+                "merge_impact"
+              ]
+            },
+            "then": {
+              "required": [
+                "follow_up_ticket"
+              ]
+            }
+          }
+        ]
       }
     },
     "next_steps": {

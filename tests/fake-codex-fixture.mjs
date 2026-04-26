@@ -197,7 +197,10 @@ function structuredReviewPayload(prompt) {
           line_start: 4,
           line_end: 6,
           confidence: 0.87,
-          recommendation: "Handle empty collections before indexing."
+          recommendation: "Handle empty collections before indexing.",
+          blocker_class: "contract_or_evidence",
+          merge_impact: "follow_up_debt",
+          follow_up_ticket: "AET-413"
         }
       ],
       next_steps: ["Add an empty-state test."]

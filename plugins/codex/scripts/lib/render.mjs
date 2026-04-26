@@ -55,7 +55,10 @@ function normalizeReviewFinding(finding, index) {
     file: typeof source.file === "string" && source.file.trim() ? source.file.trim() : "unknown",
     line_start: lineStart,
     line_end: lineEnd,
-    recommendation: typeof source.recommendation === "string" ? source.recommendation.trim() : ""
+    recommendation: typeof source.recommendation === "string" ? source.recommendation.trim() : "",
+    blocker_class: typeof source.blocker_class === "string" ? source.blocker_class.trim() : "",
+    merge_impact: typeof source.merge_impact === "string" ? source.merge_impact.trim() : "",
+    follow_up_ticket: typeof source.follow_up_ticket === "string" ? source.follow_up_ticket.trim() : ""
   };
 }
 
@@ -267,6 +270,15 @@ export function renderReviewResult(parsedResult, meta) {
       const lineSuffix = formatLineRange(finding);
       lines.push(`- [${finding.severity}] ${finding.title} (${finding.file}${lineSuffix})`);
       lines.push(`  ${finding.body}`);
+      if (finding.blocker_class) {
+        lines.push(`  Blocker class: ${finding.blocker_class}`);
+      }
+      if (finding.merge_impact) {
+        lines.push(`  Merge impact: ${finding.merge_impact}`);
+      }
+      if (finding.follow_up_ticket) {
+        lines.push(`  Follow-up ticket: ${finding.follow_up_ticket}`);
+      }
       if (finding.recommendation) {
         lines.push(`  Recommendation: ${finding.recommendation}`);
       }

@@ -57,3 +57,40 @@ test("renderStoredJobResult prefers rendered output for structured review jobs",
   assert.match(output, /Codex session ID: thr_123/);
   assert.match(output, /Resume in Codex: codex resume thr_123/);
 });
+
+test("renderReviewResult includes adversarial disposition metadata when present", () => {
+  const output = renderReviewResult(
+    {
+      parsed: {
+        verdict: "needs-attention",
+        summary: "One issue needs follow-up.",
+        findings: [
+          {
+            severity: "high",
+            title: "Missing empty-state guard",
+            body: "The change assumes data is always present.",
+            file: "src/app.js",
+            line_start: 4,
+            line_end: 6,
+            confidence: 0.87,
+            recommendation: "Handle empty collections before indexing.",
+            blocker_class: "contract_or_evidence",
+            merge_impact: "follow_up_debt",
+            follow_up_ticket: "AET-413"
+          }
+        ],
+        next_steps: ["Add an empty-state test."]
+      },
+      rawOutput: "",
+      parseError: null
+    },
+    {
+      reviewLabel: "Adversarial Review",
+      targetLabel: "working tree diff"
+    }
+  );
+
+  assert.match(output, /Blocker class: contract_or_evidence/);
+  assert.match(output, /Merge impact: follow_up_debt/);
+  assert.match(output, /Follow-up ticket: AET-413/);
+});

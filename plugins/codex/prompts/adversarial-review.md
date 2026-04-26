@@ -50,11 +50,15 @@ Return only valid JSON matching the provided schema.
 Keep the output compact and specific.
 Use `needs-attention` if there is any material risk worth blocking on.
 Use `approve` only if you cannot support any substantive adversarial finding from the provided context.
+Use `approve` only when `findings` is empty.
 Every finding must include:
 - the affected file
 - `line_start` and `line_end`
 - a confidence score from 0 to 1
 - a concrete recommendation
+- `blocker_class`: one of `runtime_or_behavioral_regression`, `trust_or_safety`, `contract_or_evidence`, `architecture_or_scope`
+- `merge_impact`: one of `merge_blocker`, `follow_up_debt`, `non_blocking_polish`
+- `follow_up_ticket` when `merge_impact` is `follow_up_debt`, formatted as `AET-<number>`
 Write the summary like a terse ship/no-ship assessment, not a neutral recap.
 </structured_output_contract>
 
@@ -77,6 +81,7 @@ Before finalizing, check that each finding is:
 - tied to a concrete code location
 - plausible under a real failure scenario
 - actionable for an engineer fixing the issue
+- classified with the required `blocker_class` and `merge_impact`
 </final_check>
 
 <repository_context>
