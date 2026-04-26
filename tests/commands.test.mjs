@@ -119,6 +119,14 @@ test("image command forwards to codex-image subagent and pins inline Agent trans
   assert.match(agent, /native image generation tool/i);
   assert.match(agent, /<image_prompt>/);
   assert.match(agent, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
+  // Post-process contract: chain task + latest-images so we always report the
+  // real PNG path even when Codex's text response hallucinates a different one.
+  assert.match(agent, /SINCE_MS=\$\(node -e 'console\.log\(Date\.now\(\)\)'\)/);
+  assert.match(agent, /codex-companion\.mjs" task --write/);
+  assert.match(agent, /codex-companion\.mjs" latest-images --since "\$SINCE_MS"/);
+  assert.match(agent, /add `--copy-to "<path>"` to the `latest-images` call/);
+  assert.match(agent, /==Generated PNG\(s\)==/);
+  assert.match(agent, /Codex's text response can mention a different path, but that text is not authoritative/i);
 
   assert.match(skill, /name:\s*image/);
   assert.match(skill, /user-invocable:\s*false/);
