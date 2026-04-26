@@ -96,21 +96,6 @@
             "type": "string",
             "pattern": "^AET-[1-9][0-9]*$"
           }
-        },
-        "if": {
-          "properties": {
-            "merge_impact": {
-              "const": "follow_up_debt"
-            }
-          },
-          "required": [
-            "merge_impact"
-          ]
-        },
-        "then": {
-          "required": [
-            "follow_up_ticket"
-          ]
         }
       }
     },
