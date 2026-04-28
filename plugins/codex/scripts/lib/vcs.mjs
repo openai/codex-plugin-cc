@@ -22,9 +22,14 @@ export function detectVcs(cwd) {
   if (vcsCache.has(resolved)) return vcsCache.get(resolved);
 
   let kind = null;
-  if (findDirUpward(resolved, ".jj")) {
+  const jjRoot = findDirUpward(resolved, ".jj");
+  const gitRoot = findDirUpward(resolved, ".git");
+  if (jjRoot && gitRoot) {
+    // Pick the closer (deeper) root; if equal depth, prefer jj (colocated repo)
+    kind = gitRoot.length > jjRoot.length ? "git" : "jj";
+  } else if (jjRoot) {
     kind = "jj";
-  } else if (findDirUpward(resolved, ".git")) {
+  } else if (gitRoot) {
     kind = "git";
   } else {
     const jjResult = runCommand("jj", ["--no-pager", "--color=never", "--quiet", "--ignore-working-copy", "--at-operation", "@", "workspace", "root"], { cwd: resolved });

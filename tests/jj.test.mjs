@@ -50,14 +50,23 @@ test("getCurrentBranch — returns change ID when no bookmarks", { skip: JJ_SKIP
 
 // ─── detectDefaultBranch ─────────────────────────────────────────────────────
 
-test("detectDefaultBranch — throws when trunk() is root()", { skip: JJ_SKIP }, () => {
+test("detectDefaultBranch — throws when trunk() is root() and no bookmarks", { skip: JJ_SKIP }, () => {
   const cwd = makeTempDir("jj-test-trunk-root-");
   initJjRepo(cwd); // fresh repo, no remote — trunk() resolves to root()
   assert.throws(
     () => detectDefaultBranch(cwd),
     /Unable to detect the repository default branch/,
-    "should throw when trunk() resolves to root()"
+    "should throw when trunk() resolves to root() and no candidate bookmarks exist"
   );
+});
+
+test("detectDefaultBranch — falls back to main bookmark when trunk() is root()", { skip: JJ_SKIP }, () => {
+  const cwd = makeTempDir("jj-test-trunk-fallback-main-");
+  initJjRepoWithCommit(cwd);
+  // Create a 'main' bookmark on the initial commit (trunk() still resolves to root)
+  run("jj", ["bookmark", "create", "main", "-r", "@-"], { cwd });
+  const base = detectDefaultBranch(cwd);
+  assert.equal(base, "main", "should fall back to 'main' bookmark when trunk() resolves to root()");
 });
 
 // ─── resolveReviewTarget ─────────────────────────────────────────────────────
@@ -180,6 +189,15 @@ test("collectReviewContext — self-collect mode when forced", { skip: JJ_SKIP }
     /lightweight summary/i,
     "collectionGuidance should mention 'lightweight summary' for self-collect mode"
   );
+  assert.ok(
+    !context.collectionGuidance.includes("jj diff"),
+    "self-collect guidance must NOT suggest running jj commands (sandbox-unsafe)"
+  );
+  assert.match(
+    context.collectionGuidance,
+    /do not attempt to run jj commands/i,
+    "self-collect guidance must explicitly warn against running jj commands"
+  );
 });
 
 // ─── collectReviewContext — range mode ───────────────────────────────────────
@@ -191,6 +209,24 @@ function setupRepoWithBranch(cwd) {
   run("jj", ["bookmark", "create", "main", "-r", "@-"], { cwd });
   fs.writeFileSync(path.join(cwd, "feature.js"), "// feature\n");
   commitJjChange(cwd, "second change");
+}
+
+function setupDivergedRepoWithAdvancedBase(cwd) {
+  initJjRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "base.js"), "// base\n");
+  commitJjChange(cwd, "base change");
+  const baseId = run("jj", ["log", "-r", "@-", "--no-graph", "-T", "change_id.short(8)"], { cwd }).stdout.trim();
+  run("jj", ["bookmark", "create", "main", "-r", "@-"], { cwd });
+
+  fs.writeFileSync(path.join(cwd, "feature.js"), "// feature\n");
+  commitJjChange(cwd, "feature change");
+  const featureId = run("jj", ["log", "-r", "@-", "--no-graph", "-T", "change_id.short(8)"], { cwd }).stdout.trim();
+
+  run("jj", ["new", baseId], { cwd });
+  fs.writeFileSync(path.join(cwd, "main-only.js"), "// main advance\n");
+  commitJjChange(cwd, "main advance");
+  run("jj", ["bookmark", "move", "main", "--to", "@-"], { cwd });
+  run("jj", ["edit", featureId], { cwd });
 }
 
 test("collectReviewContext — range mode with inline diff", { skip: JJ_SKIP }, () => {
@@ -220,7 +256,7 @@ test("collectReviewContext — range mode with inline diff", { skip: JJ_SKIP }, 
   }
 });
 
-test("collectReviewContext — range mode self-collect", { skip: JJ_SKIP }, () => {
+test("collectReviewContext — range mode self-collect with sandbox-safe guidance", { skip: JJ_SKIP }, () => {
   const cwd = makeTempDir("jj-test-collect-range-self-");
   setupRepoWithBranch(cwd);
 
@@ -233,6 +269,10 @@ test("collectReviewContext — range mode self-collect", { skip: JJ_SKIP }, () =
     "range self-collect content must include '## Changed Files' section (not 'Branch Diff')"
   );
   assert.equal(context.inputMode, "self-collect", "stat-only mode should be self-collect");
+  assert.ok(
+    !context.collectionGuidance.includes("jj diff"),
+    "self-collect guidance must NOT suggest running jj commands"
+  );
 });
 
 test("collectReviewContext — range mode no ANSI codes", { skip: JJ_SKIP }, () => {
@@ -248,3 +288,88 @@ test("collectReviewContext — range mode no ANSI codes", { skip: JJ_SKIP }, () 
   );
 });
 
+test("collectReviewContext — branch mode excludes unrelated base bookmark advances", { skip: JJ_SKIP }, () => {
+  const cwd = makeTempDir("jj-test-diverged-base-");
+  setupDivergedRepoWithAdvancedBase(cwd);
+
+  const target = resolveReviewTarget(cwd, { base: "main" });
+  const context = collectReviewContext(cwd, target);
+
+  assert.ok(context.changedFiles.includes("feature.js"), "feature.js should be reviewed");
+  assert.ok(!context.changedFiles.includes("main-only.js"), "base-only changes should not be included in the review diff");
+  assert.match(context.summary, /fork point with main/, "summary should describe merge-base semantics");
+});
+
+// ─── collectReviewContext — custom base ref ──────────────────────────────────
+
+function setupRepoWithMidCommit(cwd) {
+  initJjRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "base.js"), "// base\n");
+  commitJjChange(cwd, "first change");
+  run("jj", ["bookmark", "create", "main", "-r", "@-"], { cwd });
+  // mid commit — between trunk and feature
+  fs.writeFileSync(path.join(cwd, "mid.js"), "// mid\n");
+  commitJjChange(cwd, "mid change");
+  // Capture mid commit's change ID for use as custom --base
+  const midId = run("jj", ["log", "-r", "@-", "--no-graph", "-T", "change_id.short(8)"], { cwd }).stdout.trim();
+  // feature commit on top
+  fs.writeFileSync(path.join(cwd, "feature.js"), "// feature\n");
+  commitJjChange(cwd, "feature change");
+  return { midId };
+}
+
+test("collectReviewContext — custom --base revset used in range diff", { skip: JJ_SKIP }, () => {
+  const cwd = makeTempDir("jj-test-collect-custom-base-");
+  const { midId } = setupRepoWithMidCommit(cwd);
+
+  const target = resolveReviewTarget(cwd, { base: midId });
+  assert.equal(target.mode, "branch");
+  assert.equal(target.baseRef, midId);
+
+  const context = collectReviewContext(cwd, target);
+
+  // Only feature.js should appear — mid.js is before the custom base
+  assert.ok(context.changedFiles.includes("feature.js"), "feature.js should be in changedFiles");
+  assert.ok(!context.changedFiles.includes("mid.js"), "mid.js should NOT be in changedFiles when using mid commit as base");
+  assert.ok(!context.changedFiles.includes("base.js"), "base.js should NOT be in changedFiles");
+
+  // Summary should reference the custom base, not trunk()
+  assert.ok(context.summary.includes(midId), `summary should reference custom base '${midId}', got: ${context.summary}`);
+  assert.ok(!context.summary.includes("trunk()"), "summary should NOT reference trunk() when custom base is used");
+
+  assert.equal(context.mode, "branch");
+  assert.ok(context.fileCount >= 1, "fileCount should be at least 1");
+});
+
+test("collectReviewContext — custom --base context has all required fields", { skip: JJ_SKIP }, () => {
+  const cwd = makeTempDir("jj-test-collect-custom-base-shape-");
+  const { midId } = setupRepoWithMidCommit(cwd);
+
+  const target = resolveReviewTarget(cwd, { base: midId });
+  const context = collectReviewContext(cwd, target);
+
+  const requiredFields = [
+    "cwd", "repoRoot", "branch", "target", "fileCount",
+    "diffBytes", "inputMode", "collectionGuidance", "mode", "summary", "content", "changedFiles"
+  ];
+  for (const field of requiredFields) {
+    assert.ok(field in context, `context missing required field: ${field}`);
+  }
+
+  // Verify types match git backend contract
+  assert.equal(typeof context.cwd, "string");
+  assert.equal(typeof context.repoRoot, "string");
+  assert.equal(typeof context.branch, "string");
+  assert.equal(typeof context.target, "object");
+  assert.equal(typeof context.fileCount, "number");
+  assert.equal(typeof context.diffBytes, "number");
+  assert.equal(typeof context.inputMode, "string");
+  assert.equal(typeof context.collectionGuidance, "string");
+  assert.equal(typeof context.mode, "string");
+  assert.equal(typeof context.summary, "string");
+  assert.equal(typeof context.content, "string");
+  assert.ok(Array.isArray(context.changedFiles), "changedFiles should be an array");
+
+  // collectionGuidance should be set (adversarial review uses this)
+  assert.ok(context.collectionGuidance.length > 0, "collectionGuidance should not be empty");
+});

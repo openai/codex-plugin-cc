@@ -21,9 +21,7 @@ function jjChecked(cwd, args, options = {}) {
   ], { cwd, ...options });
 }
 
-function listUniqueFiles(...groups) {
-  return [...new Set(groups.flat().filter(Boolean))].sort();
-}
+
 
 function normalizeMaxInlineFiles(value) {
   const parsed = Number(value);
@@ -45,12 +43,16 @@ function formatSection(title, body) {
   return [`## ${title}`, "", body.trim() ? body.trim() : "(none)", ""].join("\n");
 }
 
+function buildForkPointRevset(baseRef) {
+  return `fork_point((${baseRef}) | @)`;
+}
+
 function buildAdversarialCollectionGuidance(options = {}) {
   if (options.includeDiff !== false) {
     return "Use the repository context below as primary evidence. This is a Jujutsu (jj) repository — if you need to run additional commands, use jj (not git).";
   }
 
-  return "The repository context below is a lightweight summary. This is a Jujutsu (jj) repository — use read-only jj commands (not git) to inspect the target diff before finalizing findings. Key commands: `jj diff`, `jj log`, `jj diff --stat`, `jj show`.";
+  return "The repository context below is a lightweight summary (diff stat and changed file list). The full diff was too large to inline. Base your review on the provided summary, commit log, and changed file list. Do NOT attempt to run jj commands — the sandbox does not support them.";
 }
 
 function measureJjOutputBytes(cwd, args, maxBytes) {
@@ -102,32 +104,33 @@ function collectWorkingTreeContext(cwd, state, options = {}) {
   }
 }
 
-function collectRangeContext(cwd, includeDiff) {
+function collectRangeContext(cwd, includeDiff, baseRef = "trunk()") {
+  const comparisonBase = buildForkPointRevset(baseRef);
   const logOutput = jjChecked(cwd, [
-    "log", "-r", "trunk()..@", "--no-graph",
+    "log", "-r", `${comparisonBase}..@`, "--no-graph",
     "-T", 'change_id.short(8) ++ " " ++ description.first_line() ++ "\\n"'
   ]).stdout.trim();
 
   const diffStat = jjChecked(cwd, [
-    "diff", "--from", "trunk()", "--to", "@", "--stat"
+    "diff", "--from", comparisonBase, "--to", "@", "--stat"
   ]).stdout.trim();
 
   const changedFiles = jjChecked(cwd, [
-    "diff", "--from", "trunk()", "--to", "@", "--name-only"
+    "diff", "--from", comparisonBase, "--to", "@", "--name-only"
   ]).stdout.trim().split("\n").filter(Boolean);
 
   const currentBranch = getCurrentBranch(cwd);
 
   return {
     mode: "branch",
-    summary: `Reviewing range trunk()..@ on ${currentBranch}.`,
+    summary: `Reviewing changes on ${currentBranch} since the fork point with ${baseRef}.`,
     content: includeDiff
       ? [
           formatSection("Commit Log", logOutput),
           formatSection("Diff Stat", diffStat),
           formatSection(
             "Branch Diff",
-            jjChecked(cwd, ["diff", "--from", "trunk()", "--to", "@", "--git"]).stdout
+            jjChecked(cwd, ["diff", "--from", comparisonBase, "--to", "@", "--git"]).stdout
           )
         ].join("\n")
       : [
@@ -160,17 +163,26 @@ export function getRepoRoot(cwd) {
 }
 
 export function detectDefaultBranch(cwd) {
-  const trunkId = jjChecked(cwd, [
+  const trunkResult = jj(cwd, [
     "log", "-r", "trunk()", "--no-graph", "-T", "commit_id"
-  ]).stdout.trim();
-
-  if (/^0+$/.test(trunkId)) {
-    throw new Error(
-      "Unable to detect the repository default branch. Pass --base <ref> or use --scope working-tree."
-    );
+  ]);
+  if (trunkResult.status === 0 && !/^0+$/.test(trunkResult.stdout.trim())) {
+    return "trunk()";
   }
 
-  return "trunk()";
+  const candidates = ["main", "master", "trunk"];
+  for (const name of candidates) {
+    const result = jj(cwd, [
+      "log", "-r", name, "--no-graph", "-T", "commit_id"
+    ]);
+    if (result.status === 0 && result.stdout.trim() && !/^0+$/.test(result.stdout.trim())) {
+      return name;
+    }
+  }
+
+  throw new Error(
+    "Unable to detect the repository default branch. Pass --base <ref> or use --scope working-tree."
+  );
 }
 
 export function getCurrentBranch(cwd) {
@@ -274,16 +286,17 @@ export function collectReviewContext(cwd, target, options = {}) {
       (state.staged.length <= maxInlineFiles && diffBytes <= maxInlineDiffBytes);
     details = collectWorkingTreeContext(repoRoot, state, { includeDiff });
   } else {
+    const comparisonBase = buildForkPointRevset(target.baseRef);
     const fileCount = jjChecked(repoRoot, [
-      "diff", "--from", "trunk()", "--to", "@", "--name-only"
+      "diff", "--from", comparisonBase, "--to", "@", "--name-only"
     ]).stdout.trim().split("\n").filter(Boolean).length;
     diffBytes = measureJjOutputBytes(
       repoRoot,
-      ["diff", "--from", "trunk()", "--to", "@", "--git"],
+      ["diff", "--from", comparisonBase, "--to", "@", "--git"],
       maxInlineDiffBytes
     );
     includeDiff = options.includeDiff ?? (fileCount <= maxInlineFiles && diffBytes <= maxInlineDiffBytes);
-    details = collectRangeContext(repoRoot, includeDiff);
+    details = collectRangeContext(repoRoot, includeDiff, target.baseRef);
   }
 
   return {

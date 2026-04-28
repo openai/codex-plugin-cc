@@ -47,6 +47,32 @@ test("detectVcs throws when neither .jj nor .git found", () => {
   assert.throws(() => detectVcs(cwd), /Git or Jujutsu repository/);
 });
 
+test("detectVcs prefers closer .git over ancestor .jj (nested Git inside JJ)", () => {
+  const outer = makeTempDir();
+  fs.mkdirSync(path.join(outer, ".jj"), { recursive: true });
+  const inner = path.join(outer, "nested-git-repo");
+  fs.mkdirSync(path.join(inner, ".git"), { recursive: true });
+  assert.equal(detectVcs(inner), "git");
+});
+
+test("detectVcs prefers closer .jj over ancestor .git (nested JJ inside Git)", () => {
+  const outer = makeTempDir();
+  fs.mkdirSync(path.join(outer, ".git"), { recursive: true });
+  const inner = path.join(outer, "nested-jj-repo");
+  fs.mkdirSync(path.join(inner, ".jj"), { recursive: true });
+  assert.equal(detectVcs(inner), "jj");
+});
+
+test("detectVcs prefers closer .git from subdirectory of nested Git repo", () => {
+  const outer = makeTempDir();
+  fs.mkdirSync(path.join(outer, ".jj"), { recursive: true });
+  const inner = path.join(outer, "nested-git-repo");
+  fs.mkdirSync(path.join(inner, ".git"), { recursive: true });
+  const deep = path.join(inner, "src", "lib");
+  fs.mkdirSync(deep, { recursive: true });
+  assert.equal(detectVcs(deep), "git");
+});
+
 test("detectVcs caches result for same resolved path", () => {
   const cwd = makeTempDir();
   fs.mkdirSync(path.join(cwd, ".jj"), { recursive: true });
