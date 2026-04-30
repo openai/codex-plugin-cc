@@ -20,7 +20,9 @@ function defaultState() {
   return {
     version: STATE_VERSION,
     config: {
-      stopReviewGate: false
+      stopReviewGate: false,
+      stopReviewGateMaxPerSession: null,
+      stopReviewGateCooldownMinutes: null
     },
     jobs: []
   };
