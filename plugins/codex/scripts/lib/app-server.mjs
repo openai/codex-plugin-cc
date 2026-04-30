@@ -53,7 +53,7 @@ function createProtocolError(message, data) {
   return error;
 }
 
-class AppServerClientBase {
+export class AppServerClientBase {
   constructor(cwd, options = {}) {
     this.cwd = cwd;
     this.options = options;
@@ -119,11 +119,18 @@ class AppServerClientBase {
       return;
     }
 
+    // Strip ANSI escape sequences that terminals may inject into stdout
+    // (e.g. bracketed paste mode \x1b[?2004h from shell initialization).
+    const cleaned = line.replace(/\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][A-B012]/g, "").trim();
+    if (!cleaned) {
+      return;
+    }
+
     let message;
     try {
-      message = JSON.parse(line);
+      message = JSON.parse(cleaned);
     } catch (error) {
-      this.handleExit(createProtocolError(`Failed to parse codex app-server JSONL: ${error.message}`, { line }));
+      this.handleExit(createProtocolError(`Failed to parse codex app-server JSONL: ${error.message}`, { line: cleaned }));
       return;
     }
 
