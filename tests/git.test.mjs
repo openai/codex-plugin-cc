@@ -4,6 +4,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { collectReviewContext, resolveReviewTarget } from "../plugins/codex/scripts/lib/git.mjs";
+import { runCommandChecked } from "../plugins/codex/scripts/lib/process.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 
 test("resolveReviewTarget prefers working tree when repo is dirty", () => {
@@ -180,4 +181,91 @@ test("collectReviewContext keeps untracked file content in lightweight working t
   assert.doesNotMatch(context.content, /TRACKED_MARKER_[AB]/);
   assert.match(context.content, /## Untracked Files/);
   assert.match(context.content, /UNTRACKED_RISK_MARKER/);
+});
+
+// --- option-injection hardening tests ---
+
+test("resolveReviewTarget with a flag-shaped --base value does not pass it as a git option", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v1');\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  run("git", ["checkout", "-b", "feature/test"], { cwd });
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v2');\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "change"], { cwd });
+
+  // Sentinel file that --output= would create if option-parsing succeeded.
+  const sentinel = path.join(cwd, "sentinel-must-not-exist.txt");
+  assert.equal(fs.existsSync(sentinel), false, "sentinel must not exist before the call");
+
+  const target = resolveReviewTarget(cwd, { base: `--output=${sentinel}` });
+
+  // resolveReviewTarget itself just records the baseRef; the hostile value
+  // only reaches git when collectReviewContext calls buildBranchComparison.
+  assert.equal(target.mode, "branch");
+  assert.equal(target.baseRef, `--output=${sentinel}`);
+
+  // collectReviewContext must throw because git rejects the value as a bad ref,
+  // NOT silently succeed (which would indicate option-injection worked).
+  // Note: git merge-base does not support --output, so in practice the current
+  // code also errors — but without --end-of-options the boundary is unguarded
+  // if a future subcommand does accept such an option.
+  assert.throws(
+    () => collectReviewContext(cwd, target),
+    /unknown revision|bad revision|did not match|ambiguous argument|unknown option|not a valid object name/i
+  );
+
+  // The sentinel must still not exist — git did NOT treat the value as --output=<file>.
+  assert.equal(fs.existsSync(sentinel), false, "sentinel must remain absent after the call");
+});
+
+test("resolveReviewTarget accepts refs with embedded dashes", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v1');\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  run("git", ["checkout", "-b", "feature/has-dashes-in-name"], { cwd });
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v2');\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "change"], { cwd });
+  run("git", ["checkout", "main"], { cwd });
+
+  const target = resolveReviewTarget(cwd, { base: "feature/has-dashes-in-name" });
+  const context = collectReviewContext(cwd, target);
+
+  assert.equal(target.mode, "branch");
+  assert.equal(target.baseRef, "feature/has-dashes-in-name");
+  assert.match(context.content, /Branch Diff|Diff Stat|Changed Files/);
+});
+
+test("buildBranchComparison passes --end-of-options before user-controlled baseRef in merge-base argv", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v1');\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  run("git", ["checkout", "-b", "feature/test"], { cwd });
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v2');\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "change"], { cwd });
+
+  const capturedArgvs = [];
+  const spyGitChecked = (wd, args, opts = {}) => {
+    capturedArgvs.push([...args]);
+    return runCommandChecked("git", args, { cwd: wd, ...opts });
+  };
+
+  const target = resolveReviewTarget(cwd, { base: "main" });
+  collectReviewContext(cwd, target, { _gitCheckedImpl: spyGitChecked });
+
+  const mergeBaseArgv = capturedArgvs.find((args) => args[0] === "merge-base");
+  assert.ok(mergeBaseArgv, "expected a merge-base call to be captured");
+
+  const eooIdx = mergeBaseArgv.indexOf("--end-of-options");
+  const baseRefIdx = mergeBaseArgv.indexOf("main");
+  assert.ok(eooIdx !== -1, `--end-of-options must appear in merge-base argv; got: ${JSON.stringify(mergeBaseArgv)}`);
+  assert.ok(eooIdx < baseRefIdx, `--end-of-options must come before baseRef; got: ${JSON.stringify(mergeBaseArgv)}`);
 });
