@@ -65,8 +65,8 @@ function measureCombinedGitOutputBytes(cwd, argSets, maxBytes) {
   return totalBytes;
 }
 
-function buildBranchComparison(cwd, baseRef) {
-  const mergeBase = gitChecked(cwd, ["merge-base", "HEAD", baseRef]).stdout.trim();
+function buildBranchComparison(cwd, baseRef, _gitCheckedImpl = gitChecked) {
+  const mergeBase = _gitCheckedImpl(cwd, ["merge-base", "HEAD", "--end-of-options", baseRef]).stdout.trim();
   return {
     mergeBase,
     commitRange: `${mergeBase}..HEAD`,
@@ -101,11 +101,11 @@ export function detectDefaultBranch(cwd) {
 
   const candidates = ["main", "master", "trunk"];
   for (const candidate of candidates) {
-    const local = git(cwd, ["show-ref", "--verify", "--quiet", `refs/heads/${candidate}`]);
+    const local = git(cwd, ["show-ref", "--verify", "--quiet", "--end-of-options", `refs/heads/${candidate}`]);
     if (local.status === 0) {
       return candidate;
     }
-    const remote = git(cwd, ["show-ref", "--verify", "--quiet", `refs/remotes/origin/${candidate}`]);
+    const remote = git(cwd, ["show-ref", "--verify", "--quiet", "--end-of-options", `refs/remotes/origin/${candidate}`]);
     if (remote.status === 0) {
       return `origin/${candidate}`;
     }
@@ -262,9 +262,9 @@ function collectBranchContext(cwd, baseRef, options = {}) {
   const includeDiff = options.includeDiff !== false;
   const comparison = options.comparison ?? buildBranchComparison(cwd, baseRef);
   const currentBranch = getCurrentBranch(cwd);
-  const changedFiles = gitChecked(cwd, ["diff", "--name-only", comparison.commitRange]).stdout.trim().split("\n").filter(Boolean);
-  const logOutput = gitChecked(cwd, ["log", "--oneline", "--decorate", comparison.commitRange]).stdout.trim();
-  const diffStat = gitChecked(cwd, ["diff", "--stat", comparison.commitRange]).stdout.trim();
+  const changedFiles = gitChecked(cwd, ["diff", "--name-only", "--end-of-options", comparison.commitRange]).stdout.trim().split("\n").filter(Boolean);
+  const logOutput = gitChecked(cwd, ["log", "--oneline", "--decorate", "--end-of-options", comparison.commitRange]).stdout.trim();
+  const diffStat = gitChecked(cwd, ["diff", "--stat", "--end-of-options", comparison.commitRange]).stdout.trim();
 
   return {
     mode: "branch",
@@ -275,7 +275,7 @@ function collectBranchContext(cwd, baseRef, options = {}) {
           formatSection("Diff Stat", diffStat),
           formatSection(
             "Branch Diff",
-            gitChecked(cwd, ["diff", "--binary", "--no-ext-diff", "--submodule=diff", comparison.commitRange]).stdout
+            gitChecked(cwd, ["diff", "--binary", "--no-ext-diff", "--submodule=diff", "--end-of-options", comparison.commitRange]).stdout
           )
         ].join("\n")
       : [
@@ -321,11 +321,11 @@ export function collectReviewContext(cwd, target, options = {}) {
         diffBytes <= maxInlineDiffBytes);
     details = collectWorkingTreeContext(repoRoot, state, { includeDiff });
   } else {
-    const comparison = buildBranchComparison(repoRoot, target.baseRef);
-    const fileCount = gitChecked(repoRoot, ["diff", "--name-only", comparison.commitRange]).stdout.trim().split("\n").filter(Boolean).length;
+    const comparison = buildBranchComparison(repoRoot, target.baseRef, options._gitCheckedImpl);
+    const fileCount = gitChecked(repoRoot, ["diff", "--name-only", "--end-of-options", comparison.commitRange]).stdout.trim().split("\n").filter(Boolean).length;
     diffBytes = measureGitOutputBytes(
       repoRoot,
-      ["diff", "--binary", "--no-ext-diff", "--submodule=diff", comparison.commitRange],
+      ["diff", "--binary", "--no-ext-diff", "--submodule=diff", "--end-of-options", comparison.commitRange],
       maxInlineDiffBytes
     );
     includeDiff = options.includeDiff ?? (fileCount <= maxInlineFiles && diffBytes <= maxInlineDiffBytes);
