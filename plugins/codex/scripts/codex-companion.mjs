@@ -28,6 +28,7 @@ import {
   generateJobId,
   getConfig,
   listJobs,
+  resolveJobLogFile,
   setConfig,
   upsertJob,
   writeJobFile
@@ -837,6 +838,62 @@ async function handleTaskWorker(argv) {
   );
 }
 
+async function handleAttach(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "poll-interval-ms"],
+    booleanOptions: []
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveCommandWorkspace(options);
+  const pollIntervalMs = Math.max(200, Number(options["poll-interval-ms"]) || 500);
+  const reference = positionals[0] ?? "";
+
+  let job;
+  if (reference) {
+    const snapshot = buildSingleJobSnapshot(cwd, reference);
+    job = snapshot.job;
+  } else {
+    const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+    job = jobs.find((j) => isActiveJobStatus(j.status)) ?? jobs[0] ?? null;
+  }
+
+  if (!job) {
+    process.stdout.write("No Codex job found. Start one with /codex:rescue.\n");
+    return;
+  }
+
+  const logFile = job.logFile ?? resolveJobLogFile(workspaceRoot, job.id);
+  process.stdout.write(`[attach] Job ${job.id} · status: ${job.status}\n`);
+  if (job.title) process.stdout.write(`[attach] Task: ${job.title}\n`);
+  process.stdout.write(`[attach] Log: ${logFile}\n---\n`);
+
+  let offset = 0;
+
+  function flushNewLogContent() {
+    if (!fs.existsSync(logFile)) return;
+    const content = fs.readFileSync(logFile, "utf8");
+    if (content.length > offset) {
+      process.stdout.write(content.slice(offset));
+      offset = content.length;
+    }
+  }
+
+  flushNewLogContent();
+
+  while (true) {
+    await sleep(pollIntervalMs);
+    flushNewLogContent();
+
+    const currentJob = listJobs(workspaceRoot).find((j) => j.id === job.id);
+    if (!currentJob || !isActiveJobStatus(currentJob.status)) {
+      flushNewLogContent();
+      process.stdout.write(`\n--- Job ${job.id} ${currentJob?.status ?? "gone"} ---\n`);
+      break;
+    }
+  }
+}
+
 async function handleStatus(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
@@ -1014,6 +1071,9 @@ async function main() {
       break;
     case "cancel":
       await handleCancel(argv);
+      break;
+    case "attach":
+      await handleAttach(argv);
       break;
     default:
       throw new Error(`Unknown subcommand: ${subcommand}`);
