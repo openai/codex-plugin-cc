@@ -21,7 +21,7 @@ import {
     runAppServerTurn
   } from "./lib/codex.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
-import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
+import { collectReviewContext, detectVcs, ensureGitRepository, resolveReviewTarget } from "./lib/vcs.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
@@ -246,6 +246,30 @@ function buildAdversarialReviewPrompt(context, focusText) {
   });
 }
 
+function buildJjNativeReviewInstructions(target) {
+  if (target.mode === "working-tree") {
+    return [
+      "Review the current changes in this repository.",
+      "This repository uses Jujutsu (jj), not git.",
+      "When reasoning about the change, use jj concepts such as revsets, bookmarks, and the working copy commit."
+    ].join(" ");
+  }
+
+  if (target.mode === "branch") {
+    return [
+      `Review only the changes introduced on the current branch relative to the common ancestor (fork point) of ${target.baseRef} and @ in this repository.`,
+      "This repository uses Jujutsu (jj), not git.",
+      "When reasoning about the change, use jj concepts such as revsets, bookmarks, and the working copy commit."
+    ].join(" ");
+  }
+
+  return [
+    "Review the requested changes in this repository.",
+    "This repository uses Jujutsu (jj), not git.",
+    "When reasoning about the change, use jj concepts such as revsets, bookmarks, and the working copy commit."
+  ].join(" ");
+}
+
 function ensureCodexAvailable(cwd) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
@@ -253,7 +277,14 @@ function ensureCodexAvailable(cwd) {
   }
 }
 
-function buildNativeReviewTarget(target) {
+function buildNativeReviewTarget(cwd, target) {
+  if (detectVcs(cwd) === "jj") {
+    return {
+      type: "custom",
+      instructions: buildJjNativeReviewInstructions(target)
+    };
+  }
+
   if (target.mode === "working-tree") {
     return { type: "uncommittedChanges" };
   }
@@ -265,14 +296,14 @@ function buildNativeReviewTarget(target) {
   return null;
 }
 
-function validateNativeReviewRequest(target, focusText) {
+function validateNativeReviewRequest(cwd, target, focusText) {
   if (focusText.trim()) {
     throw new Error(
       `\`/codex:review\` now maps directly to the built-in reviewer and does not support custom focus text. Retry with \`/codex:adversarial-review ${focusText.trim()}\` for focused review instructions.`
     );
   }
 
-  const nativeTarget = buildNativeReviewTarget(target);
+  const nativeTarget = buildNativeReviewTarget(cwd, target);
   if (!nativeTarget) {
     throw new Error("This `/codex:review` target is not supported by the built-in reviewer. Retry with `/codex:adversarial-review` for custom targeting.");
   }
@@ -362,8 +393,12 @@ async function executeReviewRun(request) {
   });
   const focusText = request.focusText?.trim() ?? "";
   const reviewName = request.reviewName ?? "Review";
-  if (reviewName === "Review") {
-    const reviewTarget = validateNativeReviewRequest(target, focusText);
+  // Plain review uses the native reviewer. Git repos can use structured review
+  // targets directly, while jj repos use the native custom target plus
+  // Jujutsu-specific instructions.
+  const useNativeReviewer = reviewName === "Review";
+  if (useNativeReviewer) {
+    const reviewTarget = validateNativeReviewRequest(request.cwd, target, focusText);
     const result = await runAppServerReview(request.cwd, {
       target: reviewTarget,
       model: request.model,
@@ -696,7 +731,7 @@ async function handleReviewCommand(argv, config) {
     scope: options.scope
   });
 
-  config.validateRequest?.(target, focusText);
+  config.validateRequest?.(cwd, target, focusText);
   const metadata = buildReviewJobMetadata(config.reviewName, target);
   const job = createCompanionJob({
     prefix: "review",
