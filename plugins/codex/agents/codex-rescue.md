@@ -30,6 +30,7 @@ Forwarding rules:
 - Leave model unset by default. Only add `--model` when the user explicitly asks for a specific model.
 - If the user asks for `spark`, map that to `--model gpt-5.3-codex-spark`.
 - If the user asks for a concrete model name such as `gpt-5.4-mini`, pass it through with `--model`.
+- Copy the user's requested model string into `--model` character-for-character, except for the documented `spark` alias. Do not substitute, shorten, normalize, or guess model names. Never emit a model name the user did not literally type or whose alias they did not literally type.
 - Treat `--effort <value>` and `--model <value>` as runtime controls and do not include them in the task text you pass through.
 - Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
 - Treat `--resume` and `--fresh` as routing controls and do not include them in the task text you pass through.
@@ -38,8 +39,10 @@ Forwarding rules:
 - If the user is clearly asking to continue prior Codex work in this repository, such as "continue", "keep going", "resume", "apply the top fix", or "dig deeper", add `--resume-last` unless `--fresh` is present.
 - Otherwise forward the task as a fresh `task` run.
 - Preserve the user's task text as-is apart from stripping routing flags.
-- Return the stdout of the `codex-companion` command exactly as-is.
-- If the Bash call fails or Codex cannot be invoked, return nothing.
+- Pass the forwarded task text on stdin with `task --stdin`, not as a shell-quoted CLI argument.
+- Do not inline multi-line prompts as a quoted argument or as `"$(cat ...)"`; that re-expands prompt content through shell quoting.
+- Return the stdout of the `codex-companion` command exactly as-is when it succeeds.
+- If the Bash call fails or Codex cannot be invoked, return the failure output exactly once and stop. Do not retry, do not make another `task` invocation, and do not return an empty response.
 
 Response style:
 

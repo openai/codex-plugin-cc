@@ -627,6 +627,116 @@ test("task --fresh is treated as routing control and does not leak into the prom
   assert.equal(fakeState.lastTurnStart.prompt, "diagnose the flaky test");
 });
 
+test("task --prompt-file preserves multiline shell-sensitive prompt text", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const prompt = "diagnose quoting\nliteral $(echo should-not-run)\nquote ' and double \" and backslash \\";
+  const promptFile = path.join(repo, "prompt.txt");
+  fs.writeFileSync(promptFile, prompt, "utf8");
+
+  const result = run("node", [SCRIPT, "task", "--prompt-file", promptFile], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.prompt, prompt);
+});
+
+test("task --stdin preserves multiline shell-sensitive prompt text", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const prompt = "diagnose quoting\nliteral $(echo should-not-run)\nquote ' and double \" and backslash \\";
+  const result = run("node", [SCRIPT, "task", "--stdin"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: prompt
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.prompt, prompt);
+});
+
+test("task --stdin rejects mixed prompt sources", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const withPositional = run("node", [SCRIPT, "task", "--stdin", "diagnose"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: "from stdin"
+  });
+  assert.notEqual(withPositional.status, 0);
+  assert.match(withPositional.stderr, /Do not pass positional prompt text when using --stdin/);
+
+  const promptFile = path.join(repo, "prompt.txt");
+  fs.writeFileSync(promptFile, "from file", "utf8");
+  const withPromptFile = run("node", [SCRIPT, "task", "--stdin", "--prompt-file", promptFile], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: "from stdin"
+  });
+  assert.notEqual(withPromptFile.status, 0);
+  assert.match(withPromptFile.stderr, /Choose either --stdin or --prompt-file/);
+});
+
+test("task --stdin allows empty prompt only when resuming", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const firstRun = run("node", [SCRIPT, "task", "initial task"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+
+  const resume = run("node", [SCRIPT, "task", "--stdin", "--resume-last"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: ""
+  });
+
+  assert.equal(resume.status, 0, resume.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.threadId, "thr_1");
+  assert.equal(fakeState.lastTurnStart.prompt, "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.");
+
+  const fresh = run("node", [SCRIPT, "task", "--stdin"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: ""
+  });
+  assert.notEqual(fresh.status, 0);
+  assert.match(fresh.stderr, /Expected prompt text on stdin/);
+});
+
 test("task forwards model selection and reasoning effort to app-server turn/start", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
