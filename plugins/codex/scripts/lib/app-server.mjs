@@ -186,11 +186,16 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   }
 
   async initialize() {
+    // Pin to cmd.exe on Windows (NOT $SHELL) so the .cmd shim for codex is
+    // resolved via PATHEXT but no MSYS path translation kicks in on Git Bash.
+    // The original code used `process.env.SHELL || true`, which under Git Bash
+    // mangled Windows-style command flags. On POSIX, codex is a JS shebang
+    // file so direct spawn (shell:false) works.
     this.proc = spawn("codex", ["app-server"], {
       cwd: this.cwd,
       env: this.options.env ?? process.env,
       stdio: ["pipe", "pipe", "pipe"],
-      shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
+      shell: process.platform === "win32" ? "cmd.exe" : false,
       windowsHide: true
     });
 

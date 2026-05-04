@@ -140,6 +140,16 @@ export function resolveReviewTarget(cwd, options = {}) {
   const supportedScopes = new Set(["auto", "working-tree", "branch"]);
 
   if (baseRef) {
+    // Verify the ref exists locally before we kick off a Codex thread; without
+    // this check the user gets a confusing "Reconnecting..." API error several
+    // seconds later instead of the actual root cause (typo or unfetched ref).
+    const verify = git(cwd, ["rev-parse", "--verify", "--quiet", `${baseRef}^{commit}`]);
+    if (verify.status !== 0) {
+      throw new Error(
+        `Base ref "${baseRef}" does not resolve to a commit in this repository. ` +
+        `Did you mean a different branch, or do you need to fetch it first (e.g. \`git fetch origin ${baseRef}\`)?`
+      );
+    }
     return {
       mode: "branch",
       label: `branch diff against ${baseRef}`,

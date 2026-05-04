@@ -2,6 +2,13 @@ import { spawnSync } from "node:child_process";
 import process from "node:process";
 
 export function runCommand(command, args = [], options = {}) {
+  // On Windows we MUST go through a shell to resolve npm-installed CLIs, which
+  // are .cmd shims (PATHEXT lookup is shell-only). The previous code used
+  // `process.env.SHELL || true`, which under Git Bash resolved to /usr/bin/bash
+  // and rewrote args like `/PID 123 /T /F` as Unix paths
+  // (`/c/Program Files/Git/PID 123 /T /F`), breaking taskkill. Pin to cmd.exe
+  // so we keep .cmd resolution but skip MSYS path translation. On POSIX
+  // shell:false is fine.
   const result = spawnSync(command, args, {
     cwd: options.cwd,
     env: options.env,
@@ -9,7 +16,7 @@ export function runCommand(command, args = [], options = {}) {
     input: options.input,
     maxBuffer: options.maxBuffer,
     stdio: options.stdio ?? "pipe",
-    shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
+    shell: process.platform === "win32" ? "cmd.exe" : false,
     windowsHide: true
   });
 
