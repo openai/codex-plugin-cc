@@ -150,6 +150,36 @@ export function listJobs(cwd) {
   return loadState(cwd).jobs;
 }
 
+/**
+ * Check whether a process with the given pid is currently alive.
+ * Cross-platform: uses `process.kill(pid, 0)` which sends signal 0
+ * (no-op signal) and throws ESRCH if the process is gone. EPERM means
+ * the process exists but we lack permission to signal it (still alive).
+ */
+export function isPidAlive(pid) {
+  if (!pid || typeof pid !== "number") return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err && err.code === "EPERM";
+  }
+}
+
+/**
+ * A job counts as "active" only if its status says queued/running AND
+ * the recorded pid is still alive. This prevents zombie state from
+ * causing false alarms when the codex process was SIGKILL'd
+ * (e.g., by a cleanup script or an OS reboot) without getting a chance
+ * to write status="completed" to disk.
+ */
+export function isJobActive(job) {
+  if (!job) return false;
+  if (job.status !== "queued" && job.status !== "running") return false;
+  if (!job.pid) return false;
+  return isPidAlive(job.pid);
+}
+
 export function setConfig(cwd, key, value) {
   return updateState(cwd, (state) => {
     state.config = {
