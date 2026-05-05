@@ -1,6 +1,6 @@
 ---
-description: Delegate investigation, an explicit fix request, or follow-up rescue work to the Codex rescue subagent
-argument-hint: "[--background|--wait] [--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [what Codex should investigate, solve, or continue]"
+description: Delegate investigation, an explicit fix request, review-result rescue, or follow-up rescue work to the Codex rescue subagent
+argument-hint: "[--background|--wait] [--resume|--fresh] [--from-review <review-job-id|session-id>] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [what Codex should investigate, solve, or continue]"
 allowed-tools: Bash(node:*), AskUserQuestion, Agent
 ---
 
@@ -20,6 +20,8 @@ Execution mode:
 - `--model` and `--effort` are runtime-selection flags. Preserve them for the forwarded `task` call, but do not treat them as part of the natural-language task text.
 - If the request includes `--resume`, do not ask whether to continue. The user already chose.
 - If the request includes `--fresh`, do not ask whether to continue. The user already chose.
+- If the request includes `--from-review <review-job-id|session-id>`, do not ask whether to continue unless the request also includes `--resume`. Start a fresh rescue by preserving `--from-review` and adding `--fresh` before routing to the subagent.
+- If the request is exactly one review-looking id such as `review-abc123` or `thr_abc123`, do not ask whether to continue. Treat it as review-result rescue and add `--fresh` before routing to the subagent.
 - Otherwise, before starting Codex, check for a resumable rescue thread from this Claude session by running:
 
 ```bash
@@ -44,6 +46,7 @@ Operating rules:
 - Do not ask the subagent to inspect files, monitor progress, poll `/codex:status`, fetch `/codex:result`, call `/codex:cancel`, summarize output, or do follow-up work of its own.
 - Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort.
 - Leave the model unset unless the user explicitly asks for one. If they ask for `spark`, map it to `gpt-5.3-codex-spark`.
+- Leave `--from-review` in the forwarded request. It tells `task` to turn a completed review job or Codex review session into a fix prompt.
 - Leave `--resume` and `--fresh` in the forwarded request. The subagent handles that routing when it builds the `task` command.
 - If the helper reports that Codex is missing or unauthenticated, stop and tell the user to run `/codex:setup`.
 - If the user did not supply a request, ask what Codex should investigate or fix.

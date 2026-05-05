@@ -137,7 +137,9 @@ Use it when you want Codex to:
 > [!NOTE]
 > Depending on the task and the model you choose these tasks might take a long time and it's generally recommended to force the task to be in the background or move the agent to the background.
 
-It supports `--background`, `--wait`, `--resume`, and `--fresh`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo.
+It supports `--background`, `--wait`, `--resume`, `--fresh`, and `--from-review <review-job-id|session-id>`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo.
+
+Use `--from-review` when you want Codex to apply the smallest safe fixes for findings from a completed `/codex:review` or `/codex:adversarial-review` run. The id can be either a review job id from `/codex:status` or the Codex session id shown by `/codex:result`.
 
 Examples:
 
@@ -145,6 +147,8 @@ Examples:
 /codex:rescue investigate why the tests started failing
 /codex:rescue fix the failing test with the smallest safe patch
 /codex:rescue --resume apply the top fix from the last run
+/codex:rescue --from-review review-abc123
+/codex:rescue --from-review thr_review_session fix only the high severity finding
 /codex:rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
 /codex:rescue --model spark fix the issue quickly
 /codex:rescue --background investigate the regression
@@ -161,6 +165,7 @@ Ask Codex to redesign the database connection to be more resilient.
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
+- a single review-looking id such as `/codex:rescue review-abc123` is treated as `/codex:rescue --from-review review-abc123`
 
 ### `/codex:status`
 

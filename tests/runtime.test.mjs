@@ -580,6 +580,232 @@ test("write task output focuses on the Codex result without generic follow-up hi
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
+test("task --from-review turns a review job result into a write prompt", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  const review = run("node", [SCRIPT, "review"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(review.status, 0, review.stderr);
+
+  const stateDir = resolveStateDir(repo);
+  const companionState = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const reviewJob = companionState.jobs.find((job) => job.jobClass === "review");
+  assert.ok(reviewJob);
+
+  const result = run("node", [SCRIPT, "task", "--write", "--from-review", reviewJob.id], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.match(fakeState.lastTurnStart.prompt, /Apply the smallest safe fixes for the actionable findings/);
+  assert.match(fakeState.lastTurnStart.prompt, new RegExp(`Review job id: ${reviewJob.id}`));
+  assert.match(fakeState.lastTurnStart.prompt, /Reviewed uncommitted changes\./);
+});
+
+test("task --from-review accepts a review session id and extra instructions", () => {
+  const workspace = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  fs.writeFileSync(
+    path.join(jobsDir, "review-finished.json"),
+    JSON.stringify(
+      {
+        id: "review-finished",
+        status: "completed",
+        title: "Codex Adversarial Review",
+        rendered: "# Codex Adversarial Review\n\nFindings:\n- [high] Missing empty-state guard (src/app.js:4-6)\n",
+        threadId: "thr_review_finished"
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "review-finished",
+            kind: "adversarial-review",
+            kindLabel: "adversarial-review",
+            status: "completed",
+            title: "Codex Adversarial Review",
+            jobClass: "review",
+            threadId: "thr_review_finished",
+            summary: "Adversarial review working tree diff",
+            updatedAt: "2026-03-24T20:00:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "task", "--write", "--from-review", "thr_review_finished", "fix only the high severity finding"], {
+    cwd: workspace,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.match(fakeState.lastTurnStart.prompt, /Review job id: review-finished/);
+  assert.match(fakeState.lastTurnStart.prompt, /Review kind: adversarial-review/);
+  assert.match(fakeState.lastTurnStart.prompt, /Missing empty-state guard/);
+  assert.match(fakeState.lastTurnStart.prompt, /Additional user instructions:\nfix only the high severity finding/);
+});
+
+test("task treats a single review-looking id as --from-review shorthand", () => {
+  const workspace = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  fs.writeFileSync(
+    path.join(jobsDir, "review-shorthand.json"),
+    JSON.stringify(
+      {
+        id: "review-shorthand",
+        status: "completed",
+        title: "Codex Review",
+        rendered: "# Codex Review\n\nFinding: fix src/app.js\n",
+        threadId: "thr_review_shorthand"
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "review-shorthand",
+            status: "completed",
+            title: "Codex Review",
+            jobClass: "review",
+            threadId: "thr_review_shorthand",
+            summary: "Review working tree diff",
+            updatedAt: "2026-03-24T20:00:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "task", "--write", "review-shorthand"], {
+    cwd: workspace,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.match(fakeState.lastTurnStart.prompt, /Review job id: review-shorthand/);
+  assert.match(fakeState.lastTurnStart.prompt, /Finding: fix src\/app\.js/);
+});
+
+test("task --from-review rejects unresolved, running, non-review, and resultless refs", () => {
+  const workspace = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  fs.writeFileSync(path.join(jobsDir, "review-running.json"), JSON.stringify({ id: "review-running", status: "running" }, null, 2), "utf8");
+  fs.writeFileSync(path.join(jobsDir, "task-finished.json"), JSON.stringify({ id: "task-finished", status: "completed" }, null, 2), "utf8");
+  fs.writeFileSync(path.join(jobsDir, "review-empty.json"), JSON.stringify({ id: "review-empty", status: "completed" }, null, 2), "utf8");
+  fs.writeFileSync(path.join(jobsDir, "review-ambig-a.json"), JSON.stringify({ id: "review-ambig-a", status: "completed", rendered: "A" }, null, 2), "utf8");
+  fs.writeFileSync(path.join(jobsDir, "review-ambig-b.json"), JSON.stringify({ id: "review-ambig-b", status: "completed", rendered: "B" }, null, 2), "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          { id: "review-running", status: "running", title: "Codex Review", jobClass: "review", updatedAt: "2026-03-24T20:00:00.000Z" },
+          { id: "task-finished", status: "completed", title: "Codex Task", jobClass: "task", updatedAt: "2026-03-24T19:00:00.000Z" },
+          { id: "review-empty", status: "completed", title: "Codex Review", jobClass: "review", updatedAt: "2026-03-24T18:00:00.000Z" },
+          { id: "review-ambig-a", status: "completed", title: "Codex Review", jobClass: "review", updatedAt: "2026-03-24T17:00:00.000Z" },
+          { id: "review-ambig-b", status: "completed", title: "Codex Review", jobClass: "review", updatedAt: "2026-03-24T16:00:00.000Z" }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const missing = run("node", [SCRIPT, "task", "--write", "--from-review", "review-missing"], {
+    cwd: workspace,
+    env: buildEnv(binDir)
+  });
+  assert.equal(missing.status, 1);
+  assert.match(missing.stderr, /No review job found for "review-missing"/);
+
+  const running = run("node", [SCRIPT, "task", "--write", "--from-review", "review-running"], {
+    cwd: workspace,
+    env: buildEnv(binDir)
+  });
+  assert.equal(running.status, 1);
+  assert.match(running.stderr, /only completed review jobs can be rescued/);
+
+  const nonReview = run("node", [SCRIPT, "task", "--write", "--from-review", "task-finished"], {
+    cwd: workspace,
+    env: buildEnv(binDir)
+  });
+  assert.equal(nonReview.status, 1);
+  assert.match(nonReview.stderr, /is not a review job/);
+
+  const resultless = run("node", [SCRIPT, "task", "--write", "--from-review", "review-empty"], {
+    cwd: workspace,
+    env: buildEnv(binDir)
+  });
+  assert.equal(resultless.status, 1);
+  assert.match(resultless.stderr, /has no captured review output/);
+
+  const ambiguous = run("node", [SCRIPT, "task", "--write", "--from-review", "review-ambig"], {
+    cwd: workspace,
+    env: buildEnv(binDir)
+  });
+  assert.equal(ambiguous.status, 1);
+  assert.match(ambiguous.stderr, /is ambiguous/);
+});
+
 test("task --resume acts like --resume-last without leaking the flag into the prompt", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

@@ -1,0 +1,974 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Codex Claude Code 插件命令参数速查</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f8fb;
+      --panel: #ffffff;
+      --panel-soft: #f1f5f9;
+      --text: #111827;
+      --muted: #5b6472;
+      --border: #d9e0ea;
+      --accent: #0f766e;
+      --accent-strong: #115e59;
+      --accent-soft: #d9f3ee;
+      --warn: #a16207;
+      --code: #172033;
+      --code-bg: #eef2f7;
+      --shadow: 0 18px 45px rgba(15, 23, 42, 0.08);
+    }
+
+    [data-theme="dark"] {
+      color-scheme: dark;
+      --bg: #111318;
+      --panel: #191d25;
+      --panel-soft: #222838;
+      --text: #eef2f7;
+      --muted: #a8b1c2;
+      --border: #343b4d;
+      --accent: #2dd4bf;
+      --accent-strong: #5eead4;
+      --accent-soft: #123c39;
+      --warn: #facc15;
+      --code: #e7edf7;
+      --code-bg: #0d1118;
+      --shadow: 0 22px 55px rgba(0, 0, 0, 0.28);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.55;
+      letter-spacing: 0;
+    }
+
+    button,
+    input {
+      font: inherit;
+    }
+
+    .app {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: minmax(230px, 280px) minmax(0, 1fr);
+    }
+
+    aside {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      padding: 24px 18px;
+      border-right: 1px solid var(--border);
+      background: var(--panel);
+      overflow: auto;
+    }
+
+    main {
+      min-width: 0;
+      padding: 30px;
+    }
+
+    .brand {
+      margin: 0 0 18px;
+    }
+
+    .brand h1 {
+      margin: 0;
+      font-size: 20px;
+      line-height: 1.25;
+    }
+
+    .brand p {
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .search {
+      display: grid;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+
+    .search label {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .search input {
+      width: 100%;
+      height: 40px;
+      padding: 0 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel-soft);
+      color: var(--text);
+      outline: none;
+    }
+
+    .search input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-soft);
+    }
+
+    .nav {
+      display: grid;
+      gap: 6px;
+    }
+
+    .nav button,
+    .theme-toggle {
+      width: 100%;
+      min-height: 38px;
+      padding: 8px 10px;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      background: transparent;
+      color: var(--muted);
+      text-align: left;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .nav button:hover,
+    .theme-toggle:hover {
+      background: var(--panel-soft);
+      color: var(--text);
+    }
+
+    .nav button.active {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+      color: var(--accent-strong);
+    }
+
+    .nav code {
+      white-space: nowrap;
+      font-size: 12px;
+    }
+
+    .count {
+      min-width: 22px;
+      height: 22px;
+      border-radius: 999px;
+      display: inline-grid;
+      place-items: center;
+      background: var(--panel-soft);
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .side-actions {
+      margin-top: 18px;
+      padding-top: 18px;
+      border-top: 1px solid var(--border);
+      display: grid;
+      gap: 8px;
+    }
+
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+
+    .metric {
+      min-height: 92px;
+      padding: 16px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+
+    .metric strong {
+      display: block;
+      font-size: 24px;
+      line-height: 1;
+      margin-bottom: 10px;
+    }
+
+    .metric span {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .toolbar {
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 14px 0 18px;
+      background: var(--bg);
+    }
+
+    .toolbar h2 {
+      margin: 0;
+      font-size: 18px;
+    }
+
+    .toolbar-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .action-button {
+      min-height: 36px;
+      padding: 7px 11px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--text);
+      cursor: pointer;
+    }
+
+    .action-button:hover {
+      border-color: var(--accent);
+      color: var(--accent-strong);
+    }
+
+    .cards {
+      display: grid;
+      gap: 14px;
+    }
+
+    .command-card {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .command-card.hidden {
+      display: none;
+    }
+
+    .command-header {
+      width: 100%;
+      min-height: 72px;
+      padding: 16px 18px;
+      border: 0;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
+      text-align: left;
+      cursor: pointer;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 14px;
+      align-items: center;
+    }
+
+    .command-title {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .command-title code {
+      font-size: 16px;
+      color: var(--accent-strong);
+    }
+
+    .badge {
+      min-height: 24px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: var(--panel-soft);
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .badge.write {
+      color: var(--warn);
+      background: color-mix(in srgb, var(--warn) 12%, transparent);
+    }
+
+    .command-subtitle {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .chevron {
+      width: 28px;
+      height: 28px;
+      border-radius: 999px;
+      display: grid;
+      place-items: center;
+      background: var(--panel-soft);
+      color: var(--muted);
+      transition: transform 160ms ease;
+    }
+
+    .command-card.open .chevron {
+      transform: rotate(90deg);
+    }
+
+    .command-body {
+      display: none;
+      padding: 18px;
+    }
+
+    .command-card.open .command-body {
+      display: grid;
+      gap: 18px;
+    }
+
+    .usage {
+      display: grid;
+      gap: 8px;
+    }
+
+    .section-title {
+      margin: 0;
+      font-size: 14px;
+      color: var(--muted);
+      text-transform: uppercase;
+    }
+
+    pre {
+      margin: 0;
+      padding: 14px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--code-bg);
+      color: var(--code);
+      overflow: auto;
+      line-height: 1.45;
+      font-size: 13px;
+    }
+
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+      overflow: hidden;
+      border-radius: 8px;
+    }
+
+    th,
+    td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: var(--panel-soft);
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .examples {
+      display: grid;
+      gap: 8px;
+    }
+
+    .example {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: stretch;
+    }
+
+    .example pre {
+      border-top-right-radius: 0;
+      border-bottom-right-radius: 0;
+    }
+
+    .copy {
+      width: 44px;
+      border: 1px solid var(--border);
+      border-left: 0;
+      border-radius: 0 8px 8px 0;
+      background: var(--panel-soft);
+      color: var(--muted);
+      cursor: pointer;
+      display: grid;
+      place-items: center;
+    }
+
+    .copy:hover {
+      color: var(--accent-strong);
+    }
+
+    .notes {
+      margin: 0;
+      padding-left: 20px;
+      color: var(--muted);
+    }
+
+    .empty {
+      display: none;
+      padding: 34px;
+      border: 1px dashed var(--border);
+      border-radius: 8px;
+      color: var(--muted);
+      text-align: center;
+      background: var(--panel);
+    }
+
+    .empty.visible {
+      display: block;
+    }
+
+    @media (max-width: 900px) {
+      .app {
+        display: block;
+      }
+
+      aside {
+        position: relative;
+        height: auto;
+        border-right: 0;
+        border-bottom: 1px solid var(--border);
+      }
+
+      main {
+        padding: 18px;
+      }
+
+      .summary {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .toolbar {
+        position: relative;
+        display: grid;
+      }
+    }
+
+    @media (max-width: 560px) {
+      .summary {
+        grid-template-columns: 1fr;
+      }
+
+      .command-header {
+        grid-template-columns: minmax(0, 1fr);
+      }
+
+      .chevron {
+        display: none;
+      }
+
+      table,
+      thead,
+      tbody,
+      th,
+      td,
+      tr {
+        display: block;
+      }
+
+      thead {
+        display: none;
+      }
+
+      tr {
+        border-bottom: 1px solid var(--border);
+      }
+
+      td {
+        border-bottom: 0;
+      }
+
+      td::before {
+        content: attr(data-label);
+        display: block;
+        margin-bottom: 4px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app" data-theme="light">
+    <aside>
+      <div class="brand">
+        <h1>Codex 命令参数速查</h1>
+        <p>Claude Code 插件 `/codex:*` 命令的交互式参考。</p>
+      </div>
+
+      <div class="search">
+        <label for="search">搜索命令、参数或说明</label>
+        <input id="search" type="search" placeholder="例如 rescue、--background、review gate">
+      </div>
+
+      <nav class="nav" aria-label="Command navigation">
+        <button class="active" data-filter="all"><code>全部命令</code><span class="count">7</span></button>
+        <button data-filter="setup"><code>/codex:setup</code></button>
+        <button data-filter="review"><code>/codex:review</code></button>
+        <button data-filter="adversarial-review"><code>/codex:adversarial-review</code></button>
+        <button data-filter="rescue"><code>/codex:rescue</code></button>
+        <button data-filter="status"><code>/codex:status</code></button>
+        <button data-filter="result"><code>/codex:result</code></button>
+        <button data-filter="cancel"><code>/codex:cancel</code></button>
+      </nav>
+
+      <div class="side-actions">
+        <button class="theme-toggle" id="themeToggle" type="button"><span>切换主题</span><span aria-hidden="true">◐</span></button>
+      </div>
+    </aside>
+
+    <main>
+      <section class="summary" aria-label="Summary">
+        <div class="metric">
+          <strong>7</strong>
+          <span>公开 slash commands</span>
+        </div>
+        <div class="metric">
+          <strong>2</strong>
+          <span>只读 review 命令</span>
+        </div>
+        <div class="metric">
+          <strong>1</strong>
+          <span>Codex 任务委托命令</span>
+        </div>
+        <div class="metric">
+          <strong>3</strong>
+          <span>后台任务管理命令</span>
+        </div>
+      </section>
+
+      <div class="toolbar">
+        <h2 id="viewTitle">全部命令</h2>
+        <div class="toolbar-actions">
+          <button class="action-button" id="expandAll" type="button">全部展开</button>
+          <button class="action-button" id="collapseAll" type="button">全部折叠</button>
+        </div>
+      </div>
+
+      <section class="cards" id="cards">
+        <article class="command-card open" data-command="setup" data-search="/codex:setup setup enable-review-gate disable-review-gate codex cli login review gate 安装 登录 检查">
+          <button class="command-header" type="button" aria-expanded="true">
+            <div>
+              <div class="command-title">
+                <code>/codex:setup</code>
+                <span class="badge">只读</span>
+              </div>
+              <div class="command-subtitle">检查 Codex CLI 是否可用、是否已登录，并可开关 stop-time review gate。</div>
+            </div>
+            <span class="chevron" aria-hidden="true">›</span>
+          </button>
+          <div class="command-body">
+            <div class="usage">
+              <h3 class="section-title">Usage</h3>
+              <pre><code>/codex:setup [--enable-review-gate|--disable-review-gate]</code></pre>
+            </div>
+            <div>
+              <h3 class="section-title">参数</h3>
+              <table>
+                <thead><tr><th>参数</th><th>含义</th></tr></thead>
+                <tbody>
+                  <tr><td data-label="参数"><code>--enable-review-gate</code></td><td data-label="含义">启用 stop-time review gate。Claude 停止前会触发 Codex review，发现问题时阻止结束。</td></tr>
+                  <tr><td data-label="参数"><code>--disable-review-gate</code></td><td data-label="含义">关闭 stop-time review gate。</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <ul class="notes">
+              <li><code>--enable-review-gate</code> 和 <code>--disable-review-gate</code> 不能同时使用。</li>
+              <li>如果缺少 Codex 且 npm 可用，Claude Code 会询问是否安装 <code>@openai/codex</code>。</li>
+            </ul>
+            <div class="examples">
+              <h3 class="section-title">示例</h3>
+              <div class="example"><pre><code>/codex:setup</code></pre><button class="copy" type="button" aria-label="复制示例">⧉</button></div>
+              <div class="example"><pre><code>/codex:setup --enable-review-gate</code></pre><button class="copy" type="button" aria-label="复制示例">⧉</button></div>
+              <div class="example"><pre><code>/codex:setup --disable-review-gate</code></pre><button class="copy" type="button" aria-label="复制示例">⧉</button></div>
+            </div>
+          </div>
+        </article>
+
+        <article class="command-card open" data-command="review" data-search="/codex:review review wait background base scope auto working-tree branch staged unstaged 普通 只读 代码审查">
+          <button class="command-header" type="button" aria-expanded="true">
+            <div>
+              <div class="command-title">
+                <code>/codex:review</code>
+                <span class="badge">只读</span>
+              </div>
+              <div class="command-subtitle">对当前工作区或分支差异运行普通 Codex review。</div>
+            </div>
+            <span class="chevron" aria-hidden="true">›</span>
+          </button>
+          <div class="command-body">
+            <div class="usage">
+              <h3 class="section-title">Usage</h3>
+              <pre><code>/codex:review [--wait|--background] [--base &lt;ref&gt;] [--scope auto|working-tree|branch]</code></pre>
+            </div>
+            <div>
+              <h3 class="section-title">参数</h3>
+              <table>
+                <thead><tr><th>参数</th><th>含义</th></tr></thead>
+                <tbody>
+                  <tr><td data-label="参数"><code>--wait</code></td><td data-label="含义">前台等待 review 完成。</td></tr>
+                  <tr><td data-label="参数"><code>--background</code></td><td data-label="含义">后台运行 review，之后用 <code>/codex:status</code> 和 <code>/codex:result</code> 查看。</td></tr>
+                  <tr><td data-label="参数"><code>--base &lt;ref&gt;</code></td><td data-label="含义">review 当前分支相对某个 git ref 的差异，例如 <code>main</code>。</td></tr>
+                  <tr><td data-label="参数"><code>--scope auto</code></td><td data-label="含义">自动选择 review 目标。工作区有改动时 review working tree，否则 review 当前分支相对默认分支的差异。</td></tr>
+                  <tr><td data-label="参数"><code>--scope working-tree</code></td><td data-label="含义">review 当前工作区改动，包括 staged、unstaged、untracked。</td></tr>
+                  <tr><td data-label="参数"><code>--scope branch</code></td><td data-label="含义">review 当前分支相对默认分支的差异。</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <ul class="notes">
+              <li>不支持额外 focus text。</li>
+              <li>不支持 staged-only 或 unstaged-only review。</li>
+              <li>需要自定义关注点时使用 <code>/codex:adversarial-review</code>。</li>
+            </ul>
+            <div class="examples">
+              <h3 class="section-title">示例</h3>
+              <div class="example"><pre><code>/codex:review</code></pre><button class="copy" type="button" aria-label="复制示例">⧉</button></div>
+              <div class="example"><pre><code>/codex:review --background</code></pre><button class="copy" type="button" aria-label="复制示例">⧉</button></div>
+              <div class="example"><pre><code>/codex:review --base main</code></pre><button class="copy" type="button" aria-label="复制示例">⧉</button></div>
+              <div class="example"><pre><code>/codex:review --scope working-tree --wait</code></pre><button class="copy" type="button" aria-label="复制示例">⧉</button></div>
+            </div>
+          </div>
+        </article>
+
+        <article class="command-card open" data-command="adversarial-review" data-search="/codex:adversarial-review adversarial review wait background base scope focus challenge race conditions rollback risks 设计 风险 挑战式">
+          <button class="command-header" type="button" aria-expanded="true">
+            <div>
+              <div class="command-title">
+                <code>/codex:adversarial-review</code>
+                <span class="badge">只读</span>
+              </div>
+              <div class="command-subtitle">挑战实现方向、设计取舍、隐藏假设和真实场景下的失败模式。</div>
+            </div>
+            <span class="chevron" aria-hidden="true">›</span>
+          </button>
+          <div class="command-body">
+            <div class="usage">
+              <h3 class="section-title">Usage</h3>
+              <pre><code>/codex:adversarial-review [--wait|--background] [--base &lt;ref&gt;] [--scope auto|working-tree|branch] [focus ...]</code></pre>
+            </div>
+            <div>
+              <h3 class="section-title">参数</h3>
+              <table>
+                <thead><tr><th>参数</th><th>含义</th></tr></thead>
+                <tbody>
+                  <tr><td data-label="参数"><code>--wait</code></td><td data-label="含义">前台等待 review 完成。</td></tr>
+                  <tr><td data-label="参数"><code>--background</code></td><td data-label="含义">后台运行 review。</td></tr>
+                  <tr><td data-label="参数"><code>--base &lt;ref&gt;</code></td><td data-label="含义">review 当前分支相对某个 git ref 的差异。</td></tr>
+                  <tr><td data-label="参数"><code>--scope auto</code></td><td data-label="含义">自动选择 review 目标。</td></tr>
+                  <tr><td data-label="参数"><code>--scope working-tree</code></td><td data-label="含义">review 当前工作区改动。</td></tr>
+                  <tr><td data-label="参数"><code>--scope branch</code></td><td data-label="含义">review 当前分支相对默认分支的差异。</td></tr>
+                  <tr><td data-label="参数"><code>focus ...</code></td><td data-label="含义">额外关注点，例如缓存设计、并发、回滚、权限边界等。</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <ul class="notes">
+              <li>不支持 <code>--scope staged</code> 或 <code>--scope unstaged</code>。</li>
+              <li>与 <code>/codex:review</code> 使用相同的 review 目标选择逻辑。</li>
+            </ul>
+            <div class="examples">
+              <h3 class="section-title">示例</h3>
+              <div class="example"><pre><code>/codex:adversarial-review</code></pre><button class="copy" type="button" aria-label="复制示例">⧉</button></div>
+              <div class="example"><pre><code>/codex:adversarial-review --base main challenge the caching and retry design</code></pre><button class="copy" type="button" aria-label="复制示例">⧉</button></div>
+              <div class="example"><pre><code>/codex:adversarial-review --background look for race conditions and rollback risks</code></pre><button class="copy" type="button" aria-label="复制示例">⧉</button></div>
+            </div>
+          </div>
+        </article>
+
+        <article class="command-card open" data-command="rescue" data-search="/codex:rescue rescue background wait resume fresh from-review review session model spark effort none minimal low medium high xhigh plan read-only write implement task 委托 实现 计划 修复">
+          <button class="command-header" type="button" aria-expanded="true">
+            <div>
+              <div class="command-title">
+                <code>/codex:rescue</code>
+                <span class="badge write">默认可能写文件</span>
+              </div>
+              <div class="command-subtitle">把调查、计划、review 结果修复或实现任务转交给 Codex。</div>
+            </div>
+            <span class="chevron" aria-hidden="true">›</span>
+          </button>
+          <div class="command-body">
+            <div class="usage">
+              <h3 class="section-title">Usage</h3>
+              <pre><code>/codex:rescue [--background|--wait] [--resume|--fresh] [--from-review &lt;review-job-id|session-id&gt;] [--model &lt;model|spark&gt;] [--effort &lt;none|minimal|low|medium|high|xhigh&gt;] [task ...]</code></pre>
+            </div>
+            <div>
+              <h3 class="section-title">参数</h3>
+              <table>
+                <thead><tr><th>参数</th><th>含义</th></tr></thead>
+                <tbody>
+                  <tr><td data-label="参数"><code>--background</code></td><td data-label="含义">后台运行 Codex 任务。</td></tr>
+                  <tr><td data-label="参数"><code>--wait</code></td><td data-label="含义">前台等待 Codex 任务完成。</td></tr>
+                  <tr><td data-label="参数"><code>--resume</code></td><td data-label="含义">继续当前或最近的 Codex rescue 线程。</td></tr>
+                  <tr><td data-label="参数"><code>--fresh</code></td><td data-label="含义">强制开启新的 Codex 线程。</td></tr>
+                  <tr><td data-label="参数"><code>--from-review &lt;id&gt;</code></td><td data-label="含义">从已完成的 review job id 或 Codex session id 生成修复任务。</td></tr>
+                  <tr><td data-label="参数"><code>--model &lt;model&gt;</code></td><td data-label="含义">指定 Codex 使用的模型，例如 <code>gpt-5.4-mini</code>。</td></tr>
+                  <tr><td data-label="参数"><code>--model spark</code></td><td data-label="含义"><code>spark</code> 是简写，会映射到 <code>gpt-5.3-codex-spark</code>。</td></tr>
+                  <tr><td data-label="参数"><code>--effort none|minimal|low|medium|high|xhigh</code></td><td data-label="含义">指定推理强度。</td></tr>
+                  <tr><td data-label="参数"><code>task ...</code></td><td data-label="含义">要 Codex 做的任务描述。</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <ul class="notes">
+              <li>默认倾向于 write-capable run，也就是 Codex 可能修改文件。</li>
+              <li><code>--from-review</code> 默认要求 Codex 对 review findings 做最小安全修复；如果 review 没有实质问题，Codex 应简短验证并避免无意义改动。</li>
+              <li>单独传一个看起来像 review id 的参数，例如 <code>/codex:rescue review-abc123</code>，等价于 <code>/codex:rescue --from-review review-abc123</code>。</li>
+              <li>只想要 plan、分析或诊断时，明确写 <code>read-only</code>、<code>plan only</code>、<code>do not edit files</code>，或中文“只分析，不要修改文件”。</li>
+              <li>不传 <code>--model</code> 或 <code>--effort</code> 时，Codex 使用默认选择。</li>
+            </ul>
+            <div class="examples">
+              <h3 class="section-title">示例</h3>
+              <div class="example"><pre><code>/codex:rescue --fresh investigate why tests are failing</code></pre><button class="copy" type="button" aria-label="复制示例">⧉</button></div>
+              <div class="example"><pre><code>/codex:rescue --background --model spark fix the failing login test</code></pre><button class="copy" type="button" aria-label="复制示例">⧉</button></div>
+              <div class="example"><pre><code>/codex:rescue --resume implement the previous plan</code></pre><button class="copy" type="button" aria-label="复制示例">⧉</button></div>
+              <div class="example"><pre><code>/codex:rescue --from-review review-abc123</code></pre><button class="copy" type="button" aria-label="复制示例">⧉</button></div>
+              <div class="example"><pre><code>/codex:rescue --from-review thr_review_session fix only the high severity finding</code></pre><button class="copy" type="button" aria-label="复制示例">⧉</button></div>
+              <div class="example"><pre><code>/codex:rescue --fresh --effort high read-only plan only: design the refactor, do not edit files</code></pre><button class="copy" type="button" aria-label="复制示例">⧉</button></div>
+            </div>
+          </div>
+        </article>
+
+        <article class="command-card open" data-command="status" data-search="/codex:status status job-id wait timeout-ms all poll progress 状态 后台 等待">
+          <button class="command-header" type="button" aria-expanded="true">
+            <div>
+              <div class="command-title">
+                <code>/codex:status</code>
+                <span class="badge">只读</span>
+              </div>
+              <div class="command-subtitle">查看当前仓库里运行中和近期的 Codex jobs。</div>
+            </div>
+            <span class="chevron" aria-hidden="true">›</span>
+          </button>
+          <div class="command-body">
+            <div class="usage">
+              <h3 class="section-title">Usage</h3>
+              <pre><code>/codex:status [job-id] [--wait] [--timeout-ms &lt;ms&gt;] [--all]</code></pre>
+            </div>
+            <div>
+              <h3 class="section-title">参数</h3>
+              <table>
+                <thead><tr><th>参数</th><th>含义</th></tr></thead>
+                <tbody>
+                  <tr><td data-label="参数"><code>job-id</code></td><td data-label="含义">查看某个具体 job 的详细状态。</td></tr>
+                  <tr><td data-label="参数"><code>--wait</code></td><td data-label="含义">等待指定 job 结束后再返回。</td></tr>
+                  <tr><td data-label="参数"><code>--timeout-ms &lt;ms&gt;</code></td><td data-label="含义">配合 <code>--wait</code> 使用，设置最长等待时间，单位毫秒。</td></tr>
+                  <tr><td data-label="参数"><code>--all</code></td><td data-label="含义">显示更多历史 jobs，而不只显示默认范围。</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <ul class="notes">
+              <li><code>--wait</code> 需要配合 <code>job-id</code> 使用。</li>
+            </ul>
+            <div class="examples">
+              <h3 class="section-title">示例</h3>
+              <div class="example"><pre><code>/codex:status</code></pre><button class="copy" type="button" aria-label="复制示例">⧉</button></div>
+              <div class="example"><pre><code>/codex:status --all</code></pre><button class="copy" type="button" aria-label="复制示例">⧉</button></div>
+              <div class="example"><pre><code>/codex:status task-abc123</code></pre><button class="copy" type="button" aria-label="复制示例">⧉</button></div>
+              <div class="example"><pre><code>/codex:status task-abc123 --wait --timeout-ms 300000</code></pre><button class="copy" type="button" aria-label="复制示例">⧉</button></div>
+            </div>
+          </div>
+        </article>
+
+        <article class="command-card open" data-command="result" data-search="/codex:result result job-id output final payload verdict summary findings 结果 输出">
+          <button class="command-header" type="button" aria-expanded="true">
+            <div>
+              <div class="command-title">
+                <code>/codex:result</code>
+                <span class="badge">只读</span>
+              </div>
+              <div class="command-subtitle">查看已完成 job 的最终输出。</div>
+            </div>
+            <span class="chevron" aria-hidden="true">›</span>
+          </button>
+          <div class="command-body">
+            <div class="usage">
+              <h3 class="section-title">Usage</h3>
+              <pre><code>/codex:result [job-id]</code></pre>
+            </div>
+            <div>
+              <h3 class="section-title">参数</h3>
+              <table>
+                <thead><tr><th>参数</th><th>含义</th></tr></thead>
+                <tbody>
+                  <tr><td data-label="参数"><code>job-id</code></td><td data-label="含义">指定要查看结果的 job。不传时通常查看最近的可用结果。</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="examples">
+              <h3 class="section-title">示例</h3>
+              <div class="example"><pre><code>/codex:result</code></pre><button class="copy" type="button" aria-label="复制示例">⧉</button></div>
+              <div class="example"><pre><code>/codex:result task-abc123</code></pre><button class="copy" type="button" aria-label="复制示例">⧉</button></div>
+            </div>
+          </div>
+        </article>
+
+        <article class="command-card open" data-command="cancel" data-search="/codex:cancel cancel job-id background stop interrupt 取消 后台 任务">
+          <button class="command-header" type="button" aria-expanded="true">
+            <div>
+              <div class="command-title">
+                <code>/codex:cancel</code>
+                <span class="badge">任务控制</span>
+              </div>
+              <div class="command-subtitle">取消一个正在运行的后台 Codex job。</div>
+            </div>
+            <span class="chevron" aria-hidden="true">›</span>
+          </button>
+          <div class="command-body">
+            <div class="usage">
+              <h3 class="section-title">Usage</h3>
+              <pre><code>/codex:cancel [job-id]</code></pre>
+            </div>
+            <div>
+              <h3 class="section-title">参数</h3>
+              <table>
+                <thead><tr><th>参数</th><th>含义</th></tr></thead>
+                <tbody>
+                  <tr><td data-label="参数"><code>job-id</code></td><td data-label="含义">指定要取消的 job。不传时会尝试取消当前可取消的 job。</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="examples">
+              <h3 class="section-title">示例</h3>
+              <div class="example"><pre><code>/codex:cancel</code></pre><button class="copy" type="button" aria-label="复制示例">⧉</button></div>
+              <div class="example"><pre><code>/codex:cancel task-abc123</code></pre><button class="copy" type="button" aria-label="复制示例">⧉</button></div>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <p class="empty" id="empty">没有匹配的命令或参数。</p>
+    </main>
+  </div>
+
+  <script>
+    const app = document.querySelector(".app");
+    const cards = Array.from(document.querySelectorAll(".command-card"));
+    const navButtons = Array.from(document.querySelectorAll(".nav button"));
+    const search = document.getElementById("search");
+    const viewTitle = document.getElementById("viewTitle");
+    const empty = document.getElementById("empty");
+    const titleByFilter = {
+      all: "全部命令",
+      setup: "/codex:setup",
+      review: "/codex:review",
+      "adversarial-review": "/codex:adversarial-review",
+      rescue: "/codex:rescue",
+      status: "/codex:status",
+      result: "/codex:result",
+      cancel: "/codex:cancel"
+    };
+
+    let activeFilter = "all";
+
+    function normalize(value) {
+      return value.trim().toLowerCase();
+    }
+
+    function applyFilters() {
+      const query = normalize(search.value);
+      let visible = 0;
+
+      cards.forEach((card) => {
+        const matchesFilter = activeFilter === "all" || card.dataset.command === activeFilter;
+        const text = `${card.dataset.search} ${card.textContent}`;
+        const matchesQuery = normalize(text).includes(query);
+        const show = matchesFilter && matchesQuery;
+        card.classList.toggle("hidden", !show);
+        if (show) visible += 1;
+      });
+
+      empty.classList.toggle("visible", visible === 0);
+      viewTitle.textContent = query ? `${titleByFilter[activeFilter]} · ${visible} 个匹配` : titleByFilter[activeFilter];
+    }
+
+    navButtons.forEach((button) => {
+      button.addEventListener("click", () => {
+        activeFilter = button.dataset.filter;
+        navButtons.forEach((item) => item.classList.toggle("active", item === button));
+        applyFilters();
+      });
+    });
+
+    search.addEventListener("input", applyFilters);
+
+    document.querySelectorAll(".command-header").forEach((header) => {
+      header.addEventListener("click", () => {
+        const card = header.closest(".command-card");
+        const open = !card.classList.contains("open");
+        card.classList.toggle("open", open);
+        header.setAttribute("aria-expanded", String(open));
+      });
+    });
+
+    document.getElementById("expandAll").addEventListener("click", () => {
+      cards.forEach((card) => {
+        card.classList.add("open");
+        card.querySelector(".command-header").setAttribute("aria-expanded", "true");
+      });
+    });
+
+    document.getElementById("collapseAll").addEventListener("click", () => {
+      cards.forEach((card) => {
+        card.classList.remove("open");
+        card.querySelector(".command-header").setAttribute("aria-expanded", "false");
+      });
+    });
+
+    document.getElementById("themeToggle").addEventListener("click", () => {
+      const next = app.dataset.theme === "dark" ? "light" : "dark";
+      app.dataset.theme = next;
+      localStorage.setItem("codexCommandTheme", next);
+    });
+
+    const savedTheme = localStorage.getItem("codexCommandTheme");
+    if (savedTheme === "dark" || savedTheme === "light") {
+      app.dataset.theme = savedTheme;
+    }
+
+    document.querySelectorAll(".copy").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const text = button.parentElement.querySelector("code").textContent;
+        try {
+          await navigator.clipboard.writeText(text);
+          button.textContent = "✓";
+          setTimeout(() => {
+            button.textContent = "⧉";
+          }, 900);
+        } catch {
+          button.textContent = "!";
+          setTimeout(() => {
+            button.textContent = "⧉";
+          }, 900);
+        }
+      });
+    });
+
+    applyFilters();
+  </script>
+</body>
+</html>

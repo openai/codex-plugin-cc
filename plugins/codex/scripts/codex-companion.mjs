@@ -77,7 +77,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--from-review <review-id|session-id>] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
@@ -625,6 +625,108 @@ function requireTaskRequest(prompt, resumeLast) {
   }
 }
 
+function looksLikeReviewReference(value) {
+  return /^review[-_][a-z0-9._-]+$/i.test(String(value ?? "")) || /^thr[_-][a-z0-9._-]+$/i.test(String(value ?? ""));
+}
+
+function shouldUseReviewReferenceShorthand(options, positionals) {
+  return !options["from-review"] && !options["prompt-file"] && positionals.length === 1 && looksLikeReviewReference(positionals[0]);
+}
+
+function selectStoredReviewOutput(storedJob) {
+  const candidates = [
+    storedJob?.rendered,
+    storedJob?.result?.codex?.stdout,
+    storedJob?.result?.rawOutput,
+    storedJob?.result?.rawOutput?.stdout,
+    storedJob?.result?.codex?.stderr
+  ];
+
+  return candidates.find((value) => typeof value === "string" && value.trim())?.trim() ?? "";
+}
+
+function resolveReviewJobForTask(cwd, reference) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  const ref = String(reference ?? "").trim();
+  if (!ref) {
+    throw new Error("Provide a review job id or Codex session id after --from-review.");
+  }
+
+  const exactJob = jobs.find((job) => job.id === ref);
+  if (exactJob) {
+    if (exactJob.jobClass !== "review") {
+      throw new Error(`Job "${ref}" is not a review job.`);
+    }
+    return { workspaceRoot, job: exactJob };
+  }
+
+  const prefixMatches = jobs.filter((job) => job.id?.startsWith(ref));
+  if (prefixMatches.length > 1) {
+    throw new Error(`Review reference "${ref}" is ambiguous. Use a longer job id or the Codex session id.`);
+  }
+  if (prefixMatches.length === 1) {
+    const [job] = prefixMatches;
+    if (job.jobClass !== "review") {
+      throw new Error(`Job "${ref}" is not a review job.`);
+    }
+    return { workspaceRoot, job };
+  }
+
+  const threadMatches = jobs.filter((job) => job.jobClass === "review" && job.threadId === ref);
+  if (threadMatches.length > 1) {
+    throw new Error(`Review session id "${ref}" is ambiguous. Use the review job id instead.`);
+  }
+  if (threadMatches.length === 1) {
+    return { workspaceRoot, job: threadMatches[0] };
+  }
+
+  throw new Error(`No review job found for "${ref}". Run /codex:status --all to list known jobs.`);
+}
+
+function buildPromptFromReviewResult(cwd, reference, extraInstructions) {
+  const { workspaceRoot, job } = resolveReviewJobForTask(cwd, reference);
+  const storedJob = readStoredJob(workspaceRoot, job.id);
+  if (!storedJob) {
+    throw new Error(`Review job "${job.id}" has no stored result payload.`);
+  }
+  if (job.status !== "completed" && storedJob.status !== "completed") {
+    throw new Error(`Review job "${job.id}" is ${job.status ?? storedJob.status ?? "not completed"}; only completed review jobs can be rescued.`);
+  }
+
+  const reviewOutput = selectStoredReviewOutput(storedJob);
+  if (!reviewOutput) {
+    throw new Error(`Review job "${job.id}" has no captured review output to rescue.`);
+  }
+
+  const instructions = String(extraInstructions ?? "").trim();
+  const metadata = [
+    `Review job id: ${job.id}`,
+    `Review kind: ${job.kindLabel ?? job.kind ?? "review"}`,
+    `Review target: ${job.summary ?? storedJob.targetLabel ?? "unknown"}`,
+    `Codex review session id: ${storedJob.threadId ?? job.threadId ?? "unknown"}`
+  ].join("\n");
+
+  return [
+    "Apply the smallest safe fixes for the actionable findings from this Codex review.",
+    "",
+    "Rules:",
+    "- Preserve unrelated behavior and avoid broad refactors.",
+    "- If the review says there are no material findings, verify briefly and do not make unnecessary edits.",
+    "- Run focused relevant checks when available. If a check cannot be run, report why.",
+    "- In the final response, summarize the changes and verification.",
+    "",
+    "Review metadata:",
+    metadata,
+    "",
+    "Review output:",
+    "```text",
+    reviewOutput,
+    "```",
+    ...(instructions ? ["", "Additional user instructions:", instructions] : [])
+  ].join("\n");
+}
+
 async function runForegroundCommand(job, runner, options = {}) {
   const { logFile, progress } = createTrackedProgress(job, {
     logFile: options.logFile,
@@ -731,7 +833,7 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "from-review"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
     aliasMap: {
       m: "model"
@@ -742,7 +844,11 @@ async function handleTask(argv) {
   const workspaceRoot = resolveCommandWorkspace(options);
   const model = normalizeRequestedModel(options.model);
   const effort = normalizeReasoningEffort(options.effort);
-  const prompt = readTaskPrompt(cwd, options, positionals);
+  const useReviewShorthand = shouldUseReviewReferenceShorthand(options, positionals);
+  const fromReview = options["from-review"] ?? (useReviewShorthand ? positionals[0] : null);
+  const prompt = fromReview
+    ? buildPromptFromReviewResult(cwd, fromReview, useReviewShorthand ? "" : readTaskPrompt(cwd, options, positionals))
+    : readTaskPrompt(cwd, options, positionals);
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
   const fresh = Boolean(options.fresh);
