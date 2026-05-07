@@ -2121,3 +2121,55 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
   assert.equal(payload.sessionRuntime.mode, "shared");
   assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
 });
+
+test("task fails fast when an app-server JSON-RPC request never receives a response", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "hang-rpc-thread-start");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    CODEX_APP_SERVER_RPC_TIMEOUT_MS: "200"
+  };
+  const startedAt = Date.now();
+  const result = run("node", [SCRIPT, "task", "rpc hang check"], {
+    cwd: repo,
+    env
+  });
+  const elapsed = Date.now() - startedAt;
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr + result.stdout, /timed out after 200ms/);
+  // Should fail well before any default 30s timeout — give plenty of slack for
+  // node startup + IPC, but assert we did not silently wait minutes.
+  assert.ok(elapsed < 15000, `expected fast timeout, took ${elapsed}ms`);
+});
+
+test("task fails fast when the app-server stops emitting notifications mid-turn", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "hang-after-turn-start");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    CODEX_TURN_IDLE_TIMEOUT_MS: "200"
+  };
+  const startedAt = Date.now();
+  const result = run("node", [SCRIPT, "task", "turn idle hang check"], {
+    cwd: repo,
+    env
+  });
+  const elapsed = Date.now() - startedAt;
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr + result.stdout, /turn idle timeout after 200ms/);
+  assert.ok(elapsed < 15000, `expected fast turn-idle timeout, took ${elapsed}ms`);
+});
