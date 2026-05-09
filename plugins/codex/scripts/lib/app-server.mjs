@@ -14,6 +14,7 @@ import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
+import { cleanProtocolLine } from "./jsonl.mjs";
 import { terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
@@ -114,16 +115,20 @@ class AppServerClientBase {
     }
   }
 
-  handleLine(line) {
-    if (!line.trim()) {
+  handleLine(rawLine) {
+    const candidate = cleanProtocolLine(rawLine);
+    if (candidate === null) {
+      // Empty line, terminal noise (issue #23), or localized OS messages
+      // (e.g. CP-950 mojibaked taskkill SUCCESS on Windows zh-TW). Drop
+      // it instead of tearing the connection down — see lib/jsonl.mjs.
       return;
     }
 
     let message;
     try {
-      message = JSON.parse(line);
+      message = JSON.parse(candidate);
     } catch (error) {
-      this.handleExit(createProtocolError(`Failed to parse codex app-server JSONL: ${error.message}`, { line }));
+      this.handleExit(createProtocolError(`Failed to parse codex app-server JSONL: ${error.message}`, { line: rawLine }));
       return;
     }
 
