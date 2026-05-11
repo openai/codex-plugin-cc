@@ -235,15 +235,115 @@ async function handleSetup(argv) {
   outputResult(options.json ? finalReport : renderSetupReport(finalReport), options.json);
 }
 
-function buildAdversarialReviewPrompt(context, focusText) {
+// Codex API thread input cap is 1048576 chars. Leave safety margin for system
+// prompt / thread metadata that the API stitches onto every turn.
+export const MAX_ADVERSARIAL_PROMPT_CHARS = 900 * 1024;
+export const MAX_ADVERSARIAL_PROMPT_BYTES = 850 * 1024;
+const LIGHTWEIGHT_COLLECTION_GUIDANCE =
+  "The repository context below is a lightweight summary because the full diff exceeded the prompt size budget. Inspect the target diff yourself with read-only git commands before finalizing findings.";
+const TRUNCATION_NOTICE_TEMPLATE = "\n\n[truncated: REVIEW_INPUT was trimmed by {{DROPPED}} bytes to keep the prompt within the Codex API input budget]\n";
+
+function measurePromptSize(text) {
+  return {
+    bytes: Buffer.byteLength(text, "utf8"),
+    chars: [...text].length
+  };
+}
+
+function fitsBudget(text) {
+  const { bytes, chars } = measurePromptSize(text);
+  return bytes <= MAX_ADVERSARIAL_PROMPT_BYTES && chars <= MAX_ADVERSARIAL_PROMPT_CHARS;
+}
+
+function renderAdversarialPromptTemplate(values) {
   const template = loadPromptTemplate(ROOT_DIR, "adversarial-review");
-  return interpolateTemplate(template, {
+  return interpolateTemplate(template, values);
+}
+
+function trimContentToBudget(content, fixedOverheadText) {
+  // Binary search the largest content prefix that keeps the rendered prompt
+  // within both the byte and char budgets. Account for the constant overhead
+  // of every other interpolated placeholder so the answer is precise.
+  const overhead = measurePromptSize(fixedOverheadText);
+  const byteHeadroom = MAX_ADVERSARIAL_PROMPT_BYTES - overhead.bytes;
+  const charHeadroom = MAX_ADVERSARIAL_PROMPT_CHARS - overhead.chars;
+  if (byteHeadroom <= 0 || charHeadroom <= 0) {
+    return "";
+  }
+  // Reserve room for the truncation notice that will be appended.
+  const notice = TRUNCATION_NOTICE_TEMPLATE.replace("{{DROPPED}}", String(content.length));
+  const noticeSize = measurePromptSize(notice);
+  const byteLimit = Math.max(0, byteHeadroom - noticeSize.bytes);
+  const charLimit = Math.max(0, charHeadroom - noticeSize.chars);
+  if (byteLimit === 0 || charLimit === 0) {
+    return "";
+  }
+
+  let lo = 0;
+  let hi = content.length;
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi + 1) / 2);
+    const candidate = content.slice(0, mid);
+    const { bytes, chars } = measurePromptSize(candidate);
+    if (bytes <= byteLimit && chars <= charLimit) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return content.slice(0, lo);
+}
+
+export function buildAdversarialReviewPrompt(context, focusText) {
+  const targetLabel = context.target.label;
+  const userFocus = focusText || "No extra focus provided.";
+  const collectionGuidance = context.collectionGuidance;
+  const content = typeof context.content === "string" ? context.content : "";
+
+  const fullPrompt = renderAdversarialPromptTemplate({
     REVIEW_KIND: "Adversarial Review",
-    TARGET_LABEL: context.target.label,
-    USER_FOCUS: focusText || "No extra focus provided.",
-    REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
-    REVIEW_INPUT: context.content
+    TARGET_LABEL: targetLabel,
+    USER_FOCUS: userFocus,
+    REVIEW_COLLECTION_GUIDANCE: collectionGuidance,
+    REVIEW_INPUT: content
   });
+  if (fitsBudget(fullPrompt)) {
+    return fullPrompt;
+  }
+
+  // Fallback 1: trim REVIEW_INPUT until the rendered prompt fits the budget.
+  const fixedOverheadPrompt = renderAdversarialPromptTemplate({
+    REVIEW_KIND: "Adversarial Review",
+    TARGET_LABEL: targetLabel,
+    USER_FOCUS: userFocus,
+    REVIEW_COLLECTION_GUIDANCE: collectionGuidance,
+    REVIEW_INPUT: ""
+  });
+  const trimmed = trimContentToBudget(content, fixedOverheadPrompt);
+  if (trimmed.length > 0) {
+    const droppedBytes = Buffer.byteLength(content, "utf8") - Buffer.byteLength(trimmed, "utf8");
+    const notice = TRUNCATION_NOTICE_TEMPLATE.replace("{{DROPPED}}", String(droppedBytes));
+    const trimmedPrompt = renderAdversarialPromptTemplate({
+      REVIEW_KIND: "Adversarial Review",
+      TARGET_LABEL: targetLabel,
+      USER_FOCUS: userFocus,
+      REVIEW_COLLECTION_GUIDANCE: collectionGuidance,
+      REVIEW_INPUT: trimmed + notice
+    });
+    if (fitsBudget(trimmedPrompt)) {
+      return trimmedPrompt;
+    }
+  }
+
+  // Fallback 2: drop REVIEW_INPUT entirely and switch to self-collect guidance.
+  const lightweightPrompt = renderAdversarialPromptTemplate({
+    REVIEW_KIND: "Adversarial Review",
+    TARGET_LABEL: targetLabel,
+    USER_FOCUS: userFocus,
+    REVIEW_COLLECTION_GUIDANCE: LIGHTWEIGHT_COLLECTION_GUIDANCE,
+    REVIEW_INPUT: "[truncated: the diff was too large to inline; collect it with read-only git commands such as `git diff` and `git log`.]"
+  });
+  return lightweightPrompt;
 }
 
 function ensureCodexAvailable(cwd) {
@@ -1020,8 +1120,21 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${message}\n`);
-  process.exitCode = 1;
-});
+function isDirectInvocation() {
+  if (!process.argv[1]) {
+    return false;
+  }
+  try {
+    return fileURLToPath(import.meta.url) === fs.realpathSync(process.argv[1]);
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectInvocation()) {
+  main().catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${message}\n`);
+    process.exitCode = 1;
+  });
+}
