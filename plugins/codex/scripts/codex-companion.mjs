@@ -69,6 +69,10 @@ const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
+const MAX_PROMPT_BYTES = 800 * 1024;
+const TRUNCATION_MARKER = "\n\n[content truncated to fit prompt size limit]\n";
+const LIGHTWEIGHT_GUIDANCE =
+  "The repository context below is a lightweight summary. Inspect the target diff yourself with read-only git commands before finalizing findings.";
 
 function printUsage() {
   console.log(
@@ -235,15 +239,114 @@ async function handleSetup(argv) {
   outputResult(options.json ? finalReport : renderSetupReport(finalReport), options.json);
 }
 
-function buildAdversarialReviewPrompt(context, focusText) {
+export function buildAdversarialReviewPrompt(context, focusText) {
   const template = loadPromptTemplate(ROOT_DIR, "adversarial-review");
+  const initial = renderAdversarialReviewPrompt(
+    template,
+    context,
+    focusText,
+    context.collectionGuidance,
+    context.content
+  );
+  if (Buffer.byteLength(initial, "utf8") <= MAX_PROMPT_BYTES) {
+    return initial;
+  }
+
+  const lightweightContent = buildLightweightAdversarialReviewContent(context);
+  const lightweight = renderAdversarialReviewPrompt(
+    template,
+    context,
+    focusText,
+    LIGHTWEIGHT_GUIDANCE,
+    lightweightContent
+  );
+  if (Buffer.byteLength(lightweight, "utf8") <= MAX_PROMPT_BYTES && lightweightContent !== context.content) {
+    return lightweight;
+  }
+
+  const overhead = Buffer.byteLength(
+    renderAdversarialReviewPrompt(template, context, focusText, LIGHTWEIGHT_GUIDANCE, ""),
+    "utf8"
+  );
+  const budget = MAX_PROMPT_BYTES - overhead - Buffer.byteLength(TRUNCATION_MARKER, "utf8");
+
+  if (budget < 0) {
+    return hardTruncateWithMarker(
+      renderAdversarialReviewPrompt(template, context, "", LIGHTWEIGHT_GUIDANCE, ""),
+      MAX_PROMPT_BYTES
+    );
+  }
+
+  return renderAdversarialReviewPrompt(
+    template,
+    context,
+    focusText,
+    LIGHTWEIGHT_GUIDANCE,
+    `${truncateToByteBudget(lightweightContent, budget)}${TRUNCATION_MARKER}`
+  );
+}
+
+function renderAdversarialReviewPrompt(template, context, focusText, guidance, content) {
   return interpolateTemplate(template, {
     REVIEW_KIND: "Adversarial Review",
     TARGET_LABEL: context.target.label,
     USER_FOCUS: focusText || "No extra focus provided.",
-    REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
-    REVIEW_INPUT: context.content
+    REVIEW_COLLECTION_GUIDANCE: guidance,
+    REVIEW_INPUT: content
   });
+}
+
+function buildLightweightAdversarialReviewContent(context) {
+  const parts = [];
+
+  if (context.summary) {
+    parts.push(`Summary: ${context.summary}`);
+  }
+  if (Array.isArray(context.changedFiles) && context.changedFiles.length > 0) {
+    parts.push(`Changed files (${context.changedFiles.length}):\n${context.changedFiles.slice(0, 50).join("\n")}`);
+  } else if (typeof context.fileCount === "number") {
+    parts.push(`Changed file count: ${context.fileCount}`);
+  }
+
+  return parts.length > 0 ? parts.join("\n\n") : context.content;
+}
+
+function truncateToByteBudget(value, maxBytes) {
+  if (maxBytes <= 0) {
+    return "";
+  }
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) {
+    return value;
+  }
+
+  const buffer = Buffer.from(value, "utf8");
+  let end = Math.min(maxBytes, buffer.length);
+  // Avoid ending mid-sequence so the truncated prompt stays valid UTF-8.
+  while (end > 0 && (buffer[end] & 0xc0) === 0x80) {
+    end -= 1;
+  }
+  return buffer.subarray(0, end).toString("utf8");
+}
+
+function hardTruncateWithMarker(value, maxBytes) {
+  const head = truncateToByteBudget(
+    value,
+    Math.max(0, maxBytes - Buffer.byteLength(TRUNCATION_MARKER, "utf8"))
+  );
+  return `${head}${TRUNCATION_MARKER}`;
+}
+
+function isDirectExecution() {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  const moduleFile = fileURLToPath(import.meta.url);
+  // Compare canonical (realpath) forms so symlinked install paths
+  // (plugin cache, macOS /var vs /private/var) still match the script.
+  try {
+    return fs.realpathSync.native(entry) === fs.realpathSync.native(moduleFile);
+  } catch {
+    return path.resolve(entry) === moduleFile;
+  }
 }
 
 function ensureCodexAvailable(cwd) {
@@ -1020,8 +1123,10 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${message}\n`);
-  process.exitCode = 1;
-});
+if (isDirectExecution()) {
+  main().catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${message}\n`);
+    process.exitCode = 1;
+  });
+}
