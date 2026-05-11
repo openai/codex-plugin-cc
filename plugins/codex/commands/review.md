@@ -24,7 +24,7 @@ Execution mode rules:
   - For base-branch review, use `git diff --shortstat <base>...HEAD`.
   - Treat untracked files or directories as reviewable work even when `git diff --shortstat` is empty.
   - Only conclude there is nothing to review when the relevant working-tree status is empty or the explicit branch diff is empty.
-  - Recommend waiting only when the review is clearly tiny, roughly 1-2 files total and no sign of a broader directory-sized change.
+  - Recommend waiting when the review is small, roughly up to 5 files or 200 lines of diff, with no sign of a broader directory-sized change. Codex finishes within Claude's prompt cache window (5 minutes) for diffs of this size, so wait in the foreground and the result feeds the next step.
   - In every other case, including unclear size, recommend background.
   - When in doubt, run the review instead of declaring that there is nothing to review.
 - Then use `AskUserQuestion` exactly once with two options, putting the recommended option first and suffixing its label with `(Recommended)`:
