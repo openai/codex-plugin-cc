@@ -249,6 +249,68 @@ Then check in with:
 /codex:result
 ```
 
+## Troubleshooting
+
+### Tasks complete but `apply_patch` and shell tools fail (bwrap sandbox error)
+
+**Symptom.** A task launched via `/codex:rescue` (or any `task` command that needs write access) finishes with status `completed`, but the result summary reports that `apply_patch` failed and that the shell sandbox could not initialize. The Codex worker logs show:
+
+```
+bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted
+```
+
+The wrapper's launch, poll, and result lifecycle look healthy. Only the Codex worker's filesystem mutations fail, which makes the failure easy to misdiagnose as a model issue.
+
+**Cause.** Codex uses [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) to sandbox tool calls. On some hosts — VPS instances, restricted LXC containers, kernels built with `kernel.unprivileged_userns_clone=0`, and managed runtimes that drop `CAP_NET_ADMIN` or `CAP_SYS_ADMIN` — `bwrap` is denied permission to create a network namespace and exits before the worker can run `apply_patch` or the shell tool.
+
+See also:
+- [#240 — Plugin overrides Codex sandbox config and can trigger bwrap failures](https://github.com/openai/codex-plugin-cc/issues/240)
+- [#304 — codex-companion.mjs hardcodes workspace-write sandbox for write tasks](https://github.com/openai/codex-plugin-cc/issues/304)
+
+### Diagnose
+
+Run this one-liner on the host to confirm `bwrap` cannot create a network namespace:
+
+```bash
+bwrap --bind / / --dev /dev --proc /proc --unshare-net true
+```
+
+If it prints the `loopback: Failed RTM_NEWADDR: Operation not permitted` error, `bwrap` is broken on this host and any Codex tool call that touches the sandbox will fail in the same way.
+
+### Workaround A — fix the host (preferred)
+
+When you control the host, allow unprivileged user namespaces:
+
+```bash
+sudo sysctl -w kernel.unprivileged_userns_clone=1
+echo 'kernel.unprivileged_userns_clone=1' | sudo tee /etc/sysctl.d/99-userns.conf
+```
+
+This resolves the underlying capability problem and keeps the Codex sandbox active. Some managed environments (shared LXC, certain serverless or container runtimes) do not allow this sysctl. In those cases use workaround B.
+
+### Workaround B — accept reduced sandboxing (host-isolated environments only)
+
+Only use this when the host itself is already an isolated, single-purpose environment (for example a disposable VPS used solely for this work). Do **not** use it on a personal workstation.
+
+Set the following in `~/.codex/config.toml`:
+
+```toml
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+```
+
+This config alone is **not sufficient today**: `plugins/codex/scripts/codex-companion.mjs` passes an explicit `sandbox` value per turn (`workspace-write` for write tasks, `read-only` otherwise) that overrides the config default. Until one of the in-flight code PRs lands — [#147](https://github.com/openai/codex-plugin-cc/pull/147), [#226](https://github.com/openai/codex-plugin-cc/pull/226), [#241](https://github.com/openai/codex-plugin-cc/pull/241), [#260](https://github.com/openai/codex-plugin-cc/pull/260) — the companion will still impose a sandbox. Two options in the meantime:
+
+- Wait for one of the above PRs to merge.
+- Run Codex outside the companion when you need a write task to succeed on a `bwrap`-restricted host:
+
+  ```bash
+  codex exec --dangerously-bypass-approvals-and-sandbox
+  ```
+
+> [!WARNING]
+> Workaround B grants Codex full filesystem access as the running user. Do not enable it on any machine that holds sensitive data outside the workspace.
+
 ## Codex Integration
 
 The Codex plugin wraps the [Codex app server](https://developers.openai.com/codex/app-server). It uses the global `codex` binary installed in your environment and [applies the same configuration](https://developers.openai.com/codex/config-basic).
