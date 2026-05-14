@@ -1,12 +1,14 @@
 import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
+import { INVOKER_VALUES } from "./invoker.mjs";
 import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
 export const DEFAULT_MAX_PROGRESS_LINES = 4;
+export const REVIEW_INVOKER_BREAKDOWN_WINDOW_MS = 60 * 60_000;
 
 export function sortJobsNewestFirst(jobs) {
   return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
@@ -44,6 +46,58 @@ function getJobTypeLabel(job) {
     return "rescue";
   }
   return "job";
+}
+
+function isReviewJob(job) {
+  return job.jobClass === "review" || job.kind === "review" || job.kind === "adversarial-review";
+}
+
+function getReviewJobInvoker(job) {
+  if (!isReviewJob(job)) {
+    return null;
+  }
+  return INVOKER_VALUES.includes(job.invoker) ? job.invoker : "unknown";
+}
+
+function getJobCreatedMs(job) {
+  const timestamp = Date.parse(job.createdAt ?? job.startedAt ?? job.updatedAt ?? "");
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function buildReviewInvokerBreakdown(jobs, options = {}) {
+  const nowMs = typeof options.now === "number" ? options.now : Date.now();
+  const cutoff = nowMs - REVIEW_INVOKER_BREAKDOWN_WINDOW_MS;
+  const byInvoker = Object.fromEntries(INVOKER_VALUES.map((invoker) => [invoker, 0]));
+  let unknown = 0;
+  let total = 0;
+
+  for (const job of jobs) {
+    if (!isReviewJob(job)) {
+      continue;
+    }
+    const createdMs = getJobCreatedMs(job);
+    if (createdMs == null || createdMs < cutoff || createdMs > nowMs) {
+      continue;
+    }
+
+    total += 1;
+    const invoker = getReviewJobInvoker(job);
+    if (invoker === "unknown") {
+      unknown += 1;
+    } else {
+      byInvoker[invoker] += 1;
+    }
+  }
+
+  if (unknown > 0) {
+    byInvoker.unknown = unknown;
+  }
+
+  return {
+    windowMs: REVIEW_INVOKER_BREAKDOWN_WINDOW_MS,
+    total,
+    byInvoker
+  };
 }
 
 function stripLogPrefix(line) {
@@ -163,6 +217,7 @@ export function enrichJob(job, options = {}) {
   const enriched = {
     ...job,
     kindLabel: getJobTypeLabel(job),
+    invoker: isReviewJob(job) ? getReviewJobInvoker(job) : (job.invoker ?? null),
     progressPreview:
       job.status === "queued" || job.status === "running" || job.status === "failed"
         ? readJobProgressPreview(job.logFile, maxProgressLines)
@@ -213,7 +268,8 @@ function matchJobReference(jobs, reference, predicate = () => true) {
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
-  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), options));
+  const workspaceJobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  const jobs = filterJobsForCurrentSession(workspaceJobs, options);
   const maxJobs = options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS;
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
 
@@ -235,6 +291,7 @@ export function buildStatusSnapshot(cwd, options = {}) {
     running,
     latestFinished,
     recent,
+    reviewInvokerBreakdown: buildReviewInvokerBreakdown(workspaceJobs, options),
     needsReview: Boolean(config.stopReviewGate)
   };
 }

@@ -22,8 +22,15 @@ import {
   } from "./lib/codex.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
+import { assertInvoker, DEFAULT_INVOKER } from "./lib/invoker.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
+import { enforceReviewRateLimit } from "./lib/review-rate-limit.mjs";
+import {
+  areReviewSubagentsMaterialized,
+  materializeReviewSubagents,
+  removeReviewSubagents
+} from "./lib/review-subagents.mjs";
 import {
   generateJobId,
   getConfig,
@@ -75,7 +82,7 @@ function printUsage() {
   console.log(
     [
       "Usage:",
-      "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
+      "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--enable-review-subagents|--disable-review-subagents] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
@@ -205,6 +212,7 @@ async function buildSetupReport(cwd, actionsTaken = []) {
     auth: authStatus,
     sessionRuntime: getSessionRuntimeStatus(process.env, workspaceRoot),
     reviewGateEnabled: Boolean(config.stopReviewGate),
+    reviewSubagentsEnabled: areReviewSubagentsMaterialized(ROOT_DIR),
     actionsTaken,
     nextSteps
   };
@@ -213,11 +221,20 @@ async function buildSetupReport(cwd, actionsTaken = []) {
 async function handleSetup(argv) {
   const { options } = parseCommandInput(argv, {
     valueOptions: ["cwd"],
-    booleanOptions: ["json", "enable-review-gate", "disable-review-gate"]
+    booleanOptions: [
+      "json",
+      "enable-review-gate",
+      "disable-review-gate",
+      "enable-review-subagents",
+      "disable-review-subagents"
+    ]
   });
 
   if (options["enable-review-gate"] && options["disable-review-gate"]) {
     throw new Error("Choose either --enable-review-gate or --disable-review-gate.");
+  }
+  if (options["enable-review-subagents"] && options["disable-review-subagents"]) {
+    throw new Error("Choose either --enable-review-subagents or --disable-review-subagents.");
   }
 
   const cwd = resolveCommandCwd(options);
@@ -230,6 +247,14 @@ async function handleSetup(argv) {
   } else if (options["disable-review-gate"]) {
     setConfig(workspaceRoot, "stopReviewGate", false);
     actionsTaken.push(`Disabled the stop-time review gate for ${workspaceRoot}.`);
+  }
+
+  if (options["enable-review-subagents"]) {
+    materializeReviewSubagents(ROOT_DIR);
+    actionsTaken.push("Enabled Codex review subagents.");
+  } else if (options["disable-review-subagents"]) {
+    removeReviewSubagents(ROOT_DIR);
+    actionsTaken.push("Disabled Codex review subagents.");
   }
 
   const finalReport = await buildSetupReport(cwd, actionsTaken);
@@ -566,7 +591,7 @@ function getJobKindLabel(kind, jobClass) {
   return jobClass === "review" ? "review" : "rescue";
 }
 
-function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false }) {
+function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false, invoker = null }) {
   return createJobRecord({
     id: generateJobId(prefix),
     kind,
@@ -575,7 +600,8 @@ function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summ
     workspaceRoot,
     jobClass,
     summary,
-    write
+    write,
+    ...(invoker ? { invoker } : {})
   });
 }
 
@@ -685,9 +711,26 @@ function enqueueBackgroundTask(cwd, job, request) {
   };
 }
 
+function countLongOption(argv, optionName) {
+  let count = 0;
+  for (const token of normalizeArgv(argv)) {
+    if (token === "--") {
+      break;
+    }
+    if (token === `--${optionName}` || token.startsWith(`--${optionName}=`)) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
 async function handleReviewCommand(argv, config) {
+  if (countLongOption(argv, "invoker") > 1) {
+    throw new Error("--invoker may only be specified once.");
+  }
+
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+    valueOptions: ["base", "scope", "model", "cwd", "invoker"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
       m: "model"
@@ -696,6 +739,15 @@ async function handleReviewCommand(argv, config) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
+  const invoker = assertInvoker(options.invoker ?? DEFAULT_INVOKER);
+  enforceReviewRateLimit({
+    workspaceRoot,
+    invoker,
+    env: process.env,
+    now: Date.now(),
+    listJobs,
+    warn: (message) => process.stderr.write(`${message}\n`)
+  });
   const focusText = positionals.join(" ").trim();
   const target = resolveReviewTarget(cwd, {
     base: options.base,
@@ -716,7 +768,8 @@ async function handleReviewCommand(argv, config) {
     title: metadata.title,
     workspaceRoot,
     jobClass: "review",
-    summary: metadata.summary
+    summary: metadata.summary,
+    invoker
   });
   await runForegroundCommand(
     job,

@@ -4,6 +4,18 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 
+// Tests may run from an active plugin session; keep fixtures on isolated temp state.
+for (const key of [
+  "CLAUDE_PLUGIN_DATA",
+  "CODEX_COMPANION_APP_SERVER_ENDPOINT",
+  "CODEX_COMPANION_SESSION_ID",
+  "CODEX_PLUGIN_REVIEW_RATE_LIMIT",
+  "CODEX_PLUGIN_TURN_SANDBOX",
+  "CODEX_PLUGIN_TURN_SANDBOX_NETWORK"
+]) {
+  delete process.env[key];
+}
+
 export function makeTempDir(prefix = "codex-plugin-test-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }

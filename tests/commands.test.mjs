@@ -4,11 +4,27 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
+import { makeTempDir } from "./helpers.mjs";
+import {
+  getReviewSubagentTargets,
+  materializeReviewSubagents
+} from "../plugins/codex/scripts/lib/review-subagents.mjs";
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 
 function read(relativePath) {
   return fs.readFileSync(path.join(PLUGIN_ROOT, relativePath), "utf8");
+}
+
+function splitFrontmatter(source) {
+  const match = /^---\n([\s\S]*?)\n---\n([\s\S]*)$/.exec(source);
+  assert.ok(match, "expected YAML frontmatter");
+  return { frontmatter: match[1], body: match[2] };
+}
+
+function countOccurrences(source, needle) {
+  return source.split(needle).length - 1;
 }
 
 test("review command uses AskUserQuestion and background Bash while staying review-only", () => {
@@ -168,6 +184,34 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(readme, /### `\/codex:cancel`/);
 });
 
+test("materialized review subagents stay narrow Bash forwarders", () => {
+  const pluginRoot = makeTempDir();
+  materializeReviewSubagents(pluginRoot);
+
+  for (const target of getReviewSubagentTargets(pluginRoot)) {
+    const source = fs.readFileSync(target.targetPath, "utf8");
+    const { frontmatter, body } = splitFrontmatter(source);
+
+    assert.match(frontmatter, /^description: Use ONLY when explicitly asked/m);
+    assert.match(frontmatter, /^tools: Bash$/m);
+    assert.match(frontmatter, /^skills:\n  - codex-cli-runtime$/m);
+    assert.doesNotMatch(`${frontmatter}\n${body}`, /\b(?:Read|Glob|Grep|Edit)\b/);
+    assert.equal(countOccurrences(body, "`Bash`"), 1);
+    assert.equal(countOccurrences(body, `node "\${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs"`), 1);
+    assert.equal(countOccurrences(body, "--invoker claude-subagent"), 1);
+    assert.match(
+      body,
+      new RegExp(
+        `\`\`\`shell\\nnode "\\$\\{CLAUDE_PLUGIN_ROOT\\}/scripts/codex-companion\\.mjs" ${target.command} --invoker claude-subagent --\\n\`\`\``
+      )
+    );
+    assert.match(body, /pass each user argument as one shell token wrapped in single quotes/i);
+    assert.match(body, /rewrite each embedded `'` as `'\\''`/);
+    assert.match(body, /Do not evaluate, expand, or split user-provided arguments/i);
+    assert.match(body, /Return stdout .* verbatim, exactly as-is, with no commentary\./);
+  }
+});
+
 test("result and cancel commands are exposed as deterministic runtime entrypoints", () => {
   const result = read("commands/result.md");
   const cancel = read("commands/cancel.md");
@@ -208,7 +252,7 @@ test("setup command can offer Codex install and still points users to codex logi
   const setup = read("commands/setup.md");
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
 
-  assert.match(setup, /argument-hint:\s*'\[--enable-review-gate\|--disable-review-gate\]'/);
+  assert.match(setup, /argument-hint:\s*'\[--enable-review-gate\|--disable-review-gate\] \[--enable-review-subagents\|--disable-review-subagents\]'/);
   assert.match(setup, /AskUserQuestion/);
   assert.match(setup, /npm install -g @openai\/codex/);
   assert.match(setup, /codex-companion\.mjs" setup --json \$ARGUMENTS/);

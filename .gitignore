@@ -73,6 +73,10 @@ web_modules/
 .env.*
 !.env.example
 
+# Materialized Codex plugin agents
+plugins/codex/agents/codex-review.md
+plugins/codex/agents/codex-adversarial-review.md
+
 # parcel-bundler cache (https://parceljs.org/)
 .cache
 .parcel-cache

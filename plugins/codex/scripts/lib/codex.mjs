@@ -397,6 +397,37 @@ function belongsToTurn(state, message) {
   return trackedTurnId === null || messageTurnId === null || messageTurnId === trackedTurnId;
 }
 
+function getThreadMetadataId(message) {
+  if (message.method === "thread/started") {
+    return message.params?.thread?.id ?? null;
+  }
+  if (message.method === "thread/name/updated") {
+    return message.params?.threadId ?? null;
+  }
+  return null;
+}
+
+function collectReferencedReceiverThreadIds(message) {
+  const item = message?.params?.item;
+  if (item?.type !== "collabAgentToolCall" || !Array.isArray(item.receiverThreadIds)) {
+    return [];
+  }
+  return item.receiverThreadIds.filter(Boolean);
+}
+
+function applyBufferedThreadMetadata(state, metadataByThreadId, message) {
+  for (const threadId of collectReferencedReceiverThreadIds(message)) {
+    const metadataMessages = metadataByThreadId.get(threadId);
+    if (!metadataMessages) {
+      continue;
+    }
+    for (const metadataMessage of metadataMessages) {
+      applyTurnNotification(state, metadataMessage);
+    }
+    metadataByThreadId.delete(threadId);
+  }
+}
+
 function recordItem(state, item, lifecycle, threadId = null) {
   if (item.type === "collabAgentToolCall") {
     if (!threadId || threadId === state.threadId) {
@@ -582,8 +613,18 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     if (state.turnId) {
       state.threadTurnIds.set(state.threadId, state.turnId);
     }
+    const bufferedThreadMetadata = new Map();
     for (const message of state.bufferedNotifications) {
-      if (belongsToTurn(state, message)) {
+      const metadataThreadId = getThreadMetadataId(message);
+      if (metadataThreadId) {
+        const existing = bufferedThreadMetadata.get(metadataThreadId) ?? [];
+        existing.push(message);
+        bufferedThreadMetadata.set(metadataThreadId, existing);
+        continue;
+      }
+      const inTurn = belongsToTurn(state, message);
+      if (inTurn) {
+        applyBufferedThreadMetadata(state, bufferedThreadMetadata, message);
         applyTurnNotification(state, message);
       } else {
         if (previousHandler) {

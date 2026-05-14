@@ -12,6 +12,7 @@ they already have.
 - `/codex:review` for a normal read-only Codex review
 - `/codex:adversarial-review` for a steerable challenge review
 - `/codex:rescue`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work and manage background jobs
+- Opt-in [review subagents](#enabling-review-subagents) so `Stop` hooks, agent loops, and scheduled jobs can fire `/codex:review` and `/codex:adversarial-review` programmatically — disabled by default
 - Opt-in turn-level `sandboxPolicy` forwarding for [devcontainer and other externally sandboxed environments](#devcontainer--externally-sandboxed-environments)
 
 ## Requirements
@@ -64,6 +65,7 @@ After install, you should see:
 
 - the slash commands listed below
 - the `codex:codex-rescue` subagent in `/agents`
+- `codex-review` and `codex-adversarial-review` subagents in `/agents` **only after** you opt in with `/codex:setup --enable-review-subagents` (see [Enabling review subagents](#enabling-review-subagents))
 
 One simple first run is:
 
@@ -184,6 +186,8 @@ Use it to:
 - see the latest completed job
 - confirm whether a task is still running
 
+When [review subagents are enabled](#enabling-review-subagents), `/codex:status` also surfaces the `Invoker` column (`user-slash`, `claude-subagent`, `claude-bash`, `hook`) per review job and an aggregate line showing how many of the recent reviews were Claude-driven vs user-driven.
+
 ### `/codex:result`
 
 Shows the final stored Codex output for a finished job.
@@ -212,7 +216,7 @@ Examples:
 Checks whether Codex is installed and authenticated.
 If Codex is missing and npm is available, it can offer to install Codex for you.
 
-You can also use `/codex:setup` to manage the optional review gate.
+You can also use `/codex:setup` to manage the optional review gate and the opt-in review subagents.
 
 #### Enabling review gate
 
@@ -225,6 +229,29 @@ When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted
 
 > [!WARNING]
 > The review gate can create a long-running Claude/Codex loop and may drain usage limits quickly. Only enable it when you plan to actively monitor the session.
+
+#### Enabling review subagents
+
+```bash
+/codex:setup --enable-review-subagents
+/codex:setup --disable-review-subagents
+```
+
+By default, `/codex:review` and `/codex:adversarial-review` are slash-command only (`disable-model-invocation: true`), so Claude cannot autonomously fire them. Enabling review subagents materializes two thin-wrapper subagents — `codex-review` and `codex-adversarial-review` — so power-user automation paths (`Stop` hooks, agent loops, scheduled reviews) can invoke reviews programmatically.
+
+The materialized subagents are hardened by design:
+
+- declare `tools: Bash` only — they cannot `Read`, `Glob`, `Grep`, or `Edit`, so the verbatim-return contract is enforced by what they physically can do
+- frontmatter starts with `"Use ONLY when explicitly asked"` so Claude does not invoke them as a self-directed "while I'm at it" check
+- pinned to a single `node "$CLAUDE_PLUGIN_ROOT/scripts/codex-companion.mjs" <review|adversarial-review> --invoker claude-subagent --` Bash call; `--background` and second commands are forbidden
+
+After toggling, run `/reload-plugins` so Claude Code picks up the change. `setup --json` reports `reviewSubagentsEnabled` from the actual on-disk state of both materialized files (with provenance-marker check), so the value is consistent across workspaces that share the same plugin install.
+
+##### Optional review rate limit
+
+Set `CODEX_PLUGIN_REVIEW_RATE_LIMIT=N/Xmin` (for example `3/15min`) before launching `claude` to cap how many `/codex:review` / `/codex:adversarial-review` calls non-`user-slash` invokers (subagent, hook, raw Bash) may run within a sliding window. User-typed slash commands are **never** rate-limited. Malformed values warn loudly on stderr and refuse non-user reviews rather than silently disabling enforcement. Default is **off** — no rate limit unless the env var is set.
+
+See [ADR 0002](docs/adr/0002-opt-in-review-subagents-with-invoker-tagging.md) for the full design and accepted trade-offs.
 
 ## Typical Flows
 

@@ -106,17 +106,28 @@ function formatCodexResumeCommand(job) {
   return `codex resume ${job.threadId}`;
 }
 
+function isReviewJob(job) {
+  return job?.jobClass === "review" || job?.kind === "review" || job?.kindLabel === "review" || job?.kindLabel === "adversarial-review";
+}
+
+function formatJobInvoker(job) {
+  if (!isReviewJob(job)) {
+    return "-";
+  }
+  return typeof job.invoker === "string" && job.invoker ? job.invoker : "unknown";
+}
+
 function appendActiveJobsTable(lines, jobs) {
   lines.push("Active jobs:");
-  lines.push("| Job | Kind | Status | Phase | Elapsed | Codex Session ID | Summary | Actions |");
-  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
+  lines.push("| Job | Kind | Invoker | Status | Phase | Elapsed | Codex Session ID | Summary | Actions |");
+  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
   for (const job of jobs) {
     const actions = [`/codex:status ${job.id}`];
     if (job.status === "queued" || job.status === "running") {
       actions.push(`/codex:cancel ${job.id}`);
     }
     lines.push(
-      `| ${escapeMarkdownCell(job.id)} | ${escapeMarkdownCell(job.kindLabel)} | ${escapeMarkdownCell(job.status)} | ${escapeMarkdownCell(job.phase ?? "")} | ${escapeMarkdownCell(job.elapsed ?? "")} | ${escapeMarkdownCell(job.threadId ?? "")} | ${escapeMarkdownCell(job.summary ?? "")} | ${actions.map((action) => `\`${action}\``).join("<br>")} |`
+      `| ${escapeMarkdownCell(job.id)} | ${escapeMarkdownCell(job.kindLabel)} | ${escapeMarkdownCell(formatJobInvoker(job))} | ${escapeMarkdownCell(job.status)} | ${escapeMarkdownCell(job.phase ?? "")} | ${escapeMarkdownCell(job.elapsed ?? "")} | ${escapeMarkdownCell(job.threadId ?? "")} | ${escapeMarkdownCell(job.summary ?? "")} | ${actions.map((action) => `\`${action}\``).join("<br>")} |`
     );
   }
 }
@@ -128,6 +139,9 @@ function pushJobDetails(lines, job, options = {}) {
   }
   if (job.phase) {
     lines.push(`  Phase: ${job.phase}`);
+  }
+  if (isReviewJob(job)) {
+    lines.push(`  Invoker: ${formatJobInvoker(job)}`);
   }
   if (options.showElapsed && job.elapsed) {
     lines.push(`  Elapsed: ${job.elapsed}`);
@@ -163,6 +177,17 @@ function pushJobDetails(lines, job, options = {}) {
   }
 }
 
+function appendReviewInvokerAggregate(lines, breakdown) {
+  if (!breakdown || breakdown.total === 0) {
+    return;
+  }
+
+  const claudeDriven = (breakdown.byInvoker?.["claude-subagent"] ?? 0) + (breakdown.byInvoker?.["claude-bash"] ?? 0);
+  lines.push(
+    `${claudeDriven} of last ${breakdown.total} reviews in the last hour were Claude-driven (claude-subagent or claude-bash).`
+  );
+}
+
 function appendReasoningSection(lines, reasoningSummary) {
   if (!Array.isArray(reasoningSummary) || reasoningSummary.length === 0) {
     return;
@@ -187,6 +212,7 @@ export function renderSetupReport(report) {
     `- auth: ${report.auth.detail}`,
     `- session runtime: ${report.sessionRuntime.label}`,
     `- review gate: ${report.reviewGateEnabled ? "enabled" : "disabled"}`,
+    `- review subagents: ${report.reviewSubagentsEnabled ? "enabled" : "disabled"}`,
     ""
   ];
 
@@ -370,6 +396,8 @@ export function renderStatusReport(report) {
     lines.push("The stop-time review gate is enabled.");
     lines.push("Ending the session will trigger a fresh Codex adversarial review and block if it finds issues.");
   }
+
+  appendReviewInvokerAggregate(lines, report.reviewInvokerBreakdown);
 
   return `${lines.join("\n").trimEnd()}\n`;
 }

@@ -700,6 +700,30 @@ test("task logs subagent reasoning and messages with a subagent prefix", () => {
   );
 });
 
+test("task ignores unrelated buffered collab receiver metadata", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "with-unrelated-buffered-collab");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "handle the current task"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+
+  const stateDir = resolveStateDir(repo);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const log = fs.readFileSync(state.jobs[0].logFile, "utf8");
+  assert.doesNotMatch(log, /unrelated-intruder/);
+  assert.doesNotMatch(log, /UNRELATED SUBAGENT OUTPUT SHOULD NOT APPEAR/);
+});
+
 test("task waits for the main thread to complete before returning the final result", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -1007,8 +1031,8 @@ test("status shows phases, hints, and the latest finished job", () => {
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Active jobs:/);
-  assert.match(result.stdout, /\| Job \| Kind \| Status \| Phase \| Elapsed \| Codex Session ID \| Summary \| Actions \|/);
-  assert.match(result.stdout, /\| review-live \| review \| running \| reviewing \| .* \| thr_1 \| Review working tree diff \|/);
+  assert.match(result.stdout, /\| Job \| Kind \| Invoker \| Status \| Phase \| Elapsed \| Codex Session ID \| Summary \| Actions \|/);
+  assert.match(result.stdout, /\| review-live \| review \| unknown \| running \| reviewing \| .* \| thr_1 \| Review working tree diff \|/);
   assert.match(result.stdout, /`\/codex:status review-live`<br>`\/codex:cancel review-live`/);
   assert.match(result.stdout, /Live details:/);
   assert.match(result.stdout, /Latest finished:/);
@@ -1150,7 +1174,7 @@ test("status preserves adversarial review kind labels", () => {
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /\| review-adv-live \| adversarial-review \| running \| reviewing \|/);
+  assert.match(result.stdout, /\| review-adv-live \| adversarial-review \| unknown \| running \| reviewing \|/);
   assert.match(result.stdout, /- review-adv \| completed \| adversarial-review \| Codex Adversarial Review/);
   assert.match(result.stdout, /Codex session ID: thr_adv_live/);
   assert.match(result.stdout, /Codex session ID: thr_adv_done/);

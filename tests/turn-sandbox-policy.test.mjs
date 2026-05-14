@@ -8,7 +8,7 @@ import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 
 import { resolveTurnSandboxPolicy } from "../plugins/codex/scripts/lib/turn-sandbox-policy.mjs";
-import { resolveJobsDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { resolveJobsDir, resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "plugins", "codex", "scripts", "codex-companion.mjs");
@@ -375,6 +375,67 @@ test("native /codex:review does not emit the turn-sandbox warning for an invalid
 
   // Whatever happens to the review itself, the turn-sandbox warning must never appear.
   assert.doesNotMatch(result.stderr, /CODEX_PLUGIN_TURN_SANDBOX/);
+});
+
+test("native /codex:review accepts the subagent invoker flag without treating it as focus text", () => {
+  const { repo, binDir } = setupRepo();
+
+  const result = run("node", [SCRIPT, "review", "--invoker", "claude-subagent", "--scope", "working-tree"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, /does not support custom focus text/);
+  assert.match(result.stdout, /Reviewed uncommitted changes/);
+
+  const state = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "state.json"), "utf8"));
+  assert.equal(state.jobs[0].invoker, "claude-subagent");
+});
+
+test("native /codex:review rejects duplicate invoker flags", () => {
+  const { repo, binDir } = setupRepo();
+
+  const result = run("node", [SCRIPT, "review", "--invoker", "claude-subagent", "--invoker", "user-slash"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--invoker may only be specified once\./);
+});
+
+test("adversarial-review accepts one invoker flag and persists it", () => {
+  const { repo, binDir } = setupRepo();
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--invoker", "claude-subagent", "--scope", "working-tree"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /# Codex Adversarial Review/);
+
+  const state = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "state.json"), "utf8"));
+  assert.equal(state.jobs[0].invoker, "claude-subagent");
+});
+
+test("adversarial-review rejects duplicate invoker flags", () => {
+  const { repo, binDir } = setupRepo();
+
+  const result = run("node", [
+    SCRIPT,
+    "adversarial-review",
+    "--invoker",
+    "claude-subagent",
+    "--invoker=user-slash"
+  ], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--invoker may only be specified once\./);
 });
 
 test("adversarial-review forwards external-sandbox policy to turn/start", () => {

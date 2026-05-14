@@ -385,11 +385,76 @@ rl.on("line", (line) => {
 	          prompt
 	        };
 	        saveState(state);
-	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
-
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)
           : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
+
+        if (BEHAVIOR === "with-unrelated-buffered-collab") {
+          const unrelatedParent = nextThread(state, thread.cwd, true);
+          const unrelatedReceiver = nextThread(state, thread.cwd, true);
+          const unrelatedReceiverRecord = ensureThread(state, unrelatedReceiver.id);
+          unrelatedReceiverRecord.name = "unrelated-intruder";
+          saveState(state);
+          const unrelatedTurnId = nextTurnId(state);
+
+          send({
+            method: "thread/started",
+            params: {
+              thread: {
+                ...buildThread(unrelatedReceiverRecord),
+                name: "unrelated-intruder",
+                agentNickname: "unrelated-intruder"
+              }
+            }
+          });
+          send({
+            method: "item/started",
+            params: {
+              threadId: unrelatedParent.id,
+              turnId: unrelatedTurnId,
+              item: {
+                type: "collabAgentToolCall",
+                id: "collab_unrelated_" + unrelatedTurnId,
+                tool: "wait",
+                status: "inProgress",
+                senderThreadId: unrelatedParent.id,
+                receiverThreadIds: [unrelatedReceiver.id],
+                prompt: "Unrelated work",
+                model: null,
+                reasoningEffort: null,
+                agentsStates: {
+                  [unrelatedReceiver.id]: { status: "inProgress", message: "Unrelated investigation" }
+                }
+              }
+            }
+          });
+          send({
+            method: "item/completed",
+            params: {
+              threadId: unrelatedReceiver.id,
+              turnId: unrelatedTurnId,
+              item: {
+                type: "agentMessage",
+                id: "msg_unrelated_" + unrelatedTurnId,
+                text: "UNRELATED SUBAGENT OUTPUT SHOULD NOT APPEAR",
+                phase: "analysis"
+              }
+            }
+          });
+          send({
+            method: "item/completed",
+            params: {
+              threadId: thread.id,
+              turnId,
+              item: { type: "agentMessage", id: "msg_" + turnId, text: payload, phase: "final_answer" }
+            }
+          });
+          send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+          send({ id: message.id, result: { turn: buildTurn(turnId) } });
+          break;
+        }
+
+	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
 
         if (
           BEHAVIOR === "with-subagent" ||
@@ -584,8 +649,18 @@ rl.on("line", (line) => {
 
 export function buildEnv(binDir) {
   const sep = process.platform === "win32" ? ";" : ":";
+  const {
+    CLAUDE_PLUGIN_DATA: _pluginData,
+    CODEX_COMPANION_APP_SERVER_ENDPOINT: _brokerEndpoint,
+    CODEX_COMPANION_SESSION_ID: _sessionId,
+    CODEX_PLUGIN_REVIEW_RATE_LIMIT: _reviewRateLimit,
+    CODEX_PLUGIN_TURN_SANDBOX: _turnSandbox,
+    CODEX_PLUGIN_TURN_SANDBOX_NETWORK: _turnSandboxNetwork,
+    ...baseEnv
+  } = process.env;
+
   return {
-    ...process.env,
+    ...baseEnv,
     PATH: `${binDir}${sep}${process.env.PATH}`
   };
 }

@@ -1,6 +1,6 @@
 ---
-description: Check whether the local Codex CLI is ready and optionally toggle the stop-time review gate
-argument-hint: '[--enable-review-gate|--disable-review-gate]'
+description: Check whether the local Codex CLI is ready and optionally toggle Codex setup features
+argument-hint: '[--enable-review-gate|--disable-review-gate] [--enable-review-subagents|--disable-review-subagents]'
 allowed-tools: Bash(node:*), Bash(npm:*), AskUserQuestion
 ---
 

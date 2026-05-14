@@ -11,6 +11,8 @@ const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
+export const MAX_RECENT_REVIEW_JOBS = 500;
+const RECENT_REVIEW_RETENTION_MS = 65 * 60_000;
 
 function nowIso() {
   return new Date().toISOString();
@@ -20,7 +22,8 @@ function defaultState() {
   return {
     version: STATE_VERSION,
     config: {
-      stopReviewGate: false
+      stopReviewGate: false,
+      reviewSubagentsEnabled: false
     },
     jobs: []
   };
@@ -77,10 +80,64 @@ export function loadState(cwd) {
   }
 }
 
+function sortJobsByUpdatedDesc(jobs) {
+  return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
+}
+
+function getTimestampMs(value) {
+  const timestamp = Date.parse(value ?? "");
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function sortReviewJobsByCreatedDesc(jobs) {
+  return [...jobs].sort((left, right) => {
+    const leftCreated = getTimestampMs(left?.createdAt) ?? getReviewRetentionTimestampMs(left) ?? 0;
+    const rightCreated = getTimestampMs(right?.createdAt) ?? getReviewRetentionTimestampMs(right) ?? 0;
+    if (rightCreated !== leftCreated) {
+      return rightCreated - leftCreated;
+    }
+
+    const leftUpdated = getTimestampMs(left?.updatedAt) ?? leftCreated;
+    const rightUpdated = getTimestampMs(right?.updatedAt) ?? rightCreated;
+    return rightUpdated - leftUpdated;
+  });
+}
+
+function isReviewJob(job) {
+  return job?.jobClass === "review" || job?.kind === "review" || job?.kind === "adversarial-review";
+}
+
+function getReviewRetentionTimestampMs(job) {
+  return getTimestampMs(job?.createdAt ?? job?.updatedAt);
+}
+
 function pruneJobs(jobs) {
-  return [...jobs]
-    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")))
-    .slice(0, MAX_JOBS);
+  const nowMs = Date.now();
+  const recentReviewCutoff = nowMs - RECENT_REVIEW_RETENTION_MS;
+  const recentReview = [];
+  const rest = [];
+
+  for (const job of jobs) {
+    const createdMs = getReviewRetentionTimestampMs(job);
+    if (isReviewJob(job) && createdMs != null && createdMs >= recentReviewCutoff && createdMs <= nowMs) {
+      recentReview.push(job);
+    } else {
+      rest.push(job);
+    }
+  }
+
+  const retainedRecentReview =
+    recentReview.length > MAX_RECENT_REVIEW_JOBS
+      ? sortReviewJobsByCreatedDesc(recentReview).slice(0, MAX_RECENT_REVIEW_JOBS)
+      : recentReview;
+  const retainedById = new Map();
+  for (const job of [...retainedRecentReview, ...sortJobsByUpdatedDesc(rest).slice(0, MAX_JOBS)]) {
+    if (!retainedById.has(job.id)) {
+      retainedById.set(job.id, job);
+    }
+  }
+
+  return sortJobsByUpdatedDesc([...retainedById.values()]);
 }
 
 function removeFileIfExists(filePath) {
