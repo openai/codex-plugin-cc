@@ -211,7 +211,10 @@ export function renderSetupReport(report) {
 function appendInvestigationBanner(lines, meta) {
   if (meta.investigation?.truncated === true) {
     const turns = meta.investigation.turnCount ?? "?";
-    lines.push(`Investigation truncated at ${turns} turns; findings may be shallow.`, "");
+    lines.push(
+      `Investigation truncated at ${turns} turns; findings may be shallow. Use --max-investigation-turns to raise the cap.`,
+      ""
+    );
   }
 }
 
