@@ -1,6 +1,6 @@
 ---
 description: Run a Codex review that challenges the implementation approach and design choices
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [focus ...]'
+argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--max-inline-files <n>] [--max-inline-bytes <n>] [focus ...]'
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
@@ -43,6 +43,7 @@ Argument handling:
 - It supports working-tree review, branch review, and `--base <ref>`.
 - It does not support `--scope staged` or `--scope unstaged`.
 - Unlike `/codex:review`, it can still take extra focus text after the flags.
+- `--max-inline-files <n>` and `--max-inline-bytes <n>` override the inline diff limits when the diff is too large or too small for the defaults; pass `0` to force the lightweight self-collect prompt.
 
 Foreground flow:
 - Run:

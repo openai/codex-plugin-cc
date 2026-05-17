@@ -288,7 +288,7 @@ test("adversarial review asks Codex to inspect larger diffs itself", () => {
   fs.writeFileSync(path.join(repo, "src", "b.js"), 'export const value = "PROMPT_SELF_COLLECT_B";\n');
   fs.writeFileSync(path.join(repo, "src", "c.js"), 'export const value = "PROMPT_SELF_COLLECT_C";\n');
 
-  const result = run("node", [SCRIPT, "adversarial-review"], {
+  const result = run("node", [SCRIPT, "adversarial-review", "--max-inline-files", "2"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
@@ -298,6 +298,72 @@ test("adversarial review asks Codex to inspect larger diffs itself", () => {
   assert.match(state.lastTurnStart.prompt, /lightweight summary/i);
   assert.match(state.lastTurnStart.prompt, /read-only git commands/i);
   assert.doesNotMatch(state.lastTurnStart.prompt, /PROMPT_SELF_COLLECT_[ABC]/);
+});
+
+test("adversarial review keeps medium-sized diffs inline under default limits", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  const fileNames = Array.from({ length: 10 }, (_, i) => `mod-${i}.js`);
+  for (const name of fileNames) {
+    fs.writeFileSync(path.join(repo, "src", name), `export const value = "${name}-v1";\n`);
+  }
+  run("git", ["add", ...fileNames.map((name) => `src/${name}`)], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  for (const name of fileNames) {
+    fs.writeFileSync(path.join(repo, "src", name), `export const value = "INLINE_DEFAULT_${name}";\n`);
+  }
+
+  const result = run("node", [SCRIPT, "adversarial-review"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.match(state.lastTurnStart.prompt, /primary evidence/i);
+  assert.match(state.lastTurnStart.prompt, /INLINE_DEFAULT_mod-0\.js/);
+});
+
+test("adversarial review --max-inline-bytes forces self-collect on large diffs", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "app.js"), "export const value = 'v1';\n");
+  run("git", ["add", "app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "app.js"), `export const value = '${"x".repeat(512)}';\n`);
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--max-inline-bytes", "128"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.match(state.lastTurnStart.prompt, /lightweight summary/i);
+});
+
+test("adversarial review rejects negative --max-inline-files", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "app.js"), "v1\n");
+  run("git", ["add", "app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "app.js"), "v2\n");
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--max-inline-files", "-1"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--max-inline-files must be a non-negative integer/);
 });
 
 test("review includes reasoning output when the app server returns it", () => {

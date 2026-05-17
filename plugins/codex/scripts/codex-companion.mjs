@@ -76,7 +76,7 @@ function printUsage() {
       "Usage:",
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
+      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--max-inline-files <n>] [--max-inline-bytes <n>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -155,6 +155,17 @@ function resolveCommandWorkspace(options = {}) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseNonNegativeIntegerOption(rawValue, optionLabel) {
+  if (rawValue === undefined || rawValue === null || rawValue === "") {
+    return undefined;
+  }
+  const parsed = Number(rawValue);
+  if (!Number.isFinite(parsed) || parsed < 0 || !Number.isInteger(parsed)) {
+    throw new Error(`${optionLabel} must be a non-negative integer.`);
+  }
+  return parsed;
 }
 
 function shorten(text, limit = 96) {
@@ -403,7 +414,10 @@ async function executeReviewRun(request) {
     };
   }
 
-  const context = collectReviewContext(request.cwd, target);
+  const context = collectReviewContext(request.cwd, target, {
+    maxInlineFiles: request.maxInlineFiles,
+    maxInlineDiffBytes: request.maxInlineDiffBytes
+  });
   const prompt = buildAdversarialReviewPrompt(context, focusText);
   const result = await runAppServerTurn(context.repoRoot, {
     prompt,
@@ -681,7 +695,7 @@ function enqueueBackgroundTask(cwd, job, request) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+    valueOptions: ["base", "scope", "model", "cwd", "max-inline-files", "max-inline-bytes"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
       m: "model"
@@ -695,6 +709,8 @@ async function handleReviewCommand(argv, config) {
     base: options.base,
     scope: options.scope
   });
+  const maxInlineFiles = parseNonNegativeIntegerOption(options["max-inline-files"], "--max-inline-files");
+  const maxInlineDiffBytes = parseNonNegativeIntegerOption(options["max-inline-bytes"], "--max-inline-bytes");
 
   config.validateRequest?.(target, focusText);
   const metadata = buildReviewJobMetadata(config.reviewName, target);
@@ -716,6 +732,8 @@ async function handleReviewCommand(argv, config) {
         model: options.model,
         focusText,
         reviewName: config.reviewName,
+        maxInlineFiles,
+        maxInlineDiffBytes,
         onProgress: progress
       }),
     { json: options.json }
