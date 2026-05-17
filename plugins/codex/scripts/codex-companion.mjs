@@ -246,6 +246,24 @@ function buildAdversarialReviewPrompt(context, focusText) {
   });
 }
 
+function buildAdversarialInvestigatePrompt(context, focusText) {
+  const template = loadPromptTemplate(ROOT_DIR, "adversarial-review-investigate");
+  return interpolateTemplate(template, {
+    TARGET_LABEL: context.target.label,
+    USER_FOCUS: focusText || "No extra focus provided.",
+    REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
+    REVIEW_INPUT: context.content
+  });
+}
+
+function buildAdversarialFinalizePrompt(context, focusText) {
+  const template = loadPromptTemplate(ROOT_DIR, "adversarial-review-finalize");
+  return interpolateTemplate(template, {
+    TARGET_LABEL: context.target.label,
+    USER_FOCUS: focusText || "No extra focus provided."
+  });
+}
+
 function ensureCodexAvailable(cwd) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
