@@ -482,7 +482,8 @@ async function executeReviewRun(request) {
     rendered: renderReviewResult(parsed, {
       reviewLabel: reviewName,
       targetLabel: context.target.label,
-      reasoningSummary: result.reasoningSummary
+      reasoningSummary: result.reasoningSummary,
+      investigation: result.investigation ?? null
     }),
     summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
     jobTitle: `Codex ${reviewName}`,

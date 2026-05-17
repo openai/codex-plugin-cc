@@ -513,3 +513,79 @@ test("outputSchema-set finalize turn produces schema-conformant final message", 
     fake.close();
   }
 });
+
+// -------------------------------------------------------------------
+// Task 5: renderer truncation banner
+// -------------------------------------------------------------------
+
+import { renderReviewResult } from "../plugins/codex/scripts/lib/render.mjs";
+
+test("renderer prepends truncation banner when investigation.truncated is true", () => {
+  const parsed = {
+    parsed: {
+      verdict: "needs-attention",
+      summary: "Risk identified.",
+      findings: [],
+      next_steps: []
+    }
+  };
+  const out = renderReviewResult(parsed, {
+    reviewLabel: "Adversarial Review",
+    targetLabel: "branch:feature",
+    reasoningSummary: [],
+    investigation: { turnCount: 10, truncated: true }
+  });
+  assert.match(out, /Investigation truncated at 10 turns; findings may be shallow\./);
+});
+
+test("renderer omits truncation banner when investigation is null or not truncated", () => {
+  const parsed = {
+    parsed: {
+      verdict: "approve",
+      summary: "Looks fine.",
+      findings: [],
+      next_steps: []
+    }
+  };
+  const outNull = renderReviewResult(parsed, {
+    reviewLabel: "Adversarial Review",
+    targetLabel: "branch:feature",
+    reasoningSummary: [],
+    investigation: null
+  });
+  assert.doesNotMatch(outNull, /Investigation truncated/);
+
+  const outOk = renderReviewResult(parsed, {
+    reviewLabel: "Adversarial Review",
+    targetLabel: "branch:feature",
+    reasoningSummary: [],
+    investigation: { turnCount: 4, truncated: false }
+  });
+  assert.doesNotMatch(outOk, /Investigation truncated/);
+});
+
+test("renderer shows truncation banner on parse-error and validation-error paths", () => {
+  const parseErrorOut = renderReviewResult(
+    { parsed: null, parseError: "Unexpected token", rawOutput: "{not json" },
+    {
+      reviewLabel: "Adversarial Review",
+      targetLabel: "branch:feature",
+      reasoningSummary: [],
+      investigation: { turnCount: 10, truncated: true }
+    }
+  );
+  assert.match(parseErrorOut, /Investigation truncated at 10 turns/,
+    "banner must appear when output is unparseable AND investigation was truncated");
+
+  const validationErrorOut = renderReviewResult(
+    { parsed: { not: "review-shaped" } },
+    {
+      reviewLabel: "Adversarial Review",
+      targetLabel: "branch:feature",
+      reasoningSummary: [],
+      investigation: { turnCount: 10, truncated: true }
+    }
+  );
+  assert.match(validationErrorOut, /Investigation truncated at 10 turns/,
+    "banner must appear when output has wrong shape AND investigation was truncated");
+});
