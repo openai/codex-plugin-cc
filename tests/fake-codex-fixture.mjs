@@ -373,11 +373,9 @@ rl.on("line", (line) => {
         if (BEHAVIOR === "queue-driven") {
           if (!state.requests) { state.requests = []; }
           state.requests.push({ method: "turn/start", params: message.params });
-          saveState(state);
 
           const turnId = nextTurnId(state);
           thread.updatedAt = now();
-          saveState(state);
 
           const entry = (state.queue && state.queue.length > 0) ? state.queue.shift() : null;
           saveState(state);
@@ -655,7 +653,6 @@ export function setupFakeCodex({ cwd } = {}) {
   };
   fs.writeFileSync(statePath, JSON.stringify(initialState, null, 2));
 
-  const savedPath = process.env.PATH;
   const sep = process.platform === "win32" ? ";" : ":";
   process.env.PATH = `${binDir}${sep}${process.env.PATH}`;
 
@@ -686,12 +683,17 @@ export function setupFakeCodex({ cwd } = {}) {
       state.queue.push({ rpcError: { message } });
       writeState(state);
     },
+    // `requests` re-reads the state file each access; assign to a local variable for repeated use.
     get requests() {
       const state = readState();
       return state.requests ?? [];
     },
     close() {
-      process.env.PATH = savedPath;
+      const sep = process.platform === "win32" ? ";" : ":";
+      process.env.PATH = (process.env.PATH ?? "")
+        .split(sep)
+        .filter((entry) => entry !== binDir)
+        .join(sep);
       fs.rmSync(binDir, { recursive: true, force: true });
     }
   };
