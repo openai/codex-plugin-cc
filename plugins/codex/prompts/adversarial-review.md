@@ -46,7 +46,8 @@ A finding should answer:
 </finding_bar>
 
 <structured_output_contract>
-Return only valid JSON matching the provided schema.
+This is a single-turn review. Do NOT run any shell commands or tool calls — the file contents you need are already embedded in the repository_context block below. Do not emit a tool-use stub like `{"cmd": "..."}` instead of the review; that is not the schema.
+Return only valid JSON matching the provided schema. Your entire output must be that JSON — no prose before or after, no shell commands, no tool-call payloads.
 Keep the output compact and specific.
 Use `needs-attention` if there is any material risk worth blocking on.
 Use `approve` only if you cannot support any substantive adversarial finding from the provided context.

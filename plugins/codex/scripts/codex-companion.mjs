@@ -17,6 +17,7 @@ import {
     interruptAppServerTurn,
     parseStructuredOutput,
     readOutputSchema,
+    runAppServerInvestigation,
     runAppServerReview,
     runAppServerTurn
   } from "./lib/codex.mjs";
@@ -246,6 +247,24 @@ function buildAdversarialReviewPrompt(context, focusText) {
   });
 }
 
+function buildAdversarialInvestigatePrompt(context, focusText) {
+  const template = loadPromptTemplate(ROOT_DIR, "adversarial-review-investigate");
+  return interpolateTemplate(template, {
+    TARGET_LABEL: context.target.label,
+    USER_FOCUS: focusText || "No extra focus provided.",
+    REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
+    REVIEW_INPUT: context.content
+  });
+}
+
+function buildAdversarialFinalizePrompt(context, focusText) {
+  const template = loadPromptTemplate(ROOT_DIR, "adversarial-review-finalize");
+  return interpolateTemplate(template, {
+    TARGET_LABEL: context.target.label,
+    USER_FOCUS: focusText || "No extra focus provided."
+  });
+}
+
 function ensureCodexAvailable(cwd) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
@@ -404,14 +423,29 @@ async function executeReviewRun(request) {
   }
 
   const context = collectReviewContext(request.cwd, target);
-  const prompt = buildAdversarialReviewPrompt(context, focusText);
-  const result = await runAppServerTurn(context.repoRoot, {
-    prompt,
-    model: request.model,
-    sandbox: "read-only",
-    outputSchema: readOutputSchema(REVIEW_SCHEMA),
-    onProgress: request.onProgress
-  });
+  let result;
+  if (context.inputMode === "self-collect") {
+    const investigatePrompt = buildAdversarialInvestigatePrompt(context, focusText);
+    const finalizePrompt = buildAdversarialFinalizePrompt(context, focusText);
+    result = await runAppServerInvestigation(context.repoRoot, {
+      investigatePrompt,
+      finalizePrompt,
+      outputSchema: readOutputSchema(REVIEW_SCHEMA),
+      model: request.model,
+      sandbox: "read-only",
+      maxInvestigationTurns: request.maxInvestigationTurns,
+      onProgress: request.onProgress
+    });
+  } else {
+    const prompt = buildAdversarialReviewPrompt(context, focusText);
+    result = await runAppServerTurn(context.repoRoot, {
+      prompt,
+      model: request.model,
+      sandbox: "read-only",
+      outputSchema: readOutputSchema(REVIEW_SCHEMA),
+      onProgress: request.onProgress
+    });
+  }
   const parsed = parseStructuredOutput(result.finalMessage, {
     status: result.status,
     failureMessage: result.error?.message ?? result.stderr
@@ -436,6 +470,9 @@ async function executeReviewRun(request) {
     parseError: parsed.parseError,
     reasoningSummary: result.reasoningSummary
   };
+  if (result.investigation) {
+    payload.investigation = result.investigation;
+  }
 
   return {
     exitStatus: result.status,
@@ -445,7 +482,8 @@ async function executeReviewRun(request) {
     rendered: renderReviewResult(parsed, {
       reviewLabel: reviewName,
       targetLabel: context.target.label,
-      reasoningSummary: result.reasoningSummary
+      reasoningSummary: result.reasoningSummary,
+      investigation: result.investigation ?? null
     }),
     summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
     jobTitle: `Codex ${reviewName}`,
@@ -681,12 +719,21 @@ function enqueueBackgroundTask(cwd, job, request) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+    valueOptions: ["base", "scope", "model", "cwd", "max-investigation-turns"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
       m: "model"
     }
   });
+
+  const rawMaxTurns = options["max-investigation-turns"];
+  let maxInvestigationTurns;
+  if (rawMaxTurns !== undefined) {
+    if (!/^[1-9][0-9]*$/.test(String(rawMaxTurns))) {
+      throw new Error(`--max-investigation-turns must be a positive integer (got: ${rawMaxTurns})`);
+    }
+    maxInvestigationTurns = Number(rawMaxTurns);
+  }
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
@@ -716,6 +763,7 @@ async function handleReviewCommand(argv, config) {
         model: options.model,
         focusText,
         reviewName: config.reviewName,
+        maxInvestigationTurns,
         onProgress: progress
       }),
     { json: options.json }

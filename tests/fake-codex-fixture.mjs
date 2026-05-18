@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
-import { writeExecutable } from "./helpers.mjs";
+import { makeTempDir, writeExecutable } from "./helpers.mjs";
 
 export function installFakeCodex(binDir, behavior = "review-ok") {
   const statePath = path.join(binDir, "fake-codex-state.json");
@@ -369,6 +369,50 @@ rl.on("line", (line) => {
 
 	      case "turn/start": {
 	        const thread = ensureThread(state, message.params.threadId);
+
+        if (BEHAVIOR === "queue-driven") {
+          if (!state.requests) { state.requests = []; }
+          state.requests.push({ method: "turn/start", params: message.params });
+
+          const turnId = nextTurnId(state);
+          thread.updatedAt = now();
+
+          const entry = (state.queue && state.queue.length > 0) ? state.queue.shift() : null;
+          saveState(state);
+
+          if (entry && entry.rpcError) {
+            send({ id: message.id, error: { code: -32000, message: entry.rpcError.message } });
+            break;
+          }
+
+          send({ id: message.id, result: { turn: buildTurn(turnId) } });
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+
+          const commands = (entry && entry.commands) || [];
+          let cmdCounter = 0;
+          for (const cmd of commands) {
+            const itemId = "cmd_" + turnId + "_" + (cmdCounter++);
+            send({ method: "item/started", params: { threadId: thread.id, turnId, item: { type: "commandExecution", id: itemId, command: cmd.command, status: "in_progress" } } });
+            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "commandExecution", id: itemId, command: cmd.command, exitCode: cmd.exitCode ?? 0, status: "completed" } } });
+          }
+
+          if (entry && entry.finalAnswer) {
+            const phase = entry.finalAnswer.phase ?? "final_answer";
+            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "msg_" + turnId, text: entry.finalAnswer.text, phase } } });
+          }
+
+          if (entry && entry.turnError) {
+            send({ method: "error", params: { threadId: thread.id, turnId, error: { message: entry.turnError.message } } });
+          }
+
+          if (!entry) {
+            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "msg_" + turnId, text: "", phase: "agent_message" } } });
+          }
+
+          send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+          break;
+        }
+
 	        const prompt = (message.params.input || [])
           .filter((item) => item.type === "text")
           .map((item) => item.text)
@@ -585,5 +629,73 @@ export function buildEnv(binDir) {
   return {
     ...process.env,
     PATH: `${binDir}${sep}${process.env.PATH}`
+  };
+}
+
+/**
+ * Sets up a queue-driven fake Codex harness for multi-turn tests.
+ * Returns a handle with helpers for scripting turn responses and
+ * inspecting captured requests.
+ */
+export function setupFakeCodex({ cwd } = {}) {
+  const binDir = makeTempDir("codex-queue-driven-");
+  installFakeCodex(binDir, "queue-driven");
+
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  const initialState = {
+    nextThreadId: 1,
+    nextTurnId: 1,
+    appServerStarts: 0,
+    threads: [],
+    capabilities: null,
+    lastInterrupt: null,
+    queue: [],
+    requests: []
+  };
+  fs.writeFileSync(statePath, JSON.stringify(initialState, null, 2));
+
+  const sep = process.platform === "win32" ? ";" : ":";
+  process.env.PATH = `${binDir}${sep}${process.env.PATH}`;
+
+  const env = buildEnv(binDir);
+  const resolvedCwd = cwd || process.cwd();
+
+  function readState() {
+    return JSON.parse(fs.readFileSync(statePath, "utf8"));
+  }
+
+  function writeState(state) {
+    fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+  }
+
+  return {
+    cwd: resolvedCwd,
+    env,
+    binDir,
+    queueTurnResponse(entry) {
+      const state = readState();
+      if (!state.queue) { state.queue = []; }
+      state.queue.push(entry);
+      writeState(state);
+    },
+    queueTurnRpcError({ message }) {
+      const state = readState();
+      if (!state.queue) { state.queue = []; }
+      state.queue.push({ rpcError: { message } });
+      writeState(state);
+    },
+    // `requests` re-reads the state file each access; assign to a local variable for repeated use.
+    get requests() {
+      const state = readState();
+      return state.requests ?? [];
+    },
+    close() {
+      const sep = process.platform === "win32" ? ";" : ":";
+      process.env.PATH = (process.env.PATH ?? "")
+        .split(sep)
+        .filter((entry) => entry !== binDir)
+        .join(sep);
+      fs.rmSync(binDir, { recursive: true, force: true });
+    }
   };
 }

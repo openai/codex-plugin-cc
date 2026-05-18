@@ -86,6 +86,28 @@ test("collectReviewContext keeps inline diffs for tiny adversarial reviews", () 
   assert.match(context.content, /INLINE_MARKER/);
 });
 
+test("collectReviewContext routes 2-file changes to self-collect (inline cap is 1)", () => {
+  // Regression guard: a 2-file change used to slip into inline-diff because
+  // the cap was 2, embedding both files into a single-turn schema-pinned
+  // prompt — and the model often responded with a tool-call stub instead
+  // of the review JSON. Two files now go through the two-phase self-collect
+  // path which tolerates exploratory turns.
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "seed.js"), "export const value = 'seed';\n");
+  run("git", ["add", "seed.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "doc-one.md"), "# planning doc\n".repeat(50));
+  fs.writeFileSync(path.join(cwd, "doc-two.md"), "# spec doc\n".repeat(50));
+
+  const target = resolveReviewTarget(cwd, {});
+  const context = collectReviewContext(cwd, target);
+
+  assert.equal(context.fileCount, 2);
+  assert.equal(context.inputMode, "self-collect",
+    "2-file changes must NOT be inlined; they hit the schema-pinned single-turn bug otherwise");
+});
+
 test("collectReviewContext skips untracked directories in working tree review", () => {
   const cwd = makeTempDir();
   initGitRepo(cwd);

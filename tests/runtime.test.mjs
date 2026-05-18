@@ -295,8 +295,13 @@ test("adversarial review asks Codex to inspect larger diffs itself", () => {
 
   assert.equal(result.status, 0, result.stderr);
   const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
-  assert.match(state.lastTurnStart.prompt, /lightweight summary/i);
-  assert.match(state.lastTurnStart.prompt, /read-only git commands/i);
+  // With the two-phase investigation flow, the default fake converges on turn 1
+  // (no commands, finalAnswer), then the finalize turn fires. lastTurnStart
+  // captures the finalize turn, which uses buildAdversarialFinalizePrompt.
+  // The investigate prompt (turn 1) contained the self-collect guidance; the
+  // finalize prompt (turn 2) references the investigation completed in prior turns.
+  assert.match(state.lastTurnStart.prompt, /investigation|structured review/i);
+  // File contents must not be inlined in either prompt (self-collect mode)
   assert.doesNotMatch(state.lastTurnStart.prompt, /PROMPT_SELF_COLLECT_[ABC]/);
 });
 
