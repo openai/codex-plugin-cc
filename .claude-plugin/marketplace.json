@@ -16,6 +16,15 @@
         "name": "OpenAI"
       },
       "source": "./plugins/codex"
+    },
+    {
+      "name": "claudian",
+      "description": "Obsidian integration for Claude Code. Auto-saves conversation notes and decisions to your Obsidian vault.",
+      "version": "1.0.0",
+      "author": {
+        "name": "YUICHIRO TANAKA"
+      },
+      "source": "./plugins/claudian"
     }
   ]
 }
