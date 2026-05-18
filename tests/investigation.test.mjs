@@ -845,3 +845,35 @@ test("--max-investigation-turns rejects malformed numeric tokens", () => {
     );
   }
 });
+
+// -------------------------------------------------------------------
+// Prompt contract: inline + finalize prompts must forbid tool-call stubs
+// -------------------------------------------------------------------
+
+import { readFileSync } from "node:fs";
+import { fileURLToPath as fileURLToPathPromptCheck } from "node:url";
+
+const PROMPT_DIR = fileURLToPathPromptCheck(
+  new URL("../plugins/codex/prompts/", import.meta.url)
+);
+
+test("inline adversarial-review prompt forbids tool-call stub output", () => {
+  const text = readFileSync(`${PROMPT_DIR}adversarial-review.md`, "utf8");
+  // The model used to respond with payloads like {"cmd": "wc -l ..."}
+  // instead of the review JSON — the prompt must explicitly disallow it
+  // since this path is single-turn and has no recovery.
+  assert.match(text, /tool[- ]?call|tool[- ]?use/i,
+    "inline prompt must mention tool-call/tool-use");
+  assert.match(text, /\{"cmd"|stub/i,
+    "inline prompt must show or name the tool-call stub anti-pattern");
+  assert.match(text, /Do NOT run any shell commands/,
+    "inline prompt must explicitly forbid running shell commands");
+});
+
+test("finalize prompt forbids tool-call stub output", () => {
+  const text = readFileSync(`${PROMPT_DIR}adversarial-review-finalize.md`, "utf8");
+  assert.match(text, /Do NOT run any shell commands/,
+    "finalize prompt must explicitly forbid running shell commands");
+  assert.match(text, /no tool-call payloads|no shell commands/i,
+    "finalize prompt must spell out the no-tool-call rule");
+});

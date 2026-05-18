@@ -5,7 +5,12 @@ import { isProbablyText } from "./fs.mjs";
 import { formatCommandFailure, runCommand, runCommandChecked } from "./process.mjs";
 
 const MAX_UNTRACKED_BYTES = 24 * 1024;
-const DEFAULT_INLINE_DIFF_MAX_FILES = 2;
+// Inline-diff embeds full file contents into the prompt and pins outputSchema
+// on a single turn — there is no recovery if the model wants to investigate
+// before producing the verdict. Keep this path narrow: only single-file
+// reviews of small diffs use it. Anything larger falls through to the
+// two-phase self-collect path which can tolerate exploratory turns.
+const DEFAULT_INLINE_DIFF_MAX_FILES = 1;
 const DEFAULT_INLINE_DIFF_MAX_BYTES = 256 * 1024;
 
 function git(cwd, args, options = {}) {
