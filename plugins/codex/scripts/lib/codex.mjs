@@ -1107,6 +1107,68 @@ export async function getCodexAuthStatus(cwd, options = {}) {
   }
 }
 
+/**
+ * Trigger codex's protocol-native context compaction on a thread. This is
+ * the recovery path for "prompt too long / context overflow" scenarios:
+ * main-loop Claude calls /codex:compact, then resumes the thread with an
+ * amended prompt via /codex:rescue --resume. Compaction itself runs on
+ * the codex side; this wrapper is fire-and-return — it kicks off the
+ * compact request and returns once the app-server acknowledges it.
+ * Streaming notifications (broker recognizes thread/compact/start as a
+ * STREAMING_METHOD) flow to whoever owns the broker stream at that moment;
+ * if no consumer is active, codex still completes compaction on its side.
+ *
+ * NOTE: the exact shape of the success payload is not documented for
+ * codex CLI 0.131; this returns the raw result alongside the bookkeeping
+ * fields. A typed wrapper in app-server-protocol.d.ts can land once the
+ * shape is observed in a real run.
+ */
+export async function compactAppServerThread(cwd, { threadId }) {
+  if (!threadId) {
+    return {
+      attempted: false,
+      compacted: false,
+      transport: null,
+      result: null,
+      detail: "missing threadId"
+    };
+  }
+
+  const availability = getCodexAvailability(cwd);
+  if (!availability.available) {
+    return {
+      attempted: false,
+      compacted: false,
+      transport: null,
+      result: null,
+      detail: availability.detail
+    };
+  }
+
+  let client = null;
+  try {
+    client = await CodexAppServerClient.connect(cwd, { reuseExistingBroker: true });
+    const result = await client.request("thread/compact/start", { threadId });
+    return {
+      attempted: true,
+      compacted: true,
+      transport: client.transport,
+      result,
+      detail: `Compaction started on ${threadId}.`
+    };
+  } catch (error) {
+    return {
+      attempted: true,
+      compacted: false,
+      transport: client?.transport ?? null,
+      result: null,
+      detail: error instanceof Error ? error.message : String(error)
+    };
+  } finally {
+    await client?.close().catch(() => {});
+  }
+}
+
 export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
   if (!threadId || !turnId) {
     return {

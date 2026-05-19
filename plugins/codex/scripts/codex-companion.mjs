@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import {
     buildPersistentTaskThreadName,
+    compactAppServerThread,
     DEFAULT_CONTINUE_PROMPT,
     findLatestTaskThread,
     getCodexAuthStatus,
@@ -82,6 +83,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs events <job-id> [--since <iso>] [--after-seq <n>] [--limit <n>] [--json]",
+      "  node scripts/codex-companion.mjs compact <thread-id> [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
@@ -933,6 +935,44 @@ async function handleTaskWorker(argv) {
   if (workerError) throw workerError;
 }
 
+async function handleCompact(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const threadId = positionals[0];
+  if (!threadId) {
+    throw new Error("Usage: compact <thread-id> [--json]");
+  }
+
+  const report = await compactAppServerThread(cwd, { threadId });
+
+  if (options.json) {
+    console.log(JSON.stringify(report, null, 2));
+    return;
+  }
+
+  if (!report.attempted) {
+    process.stderr.write(`Compaction not attempted: ${report.detail}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  if (!report.compacted) {
+    process.stderr.write(`Compaction failed: ${report.detail}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  process.stdout.write(`${report.detail}\n`);
+  process.stdout.write(
+    `Resume the thread with a tightened prompt via:\n` +
+      `  /codex:rescue --resume <amended prompt>\n` +
+      `or directly:\n` +
+      `  codex resume ${threadId}\n`
+  );
+}
+
 async function handleEvents(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd", "since", "after-seq", "limit"],
@@ -1158,6 +1198,9 @@ async function main() {
       break;
     case "events":
       await handleEvents(argv);
+      break;
+    case "compact":
+      await handleCompact(argv);
       break;
     case "status":
       await handleStatus(argv);

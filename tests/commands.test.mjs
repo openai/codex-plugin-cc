@@ -72,9 +72,15 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
 
 test("continue is not exposed as a user-facing command", () => {
   const commandFiles = fs.readdirSync(path.join(PLUGIN_ROOT, "commands")).sort();
+  // events.md + compact.md added by feat/event-stream-foundation: the main
+  // Claude loop polls /codex:events to monitor codex state and runs
+  // /codex:compact to recover from "prompt too long" via codex's protocol-
+  // native thread/compact/start RPC.
   assert.deepEqual(commandFiles, [
     "adversarial-review.md",
     "cancel.md",
+    "compact.md",
+    "events.md",
     "rescue.md",
     "result.md",
     "review.md",
@@ -109,7 +115,11 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /Continue current Codex thread/);
   assert.match(rescue, /Start a new Codex thread/);
   assert.match(rescue, /run the `codex:codex-rescue` subagent in the background/i);
-  assert.match(rescue, /default to foreground/i);
+  // Default execution mode was flipped from foreground to background so the
+  // main Claude loop polls /codex:events instead of blocking on a synchronous
+  // Bash call when Codex stalls. See feat/event-stream-foundation.
+  assert.match(rescue, /default to background/i);
+  assert.match(rescue, /poll progress with `\/codex:events <job-id>/i);
   assert.match(rescue, /Do not forward them to `task`/i);
   assert.match(rescue, /`--model` and `--effort` are runtime-selection flags/i);
   assert.match(rescue, /Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort/i);
@@ -126,8 +136,13 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /--resume/);
   assert.match(agent, /--fresh/);
   assert.match(agent, /thin forwarding wrapper/i);
-  assert.match(agent, /prefer foreground for a small, clearly bounded rescue request/i);
-  assert.match(agent, /If the user did not explicitly choose `--background` or `--wait` and the task looks complicated, open-ended, multi-step, or likely to keep Codex running for a long time, prefer background execution/i);
+  // Default execution mode is now background (see feat/event-stream-foundation):
+  // foreground rescue blocks the main Claude loop when codex stalls, which is
+  // exactly the deadlock the per-job event stream was added to break.
+  assert.match(agent, /Default to background execution/i);
+  assert.match(agent, /append `--background`/i);
+  assert.match(agent, /monitor progress via `\/codex:events/i);
+  assert.match(agent, /Honor `--wait` only when the user explicitly asks for foreground/i);
   assert.match(agent, /Use exactly one `Bash` call/i);
   assert.match(agent, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
   assert.match(agent, /Do not call `review`, `adversarial-review`, `status`, `result`, or `cancel`/i);

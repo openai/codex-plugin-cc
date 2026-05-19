@@ -15,7 +15,7 @@ Execution mode:
 
 - If the request includes `--background`, run the `codex:codex-rescue` subagent in the background.
 - If the request includes `--wait`, run the `codex:codex-rescue` subagent in the foreground.
-- If neither flag is present, default to foreground.
+- If neither flag is present, default to background. The companion returns a job id immediately; poll progress with `/codex:events <job-id> --since <last-seq> --json` (or `/codex:status <job-id>`) instead of blocking on a synchronous Bash call. This prevents the main Claude loop from deadlocking when Codex stalls or fails silently.
 - `--background` and `--wait` are execution flags for Claude Code. Do not forward them to `task`, and do not treat them as part of the natural-language task text.
 - `--model` and `--effort` are runtime-selection flags. Preserve them for the forwarded `task` call, but do not treat them as part of the natural-language task text.
 - If the request includes `--resume`, do not ask whether to continue. The user already chose.
