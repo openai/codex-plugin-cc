@@ -189,3 +189,82 @@ export function resolveJobFile(cwd, jobId) {
   ensureStateDir(cwd);
   return path.join(resolveJobsDir(cwd), `${jobId}.json`);
 }
+
+// POSIX guarantees `write(fd, buf, n)` with O_APPEND is atomic when `n` is
+// less than PIPE_BUF (typically 4096 on Linux/macOS). Keep one NDJSON line
+// at or below this bound so a concurrent reader can never observe a partial
+// event. Writers truncate the `raw` field (or elide it entirely) to fit.
+const MAX_EVENT_LINE_BYTES = 4096;
+
+export function resolveJobEventsFile(cwd, jobId) {
+  ensureStateDir(cwd);
+  return path.join(resolveJobsDir(cwd), `${jobId}.events.ndjson`);
+}
+
+export function appendJobEvent(cwd, jobId, event) {
+  const eventsFile = resolveJobEventsFile(cwd, jobId);
+  let line = `${JSON.stringify(event)}\n`;
+
+  if (Buffer.byteLength(line, "utf8") > MAX_EVENT_LINE_BYTES && event.raw != null) {
+    const summary =
+      event.raw && typeof event.raw === "object"
+        ? Object.keys(event.raw).slice(0, 8).join(",")
+        : String(event.raw).slice(0, 100);
+    const truncated = { ...event, raw: { truncated: true, summary } };
+    line = `${JSON.stringify(truncated)}\n`;
+  }
+
+  if (Buffer.byteLength(line, "utf8") > MAX_EVENT_LINE_BYTES) {
+    const elided = {
+      seq: event.seq,
+      ts: event.ts,
+      type: "oversize-event-elided",
+      method: event.method ?? null,
+      phase: event.phase ?? null
+    };
+    line = `${JSON.stringify(elided)}\n`;
+  }
+
+  fs.appendFileSync(eventsFile, line, "utf8");
+}
+
+export function readJobEvents(cwd, jobId, options = {}) {
+  const { since = null, afterSeq = null, limit = null } = options;
+  const eventsFile = resolveJobEventsFile(cwd, jobId);
+  if (!fs.existsSync(eventsFile)) {
+    return [];
+  }
+
+  const content = fs.readFileSync(eventsFile, "utf8");
+  const lines = content.split("\n");
+  const lastIndex = lines.length - 1;
+  const events = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line) continue;
+    try {
+      events.push(JSON.parse(line));
+    } catch {
+      // Tolerate a partial last line: writer may be mid-write between
+      // assembling the JSON and writing the trailing newline. Drop it; the
+      // next read picks it up. For any non-trailing parse failure, treat as
+      // skipped corruption (rare; we'd see it again on next read).
+      if (i === lastIndex || (i === lastIndex - 1 && lines[lastIndex] === "")) {
+        continue;
+      }
+      continue;
+    }
+  }
+
+  let filtered = events;
+  if (afterSeq != null) {
+    filtered = filtered.filter((event) => typeof event.seq === "number" && event.seq > afterSeq);
+  } else if (since != null) {
+    filtered = filtered.filter((event) => typeof event.ts === "string" && event.ts > since);
+  }
+  if (limit != null && Number.isFinite(limit)) {
+    filtered = filtered.slice(0, limit);
+  }
+  return filtered;
+}
