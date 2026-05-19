@@ -187,3 +187,146 @@ test("normalizeNotification: handles malformed message without crashing", () => 
   assert.equal(event.phase, "unknown");
   assert.match(event.ts, /^\d{4}-\d{2}-\d{2}T/);
 });
+
+test("normalizeNotification: thread/status/changed active -> thinking phase", () => {
+  const event = normalizeNotification(makeState(), {
+    method: "thread/status/changed",
+    params: { threadId: "thr_main", status: { type: "active", activeFlags: [] } }
+  });
+
+  assert.equal(event.method, "thread/status/changed");
+  assert.equal(event.phase, "thinking");
+  assert.equal(event.threadId, "thr_main");
+  assert.match(event.message, /active/);
+});
+
+test("normalizeNotification: thread/status/changed systemError -> failed phase", () => {
+  const event = normalizeNotification(makeState(), {
+    method: "thread/status/changed",
+    params: { threadId: "thr_main", status: { type: "systemError" } }
+  });
+
+  assert.equal(event.phase, "failed");
+  assert.match(event.message, /system error/i);
+});
+
+test("normalizeNotification: thread/status/changed unknown status type -> unknown (forward-compat)", () => {
+  const event = normalizeNotification(makeState(), {
+    method: "thread/status/changed",
+    params: { threadId: "thr_main", status: { type: "futureStatusWeDontKnow" } }
+  });
+
+  assert.equal(event.phase, "unknown");
+});
+
+test("normalizeNotification: warning -> warning phase with message body", () => {
+  const event = normalizeNotification(makeState(), {
+    method: "warning",
+    params: { threadId: "thr_main", message: "Exceeded skills context budget of 2%." }
+  });
+
+  assert.equal(event.method, "warning");
+  assert.equal(event.phase, "warning");
+  assert.match(event.message, /Exceeded skills context budget/);
+});
+
+test("normalizeNotification: item/started userMessage -> thinking phase", () => {
+  const event = normalizeNotification(makeState(), {
+    method: "item/started",
+    params: {
+      threadId: "thr_main",
+      item: { type: "userMessage", id: "u1", content: [{ type: "text", text: "Hi" }] }
+    }
+  });
+
+  assert.equal(event.itemType, "userMessage");
+  assert.equal(event.phase, "thinking");
+  assert.match(event.message, /User input received/);
+});
+
+test("normalizeNotification: item/started assistantMessage -> thinking phase", () => {
+  const event = normalizeNotification(makeState(), {
+    method: "item/started",
+    params: {
+      threadId: "thr_main",
+      item: { type: "assistantMessage", id: "a1" }
+    }
+  });
+
+  assert.equal(event.itemType, "assistantMessage");
+  assert.equal(event.phase, "thinking");
+});
+
+test("normalizeNotification: item/started reasoning -> thinking phase", () => {
+  const event = normalizeNotification(makeState(), {
+    method: "item/started",
+    params: { threadId: "thr_main", item: { type: "reasoning" } }
+  });
+
+  assert.equal(event.itemType, "reasoning");
+  assert.equal(event.phase, "thinking");
+});
+
+test("normalizeNotification: thread/status/changed idle -> idle phase", () => {
+  const event = normalizeNotification(makeState(), {
+    method: "thread/status/changed",
+    params: { threadId: "thr_main", status: { type: "idle" } }
+  });
+
+  assert.equal(event.phase, "idle");
+  assert.match(event.message, /idle/i);
+});
+
+test("normalizeNotification: thread/tokenUsage/updated -> metering phase with in/out tokens", () => {
+  const event = normalizeNotification(makeState(), {
+    method: "thread/tokenUsage/updated",
+    params: {
+      threadId: "thr_main",
+      usage: { inputTokens: 1234, outputTokens: 56, cachedInputTokens: 100 }
+    }
+  });
+
+  assert.equal(event.method, "thread/tokenUsage/updated");
+  assert.equal(event.phase, "metering");
+  assert.match(event.message, /in=1234/);
+  assert.match(event.message, /out=56/);
+  assert.match(event.message, /cached=100/);
+});
+
+test("normalizeNotification: thread/tokenUsage/updated without usage still yields metering phase", () => {
+  const event = normalizeNotification(makeState(), {
+    method: "thread/tokenUsage/updated",
+    params: { threadId: "thr_main" }
+  });
+
+  assert.equal(event.phase, "metering");
+  assert.match(event.message, /Token usage updated/i);
+});
+
+test("normalizeNotification: item/started agentMessage with text shows reply preview", () => {
+  const event = normalizeNotification(makeState(), {
+    method: "item/started",
+    params: {
+      threadId: "thr_main",
+      item: { type: "agentMessage", text: "pong" }
+    }
+  });
+
+  assert.equal(event.itemType, "agentMessage");
+  assert.equal(event.phase, "thinking");
+  assert.match(event.message, /Codex replying: pong/);
+});
+
+test("normalizeNotification: item/completed agentMessage with content[].text shows reply", () => {
+  const event = normalizeNotification(makeState(), {
+    method: "item/completed",
+    params: {
+      threadId: "thr_main",
+      item: { type: "agentMessage", content: [{ type: "text", text: "Final answer: 42" }] }
+    }
+  });
+
+  assert.equal(event.itemType, "agentMessage");
+  assert.equal(event.phase, "thinking");
+  assert.match(event.message, /Codex replied: Final answer: 42/);
+});

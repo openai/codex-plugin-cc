@@ -257,9 +257,36 @@ function describeStartedItem(state, item) {
     }
     case "webSearch":
       return { message: `Searching: ${shorten(item.query, 96)}`, phase: "investigating" };
+    case "userMessage":
+      return { message: "User input received.", phase: "thinking" };
+    case "assistantMessage":
+    case "agentMessage": {
+      const text = extractItemText(item);
+      return {
+        message: text ? `Codex replying: ${shorten(text, 96)}` : "Codex drafting reply.",
+        phase: "thinking"
+      };
+    }
+    case "reasoning":
+      return { message: "Reasoning.", phase: "thinking" };
     default:
       return null;
   }
+}
+
+function extractItemText(item) {
+  // codex CLI emits item content under several shapes depending on the
+  // version. Try the common ones in priority order; the raw payload is
+  // always preserved in the event record so callers can fall back.
+  if (typeof item?.text === "string") return item.text;
+  if (Array.isArray(item?.content)) {
+    return item.content
+      .map((part) => part?.text || part?.value || "")
+      .join("")
+      .trim();
+  }
+  if (typeof item?.message === "string") return item.message;
+  return "";
 }
 
 function describeCompletedItem(state, item) {
@@ -288,6 +315,18 @@ function describeCompletedItem(state, item) {
     }
     case "exitedReviewMode":
       return { message: "Reviewer finished.", phase: "finalizing" };
+    case "userMessage":
+      return { message: "User input received.", phase: "thinking" };
+    case "assistantMessage":
+    case "agentMessage": {
+      const text = extractItemText(item);
+      return {
+        message: text ? `Codex replied: ${shorten(text, 96)}` : "Codex reply complete.",
+        phase: "thinking"
+      };
+    }
+    case "reasoning":
+      return { message: "Reasoning complete.", phase: "thinking" };
     default:
       return null;
   }
@@ -516,6 +555,75 @@ export function normalizeNotification(state, message) {
         lifecycle: null,
         phase: "starting",
         message: `Thread renamed: ${params.threadName ?? "?"}`,
+        raw: params
+      };
+    case "thread/status/changed": {
+      const statusType = params.status?.type ?? null;
+      let phase = "unknown";
+      let message = `Thread status: ${statusType ?? "?"}`;
+      if (statusType === "active") {
+        phase = "thinking";
+        message = "Thread active.";
+      } else if (statusType === "idle") {
+        // codex flips to idle after a turn completes (post turn/completed).
+        // Treat as completed-side phase so main loop reads it as quiescent.
+        phase = "idle";
+        message = "Thread idle.";
+      } else if (statusType === "systemError") {
+        phase = "failed";
+        message = "Thread system error.";
+      }
+      return {
+        ts,
+        method,
+        threadId: params.threadId ?? null,
+        turnId: null,
+        itemType: null,
+        lifecycle: null,
+        phase,
+        message,
+        raw: params
+      };
+    }
+    case "thread/tokenUsage/updated": {
+      // codex streams token usage updates as the turn progresses. P7
+      // top-level surface (runAppServerTurn.usage) reads from
+      // turnState.finalTurn?.usage at turn end; this event source is the
+      // real-time signal main-loop Claude can poll to detect "this turn
+      // is burning a lot of tokens, maybe compact before it overflows."
+      const usage = params.usage ?? params.tokenUsage ?? params ?? {};
+      const inTok = usage.inputTokens ?? usage.input ?? null;
+      const outTok = usage.outputTokens ?? usage.output ?? null;
+      const cachedTok = usage.cachedInputTokens ?? usage.cached ?? null;
+      const parts = [];
+      if (inTok != null) parts.push(`in=${inTok}`);
+      if (outTok != null) parts.push(`out=${outTok}`);
+      if (cachedTok != null) parts.push(`cached=${cachedTok}`);
+      return {
+        ts,
+        method,
+        threadId: params.threadId ?? null,
+        turnId: null,
+        itemType: null,
+        lifecycle: null,
+        phase: "metering",
+        message: parts.length > 0 ? `Token usage: ${parts.join(" ")}` : "Token usage updated.",
+        raw: params
+      };
+    }
+    case "warning":
+      // Codex emits these for non-fatal conditions (context budget exceeded,
+      // skipped capabilities, etc.). Surface them so main-loop Claude can
+      // factor them into routing decisions without confusing them with errors.
+      return {
+        ts,
+        method,
+        threadId: params.threadId ?? null,
+        turnId: null,
+        itemType: null,
+        lifecycle: null,
+        phase: "warning",
+        message: params.message ? `Warning: ${params.message}` : "Warning notification.",
         raw: params
       };
     case "turn/started":

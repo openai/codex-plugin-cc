@@ -880,10 +880,10 @@ async function handleTaskWorker(argv) {
   }, 5000);
   watchdog.unref?.();
 
-  let completed = false;
+  let execution = null;
   let workerError = null;
   try {
-    await runTrackedJob(
+    execution = await runTrackedJob(
       {
         ...storedJob,
         workspaceRoot,
@@ -897,26 +897,34 @@ async function handleTaskWorker(argv) {
         }),
       { logFile }
     );
-    completed = true;
   } catch (error) {
     workerError = error;
   } finally {
     clearInterval(watchdog);
-    // Terminal event so a polling reader can distinguish "still slow" from
-    // "already finished". This is the single source of truth for end-of-job —
-    // main-loop Claude must check for {type:"job/exited"} not just job.status.
+    // Terminal event — single source of truth for end-of-job. Main-loop
+    // Claude must check for {type:"job/exited"} not just job.status.
+    //
+    // CRITICAL: runTrackedJob does NOT throw when codex returns a failed
+    // turn — it resolves with execution.exitStatus != 0 and writes
+    // state.status="failed" out-of-band. So "did we catch an exception"
+    // is NOT enough to decide success. We must inspect execution.exitStatus
+    // and treat exitStatus !== 0 as failure even when no exception was
+    // thrown.
+    const success = !workerError && execution?.exitStatus === 0;
     try {
       appendJobEvent(workspaceRoot, jobId, {
         seq: seq++,
         ts: new Date().toISOString(),
         type: "job/exited",
-        phase: completed ? "completed" : "failed",
-        exitCode: completed ? 0 : 1,
+        phase: success ? "completed" : "failed",
+        exitCode: success ? 0 : execution?.exitStatus ?? 1,
         errorMessage: workerError
           ? workerError instanceof Error
             ? workerError.message
             : String(workerError)
-          : null
+          : success
+            ? null
+            : "Task did not complete successfully (see prior events for details)."
       });
     } catch {
       // ignore
