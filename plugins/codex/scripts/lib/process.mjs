@@ -54,6 +54,26 @@ function looksLikeMissingProcessMessage(text) {
   return /not found|no running instance|cannot find|does not exist|no such process/i.test(text);
 }
 
+/**
+ * Checks whether a process with the given PID is still running.
+ * Uses signal 0 which does not affect the process - it only checks existence.
+ *
+ * @param {number | null | undefined} pid
+ * @returns {boolean}
+ */
+export function isProcessAlive(pid) {
+  if (pid == null || !Number.isFinite(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // ESRCH = no such process (dead). EPERM = exists but no signal permission.
+    return error?.code === "EPERM";
+  }
+}
+
 export function terminateProcessTree(pid, options = {}) {
   if (!Number.isFinite(pid)) {
     return { attempted: false, delivered: false, method: null };

@@ -597,7 +597,37 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       completeTurn(state, response.turn);
     }
 
-    return await state.completion;
+    // Race the turn completion against the client's exit promise so that if
+    // the underlying codex app-server (or broker socket) dies mid-turn, we
+    // reject instead of hanging forever waiting for a terminal event that
+    // will never arrive. See: openai/codex-plugin-cc#183.
+    const exitWatch = client.exitPromise.then(() => {
+      if (state.completed) {
+        return;
+      }
+      const reason =
+        client.exitError instanceof Error
+          ? client.exitError
+          : new Error(
+              client.exitError
+                ? String(client.exitError)
+                : "codex app-server connection closed before the turn completed."
+            );
+      emitProgress(
+        state.onProgress,
+        `Codex app-server disconnected mid-turn: ${reason.message}`,
+        "failed"
+      );
+      state.rejectCompletion(reason);
+    });
+
+    try {
+      return await state.completion;
+    } finally {
+      // Detach the exit watcher so its rejection (if any) does not surface
+      // as an unhandled rejection after we have already settled the turn.
+      exitWatch.catch(() => {});
+    }
   } finally {
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
