@@ -833,6 +833,50 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
 });
 
+test("task --background writes a .done signal file on completion for Monitor-based notification", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(launched.status, 0, launched.stderr);
+  const launchPayload = JSON.parse(launched.stdout);
+  assert.equal(launchPayload.status, "queued");
+  assert.ok(launchPayload.signalFile, "launch payload must include signalFile");
+  assert.ok(launchPayload.jobsDir, "launch payload must include jobsDir");
+  assert.equal(launchPayload.signalFile, path.join(launchPayload.jobsDir, `${launchPayload.jobId}.done`));
+
+  // The signal file should not exist yet (task is still running).
+  assert.equal(fs.existsSync(launchPayload.signalFile), false, "signal file must not exist before completion");
+
+  // Wait for the background worker to finish.
+  const waitedStatus = run(
+    "node",
+    [SCRIPT, "status", launchPayload.jobId, "--wait", "--timeout-ms", "15000", "--json"],
+    {
+      cwd: repo,
+      env: buildEnv(binDir)
+    }
+  );
+  assert.equal(waitedStatus.status, 0, waitedStatus.stderr);
+  const waitedPayload = JSON.parse(waitedStatus.stdout);
+  assert.equal(waitedPayload.job.status, "completed");
+
+  // The signal file should now exist and contain the completion marker.
+  await waitFor(() => fs.existsSync(launchPayload.signalFile));
+  const signalContent = fs.readFileSync(launchPayload.signalFile, "utf8");
+  assert.match(signalContent, /completed/);
+  assert.match(signalContent, new RegExp(launchPayload.jobId));
+});
+
 test("review rejects focus text because it is native-review only", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

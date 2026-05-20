@@ -28,6 +28,7 @@ import {
   generateJobId,
   getConfig,
   listJobs,
+  resolveJobsDir,
   setConfig,
   upsertJob,
   writeJobFile
@@ -47,6 +48,7 @@ import {
   createJobRecord,
   createProgressReporter,
   nowIso,
+  resolveSignalFile,
   runTrackedJob,
   SESSION_ID_ENV
 } from "./lib/tracked-jobs.mjs";
@@ -551,7 +553,17 @@ function buildTaskRunMetadata({ prompt, resumeLast = false }) {
 }
 
 function renderQueuedTaskLaunch(payload) {
-  return `${payload.title} started in the background as ${payload.jobId}. Check /codex:status ${payload.jobId} for progress.\n`;
+  const lines = [`${payload.title} started in the background as ${payload.jobId}. Check /codex:status ${payload.jobId} for progress.`];
+  if (payload.worktreePath) {
+    lines.push(`  Worktree: ${payload.worktreePath}`);
+    if (payload.worktreeBranch) {
+      lines.push(`  Branch:   ${payload.worktreeBranch}`);
+    }
+  }
+  if (payload.signalFile) {
+    lines.push(`  Signal:   ${payload.signalFile}`);
+  }
+  return `${lines.join("\n")}\n`;
 }
 
 function getJobKindLabel(kind, jobClass) {
@@ -656,12 +668,15 @@ function enqueueBackgroundTask(cwd, job, request) {
   appendLogLine(logFile, "Queued for background execution.");
 
   const child = spawnDetachedTaskWorker(cwd, job.id);
+  const jobsDir = resolveJobsDir(job.workspaceRoot);
+  const signalFile = resolveSignalFile(jobsDir, job.id);
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
     pid: child.pid ?? null,
     logFile,
+    signalFile,
     request
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
@@ -673,7 +688,9 @@ function enqueueBackgroundTask(cwd, job, request) {
       status: "queued",
       title: job.title,
       summary: job.summary,
-      logFile
+      logFile,
+      jobsDir,
+      signalFile
     },
     logFile
   };

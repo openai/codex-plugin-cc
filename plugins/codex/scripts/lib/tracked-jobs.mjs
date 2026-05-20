@@ -1,7 +1,8 @@
 import fs from "node:fs";
+import path from "node:path";
 import process from "node:process";
 
-import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { readJobFile, resolveJobFile, resolveJobLogFile, resolveJobsDir, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
@@ -46,6 +47,22 @@ export function appendLogBlock(logFile, title, body) {
     return;
   }
   fs.appendFileSync(logFile, `\n[${nowIso()}] ${title}\n${String(body).trimEnd()}\n`, "utf8");
+}
+
+export function resolveSignalFile(jobsDir, jobId) {
+  return path.join(jobsDir, `${jobId}.done`);
+}
+
+export function writeCompletionSignalFile(jobsDir, jobId, status, summary) {
+  const signalFile = resolveSignalFile(jobsDir, jobId);
+  const safeStatus = status === "completed" ? "completed" : "failed";
+  const line = `[${nowIso()}] ${safeStatus} ${jobId}${summary ? ` ${summary}` : ""}`;
+  try {
+    fs.writeFileSync(signalFile, `${line}\n`, "utf8");
+  } catch {
+    // Signal file is best-effort; do not fail the job if it cannot be written.
+  }
+  return signalFile;
 }
 
 export function createJobLogFile(workspaceRoot, jobId, title) {
@@ -151,6 +168,8 @@ export async function runTrackedJob(job, runner, options = {}) {
   writeJobFile(job.workspaceRoot, job.id, runningRecord);
   upsertJob(job.workspaceRoot, runningRecord);
 
+  const jobsDir = resolveJobsDir(job.workspaceRoot);
+
   try {
     const execution = await runner();
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
@@ -177,6 +196,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       completedAt
     });
     appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
+    writeCompletionSignalFile(jobsDir, job.id, completionStatus, execution.summary);
     return execution;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -199,6 +219,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       errorMessage,
       completedAt
     });
+    writeCompletionSignalFile(jobsDir, job.id, "failed", errorMessage);
     throw error;
   }
 }
