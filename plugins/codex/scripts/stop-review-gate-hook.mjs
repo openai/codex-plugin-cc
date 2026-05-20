@@ -52,7 +52,7 @@ function buildStopReviewPrompt(input = {}) {
     ? ["Previous Antigravity response:", lastAssistantMessage].join("\n")
     : "";
   return interpolateTemplate(template, {
-    ANTIGRAVITY_RESPONSE_BLOCK: antigravityResponseBlock
+    CLAUDE_RESPONSE_BLOCK: antigravityResponseBlock
   });
 }
 

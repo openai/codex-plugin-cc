@@ -19,7 +19,7 @@ delete process.env.GEMINI_PLUGIN_DATA;
 delete process.env.CLAUDE_PLUGIN_DATA;
 
 import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
@@ -58,6 +58,18 @@ test("setup reports ready when fake codex is installed and authenticated", () =>
   assert.equal(payload.ready, true);
   assert.match(payload.codex.detail, /advanced runtime available/);
   assert.equal(payload.sessionRuntime.mode, "direct");
+});
+
+test("app-server module loads from the shipped plugin directory", async () => {
+  const installRoot = makeTempDir();
+  const installedPluginRoot = path.join(installRoot, "codex");
+  fs.cpSync(PLUGIN_ROOT, installedPluginRoot, { recursive: true });
+
+  const moduleUrl = pathToFileURL(path.join(installedPluginRoot, "scripts", "lib", "app-server.mjs"));
+  moduleUrl.search = `?test=${Date.now()}`;
+  const appServerModule = await import(moduleUrl.href);
+
+  assert.equal(typeof appServerModule.CodexAppServerClient?.connect, "function");
 });
 
 test("setup is ready without npm when Codex is already installed and authenticated", () => {
@@ -1846,6 +1858,7 @@ test("stop hook runs a stop-time review task and blocks on findings when the rev
   assert.match(fakeState.lastTurnStart.prompt, /<task>/i);
   assert.match(fakeState.lastTurnStart.prompt, /<compact_output_contract>/i);
   assert.match(fakeState.lastTurnStart.prompt, /Only review the work from the previous (Claude|Antigravity) turn/i);
+  assert.match(fakeState.lastTurnStart.prompt, /Previous Antigravity response:/);
   assert.match(fakeState.lastTurnStart.prompt, /I completed the refactor and updated the retry logic\./);
 
   const status = run("node", [SCRIPT, "status"], {
