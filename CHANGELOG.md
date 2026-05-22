@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.5] - 2026-05-22
+
+### Fixed
+
+- **`/codex:observe`, `/codex:status <id>`, `/codex:result <id>`, `/codex:cancel <id>` returned "Job not found" when invoked from a Claude Code session whose git workspace differed from the one in which the job was created.** State is partitioned per workspace under `$CLAUDE_PLUGIN_DATA/state/<slug>-<hash>/`, and every command resolved the workspace from `process.cwd()` only. So a user who saw a job in `/codex:status` from workspace A and then copied the job id into a slash command running in workspace B hit a hard miss even though the job record was still on disk.
+  - Added `findJobByIdAcrossWorkspaces(jobId)` in `plugins/codex/scripts/lib/state.mjs`: scans every `state.json` under the configured state root and returns `{ stateDir, job }` for an exact id match (corrupted state files are skipped, not propagated).
+  - `lib/observe.mjs`: when the local workspace does not contain the requested job id, fall back to the cross-workspace lookup. The header prints a one-line note showing which state dir was used so the cross-boundary read is auditable, and the tail continues to use the absolute `eventFile` recorded on the job.
+  - `lib/job-control.mjs`: `buildSingleJobSnapshot`, `resolveResultJob`, and `resolveCancelableJob` each fall back to the cross-workspace match when an explicit reference misses locally. The returned `workspaceRoot` is the job's original workspace, so all subsequent `readStoredJob` / `writeJobFile` / `upsertJob` calls land in the correct state dir without further plumbing. Active/finished predicates are still honored across the boundary — e.g., `/codex:result` on a still-running cross-workspace job surfaces a "still running in another workspace" error instead of silently picking it up.
+  - `codex-companion.mjs` `handleCancel`: passes the resolved `workspaceRoot` (not the invocation `cwd`) to `interruptAppServerTurn`, so the broker interrupt targets the workspace that actually owns the running Codex turn.
+  - Tests: `tests/observe.test.mjs` adds coverage for `findJobByIdAcrossWorkspaces` (stateRoot missing, empty id, hit, miss, corrupted state.json). `tests/job-control.test.mjs` (new file) covers cross-workspace fallback for the three resolvers, including predicate rejection paths.
+
 ## [1.2.4] - 2026-05-22
 
 ### Fixed
