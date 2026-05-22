@@ -41,6 +41,7 @@ Operating rules:
 - The subagent is a thin forwarder only. It should use one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task ...` and return that command's stdout as-is.
 - Return the Codex companion stdout verbatim to the user.
 - Do not paraphrase, summarize, rewrite, or add commentary before or after it.
+- The Claude Code harness appends an `agentId: <id> (use SendMessage with to: '<id>' to continue this agent)` line to every `Agent(codex:codex-rescue)` return. This is a resume token for continuing the same agent thread, NOT a "still running" or "in background" status signal. By the time you see it, the subagent has finished. Do not paraphrase it as "Codex is running in background" or "task dispatched async" — the stdout above the suffix is the actual completed output, which you return verbatim per the rule above.
 - Do not ask the subagent to inspect files, monitor progress, poll `/codex:status`, fetch `/codex:result`, call `/codex:cancel`, summarize output, or do follow-up work of its own.
 - Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort.
 - Leave the model unset unless the user explicitly asks for one. If they ask for `spark`, map it to `gpt-5.3-codex-spark`.
