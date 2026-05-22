@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.4] - 2026-05-22
+
+### Fixed
+
+- **`/codex:observe` slash command produced no output in Claude Code** — removed the inline `` !`...` `` shell-exec fallback from `plugins/codex/commands/observe.md`. The fallback invoked the long-running live tail (`handleObserveCommand` waits indefinitely for `COMPLETED` or `SIGINT`), and because Claude Code's slash-exec model buffers stdout until the child process exits, a never-returning process gated the entire slash-command body — including the 36 lines of "open a new terminal" guidance that preceded it. Users typing `/codex:observe` saw nothing at all.
+  - The slash command body is now a pure static guidance document: it tells the user to open a new terminal and shows the copy-paste `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" observe …` snippet. It renders immediately regardless of job state.
+  - The CLI `observe` subcommand in `codex-companion.mjs` / `lib/observe.mjs` is **unchanged** — running `node codex-companion.mjs observe` in a terminal works exactly as before (live ANSI tail, `Ctrl+C` detach, completes on `COMPLETED` event).
+  - Structural rule captured in `openspec/changes/fix-observe-slash-command-hang/specs/observe-slash-command/spec.md`: slash command bodies MUST NOT contain inline shell-exec blocks that invoke processes which do not terminate in bounded time. One-shot subprocesses (`/codex:cancel`, `/codex:result`, `/codex:status`) may continue to use inline exec.
+
 ## [1.2.3] - 2026-05-21
 
 ### Changed

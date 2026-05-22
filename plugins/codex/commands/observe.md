@@ -34,15 +34,3 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" observe --cwd /path/to/
 ```
 
 **Note:** This command is designed to be run in a separate terminal for live observation. The slash command here shows you the exact command to copy-paste into your new terminal window.
-
-If you want to see the output inline instead, you can run:
-
-!`node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" observe $ARGUMENTS`
-
-Present the command output to the user. The observer shows:
-- Color-coded events (requires ANSI-capable terminal)
-- Tool calls with file paths
-- Command executions with exit codes
-- File changes
-- Agent messages and reasoning
-- Completion status with timestamp
