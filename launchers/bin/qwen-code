@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# Claude Code → Qwen Coding 完全定制化分身
+# 端点: DashScope / Qwen Coding Plan / Token Plan Anthropic 兼容入口，按 QWEN_PROFILE 路由
+# 模型: qwen3-coder-plus / qwen3-coder-next / qwen3.7-max / qwen3.6-plus / qwen3.6-flash
+# 品牌: Qwen Purple #615CED
+# 基准: @anthropic-ai/claude-code v2.1.150 (native binary)
+# 注意: $DASHSCOPE_API_KEY 已失效，请去百炼控制台拿新 key（必要时建 app）
+
+REAL_HOME="$HOME"
+source "$REAL_HOME/bin/cc-model-lib.sh"
+export HOME="$REAL_HOME/.claude-envs/qwen"
+mkdir -p "$HOME/.claude"
+
+cc_model_unset_proxies
+
+export ANTHROPIC_AUTH_TOKEN="${DASHSCOPE_API_KEY:-${QWEN_API_KEY:-${BAILIAN_API_KEY:-}}}"
+unset ANTHROPIC_API_KEY ANTHROPIC_API_BASE
+
+MODELS=(qwen3-coder-plus qwen3-coder-next qwen3-coder-flash qwen3.7-max qwen3.6-plus qwen3.6-flash qwen3-max qwen3.5-flash)
+if [[ "$1" == "-l" || "$1" == "--list" ]]; then printf '%s\n' "${MODELS[@]}"; exit 0; fi
+
+case "${QWEN_PROFILE:-coder}" in
+  coding|coding-plan|plan)
+    QWEN_DEFAULT_BASE_URL="https://coding-intl.dashscope.aliyuncs.com/apps/anthropic"
+    QWEN_DEFAULT_MODEL="qwen3.6-plus"
+    QWEN_DEFAULT_OPUS="qwen3.6-plus"
+    QWEN_DEFAULT_SONNET="qwen3.6-plus"
+    QWEN_DEFAULT_HAIKU="qwen3.6-plus"
+    ;;
+  token|token-plan|team)
+    QWEN_DEFAULT_BASE_URL="https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic"
+    QWEN_DEFAULT_MODEL="qwen3.7-max"
+    QWEN_DEFAULT_OPUS="qwen3.7-max"
+    QWEN_DEFAULT_SONNET="qwen3.7-max"
+    QWEN_DEFAULT_HAIKU="qwen3.6-flash"
+    ;;
+  max|payg|intl)
+    QWEN_DEFAULT_BASE_URL="https://dashscope-intl.aliyuncs.com/apps/anthropic"
+    QWEN_DEFAULT_MODEL="qwen3.7-max"
+    QWEN_DEFAULT_OPUS="qwen3.7-max"
+    QWEN_DEFAULT_SONNET="qwen3.7-max"
+    QWEN_DEFAULT_HAIKU="qwen3.6-flash"
+    ;;
+  cheap|flash)
+    QWEN_DEFAULT_BASE_URL="https://dashscope.aliyuncs.com/apps/anthropic"
+    QWEN_DEFAULT_MODEL="qwen3-coder-flash"
+    QWEN_DEFAULT_OPUS="qwen3-coder-next"
+    QWEN_DEFAULT_SONNET="qwen3-coder-flash"
+    QWEN_DEFAULT_HAIKU="qwen3-coder-flash"
+    ;;
+  coder|*)
+    QWEN_DEFAULT_BASE_URL="https://dashscope.aliyuncs.com/apps/anthropic"
+    QWEN_DEFAULT_MODEL="qwen3-coder-next"
+    QWEN_DEFAULT_OPUS="qwen3-coder-plus"
+    QWEN_DEFAULT_SONNET="qwen3-coder-next"
+    QWEN_DEFAULT_HAIKU="qwen3-coder-flash"
+    ;;
+esac
+
+export ANTHROPIC_BASE_URL="${QWEN_BASE_URL:-$QWEN_DEFAULT_BASE_URL}"
+
+MODEL="${QWEN_MODEL:-$QWEN_DEFAULT_MODEL}"
+if [[ "$1" == "-m" || "$1" == "--model" ]] && [[ -n "$2" ]]; then MODEL="$2"; shift 2; fi
+
+export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1     # 启用官方 agent-teams（同家族 CC sidecar 协作）
+export ANTHROPIC_MODEL="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="Qwen Coding · $MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTIONS_JSON="$(cc_model_json_options "Qwen Coding")"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="${QWEN_OPUS:-$QWEN_DEFAULT_OPUS}"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="${QWEN_SONNET:-$QWEN_DEFAULT_SONNET}"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="${QWEN_HAIKU:-$QWEN_DEFAULT_HAIKU}"
+export ANTHROPIC_SMALL_FAST_MODEL="${QWEN_FAST:-$QWEN_DEFAULT_HAIKU}"
+export CLAUDE_CODE_SUBAGENT_MODEL="${QWEN_SUBAGENT:-$QWEN_DEFAULT_SONNET}"
+
+export API_TIMEOUT_MS="3000000"
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"
+export DISABLE_AUTOUPDATER="1"
+export DISABLE_TELEMETRY="1"
+export DISABLE_ERROR_REPORTING="1"
+export DISABLE_BUG_COMMAND="1"
+export ENABLE_TOOL_SEARCH="false"
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${QWEN_MAX_OUTPUT:-65536}"
+export MAX_MCP_OUTPUT_TOKENS="25000"
+export BASH_DEFAULT_TIMEOUT_MS="600000"
+export BASH_MAX_TIMEOUT_MS="1200000"
+
+case "${QWEN_ENABLE_THINKING:-}" in
+  1|true|enabled) export CLAUDE_CODE_EXTRA_BODY='{"enable_thinking":true}' ;;
+  0|false|disabled) export CLAUDE_CODE_EXTRA_BODY='{"enable_thinking":false}' ;;
+esac
+
+CLAUDE_CLI="$HOME/opt/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+QWEN_PROMPT_FILE="$HOME/prompts/qwen-proactive-tools.md"
+export CC_MODEL_COMMAND="cc-qwen"
+export CC_MODEL_PROVIDER="qwen"
+export CC_MODEL_SELECTED="$MODEL"
+export CC_MODEL_AUTH_LABEL="DASHSCOPE_API_KEY/QWEN_API_KEY/BAILIAN_API_KEY"
+export CC_MODEL_AUTH_VALUE="$ANTHROPIC_AUTH_TOKEN"
+export CC_MODEL_CLI="$CLAUDE_CLI"
+export CC_MODEL_PATCH_MARKER="Qwen Coding"
+export CC_MODEL_PROMPT_FILE="$QWEN_PROMPT_FILE"
+cc_model_handle_common_command "${1:-}"
+
+[ ! -f "$CLAUDE_CLI" ] && { echo "[qwen-code] ❌ Claude Code executable missing" >&2; exit 1; }
+if [ "${CLAUDE_CLI##*/}" != "claude.exe" ] && ! grep -q "Qwen Coding" "$CLAUDE_CLI" 2>/dev/null; then
+  "$HOME/bin/apply-qwen-patch.sh" >&2 || exit 1
+fi
+
+PLUG_DIR="$HOME/.claude/plugins"
+if [ -d "$PLUG_DIR" ]; then
+  printf '%s\n' '{"version":2,"plugins":{}}' > "$PLUG_DIR/installed_plugins.json"
+  printf '%s\n' '{}' > "$PLUG_DIR/known_marketplaces.json"
+fi
+
+echo "[qwen-code] profile=${QWEN_PROFILE:-coder}  model=$MODEL  endpoint=$ANTHROPIC_BASE_URL" >&2
+[ -z "$ANTHROPIC_AUTH_TOKEN" ] && echo "[qwen-code] ⚠️  DASHSCOPE_API_KEY 未设" >&2
+
+QWEN_EXTRA=()
+[ -f "$QWEN_PROMPT_FILE" ] && QWEN_EXTRA=(--append-system-prompt "$(cat "$QWEN_PROMPT_FILE")")
+
+exec "$CLAUDE_CLI" "${QWEN_EXTRA[@]}" "$@"

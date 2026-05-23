@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# Claude Code → MiMo Coding 完全定制化分身
+# 端点: 默认 https://token-plan-sgp.xiaomimimo.com/anthropic (Singapore token-plan)
+# 模型: mimo-v2-pro（旗舰）/ mimo-v2-omni（全模态）/ mimo-v2-flash（部分 endpoint 可用）
+# 品牌: Xiaomi Orange #FF6700
+# 基准: @anthropic-ai/claude-code v2.1.150 (native binary)
+# 注意: thinking 实际支持（content 含 thinking 块，signature 为空字符串）
+
+REAL_HOME="$HOME"
+source "$REAL_HOME/bin/cc-model-lib.sh"
+export HOME="$REAL_HOME/.claude-envs/mimo"
+mkdir -p "$HOME/.claude"
+
+# Do not inherit shell-level proxy settings; each cc-* wrapper should decide
+# its own network path explicitly.
+cc_model_unset_proxies
+
+case "${MIMO_REGION:-sgp}" in
+  cn)       MIMO_DEFAULT_BASE_URL="https://token-plan-cn.xiaomimimo.com/anthropic" ;;
+  ams)      MIMO_DEFAULT_BASE_URL="https://token-plan-ams.xiaomimimo.com/anthropic" ;;
+  public)   MIMO_DEFAULT_BASE_URL="https://api.mimo-v2.com/anthropic" ;;
+  official) MIMO_DEFAULT_BASE_URL="https://api.xiaomimimo.com/anthropic" ;;
+  sgp|*)    MIMO_DEFAULT_BASE_URL="https://token-plan-sgp.xiaomimimo.com/anthropic" ;;
+esac
+export ANTHROPIC_BASE_URL="${MIMO_BASE_URL:-$MIMO_DEFAULT_BASE_URL}"
+export ANTHROPIC_AUTH_TOKEN="${MIMO_API_KEY:-${XIAOMI_API_KEY:-}}"
+unset ANTHROPIC_API_KEY ANTHROPIC_API_BASE
+
+case "${MIMO_PROFILE:-}" in
+  latest|v25|multimodal) MIMO_WANTS_V25=1 ;;
+  *)                     MIMO_WANTS_V25="${MIMO_ENABLE_V25:-0}" ;;
+esac
+
+case "${MIMO_REGION:-sgp}" in
+  public)
+    MODELS=(mimo-v2.5-pro mimo-v2.5 mimo-v2-pro mimo-v2-flash mimo-v2-omni)
+    MIMO_DEFAULT_FAST="mimo-v2-flash"
+    ;;
+  *)
+    # Live-tested 2026-05-05: token-plan-sgp accepts mimo-v2-pro but rejects
+    # mimo-v2-flash with "Not supported model". Keep Flash opt-in for accounts
+    # or endpoints where it is enabled.
+    if [ "$MIMO_WANTS_V25" = "1" ] && [ "${MIMO_ENABLE_FLASH:-0}" = "1" ]; then
+      MODELS=(mimo-v2.5-pro mimo-v2.5 mimo-v2-pro mimo-v2-flash mimo-v2-omni)
+    elif [ "$MIMO_WANTS_V25" = "1" ]; then
+      MODELS=(mimo-v2.5-pro mimo-v2.5 mimo-v2-pro mimo-v2-omni)
+    elif [ "${MIMO_ENABLE_FLASH:-0}" = "1" ]; then
+      MODELS=(mimo-v2-pro mimo-v2-flash mimo-v2-omni)
+    else
+      MODELS=(mimo-v2-pro mimo-v2-omni)
+    fi
+    MIMO_DEFAULT_FAST="mimo-v2-pro"
+    ;;
+esac
+if [[ "$1" == "-l" || "$1" == "--list" ]]; then printf '%s\n' "${MODELS[@]}"; exit 0; fi
+
+case "${MIMO_PROFILE:-pro}" in
+  latest|v25)
+    MIMO_DEFAULT_MODEL="mimo-v2.5-pro"
+    MIMO_DEFAULT_OPUS="mimo-v2.5-pro"
+    MIMO_DEFAULT_SONNET="mimo-v2.5-pro"
+    MIMO_DEFAULT_HAIKU="${MIMO_DEFAULT_FAST}"
+    ;;
+  multimodal|omni)
+    if [[ "${MIMO_REGION:-sgp}" == "public" || "${MIMO_ENABLE_V25:-0}" == "1" ]]; then
+      MIMO_DEFAULT_MODEL="mimo-v2.5"
+      MIMO_DEFAULT_OPUS="mimo-v2.5-pro"
+      MIMO_DEFAULT_SONNET="mimo-v2.5"
+    else
+      MIMO_DEFAULT_MODEL="mimo-v2-omni"
+      MIMO_DEFAULT_OPUS="mimo-v2-pro"
+      MIMO_DEFAULT_SONNET="mimo-v2-omni"
+    fi
+    MIMO_DEFAULT_HAIKU="${MIMO_DEFAULT_FAST}"
+    ;;
+  fast|flash)
+    MIMO_DEFAULT_MODEL="${MIMO_DEFAULT_FAST}"
+    MIMO_DEFAULT_OPUS="mimo-v2-pro"
+    MIMO_DEFAULT_SONNET="${MIMO_DEFAULT_FAST}"
+    MIMO_DEFAULT_HAIKU="${MIMO_DEFAULT_FAST}"
+    ;;
+  pro|*)
+    MIMO_DEFAULT_MODEL="mimo-v2-pro"
+    MIMO_DEFAULT_OPUS="mimo-v2-pro"
+    MIMO_DEFAULT_SONNET="mimo-v2-pro"
+    MIMO_DEFAULT_HAIKU="${MIMO_DEFAULT_FAST}"
+    ;;
+esac
+
+MODEL="${MIMO_MODEL:-$MIMO_DEFAULT_MODEL}"
+if [[ "$1" == "-m" || "$1" == "--model" ]] && [[ -n "$2" ]]; then MODEL="$2"; shift 2; fi
+
+export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1     # 启用官方 agent-teams（同家族 CC sidecar 协作）
+export ANTHROPIC_MODEL="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="MiMo Coding · $MODEL"
+
+# /model picker 全档位：把 MODELS 数组序列化成 JSON，patched d96 读取后展开为多条
+export ANTHROPIC_CUSTOM_MODEL_OPTIONS_JSON="$(cc_model_json_options "MiMo Coding")"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="${MIMO_OPUS:-$MIMO_DEFAULT_OPUS}"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="${MIMO_SONNET:-$MIMO_DEFAULT_SONNET}"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="${MIMO_HAIKU:-$MIMO_DEFAULT_HAIKU}"
+export ANTHROPIC_SMALL_FAST_MODEL="${MIMO_FAST:-$MIMO_DEFAULT_HAIKU}"
+export CLAUDE_CODE_SUBAGENT_MODEL="${MIMO_SUBAGENT:-$MIMO_DEFAULT_SONNET}"
+
+export API_TIMEOUT_MS="3000000"
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"
+export DISABLE_AUTOUPDATER="1"
+export DISABLE_TELEMETRY="1"
+export DISABLE_ERROR_REPORTING="1"
+export DISABLE_BUG_COMMAND="1"
+export ENABLE_TOOL_SEARCH="false"
+# 深度适配 v2：可读 MiMo API 文档给出 pro/omni 128K output，flash 64K output
+case "$MODEL" in
+  *flash*) MIMO_DEFAULT_MAX_OUT=64000 ;;
+  *)       MIMO_DEFAULT_MAX_OUT=128000 ;;
+esac
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${MIMO_MAX_OUTPUT:-$MIMO_DEFAULT_MAX_OUT}"
+export MAX_MCP_OUTPUT_TOKENS="25000"
+
+# thinking 默认关（MiMo 服务端返回 thinking 块但 signature 为空字符串；
+# CC 多轮回传带空 signature 的 thinking 块时有些中间件会拒，且官方/第三方教程
+# 都明确说 "MiMo 不支持 Claude Code 的思维链，需要关闭 Thinking"）。
+# 如需开，显式传 MIMO_ENABLE_THINKING=1；如需指定 budget 传 MIMO_THINKING_BUDGET。
+if [ "${MIMO_ENABLE_THINKING:-0}" = "1" ] || [ -n "${MIMO_THINKING_BUDGET:-}" ]; then
+  [ -n "$MIMO_THINKING_BUDGET" ] && export MAX_THINKING_TOKENS="$MIMO_THINKING_BUDGET"
+else
+  export MAX_THINKING_TOKENS=0
+  export CLAUDE_CODE_DISABLE_THINKING=1
+  export ANTHROPIC_THINKING=disabled
+  export CLAUDE_CODE_EXTRA_BODY='{"thinking":{"type":"disabled"}}'
+  unset CLAUDE_CODE_ENABLE_THINKING
+fi
+
+# reasoning_effort low/medium/high (Pro 专属；仅在 thinking 未关时有意义)
+[ -n "$MIMO_REASONING" ] && export CLAUDE_CODE_EFFORT_LEVEL="$MIMO_REASONING"
+
+# Mimo 独有 header（safety / 内置搜索）通过 ANTHROPIC_CUSTOM_HEADERS 注入
+MIMO_HEADERS=()
+[ -n "$MIMO_SAFETY" ] && MIMO_HEADERS+=("x-mimo-safety: $MIMO_SAFETY")
+[ "${MIMO_WEB_SEARCH:-0}" = "1" ] && MIMO_HEADERS+=("x-mimo-use-search: true")
+if [ ${#MIMO_HEADERS[@]} -gt 0 ]; then
+  export ANTHROPIC_CUSTOM_HEADERS="$(IFS=$'\n'; echo "${MIMO_HEADERS[*]}")"
+fi
+
+# cache_control 不支持 → 屏蔽 prompt-caching beta 避免中间件报错
+export ANTHROPIC_BETAS=""
+export DISABLE_PROMPT_CACHING="1"
+export BASH_DEFAULT_TIMEOUT_MS="600000"
+export BASH_MAX_TIMEOUT_MS="1200000"
+
+CLAUDE_CLI="$HOME/opt/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+MIMO_PROMPT_FILE="$HOME/prompts/mimo-proactive-tools.md"
+export CC_MODEL_COMMAND="cc-mimo"
+export CC_MODEL_PROVIDER="mimo"
+export CC_MODEL_SELECTED="$MODEL"
+if [ -n "${MIMO_API_KEY:-}" ]; then
+  export CC_MODEL_AUTH_LABEL="MIMO_API_KEY"
+else
+  export CC_MODEL_AUTH_LABEL="XIAOMI_API_KEY"
+fi
+export CC_MODEL_AUTH_VALUE="${MIMO_API_KEY:-${XIAOMI_API_KEY:-}}"
+export CC_MODEL_CLI="$CLAUDE_CLI"
+export CC_MODEL_PATCH_MARKER="MiMo Coding"
+export CC_MODEL_PROMPT_FILE="$MIMO_PROMPT_FILE"
+cc_model_handle_common_command "${1:-}"
+
+[ ! -f "$CLAUDE_CLI" ] && { echo "[mimo-code] ❌ Claude Code executable missing" >&2; exit 1; }
+if [ "${CLAUDE_CLI##*/}" != "claude.exe" ] && ! grep -q "MiMo Coding" "$CLAUDE_CLI" 2>/dev/null; then
+  "$HOME/bin/apply-mimo-patch.sh" >&2 || exit 1
+fi
+
+cc_model_reset_plugins
+
+echo "[mimo-code] profile=${MIMO_PROFILE:-pro}  model=$MODEL  endpoint=$ANTHROPIC_BASE_URL" >&2
+
+MIMO_EXTRA=()
+[ -f "$MIMO_PROMPT_FILE" ] && MIMO_EXTRA=(--append-system-prompt "$(cat "$MIMO_PROMPT_FILE")")
+
+exec "$CLAUDE_CLI" "${MIMO_EXTRA[@]}" "$@"

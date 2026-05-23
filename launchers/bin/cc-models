@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+# cc-models — small dispatcher for ~/bin/cc-* Claude Code model launchers.
+set -euo pipefail
+
+ROOT="${HOME}/bin"
+REGISTRY="${CC_MODELS_REGISTRY:-$ROOT/cc-model-registry.tsv}"
+RESEARCH="${CC_MODELS_RESEARCH:-$ROOT/cc-model-research.tsv}"
+BACKLOG="${CC_MODELS_BACKLOG:-$ROOT/cc-model-backlog.md}"
+COMMANDS=()
+
+load_commands() {
+  local cmd provider route default_model opus sonnet haiku fast source
+  if [ -f "$REGISTRY" ]; then
+    while IFS=$'\t' read -r cmd provider route default_model opus sonnet haiku fast source; do
+      case "$cmd" in ""|\#*) continue ;; esac
+      COMMANDS+=("$cmd")
+    done < "$REGISTRY"
+  else
+    COMMANDS=(cc-kimi cc-glm cc-qwen cc-deepseek cc-doubao cc-minimax cc-mimo cc-stepfun cc-longcat cc-gemini cc-grok cc-local)
+  fi
+}
+
+load_commands
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: cc-models <command>
+
+Commands:
+  list      Show high-frequency cc-* launchers and configured models
+  matrix    Show configured tier mapping and routes
+  sources   Show primary official/reference source per launcher
+  research  Show research/source-status table
+  backlog   Show continuation backlog
+  doctor    Run --doctor for all launchers, or one: cc-models doctor qwen
+  env       Print non-secret env for one launcher: cc-models env deepseek
+  profiles  Show provider-specific profile knobs
+  audit     Run syntax checks for installed launchers, list, and doctor
+  paths     Show launcher paths
+EOF
+}
+
+normalize_cmd() {
+  case "${1:-}" in
+    cc-*) printf '%s' "$1" ;;
+    "") printf '' ;;
+    *) printf 'cc-%s' "$1" ;;
+  esac
+}
+
+target_for() {
+  local cmd="$1"
+  local path="$ROOT/$cmd"
+  if [ -L "$path" ]; then
+    readlink "$path"
+  elif [ -e "$path" ]; then
+    printf '%s' "$path"
+  else
+    printf 'missing'
+  fi
+}
+
+script_path_for() {
+  local cmd="$1"
+  local path="$ROOT/$cmd"
+  local target
+  if [ -L "$path" ]; then
+    target="$(readlink "$path")"
+    case "$target" in
+      /*) printf '%s' "$target" ;;
+      *) printf '%s/%s' "$ROOT" "$target" ;;
+    esac
+  else
+    printf '%s' "$path"
+  fi
+}
+
+list_models() {
+  local cmd path raw models
+  for cmd in "${COMMANDS[@]}"; do
+    path="$ROOT/$cmd"
+    if [ ! -x "$path" ]; then
+      printf '%-12s missing\n' "$cmd"
+      continue
+    fi
+    if ! raw="$("$path" --list 2>/dev/null)"; then
+      raw="unavailable"
+    fi
+    models="$(printf '%s\n' "$raw" | awk 'BEGIN{first=1} {printf "%s%s", (first ? "" : ", "), $0; first=0} END{print ""}')"
+    printf '%-12s %s\n' "$cmd" "$models"
+  done
+}
+
+doctor_all() {
+  local only="${1:-}"
+  local cmd path normalized
+  normalized="$(normalize_cmd "$only")"
+  for cmd in "${COMMANDS[@]}"; do
+    [ -n "$normalized" ] && [ "$cmd" != "$normalized" ] && continue
+    path="$ROOT/$cmd"
+    if [ ! -x "$path" ]; then
+      printf '%s: missing\n' "$cmd"
+      continue
+    fi
+    if ! "$path" --doctor; then
+      printf '%s: doctor failed\n' "$cmd"
+    fi
+    echo
+  done
+}
+
+env_one() {
+  local cmd path
+  cmd="$(normalize_cmd "${1:-}")"
+  if [ -z "$cmd" ]; then
+    echo "[cc-models] env requires a launcher name, e.g. qwen" >&2
+    exit 2
+  fi
+  path="$ROOT/$cmd"
+  if [ ! -x "$path" ]; then
+    echo "[cc-models] launcher not found: $cmd" >&2
+    exit 127
+  fi
+  "$path" --env
+}
+
+paths() {
+  local cmd
+  for cmd in "${COMMANDS[@]}"; do
+    printf '%-12s %s -> %s\n' "$cmd" "$ROOT/$cmd" "$(target_for "$cmd")"
+  done
+}
+
+matrix() {
+  if [ ! -f "$REGISTRY" ]; then
+    echo "[cc-models] registry missing: $REGISTRY" >&2
+    exit 1
+  fi
+  awk -F '\t' '
+    BEGIN { printf "%-12s %-10s %-22s %-28s %-28s %-28s %-24s\n", "command", "provider", "route", "default", "opus", "sonnet", "haiku" }
+    /^[[:space:]]*#/ || NF < 8 { next }
+    { printf "%-12s %-10s %-22s %-28s %-28s %-28s %-24s\n", $1, $2, $3, $4, $5, $6, $7 }
+  ' "$REGISTRY"
+}
+
+sources() {
+  if [ ! -f "$REGISTRY" ]; then
+    echo "[cc-models] registry missing: $REGISTRY" >&2
+    exit 1
+  fi
+  awk -F '\t' '
+    /^[[:space:]]*#/ || NF < 9 { next }
+    { printf "%-12s %s\n", $1, $9 }
+  ' "$REGISTRY"
+}
+
+research() {
+  if [ ! -f "$RESEARCH" ]; then
+    echo "[cc-models] research file missing: $RESEARCH" >&2
+    exit 1
+  fi
+  awk -F '\t' '
+    BEGIN { printf "%-12s %-6s %-18s %-54s %s\n", "command", "grade", "status", "official_doc", "next_action" }
+    /^[[:space:]]*#/ || NF < 6 { next }
+    { printf "%-12s %-6s %-18s %-54s %s\n", $1, $4, $5, $2, $6 }
+  ' "$RESEARCH"
+}
+
+profiles() {
+  cat <<'EOF'
+command      env var            profiles
+cc-kimi      KIMI_*             kimi-for-coding route; KIMI_NO_CACHE=1 opt-out of prompt cache
+cc-glm       GLM_PROFILE        balanced, max/opus, turbo, cheap/lite; GLM_THINKING=auto|enabled|disabled
+cc-qwen      QWEN_PROFILE       coder, coding-plan/plan, token/token-plan, max/payg/intl, cheap/flash
+cc-deepseek  DEEPSEEK_PROFILE   agent/pro, flash/cheap, instant
+cc-doubao    DOUBAO_PROFILE     latest, agent, vision/frontend, pinned, router, seed20/reasoning, cheap
+cc-minimax   MINIMAX_PROFILE    stable/token, highspeed/payg, cheap/lite; MINIMAX_REGION=cn|global
+cc-mimo      MIMO_PROFILE       pro, latest/v25, multimodal/omni, fast/flash; MIMO_REGION=sgp|public|cn|ams
+cc-stepfun   STEPFUN_PROFILE    reasoning, fast/flash, router; STEPFUN_REASONING=low|high|none
+cc-longcat   LONGCAT_PROFILE    agent, fast/lite, stable/chat, thinking; Preview capped at 64K
+EOF
+}
+
+backlog() {
+  if [ ! -f "$BACKLOG" ]; then
+    echo "[cc-models] backlog file missing: $BACKLOG" >&2
+    exit 1
+  fi
+  sed -n '1,260p' "$BACKLOG"
+}
+
+audit() {
+  local cmd script failed=0
+  echo "[cc-models] syntax"
+  bash -n "$0" "$ROOT/cc-model-lib.sh" || failed=1
+	  for cmd in "${COMMANDS[@]}"; do
+	    script="$(script_path_for "$cmd")"
+	    if [ -f "$script" ]; then
+	      bash -n "$script" || failed=1
+	    else
+	      if [ "${CC_MODELS_AUDIT_REQUIRE_ALL:-0}" = "1" ]; then
+	        echo "[cc-models] missing script for $cmd: $script" >&2
+	        failed=1
+	      else
+	        echo "[cc-models] skip missing optional launcher $cmd: $script" >&2
+	      fi
+	    fi
+	  done
+  echo
+  echo "[cc-models] list"
+  list_models || failed=1
+  echo
+  echo "[cc-models] doctor"
+  doctor_all || failed=1
+  return "$failed"
+}
+
+case "${1:-}" in
+  list) list_models ;;
+  matrix) matrix ;;
+  sources) sources ;;
+  research) research ;;
+  backlog) backlog ;;
+  doctor) doctor_all "${2:-}" ;;
+  env) env_one "${2:-}" ;;
+  profiles) profiles ;;
+  audit) audit ;;
+  paths) paths ;;
+  -h|--help|help|"") usage ;;
+  *)
+    echo "[cc-models] unknown command: $1" >&2
+    usage
+    exit 2
+    ;;
+esac

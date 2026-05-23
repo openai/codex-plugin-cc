@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# Claude Code → Doubao Coding 完全定制化分身
+# 端点: https://ark.cn-beijing.volces.com/api/coding (火山方舟 Coding Plan)
+# 模型: Doubao Seed Code 主力 + ark-code-latest 自动路由 + Seed 2.0 系列
+# 品牌: Volcanic Red #FB4214
+# 基准: @anthropic-ai/claude-code v2.1.150 (native binary)
+
+REAL_HOME="$HOME"
+source "$REAL_HOME/bin/cc-model-lib.sh"
+export HOME="$REAL_HOME/.claude-envs/doubao"
+mkdir -p "$HOME/.claude"
+
+# Do not inherit shell-level proxy settings; each cc-* wrapper should decide
+# its own network path explicitly.
+cc_model_unset_proxies
+
+export ANTHROPIC_BASE_URL="https://ark.cn-beijing.volces.com/api/coding"
+export ANTHROPIC_AUTH_TOKEN="${ARK_API_KEY:-${VOLC_API_KEY:-${DOUBAO_API_KEY:-}}}"
+unset ANTHROPIC_API_KEY ANTHROPIC_API_BASE
+
+MODELS=(doubao-seed-code-preview-latest doubao-seed-code-preview-251028 ark-code-latest doubao-seed-2.0-code doubao-seed-2.0-pro doubao-seed-2.0-lite doubao-seed-code)
+if [[ "$1" == "-l" || "$1" == "--list" ]]; then printf '%s\n' "${MODELS[@]}"; exit 0; fi
+
+case "${DOUBAO_PROFILE:-latest}" in
+  agent)
+    DOUBAO_DEFAULT_MODEL="doubao-seed-code-preview-latest"
+    DOUBAO_DEFAULT_OPUS="doubao-seed-code-preview-latest"
+    DOUBAO_DEFAULT_SONNET="doubao-seed-code-preview-latest"
+    DOUBAO_DEFAULT_HAIKU="doubao-seed-2.0-lite"
+    ;;
+  vision|frontend)
+    DOUBAO_DEFAULT_MODEL="doubao-seed-code-preview-latest"
+    DOUBAO_DEFAULT_OPUS="doubao-seed-code-preview-latest"
+    DOUBAO_DEFAULT_SONNET="doubao-seed-code-preview-latest"
+    DOUBAO_DEFAULT_HAIKU="doubao-seed-code-preview-latest"
+    ;;
+  pinned)
+    DOUBAO_DEFAULT_MODEL="doubao-seed-code-preview-251028"
+    DOUBAO_DEFAULT_OPUS="doubao-seed-code-preview-251028"
+    DOUBAO_DEFAULT_SONNET="doubao-seed-code-preview-251028"
+    DOUBAO_DEFAULT_HAIKU="doubao-seed-code-preview-251028"
+    ;;
+  router)
+    DOUBAO_DEFAULT_MODEL="ark-code-latest"
+    DOUBAO_DEFAULT_OPUS="ark-code-latest"
+    DOUBAO_DEFAULT_SONNET="ark-code-latest"
+    DOUBAO_DEFAULT_HAIKU="doubao-seed-2.0-lite"
+    ;;
+  cheap)
+    DOUBAO_DEFAULT_MODEL="doubao-seed-2.0-lite"
+    DOUBAO_DEFAULT_OPUS="doubao-seed-2.0-lite"
+    DOUBAO_DEFAULT_SONNET="doubao-seed-2.0-lite"
+    DOUBAO_DEFAULT_HAIKU="doubao-seed-2.0-lite"
+    ;;
+  seed20|reasoning)
+    DOUBAO_DEFAULT_MODEL="doubao-seed-2.0-code"
+    DOUBAO_DEFAULT_OPUS="doubao-seed-2.0-code"
+    DOUBAO_DEFAULT_SONNET="doubao-seed-2.0-code"
+    DOUBAO_DEFAULT_HAIKU="doubao-seed-2.0-lite"
+    ;;
+  latest|*)
+    DOUBAO_DEFAULT_MODEL="doubao-seed-code-preview-latest"
+    DOUBAO_DEFAULT_OPUS="doubao-seed-2.0-code"
+    DOUBAO_DEFAULT_SONNET="doubao-seed-code-preview-latest"
+    DOUBAO_DEFAULT_HAIKU="doubao-seed-2.0-lite"
+    ;;
+esac
+
+MODEL="${DOUBAO_MODEL:-$DOUBAO_DEFAULT_MODEL}"
+if [[ "$1" == "-m" || "$1" == "--model" ]] && [[ -n "$2" ]]; then MODEL="$2"; shift 2; fi
+
+export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1     # 启用官方 agent-teams（同家族 CC sidecar 协作）
+export ANTHROPIC_MODEL="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="Doubao Coding · $MODEL"
+
+# /model picker 全档位：把 MODELS 数组序列化成 JSON，patched d96 读取后展开为多条
+export ANTHROPIC_CUSTOM_MODEL_OPTIONS_JSON="$(cc_model_json_options "Doubao Coding")"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="${DOUBAO_OPUS:-$DOUBAO_DEFAULT_OPUS}"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="${DOUBAO_SONNET:-$DOUBAO_DEFAULT_SONNET}"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="${DOUBAO_HAIKU:-$DOUBAO_DEFAULT_HAIKU}"
+export ANTHROPIC_SMALL_FAST_MODEL="${DOUBAO_FAST:-$DOUBAO_DEFAULT_HAIKU}"
+export CLAUDE_CODE_SUBAGENT_MODEL="${DOUBAO_SUBAGENT:-$DOUBAO_DEFAULT_SONNET}"
+
+# ===== 容量（深度适配 v2：Seed 2.0 全系 256K context；output 分档）=====
+# code/preview=32K max_tokens; pro/lite/router can use a higher conservative cap.
+case "$MODEL" in
+  *lite|*pro|ark-code-latest) DOUBAO_DEFAULT_MAX_OUT=131072 ;;
+  *)                          DOUBAO_DEFAULT_MAX_OUT=32768 ;;
+esac
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${DOUBAO_MAX_OUTPUT:-$DOUBAO_DEFAULT_MAX_OUT}"
+
+# reasoning_effort minimal/low/medium/high/xhigh
+[ -n "$DOUBAO_REASONING" ] && export CLAUDE_CODE_EFFORT_LEVEL="$DOUBAO_REASONING"
+
+# doubao-seed-code 老模型不认 reasoning_effort 字段（服务端会 400
+# "Unsupported reasoning_effort type"）。选中时显式关掉 thinking/effort。
+# 2.0-code/pro/lite 都支持，不受影响。
+# Live-tested 2026-05-05: ark-code-latest may return unsigned thinking blocks
+# unless the body explicitly disables thinking. Keep this off by default for
+# Claude Code multi-turn safety; opt in only when you are deliberately testing it.
+DOUBAO_EXTRA_BODY=""
+DOUBAO_EXTRA_SEP=""
+if [ "${DOUBAO_ENABLE_THINKING:-0}" != "1" ]; then
+  export MAX_THINKING_TOKENS=0
+  export CLAUDE_CODE_DISABLE_THINKING=1
+  export ANTHROPIC_THINKING=disabled
+  unset CLAUDE_CODE_EFFORT_LEVEL
+  DOUBAO_EXTRA_BODY="${DOUBAO_EXTRA_BODY}${DOUBAO_EXTRA_SEP}\"thinking\":{\"type\":\"disabled\"}"
+  DOUBAO_EXTRA_SEP=","
+fi
+if [ -n "${DOUBAO_MAX_COMPLETION_TOKENS:-}" ]; then
+  if [[ "$DOUBAO_MAX_COMPLETION_TOKENS" =~ ^[0-9]+$ ]]; then
+    DOUBAO_EXTRA_BODY="${DOUBAO_EXTRA_BODY}${DOUBAO_EXTRA_SEP}\"max_completion_tokens\":${DOUBAO_MAX_COMPLETION_TOKENS}"
+    DOUBAO_EXTRA_SEP=","
+  else
+    echo "[doubao-code] ⚠️  DOUBAO_MAX_COMPLETION_TOKENS must be an integer; ignored" >&2
+  fi
+fi
+if [ "${DOUBAO_COMPLETION_BUDGET:-}" = "full" ] && [ -z "${DOUBAO_MAX_COMPLETION_TOKENS:-}" ]; then
+  DOUBAO_EXTRA_BODY="${DOUBAO_EXTRA_BODY}${DOUBAO_EXTRA_SEP}\"max_completion_tokens\":64000"
+  DOUBAO_EXTRA_SEP=","
+fi
+if [ -n "$DOUBAO_EXTRA_BODY" ]; then
+  export CLAUDE_CODE_EXTRA_BODY="{$DOUBAO_EXTRA_BODY}"
+fi
+
+# Vision (HEIF + 标准格式) 默认开启（CC 内置支持，无需 env）
+
+export API_TIMEOUT_MS="3000000"
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"
+export DISABLE_AUTOUPDATER="1"
+export DISABLE_TELEMETRY="1"
+export DISABLE_ERROR_REPORTING="1"
+export DISABLE_BUG_COMMAND="1"
+export ENABLE_TOOL_SEARCH="false"
+export MAX_MCP_OUTPUT_TOKENS="25000"
+export BASH_DEFAULT_TIMEOUT_MS="600000"
+export BASH_MAX_TIMEOUT_MS="1200000"
+
+CLAUDE_CLI="$HOME/opt/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+DOUBAO_PROMPT_FILE="$HOME/prompts/doubao-proactive-tools.md"
+export CC_MODEL_COMMAND="cc-doubao"
+export CC_MODEL_PROVIDER="doubao"
+export CC_MODEL_SELECTED="$MODEL"
+export CC_MODEL_AUTH_LABEL="ARK_API_KEY/VOLC_API_KEY/DOUBAO_API_KEY"
+export CC_MODEL_AUTH_VALUE="$ANTHROPIC_AUTH_TOKEN"
+export CC_MODEL_CLI="$CLAUDE_CLI"
+export CC_MODEL_PATCH_MARKER="Doubao Coding"
+export CC_MODEL_PROMPT_FILE="$DOUBAO_PROMPT_FILE"
+cc_model_handle_common_command "${1:-}"
+
+[ ! -f "$CLAUDE_CLI" ] && { echo "[doubao-code] ❌ Claude Code executable missing" >&2; exit 1; }
+if [ "${CLAUDE_CLI##*/}" != "claude.exe" ] && ! grep -q "Doubao Coding" "$CLAUDE_CLI" 2>/dev/null; then
+  "$HOME/bin/apply-doubao-patch.sh" >&2 || exit 1
+fi
+
+cc_model_reset_plugins
+
+echo "[doubao-code] profile=${DOUBAO_PROFILE:-latest}  model=$MODEL  (opus→$ANTHROPIC_DEFAULT_OPUS_MODEL  sonnet→$ANTHROPIC_DEFAULT_SONNET_MODEL  haiku→$ANTHROPIC_DEFAULT_HAIKU_MODEL)" >&2
+echo "[doubao-code] endpoint=$ANTHROPIC_BASE_URL" >&2
+
+DOUBAO_EXTRA=()
+[ -f "$DOUBAO_PROMPT_FILE" ] && DOUBAO_EXTRA=(--append-system-prompt "$(cat "$DOUBAO_PROMPT_FILE")")
+
+exec "$CLAUDE_CLI" "${DOUBAO_EXTRA[@]}" "$@"

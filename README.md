@@ -1,6 +1,6 @@
 # CN-CC: Chinese Model Backends for Claude Code
 
-Route tasks from Claude Code to **7 Chinese AI model backends**. Each backend runs as an isolated Claude Code instance with its own API provider.
+Route tasks from Claude Code to **7 Chinese AI model backends**. Each backend runs as an isolated Claude Code instance with its own API provider and provider-specific profile controls.
 
 > Inspired by [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc) — the plugin architecture that made multi-model delegation in Claude Code possible. Thank you, OpenAI.
 
@@ -8,18 +8,18 @@ Route tasks from Claude Code to **7 Chinese AI model backends**. Each backend ru
 
 | Model | Backend (default tier) | Strength | Command |
 |-------|---------|----------|---------|
-| **Doubao** | ark-code-latest (auto-route to doubao-seed-2.0-pro) | General Chinese coding, **256K ctx / 128K out** | `/cn:doubao` |
-| **Qwen** | qwen3-coder-plus | SQL / Alibaba ecosystem | `/cn:qwen` |
-| **Kimi** | kimi-for-coding (K2.6) | Long context (**256K**), 64K out | `/cn:kimi` |
-| **GLM** | glm-4.7 (opus → glm-5.1) | Reasoning / Chinese understanding, web_search | `/cn:glm` |
+| **Doubao** | doubao-seed-code-preview-latest | General Chinese coding, frontend/vision coding, Seed 2.0/router fallback | `/cn:doubao` |
+| **Qwen** | qwen3-coder-next (opus → qwen3-coder-plus) | Agentic coding, SQL / Alibaba ecosystem, Token Plan/PayG routes | `/cn:qwen` |
+| **Kimi** | kimi-for-coding | Stable Kimi Code route, long context, 64K out | `/cn:kimi` |
+| **GLM** | glm-4.7 (opus → glm-5.1) | Reasoning / Chinese understanding, Z.ai Claude Code route | `/cn:glm` |
 | **StepFun** | step-3.5-flash-2603 (sonnet+) | Math / logic, vision, **64K out** | `/cn:stepfun` |
-| **MiniMax** | MiniMax-M2.7-highspeed | Native reasoning, parallel tools, **128K out** | `/cn:minimax` |
-| **MiMo** | mimo-v2-pro (Token Plan SGP) | Xiaomi flagship, **1M context**, omni-vision | `/cn:mimo` |
+| **MiniMax** | MiniMax-M2.7 | Stable M2 route, highspeed/cheap profiles, **64K Anthropic out** | `/cn:minimax` |
+| **MiMo** | mimo-v2-pro (Token Plan SGP) | Xiaomi flagship, **1M context**, V2.5/Omni/Flash profiles | `/cn:mimo` |
 
 ## Install
 
 ```bash
-/plugin marketplace add LeoLin990405/codex-plugin-cc
+/plugin marketplace add LeoLin990405/cn-cc
 /plugin install cn@cn-cc
 /reload-plugins
 /cn:setup
@@ -36,7 +36,7 @@ Or add to `~/.claude/settings.json`:
     "cn-cc": {
       "source": {
         "source": "github",
-        "repo": "LeoLin990405/codex-plugin-cc"
+        "repo": "LeoLin990405/cn-cc"
       }
     }
   }
@@ -54,13 +54,37 @@ Or add to `~/.claude/settings.json`:
 ```
 CN Models Setup — 7/7 available
 
-  ✓ doubao   Doubao (ark-code-latest)            2.1.109 (Claude Code)
-  ✓ qwen     Qwen (qwen3-coder-plus)             2.1.109 (Claude Code)
-  ✓ kimi     Kimi (kimi-for-coding K2.6)         2.1.107 (Claude Code)
-  ✓ glm      GLM (glm-4.7)                       2.1.108 (Claude Code)
-  ✓ stepfun  StepFun (step-3.5-flash-2603)       2.1.109 (Claude Code)
-  ✓ minimax  MiniMax (M2.7-highspeed)            2.1.109 (Claude Code)
-  ✓ mimo     MiMo (mimo-v2-pro)                  2.1.109 (Claude Code)
+  ✓ doubao   Doubao (doubao-seed-code-preview-latest)          2.1.150 (Claude Code)
+  ✓ qwen     Qwen (qwen3-coder-next; opus→qwen3-coder-plus)    2.1.150 (Claude Code)
+  ✓ kimi     Kimi (kimi-for-coding)                            2.1.150 (Claude Code)
+  ✓ glm      GLM (glm-4.7; opus→glm-5.1)                       2.1.150 (Claude Code)
+  ✓ stepfun  StepFun (step-3.5-flash-2603)                     2.1.150 (Claude Code)
+  ✓ minimax  MiniMax (MiniMax-M2.7)                            2.1.150 (Claude Code)
+  ✓ mimo     MiMo (mimo-v2-pro)                                2.1.150 (Claude Code)
+```
+
+### Provider profiles
+
+Direct commands pass arguments through to `cn-companion.mjs`, so provider profiles can be selected inline:
+
+```bash
+/cn:qwen --profile token 帮我做一次复杂代码审查
+/cn:glm --profile max 分析这个性能瓶颈
+/cn:doubao --profile vision 检查这个前端组件
+/cn:minimax --profile highspeed 快速总结这批日志
+/cn:mimo --profile latest 处理一个长上下文多模态任务
+```
+
+If the prompt itself starts with flags, separate command options from prompt text with `--`:
+
+```bash
+/cn:qwen --profile token -- --json 这个参数是什么意思？
+```
+
+Use `/cn:setup --doctor` for the deeper wrapper health check, or run the companion directly:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/cn-companion.mjs" profiles
 ```
 
 ### Smart routing
@@ -77,12 +101,12 @@ The `cn-dispatch` agent reads task signals and picks the best model:
 | Signal | Routes to | Why |
 |--------|-----------|-----|
 | SQL / Doris / ADB / PolarDB | Qwen | Alibaba ecosystem native |
-| Long text > 50K tokens | Kimi | 128K context window |
+| Long text 50K–200K tokens | Kimi | stable Kimi Code long-context route |
+| Ultra-long context / multimodal | MiMo | token-plan Pro plus V2.5/Omni profiles |
 | Math / proofs / logic | StepFun | Math specialist |
 | Deep reasoning / Chinese NLU | GLM | Strong Chinese reasoning |
-| Quick / lightweight tasks | MiniMax | Lowest latency |
+| Quick / lightweight tasks | MiniMax | Stable/highspeed M2 profiles |
 | General Chinese coding | Doubao | Best all-round (default) |
-| Ultra-long context (>200K) / vision | MiMo | 1M ctx, omni multimodal |
 
 ### Direct commands
 
@@ -171,12 +195,17 @@ plugins/cn/
 │   ├── glm.md                  # /cn:glm
 │   ├── stepfun.md              # /cn:stepfun
 │   ├── minimax.md              # /cn:minimax
-│   └── mimo.md                 # /cn:mimo
+│   ├── mimo.md                 # /cn:mimo
+│   └── profiles.md             # /cn:profiles
 ├── skills/
 │   ├── cn-routing/SKILL.md     # Model selection decision matrix
 │   └── cn-result-handling/SKILL.md  # Output formatting rules
 └── scripts/
-    └── cn-companion.mjs        # Core runtime (~180 lines)
+    ├── cn-companion.mjs        # Core runtime
+    └── cn-companion.test.mjs   # CLI parser smoke tests
+launchers/
+├── bin/                        # Snapshot of the local cc-* wrappers
+└── prompts/                    # Provider-specific appended system prompts
 ```
 
 ## Acknowledgements

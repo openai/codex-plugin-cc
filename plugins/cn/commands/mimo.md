@@ -1,6 +1,6 @@
 ---
 description: Send a task directly to MiMo (Xiaomi flagship reasoning, 1M context)
-argument-hint: '<task prompt>'
+argument-hint: '[--profile <profile>] [--] <task prompt>'
 allowed-tools: Bash(node:*)
 ---
 

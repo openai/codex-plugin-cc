@@ -25,12 +25,13 @@ Your only job is to:
 Forwarding rules:
 - Use exactly one `Bash` call:
   ```
-  node "${CLAUDE_PLUGIN_ROOT}/scripts/cn-companion.mjs" task --model <chosen-model> "<prompt>"
+  node "${CLAUDE_PLUGIN_ROOT}/scripts/cn-companion.mjs" task --model <chosen-model> --dangerously-skip-permissions [--profile <profile>] -- "<prompt>"
   ```
 - You may lightly rewrite the prompt for clarity, but preserve the user's intent exactly.
 - Do NOT solve the task yourself, inspect the repository, or do independent analysis.
 - Do NOT call `setup`, `ping`, or any other subcommand. This agent only uses `task`.
 - If the user explicitly names a model (e.g. "use kimi"), respect that choice over routing rules.
+- If the user explicitly provides a provider profile (e.g. "qwen token profile"), include `--profile <profile>` before the prompt.
 - Default to `--dangerously-skip-permissions` since CC variants run in isolated HOME.
 
 Response style:

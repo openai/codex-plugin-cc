@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import path from "node:path";
 import process from "node:process";
 import os from "node:os";
@@ -8,13 +8,54 @@ import os from "node:os";
 // ── Model registry ──────────────────────────────────────────────────────────
 
 const MODELS = {
-  doubao:  { bin: "cc-doubao",  label: "Doubao (ark-code-latest)",      desc: "通用中文编码 256K/128K" },
-  qwen:    { bin: "cc-qwen",    label: "Qwen (qwen3-coder-plus)",       desc: "SQL / 阿里生态" },
-  kimi:    { bin: "cc-kimi",    label: "Kimi (kimi-for-coding K2.6)",   desc: "长文本 256K / 64K out" },
-  glm:     { bin: "cc-glm",     label: "GLM (glm-4.7 / opus→glm-5.1)",  desc: "推理 / 中文理解 / web_search" },
-  stepfun: { bin: "cc-stepfun", label: "StepFun (step-3.5-flash-2603)", desc: "数学 / 逻辑 / vision" },
-  minimax: { bin: "cc-minimax", label: "MiniMax (M2.7-highspeed)",      desc: "原生 reasoning / parallel tools / 128K out" },
-  mimo:    { bin: "cc-mimo",    label: "MiMo (mimo-v2-pro)",            desc: "小米旗舰 1M ctx + omni vision" },
+  doubao: {
+    bin: "cc-doubao",
+    label: "Doubao (doubao-seed-code-preview-latest)",
+    desc: "Seed Code Preview / router / Seed 2.0",
+    profileEnv: "DOUBAO_PROFILE",
+    profiles: ["latest", "agent", "vision", "frontend", "pinned", "router", "seed20", "reasoning", "cheap"],
+  },
+  qwen: {
+    bin: "cc-qwen",
+    label: "Qwen (qwen3-coder-next; opus→qwen3-coder-plus)",
+    desc: "Coder / Coding Plan / Token Plan / PayG",
+    profileEnv: "QWEN_PROFILE",
+    profiles: ["coder", "coding-plan", "plan", "token", "token-plan", "payg", "intl", "max", "cheap", "flash"],
+  },
+  kimi: {
+    bin: "cc-kimi",
+    label: "Kimi (kimi-for-coding)",
+    desc: "stable Kimi Code route, 64K out",
+    profiles: [],
+  },
+  glm: {
+    bin: "cc-glm",
+    label: "GLM (glm-4.7; opus→glm-5.1)",
+    desc: "Z.ai Claude Code route, thinking auto on max/turbo",
+    profileEnv: "GLM_PROFILE",
+    profiles: ["balanced", "max", "opus", "turbo", "cheap", "lite"],
+  },
+  stepfun: {
+    bin: "cc-stepfun",
+    label: "StepFun (step-3.5-flash-2603)",
+    desc: "Step Plan reasoning / flash / router",
+    profileEnv: "STEPFUN_PROFILE",
+    profiles: ["reasoning", "fast", "flash", "router"],
+  },
+  minimax: {
+    bin: "cc-minimax",
+    label: "MiniMax (MiniMax-M2.7)",
+    desc: "M2 stable / highspeed / cheap, 64K Anthropic output",
+    profileEnv: "MINIMAX_PROFILE",
+    profiles: ["stable", "token", "highspeed", "payg", "cheap", "lite"],
+  },
+  mimo: {
+    bin: "cc-mimo",
+    label: "MiMo (mimo-v2-pro)",
+    desc: "token-plan Pro / V2.5 / Omni / Flash",
+    profileEnv: "MIMO_PROFILE",
+    profiles: ["pro", "latest", "v25", "multimodal", "omni", "fast", "flash"],
+  },
 };
 
 const MODEL_NAMES = Object.keys(MODELS);
@@ -27,22 +68,118 @@ function resolveBin(name) {
   return path.join(os.homedir(), "bin", MODELS[name].bin);
 }
 
-function which(name) {
-  try {
-    const result = spawnSync("which", [MODELS[name].bin]);
-    return result.status === 0;
-  } catch {
-    return false;
+function envForModel(name, profile) {
+  const info = MODELS[name];
+  const env = { ...process.env };
+  if (profile && info.profileEnv) {
+    env[info.profileEnv] = profile;
+  }
+  return env;
+}
+
+function assertProfile(name, profile) {
+  if (!profile) return;
+  const profiles = MODELS[name].profiles ?? [];
+  if (profiles.length > 0 && !profiles.includes(profile)) {
+    throw new Error(`Unknown profile "${profile}" for ${name}. Available: ${profiles.join(", ")}`);
+  }
+  if (profiles.length === 0) {
+    throw new Error(`${name} does not expose profile switching. Use its model-specific env vars instead.`);
   }
 }
 
-import { spawnSync } from "node:child_process";
+function parseBoolFlags(argv, flagNames) {
+  const values = Object.fromEntries(flagNames.map((name) => [name, false]));
+  for (const arg of argv) {
+    if (flagNames.includes(arg)) values[arg] = true;
+  }
+  return values;
+}
 
-function pingModel(name) {
+function parseValueOption(argv, name) {
+  const inlinePrefix = `${name}=`;
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--") break;
+    if (arg === name) return argv[i + 1] ?? "";
+    if (arg.startsWith(inlinePrefix)) return arg.slice(inlinePrefix.length);
+  }
+  return "";
+}
+
+function parseTaskArgs(argv) {
+  const opts = {
+    asJson: false,
+    dangerously: false,
+    dryRun: false,
+    modelName: DEFAULT_MODEL,
+    profile: "",
+    cwd: process.cwd(),
+    timeout: TASK_TIMEOUT_MS,
+    prompt: "",
+  };
+  const promptParts = [];
+  let parsingOptions = true;
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+
+    if (parsingOptions && arg === "--") {
+      promptParts.push(...argv.slice(i + 1));
+      break;
+    }
+
+    if (parsingOptions && arg === "--json") {
+      opts.asJson = true;
+      continue;
+    }
+    if (parsingOptions && arg === "--dangerously-skip-permissions") {
+      opts.dangerously = true;
+      continue;
+    }
+    if (parsingOptions && arg === "--dry-run") {
+      opts.dryRun = true;
+      continue;
+    }
+
+    if (parsingOptions && (arg === "--model" || arg.startsWith("--model="))) {
+      const value = arg.includes("=") ? arg.slice("--model=".length) : argv[++i];
+      opts.modelName = (value || "").toLowerCase();
+      continue;
+    }
+    if (parsingOptions && (arg === "--profile" || arg.startsWith("--profile="))) {
+      const value = arg.includes("=") ? arg.slice("--profile=".length) : argv[++i];
+      opts.profile = (value || "").toLowerCase();
+      continue;
+    }
+    if (parsingOptions && (arg === "--cwd" || arg.startsWith("--cwd="))) {
+      const value = arg.includes("=") ? arg.slice("--cwd=".length) : argv[++i];
+      opts.cwd = path.resolve(value || process.cwd());
+      continue;
+    }
+    if (parsingOptions && (arg === "--timeout" || arg.startsWith("--timeout="))) {
+      const value = arg.includes("=") ? arg.slice("--timeout=".length) : argv[++i];
+      const seconds = Number.parseInt(value || "", 10);
+      if (Number.isFinite(seconds) && seconds > 0) {
+        opts.timeout = seconds * 1000;
+      }
+      continue;
+    }
+
+    parsingOptions = false;
+    promptParts.push(arg);
+  }
+
+  opts.prompt = promptParts.join(" ").trim();
+  return opts;
+}
+
+function pingModel(name, opts = {}) {
   const bin = MODELS[name].bin;
-  const result = spawnSync(bin, ["--version"], {
+  const args = opts.doctor ? ["--doctor"] : ["--version"];
+  const result = spawnSync(bin, args, {
     timeout: 10_000,
-    env: process.env,
+    env: envForModel(name, opts.profile),
     stdio: ["ignore", "pipe", "pipe"],
   });
   if (result.status === 0) {
@@ -61,7 +198,7 @@ function runTask(modelName, prompt, opts = {}) {
 
     const child = spawn(bin, args, {
       cwd: opts.cwd || process.cwd(),
-      env: process.env,
+      env: envForModel(modelName, opts.profile),
       stdio: ["ignore", "pipe", "pipe"],
       timeout: opts.timeout || TASK_TIMEOUT_MS,
     });
@@ -91,12 +228,14 @@ function runTask(modelName, prompt, opts = {}) {
 // ── Commands ────────────────────────────────────────────────────────────────
 
 async function handleSetup(argv) {
-  const asJson = argv.includes("--json");
+  const flags = parseBoolFlags(argv, ["--json", "--doctor"]);
+  const asJson = flags["--json"];
+  const useDoctor = flags["--doctor"];
   const results = {};
   for (const name of MODEL_NAMES) {
     results[name] = {
       ...MODELS[name],
-      ...pingModel(name),
+      ...pingModel(name, { doctor: useDoctor }),
     };
   }
 
@@ -105,10 +244,12 @@ async function handleSetup(argv) {
   if (asJson) {
     console.log(JSON.stringify({ ready: readyCount, total: MODEL_NAMES.length, models: results }, null, 2));
   } else {
-    console.log(`CN Models Setup — ${readyCount}/${MODEL_NAMES.length} available\n`);
+      console.log(`CN Models Setup — ${readyCount}/${MODEL_NAMES.length} available\n`);
     for (const [name, info] of Object.entries(results)) {
       const icon = info.available ? "✓" : "✗";
-      console.log(`  ${icon} ${name.padEnd(8)} ${info.label.padEnd(35)} ${info.available ? info.detail : `(${info.detail})`}`);
+      const profiles = info.profiles?.length ? ` profiles: ${info.profiles.join("/")}` : " profiles: env-only";
+      console.log(`  ${icon} ${name.padEnd(8)} ${info.label.padEnd(52)} ${info.available ? info.detail : `(${info.detail})`}`);
+      console.log(`    ${profiles}`);
     }
     if (readyCount < MODEL_NAMES.length) {
       console.log(`\nSome models unavailable. Check ~/bin/cc-* scripts and API keys.`);
@@ -117,45 +258,21 @@ async function handleSetup(argv) {
 }
 
 async function handleTask(argv) {
-  const asJson = argv.includes("--json");
-  const dangerously = argv.includes("--dangerously-skip-permissions");
-
-  // Parse --model
-  let modelName = DEFAULT_MODEL;
-  const modelIdx = argv.indexOf("--model");
-  if (modelIdx !== -1 && argv[modelIdx + 1]) {
-    const requested = argv[modelIdx + 1].toLowerCase();
-    if (!MODELS[requested]) {
-      const msg = `Unknown model "${requested}". Available: ${MODEL_NAMES.join(", ")}`;
-      if (asJson) { console.log(JSON.stringify({ error: msg })); } else { console.error(msg); }
-      process.exitCode = 1;
-      return;
-    }
-    modelName = requested;
+  const { asJson, dangerously, dryRun, modelName, profile, cwd, timeout, prompt } = parseTaskArgs(argv);
+  if (!MODELS[modelName]) {
+    const msg = `Unknown model "${modelName}". Available: ${MODEL_NAMES.join(", ")}`;
+    if (asJson) { console.log(JSON.stringify({ error: msg })); } else { console.error(msg); }
+    process.exitCode = 1;
+    return;
   }
-
-  // Parse --cwd
-  let cwd = process.cwd();
-  const cwdIdx = argv.indexOf("--cwd");
-  if (cwdIdx !== -1 && argv[cwdIdx + 1]) {
-    cwd = path.resolve(argv[cwdIdx + 1]);
+  try {
+    assertProfile(modelName, profile);
+  } catch (err) {
+    const msg = err.message || String(err);
+    if (asJson) { console.log(JSON.stringify({ error: msg })); } else { console.error(msg); }
+    process.exitCode = 1;
+    return;
   }
-
-  // Parse --timeout
-  let timeout = TASK_TIMEOUT_MS;
-  const timeoutIdx = argv.indexOf("--timeout");
-  if (timeoutIdx !== -1 && argv[timeoutIdx + 1]) {
-    timeout = parseInt(argv[timeoutIdx + 1], 10) * 1000;
-  }
-
-  // Collect prompt: everything that's not a flag
-  const skipSet = new Set(["--json", "--model", "--cwd", "--timeout", "--write", "--dangerously-skip-permissions"]);
-  const prompt = argv.filter((arg, i) => {
-    if (skipSet.has(arg)) return false;
-    // skip value after value-flags
-    if (i > 0 && ["--model", "--cwd", "--timeout"].includes(argv[i - 1])) return false;
-    return true;
-  }).join(" ").trim();
 
   if (!prompt) {
     const msg = "No prompt provided.";
@@ -164,8 +281,31 @@ async function handleTask(argv) {
     return;
   }
 
+  if (dryRun) {
+    const info = {
+      model: modelName,
+      profile: profile || null,
+      profileEnv: MODELS[modelName].profileEnv ?? null,
+      cwd,
+      timeoutMs: timeout,
+      dangerously,
+      prompt,
+    };
+    if (asJson) {
+      console.log(JSON.stringify(info, null, 2));
+    } else {
+      console.log(`model=${info.model}`);
+      console.log(`profile=${info.profile ?? ""}`);
+      console.log(`cwd=${info.cwd}`);
+      console.log(`timeoutMs=${info.timeoutMs}`);
+      console.log(`dangerously=${info.dangerously}`);
+      console.log(`prompt=${info.prompt}`);
+    }
+    return;
+  }
+
   // Check availability
-  const check = pingModel(modelName);
+  const check = pingModel(modelName, { profile });
   if (!check.available) {
     const msg = `Model ${modelName} is not available: ${check.detail}. Run /cn:setup to check.`;
     if (asJson) { console.log(JSON.stringify({ error: msg })); } else { console.error(msg); }
@@ -175,15 +315,17 @@ async function handleTask(argv) {
 
   // Execute
   if (!asJson) {
-    process.stderr.write(`[cn] Dispatching to ${modelName} (${MODELS[modelName].desc})...\n`);
+    const profileText = profile ? ` profile=${profile}` : "";
+    process.stderr.write(`[cn] Dispatching to ${modelName}${profileText} (${MODELS[modelName].desc})...\n`);
   }
 
   try {
-    const result = await runTask(modelName, prompt, { cwd, timeout, dangerously });
+    const result = await runTask(modelName, prompt, { cwd, timeout, dangerously, profile });
 
     if (asJson) {
       console.log(JSON.stringify({
         model: modelName,
+        profile: profile || null,
         label: MODELS[modelName].label,
         exitCode: result.code,
         stdout: result.stdout,
@@ -212,16 +354,32 @@ function handlePing(argv) {
     process.exitCode = 1;
     return;
   }
-  const result = pingModel(modelName);
-  console.log(JSON.stringify({ model: modelName, ...result }, null, 2));
+  const profile = (parseValueOption(argv, "--profile") || "").toLowerCase();
+  try {
+    assertProfile(modelName, profile);
+  } catch (err) {
+    console.error(err.message || String(err));
+    process.exitCode = 1;
+    return;
+  }
+  const result = pingModel(modelName, { profile });
+  console.log(JSON.stringify({ model: modelName, profile: profile || null, ...result }, null, 2));
+}
+
+function handleProfiles() {
+  for (const [name, info] of Object.entries(MODELS)) {
+    const profileText = info.profiles.length > 0 ? info.profiles.join(", ") : "(no profile env)";
+    console.log(`${name.padEnd(8)} ${info.profileEnv ?? "-"} ${profileText}`);
+  }
 }
 
 function printUsage() {
   console.log([
     "Usage:",
-    "  node cn-companion.mjs setup [--json]",
-    "  node cn-companion.mjs task --model <name> [--timeout <sec>] [--cwd <dir>] [--json] <prompt>",
-    "  node cn-companion.mjs ping <model-name>",
+    "  node cn-companion.mjs setup [--json] [--doctor]",
+    "  node cn-companion.mjs task --model <name> [--profile <profile>] [--timeout <sec>] [--cwd <dir>] [--json] [--dry-run] [--] <prompt>",
+    "  node cn-companion.mjs ping <model-name> [--profile <profile>]",
+    "  node cn-companion.mjs profiles",
     "",
     `Available models: ${MODEL_NAMES.join(", ")}`,
   ].join("\n"));
@@ -240,6 +398,9 @@ switch (subcommand) {
     break;
   case "ping":
     handlePing(argv);
+    break;
+  case "profiles":
+    handleProfiles();
     break;
   case "help":
   case "--help":

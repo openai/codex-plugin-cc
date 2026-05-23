@@ -10,4 +10,4 @@ Run:
 node "${CLAUDE_PLUGIN_ROOT}/scripts/cn-companion.mjs" setup --json
 ```
 
-Present a concise summary of which models are available and which are not.
+Present a concise summary of which models are available and which are not, including profile hints when useful.

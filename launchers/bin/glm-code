@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# Claude Code → GLM Coding 完全定制化分身
+# 端点: https://api.z.ai/api/anthropic (Anthropic 兼容，官方路由；GLM_BASE_URL 可覆盖)
+# 模型: 服务端尊重 model 字段，7 档真实分路由
+#   glm-5.1 / glm-5-turbo / glm-5 / glm-4.7 / glm-4.6 / glm-4.5 / glm-4.5-air
+# 品牌: GLM Blue #134cff
+# 基准: @anthropic-ai/claude-code v2.1.150 (native binary)
+
+REAL_HOME="$HOME"
+source "$REAL_HOME/bin/cc-model-lib.sh"
+export HOME="$REAL_HOME/.claude-envs/glm"
+mkdir -p "$HOME/.claude"
+
+# Do not inherit shell-level proxy settings; each cc-* wrapper should decide
+# its own network path explicitly.
+cc_model_unset_proxies
+
+# ===== API =====
+export ANTHROPIC_BASE_URL="${GLM_BASE_URL:-https://api.z.ai/api/anthropic}"
+export ANTHROPIC_AUTH_TOKEN="${GLM_API_KEY:-${ZAI_API_KEY:-${BIGMODEL_API_KEY:-}}}"
+unset ANTHROPIC_API_KEY ANTHROPIC_API_BASE
+
+# ===== 模型：7 档真实可选 =====
+MODELS=(glm-4.7 glm-5.1 glm-5-turbo glm-5 glm-4.6 glm-4.5 glm-4.5-air)
+if [[ "$1" == "-l" || "$1" == "--list" ]]; then printf '%s\n' "${MODELS[@]}"; exit 0; fi
+
+case "${GLM_PROFILE:-balanced}" in
+  max|opus)
+    GLM_DEFAULT_MODEL="glm-5.1"
+    GLM_DEFAULT_OPUS="glm-5.1"
+    GLM_DEFAULT_SONNET="glm-5.1"
+    GLM_DEFAULT_HAIKU="glm-4.5-air"
+    ;;
+  turbo)
+    GLM_DEFAULT_MODEL="glm-5-turbo"
+    GLM_DEFAULT_OPUS="glm-5.1"
+    GLM_DEFAULT_SONNET="glm-5-turbo"
+    GLM_DEFAULT_HAIKU="glm-4.5-air"
+    ;;
+  cheap|lite)
+    GLM_DEFAULT_MODEL="glm-4.5-air"
+    GLM_DEFAULT_OPUS="glm-4.7"
+    GLM_DEFAULT_SONNET="glm-4.7"
+    GLM_DEFAULT_HAIKU="glm-4.5-air"
+    ;;
+  balanced|*)
+    GLM_DEFAULT_MODEL="glm-4.7"
+    GLM_DEFAULT_OPUS="glm-5.1"
+    GLM_DEFAULT_SONNET="glm-4.7"
+    GLM_DEFAULT_HAIKU="glm-4.5-air"
+    ;;
+esac
+
+MODEL="${GLM_MODEL:-$GLM_DEFAULT_MODEL}"
+if [[ "$1" == "-m" || "$1" == "--model" ]] && [[ -n "$2" ]]; then MODEL="$2"; shift 2; fi
+[[ "$MODEL" != glm-* ]] && MODEL="glm-$MODEL"
+
+# Tier → GLM 映射：/model 选 Opus/Sonnet/Haiku 时实际路由不同 GLM 模型
+export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1     # 启用官方 agent-teams（同家族 CC sidecar 协作）
+export ANTHROPIC_MODEL="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="GLM Coding · $MODEL"
+
+# /model picker 全档位：把 MODELS 数组序列化成 JSON，patched d96 读取后展开为多条
+export ANTHROPIC_CUSTOM_MODEL_OPTIONS_JSON="$(cc_model_json_options "GLM Coding")"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="${GLM_SONNET:-$GLM_DEFAULT_SONNET}"       # 均衡
+export ANTHROPIC_DEFAULT_OPUS_MODEL="${GLM_OPUS:-$GLM_DEFAULT_OPUS}"             # 旗舰
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="${GLM_HAIKU:-$GLM_DEFAULT_HAIKU}"          # 轻量快速
+export ANTHROPIC_SMALL_FAST_MODEL="${GLM_FAST:-$GLM_DEFAULT_HAIKU}"
+export CLAUDE_CODE_SUBAGENT_MODEL="${GLM_SUBAGENT:-glm-4.5-air}"
+
+# ===== 官方文档推荐 env =====
+export API_TIMEOUT_MS="3000000"
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"
+
+# ===== 关 CC 自升级 + 遥测 =====
+export DISABLE_AUTOUPDATER="1"
+export DISABLE_TELEMETRY="1"
+export DISABLE_ERROR_REPORTING="1"
+export DISABLE_BUG_COMMAND="1"
+export ENABLE_TOOL_SEARCH="false"
+export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="1"
+
+# ===== 容量/超时（GLM-4.7 / GLM-5.1 官方上限）=====
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${GLM_MAX_OUTPUT:-128000}"  # 官方最大 output 128K
+export MAX_MCP_OUTPUT_TOKENS="25000"
+
+# ===== GLM 独有参数（深度适配 v2）=====
+GLM_EXTRA_BODY=""
+GLM_EXTRA_SEP=""
+case "${GLM_THINKING:-auto}" in
+  1|true|enabled)
+    GLM_EXTRA_BODY="${GLM_EXTRA_BODY}${GLM_EXTRA_SEP}\"thinking\":{\"type\":\"enabled\"}"
+    GLM_EXTRA_SEP=","
+    ;;
+  0|false|disabled)
+    GLM_EXTRA_BODY="${GLM_EXTRA_BODY}${GLM_EXTRA_SEP}\"thinking\":{\"type\":\"disabled\"}"
+    GLM_EXTRA_SEP=","
+    ;;
+  auto)
+    case "${GLM_PROFILE:-balanced}" in
+      max|opus|turbo)
+        GLM_EXTRA_BODY="${GLM_EXTRA_BODY}${GLM_EXTRA_SEP}\"thinking\":{\"type\":\"enabled\"}"
+        GLM_EXTRA_SEP=","
+        ;;
+    esac
+    ;;
+esac
+# do_sample=false 给代码补全更确定性结果（推荐生产用）
+if [ "${GLM_DO_SAMPLE:-}" = "false" ]; then
+  GLM_EXTRA_BODY="${GLM_EXTRA_BODY}${GLM_EXTRA_SEP}\"do_sample\":false"
+  GLM_EXTRA_SEP=","
+fi
+if [ -n "$GLM_EXTRA_BODY" ]; then
+  export CLAUDE_CODE_EXTRA_BODY="{$GLM_EXTRA_BODY}"
+fi
+unset GLM_EXTRA_BODY GLM_EXTRA_SEP
+
+# Interleaved thinking budget（glm-5.1 旗舰可用）
+[ -n "$GLM_THINKING_BUDGET" ] && export MAX_THINKING_TOKENS="$GLM_THINKING_BUDGET"
+
+# 内置 web_search：CC 不会自动注入；如要用，对话时手动指令"使用 web_search_20250305 工具"
+# 或在 system prompt 中提示模型可用此工具
+export BASH_DEFAULT_TIMEOUT_MS="600000"
+export BASH_MAX_TIMEOUT_MS="1200000"
+
+# ===== Claude Code executable =====
+CLAUDE_CLI="$HOME/opt/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+GLM_PROMPT_FILE="$HOME/prompts/glm-proactive-tools.md"
+export CC_MODEL_COMMAND="cc-glm"
+export CC_MODEL_PROVIDER="glm"
+export CC_MODEL_SELECTED="$MODEL"
+export CC_MODEL_AUTH_LABEL="GLM_API_KEY/ZAI_API_KEY/BIGMODEL_API_KEY"
+export CC_MODEL_AUTH_VALUE="$ANTHROPIC_AUTH_TOKEN"
+export CC_MODEL_CLI="$CLAUDE_CLI"
+export CC_MODEL_PATCH_MARKER="GLM Coding"
+export CC_MODEL_PROMPT_FILE="$GLM_PROMPT_FILE"
+cc_model_handle_common_command "${1:-}"
+
+if [ ! -f "$CLAUDE_CLI" ]; then
+  echo "[glm-code] ❌ Claude Code executable 不存在: $CLAUDE_CLI" >&2
+  echo "         请先: cd $HOME/opt && npm install @anthropic-ai/claude-code" >&2
+  exit 1
+fi
+if [ "${CLAUDE_CLI##*/}" != "claude.exe" ] && ! grep -q "GLM Coding" "$CLAUDE_CLI" 2>/dev/null; then
+  echo "[glm-code] ⚠️  cli.js 未 patched，自动修补..." >&2
+  "$HOME/bin/apply-glm-patch.sh" >&2 || { echo "[glm-code] patch 失败" >&2; exit 1; }
+fi
+
+# ===== 启动时强制清 plugin =====
+cc_model_reset_plugins
+
+echo "[glm-code] profile=${GLM_PROFILE:-balanced}  model=$MODEL  (opus→$ANTHROPIC_DEFAULT_OPUS_MODEL  sonnet→$ANTHROPIC_DEFAULT_SONNET_MODEL  haiku→$ANTHROPIC_DEFAULT_HAIKU_MODEL)" >&2
+echo "[glm-code] endpoint=$ANTHROPIC_BASE_URL" >&2
+
+GLM_EXTRA=()
+if [ -f "$GLM_PROMPT_FILE" ]; then
+  GLM_EXTRA=(--append-system-prompt "$(cat "$GLM_PROMPT_FILE")")
+fi
+
+exec "$CLAUDE_CLI" "${GLM_EXTRA[@]}" "$@"

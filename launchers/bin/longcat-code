@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# LongCat Code — Claude Code → LongCat Anthropic-compatible API
+# Docs: https://longcat.chat/platform/docs/zh/ (verified 2026-04-24)
+# Endpoint: https://api.longcat.chat/anthropic
+set -e
+
+REAL_HOME="$HOME"
+source "$REAL_HOME/bin/cc-model-lib.sh"
+export HOME="$REAL_HOME/.claude-envs/longcat"
+mkdir -p "$HOME/.claude"
+
+# Do not inherit shell-level proxy settings; each cc-* wrapper should decide
+# its own network path explicitly.
+cc_model_unset_proxies
+
+if [[ -z "${LONGCAT_API_KEY:-}" ]]; then
+  LONGCAT_API_KEY="$(HOME="$REAL_HOME" zsh -lic 'printf %s "$LONGCAT_API_KEY"' 2>/dev/null || true)"
+fi
+
+export ANTHROPIC_BASE_URL="https://api.longcat.chat/anthropic"
+export ANTHROPIC_AUTH_TOKEN="${LONGCAT_API_KEY:-}"
+unset ANTHROPIC_API_KEY ANTHROPIC_API_BASE
+
+MODELS=(
+  LongCat-2.0-Preview
+  LongCat-Flash-Chat
+  LongCat-Flash-Lite
+  LongCat-Flash-Thinking
+  LongCat-Flash-Thinking-2601
+)
+
+if [[ "${1:-}" == "-l" || "${1:-}" == "--list" ]]; then
+  printf '%s\n' "${MODELS[@]}"
+  exit 0
+fi
+
+case "${LONGCAT_PROFILE:-agent}" in
+  fast|lite)
+    LONGCAT_DEFAULT_MODEL="LongCat-Flash-Lite"
+    LONGCAT_DEFAULT_OPUS="LongCat-2.0-Preview"
+    LONGCAT_DEFAULT_SONNET="LongCat-Flash-Lite"
+    LONGCAT_DEFAULT_HAIKU="LongCat-Flash-Lite"
+    ;;
+  stable|chat)
+    LONGCAT_DEFAULT_MODEL="LongCat-Flash-Chat"
+    LONGCAT_DEFAULT_OPUS="LongCat-2.0-Preview"
+    LONGCAT_DEFAULT_SONNET="LongCat-Flash-Chat"
+    LONGCAT_DEFAULT_HAIKU="LongCat-Flash-Lite"
+    ;;
+  thinking)
+    LONGCAT_DEFAULT_MODEL="LongCat-Flash-Thinking-2601"
+    LONGCAT_DEFAULT_OPUS="LongCat-Flash-Thinking-2601"
+    LONGCAT_DEFAULT_SONNET="LongCat-Flash-Thinking-2601"
+    LONGCAT_DEFAULT_HAIKU="LongCat-Flash-Lite"
+    ;;
+  agent|*)
+    LONGCAT_DEFAULT_MODEL="LongCat-2.0-Preview"
+    LONGCAT_DEFAULT_OPUS="LongCat-2.0-Preview"
+    LONGCAT_DEFAULT_SONNET="LongCat-2.0-Preview"
+    LONGCAT_DEFAULT_HAIKU="LongCat-Flash-Lite"
+    ;;
+esac
+
+MODEL="${LONGCAT_MODEL:-$LONGCAT_DEFAULT_MODEL}"
+if [[ "${1:-}" == "-m" || "${1:-}" == "--model" ]] && [[ -n "${2:-}" ]]; then
+  MODEL="$2"
+  shift 2
+fi
+
+export ANTHROPIC_MODEL="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="LongCat Code · $MODEL"
+
+_OPTS_JSON='['
+for _m in "${MODELS[@]}"; do
+  case "$_m" in
+    LongCat-2.0-Preview) _desc="LongCat Code · agentic preview" ;;
+    LongCat-Flash-Chat) _desc="LongCat Code · stable baseline" ;;
+    LongCat-Flash-Lite) _desc="LongCat Code · fast / low-cost" ;;
+    LongCat-Flash-Thinking|LongCat-Flash-Thinking-2601) _desc="LongCat Code · experimental in Claude Code" ;;
+    Sphynx) _desc="LongCat Code · invite only" ;;
+    *) _desc="LongCat Code · $_m" ;;
+  esac
+  _OPTS_JSON+="{\"value\":\"$_m\",\"label\":\"$_m\",\"description\":\"$_desc\"},"
+done
+export ANTHROPIC_CUSTOM_MODEL_OPTIONS_JSON="${_OPTS_JSON%,}]"
+unset _OPTS_JSON _m _desc
+
+# Official Claude Code guide uses LongCat-Flash-Chat as the stable baseline.
+export ANTHROPIC_DEFAULT_OPUS_MODEL="${LONGCAT_OPUS:-$LONGCAT_DEFAULT_OPUS}"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="${LONGCAT_SONNET:-$LONGCAT_DEFAULT_SONNET}"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="${LONGCAT_HAIKU:-$LONGCAT_DEFAULT_HAIKU}"
+export ANTHROPIC_SMALL_FAST_MODEL="${LONGCAT_FAST:-$LONGCAT_DEFAULT_HAIKU}"
+export CLAUDE_CODE_SUBAGENT_MODEL="${LONGCAT_SUBAGENT:-$LONGCAT_DEFAULT_SONNET}"
+
+# LongCat documents Anthropic compatibility, but not Claude extended-thinking
+# blocks. Keep CC thinking off by default and let the model variant decide.
+if [[ -z "${LONGCAT_ENABLE_THINKING:-}" && "${LONGCAT_PROFILE:-agent}" != "thinking" ]]; then
+  export MAX_THINKING_TOKENS=0
+  export CLAUDE_CODE_DISABLE_THINKING=1
+  export ANTHROPIC_THINKING=disabled
+fi
+
+export DISABLE_PROMPT_CACHING=1
+export ENABLE_TOOL_SEARCH=false
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export API_TIMEOUT_MS="${LONGCAT_API_TIMEOUT_MS:-3000000}"
+case "$MODEL" in
+  LongCat-2.0-Preview) LONGCAT_DEFAULT_MAX_OUTPUT=64000 ;;
+  LongCat-Flash-Chat) LONGCAT_DEFAULT_MAX_OUTPUT=131072 ;;
+  *) LONGCAT_DEFAULT_MAX_OUTPUT=262144 ;;
+esac
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${LONGCAT_MAX_OUTPUT:-$LONGCAT_DEFAULT_MAX_OUTPUT}"
+export MAX_MCP_OUTPUT_TOKENS="25000"
+export BASH_DEFAULT_TIMEOUT_MS="600000"
+export BASH_MAX_TIMEOUT_MS="1200000"
+export DISABLE_AUTOUPDATER=1
+export DISABLE_TELEMETRY=1
+export DISABLE_ERROR_REPORTING=1
+export DISABLE_BUG_COMMAND=1
+
+CLAUDE_CLI="$HOME/opt/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+PROMPT_FILE="$HOME/prompts/longcat-proactive-tools.md"
+export CC_MODEL_COMMAND="cc-longcat"
+export CC_MODEL_PROVIDER="longcat"
+export CC_MODEL_SELECTED="$MODEL"
+export CC_MODEL_AUTH_LABEL="LONGCAT_API_KEY"
+export CC_MODEL_AUTH_VALUE="$ANTHROPIC_AUTH_TOKEN"
+export CC_MODEL_CLI="$CLAUDE_CLI"
+export CC_MODEL_PATCH_MARKER="LongCat Code"
+export CC_MODEL_PROMPT_FILE="$PROMPT_FILE"
+cc_model_handle_common_command "${1:-}"
+
+if [ ! -f "$CLAUDE_CLI" ]; then
+  echo "[longcat-code] ❌ Claude Code executable 不存在: $CLAUDE_CLI" >&2
+  echo "               请先在 $HOME/opt 安装 @anthropic-ai/claude-code" >&2
+  exit 1
+fi
+
+if [ "${CLAUDE_CLI##*/}" != "claude.exe" ] && ! grep -q "LongCat Code" "$CLAUDE_CLI" 2>/dev/null; then
+  "$HOME/bin/apply-longcat-patch.sh" >&2 || { echo "[longcat-code] patch 失败" >&2; exit 1; }
+fi
+
+cc_model_reset_plugins
+
+echo "[longcat-code] profile=${LONGCAT_PROFILE:-agent}  model=$MODEL  endpoint=$ANTHROPIC_BASE_URL" >&2
+[ -z "$ANTHROPIC_AUTH_TOKEN" ] && echo "[longcat-code] ⚠️  LONGCAT_API_KEY 未设" >&2
+
+EXTRA=()
+[ -f "$PROMPT_FILE" ] && EXTRA=(--append-system-prompt "$(cat "$PROMPT_FILE")")
+
+exec "$CLAUDE_CLI" "${EXTRA[@]}" "$@"

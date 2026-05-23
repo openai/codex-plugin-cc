@@ -1,6 +1,6 @@
 ---
-description: Send a task directly to Qwen (SQL / Alibaba ecosystem)
-argument-hint: '<task prompt>'
+description: Send a task directly to Qwen (coding / SQL / Alibaba ecosystem)
+argument-hint: '[--profile <profile>] [--] <task prompt>'
 allowed-tools: Bash(node:*)
 ---
 

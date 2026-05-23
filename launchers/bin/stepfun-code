@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# Claude Code → Step Coding 完全定制化分身
+# 端点: https://api.stepfun.ai/step_plan
+# 模型: step-3.5-flash 系列 + Step Plan 智能路由
+# 品牌: Step Purple #7C5CFC
+# 基准: @anthropic-ai/claude-code v2.1.150 (native binary)
+# 注意: thinking 默认开启（响应自动含 thinking 块）
+
+REAL_HOME="$HOME"
+source "$REAL_HOME/bin/cc-model-lib.sh"
+export HOME="$REAL_HOME/.claude-envs/stepfun"
+mkdir -p "$HOME/.claude"
+
+# Do not inherit shell-level proxy settings; each cc-* wrapper should decide
+# its own network path explicitly.
+cc_model_unset_proxies
+
+export ANTHROPIC_BASE_URL="${STEPFUN_BASE_URL:-https://api.stepfun.ai/step_plan}"
+export ANTHROPIC_AUTH_TOKEN="${STEPFUN_API_KEY:-${STEP_API_KEY:-}}"
+unset ANTHROPIC_API_KEY ANTHROPIC_API_BASE
+
+MODELS=(step-3.5-flash-2603 step-3.5-flash step-router-v1)
+if [[ "$1" == "-l" || "$1" == "--list" ]]; then printf '%s\n' "${MODELS[@]}"; exit 0; fi
+
+case "${STEPFUN_PROFILE:-reasoning}" in
+  router)
+    STEPFUN_DEFAULT_MODEL="step-router-v1"
+    STEPFUN_DEFAULT_OPUS="step-router-v1"
+    STEPFUN_DEFAULT_SONNET="step-router-v1"
+    STEPFUN_DEFAULT_HAIKU="step-3.5-flash"
+    ;;
+  fast|flash)
+    STEPFUN_DEFAULT_MODEL="step-3.5-flash"
+    STEPFUN_DEFAULT_OPUS="step-3.5-flash-2603"
+    STEPFUN_DEFAULT_SONNET="step-3.5-flash"
+    STEPFUN_DEFAULT_HAIKU="step-3.5-flash"
+    ;;
+  reasoning|*)
+    STEPFUN_DEFAULT_MODEL="step-3.5-flash-2603"
+    STEPFUN_DEFAULT_OPUS="step-3.5-flash-2603"
+    STEPFUN_DEFAULT_SONNET="step-3.5-flash-2603"
+    STEPFUN_DEFAULT_HAIKU="step-3.5-flash"
+    ;;
+esac
+
+MODEL="${STEPFUN_MODEL:-$STEPFUN_DEFAULT_MODEL}"
+if [[ "$1" == "-m" || "$1" == "--model" ]] && [[ -n "$2" ]]; then MODEL="$2"; shift 2; fi
+
+export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1     # 启用官方 agent-teams（同家族 CC sidecar 协作）
+export ANTHROPIC_MODEL="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="Step Coding · $MODEL"
+
+# /model picker 全档位：把 MODELS 数组序列化成 JSON，patched d96 读取后展开为多条
+export ANTHROPIC_CUSTOM_MODEL_OPTIONS_JSON="$(cc_model_json_options "Step Coding")"
+# 2603 是 2026-04 深度增强版（GPQA 70%→82.6%），强推理任务首选
+export ANTHROPIC_DEFAULT_OPUS_MODEL="${STEPFUN_OPUS:-$STEPFUN_DEFAULT_OPUS}"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="${STEPFUN_SONNET:-$STEPFUN_DEFAULT_SONNET}"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="${STEPFUN_HAIKU:-$STEPFUN_DEFAULT_HAIKU}"
+export ANTHROPIC_SMALL_FAST_MODEL="${STEPFUN_FAST:-$STEPFUN_DEFAULT_HAIKU}"
+export CLAUDE_CODE_SUBAGENT_MODEL="${STEPFUN_SUBAGENT:-$STEPFUN_DEFAULT_SONNET}"
+
+export API_TIMEOUT_MS="3000000"
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"
+export DISABLE_AUTOUPDATER="1"
+export DISABLE_TELEMETRY="1"
+export DISABLE_ERROR_REPORTING="1"
+export DISABLE_BUG_COMMAND="1"
+export ENABLE_TOOL_SEARCH="false"
+# 深度适配 v2：单次输出保守使用 65536；step-router-v1 官方 Messages 文档上限更高但字段约束更窄
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${STEPFUN_MAX_OUTPUT:-65536}"
+export MAX_MCP_OUTPUT_TOKENS="25000"
+
+# reasoning_effort: 官方 Messages API 仅 step-3.5-flash-2603 支持 output_config.effort=low/high；
+# step-router-v1 会忽略该字段，step-3.5-flash 未声明支持。none 可关 thinking。
+case "${STEPFUN_REASONING:-}" in
+  low|high)
+    export CLAUDE_CODE_EFFORT_LEVEL="$STEPFUN_REASONING"
+    if [[ "$MODEL" == "step-3.5-flash-2603" || "${STEPFUN_FORCE_EFFORT:-0}" == "1" ]]; then
+      export CLAUDE_CODE_EXTRA_BODY="{\"output_config\":{\"effort\":\"$STEPFUN_REASONING\"}}"
+    else
+      echo "[stepfun-code] ⚠️  output_config.effort 仅对 step-3.5-flash-2603 生效；当前模型 $MODEL 将不注入该字段" >&2
+    fi
+    ;;
+  none)
+    export MAX_THINKING_TOKENS=0
+    export CLAUDE_CODE_DISABLE_THINKING=1
+    export CLAUDE_CODE_EFFORT_LEVEL=none
+    export CLAUDE_CODE_EXTRA_BODY='{"thinking":{"type":"disabled"}}'
+    ;;
+  "")
+    ;;
+  *)
+    echo "[stepfun-code] ⚠️  STEPFUN_REASONING 只支持: low / high / none" >&2
+    ;;
+esac
+
+# thinking opt-out（stepfun 默认每次响应都带巨大 thinking 块，token 消耗大；
+# 想要纯 text 回答可设 STEPFUN_NO_THINKING=1）
+if [ "${STEPFUN_NO_THINKING:-0}" = "1" ]; then
+  export MAX_THINKING_TOKENS=0
+  export CLAUDE_CODE_DISABLE_THINKING=1
+  export CLAUDE_CODE_EFFORT_LEVEL=none
+  export CLAUDE_CODE_EXTRA_BODY='{"thinking":{"type":"disabled"}}'
+fi
+
+# 已知 quirk：stepfun 响应里 resp.model 是空字符串 ''（而非真实模型名），
+# CC 里某些日志/UI 位置会显示空。实际功能（text/tool_use/多轮）不受影响。
+# 如需修复需 patch cli.js 100+ 处 `.model` 引用，脆弱度太高暂 deferred。
+export BASH_DEFAULT_TIMEOUT_MS="600000"
+export BASH_MAX_TIMEOUT_MS="1200000"
+
+CLAUDE_CLI="$HOME/opt/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+STEPFUN_PROMPT_FILE="$HOME/prompts/stepfun-proactive-tools.md"
+export CC_MODEL_COMMAND="cc-stepfun"
+export CC_MODEL_PROVIDER="stepfun"
+export CC_MODEL_SELECTED="$MODEL"
+export CC_MODEL_AUTH_LABEL="STEPFUN_API_KEY/STEP_API_KEY"
+export CC_MODEL_AUTH_VALUE="$ANTHROPIC_AUTH_TOKEN"
+export CC_MODEL_CLI="$CLAUDE_CLI"
+export CC_MODEL_PATCH_MARKER="Step Coding"
+export CC_MODEL_PROMPT_FILE="$STEPFUN_PROMPT_FILE"
+cc_model_handle_common_command "${1:-}"
+
+[ ! -f "$CLAUDE_CLI" ] && { echo "[stepfun-code] ❌ Claude Code executable missing" >&2; exit 1; }
+if [ "${CLAUDE_CLI##*/}" != "claude.exe" ] && ! grep -q "Step Coding" "$CLAUDE_CLI" 2>/dev/null; then
+  "$HOME/bin/apply-stepfun-patch.sh" >&2 || exit 1
+fi
+
+cc_model_reset_plugins
+
+echo "[stepfun-code] profile=${STEPFUN_PROFILE:-reasoning}  model=$MODEL  endpoint=$ANTHROPIC_BASE_URL" >&2
+
+STEPFUN_EXTRA=()
+[ -f "$STEPFUN_PROMPT_FILE" ] && STEPFUN_EXTRA=(--append-system-prompt "$(cat "$STEPFUN_PROMPT_FILE")")
+
+exec "$CLAUDE_CLI" "${STEPFUN_EXTRA[@]}" "$@"

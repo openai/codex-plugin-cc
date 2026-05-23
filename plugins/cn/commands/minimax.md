@@ -1,6 +1,6 @@
 ---
-description: Send a task directly to MiniMax (high-speed inference)
-argument-hint: '<task prompt>'
+description: Send a task directly to MiniMax (M2 stable/highspeed inference)
+argument-hint: '[--profile <profile>] [--] <task prompt>'
 allowed-tools: Bash(node:*)
 ---
 

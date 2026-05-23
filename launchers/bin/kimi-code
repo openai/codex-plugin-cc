@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# Claude Code → Kimi Coding 完全定制化分身
+# 端点: https://api.kimi.com/coding/ (Anthropic 兼容)
+# 模型: kimi-for-coding (服务端路由，自动映射到 Kimi Code 最新后端)
+# 套餐: Allegretto — 300-1200 reqs/5h，并发 30，100 tok/s
+# 基准: @anthropic-ai/claude-code v2.1.150 (native binary)
+
+REAL_HOME="$HOME"
+source "$REAL_HOME/bin/cc-model-lib.sh"
+export HOME="$REAL_HOME/.claude-envs/kimi"
+mkdir -p "$HOME/.claude"
+
+# Do not inherit shell-level proxy settings; each cc-* wrapper should decide
+# its own network path explicitly.
+cc_model_unset_proxies
+
+# ===== API =====
+export ANTHROPIC_BASE_URL="https://api.kimi.com/coding/"
+export ANTHROPIC_API_KEY="$KIMI_API_KEY"
+unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_BASE
+
+# ===== 模型（官方稳定 ID；服务端自动映射到最新 Kimi Code 模型）=====
+MODELS=(kimi-for-coding)
+if [[ "$1" == "-l" || "$1" == "--list" ]]; then printf '%s\n' "${MODELS[@]}"; exit 0; fi
+MODEL="${KIMI_MODEL:-kimi-for-coding}"
+if [[ "$1" == "-m" || "$1" == "--model" ]] && [[ -n "$2" ]]; then MODEL="$2"; shift 2; fi
+
+# 四档全钉同一模型 + subagent 模型（Kimi 官方 agent_support 文档要求）
+export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1     # 启用官方 agent-teams（同家族 CC sidecar 协作）
+export ANTHROPIC_MODEL="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="Kimi Coding · $MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTIONS_JSON="$(cc_model_json_options "Kimi Coding")"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL"
+export ANTHROPIC_SMALL_FAST_MODEL="$MODEL"
+export CLAUDE_CODE_SUBAGENT_MODEL="$MODEL"
+
+# ===== 关掉 Kimi 不支持的 Claude 专属特性 =====
+# DISABLE_PROMPT_CACHING 已移除 — Kimi 实际支持 cache_control，启用后命中省 75-85% 费用
+# 如需临时关闭：KIMI_NO_CACHE=1 cc-kimi
+[ -n "$KIMI_NO_CACHE" ] && export DISABLE_PROMPT_CACHING="1"
+export ENABLE_TOOL_SEARCH="false"            # Kimi 不支持 deferred tool_search，会 400
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"
+export DISABLE_TELEMETRY="1"
+export DISABLE_ERROR_REPORTING="1"
+export DISABLE_BUG_COMMAND="1"
+export DISABLE_AUTOUPDATER="1"               # 由 apply-kimi-patch.sh 管理版本
+
+# ===== 上下文/输出限制（匹配 Kimi K2.6 官方）=====
+# K2.6 真实能力：context 262144 (256K) / 单次 output 65535 (64K)
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${KIMI_MAX_OUTPUT:-65535}"   # 提升 32K → 64K
+export MAX_MCP_OUTPUT_TOKENS="25000"
+
+# ===== Kimi 独有参数 =====
+# safety_level: low / medium / high（默认 medium）
+[ -n "$KIMI_SAFETY" ] && export CLAUDE_CODE_EXTRA_METADATA="{\"safety_level\":\"$KIMI_SAFETY\"}"
+# thinking budget（实测可控；多轮可能需 patch 剥离 history thinking 块，先 opt-in）
+[ -n "$KIMI_THINKING_BUDGET" ] && export MAX_THINKING_TOKENS="$KIMI_THINKING_BUDGET"
+
+# ===== 超时（K2.6 思考链长）=====
+export API_TIMEOUT_MS="3000000"
+export BASH_DEFAULT_TIMEOUT_MS="600000"
+export BASH_MAX_TIMEOUT_MS="1200000"
+
+# ===== 定位 Claude Code executable =====
+CLAUDE_CLI="$HOME/opt/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+KIMI_PROMPT_FILE="$HOME/prompts/kimi-proactive-tools.md"
+export CC_MODEL_COMMAND="cc-kimi"
+export CC_MODEL_PROVIDER="kimi"
+export CC_MODEL_SELECTED="$MODEL"
+export CC_MODEL_AUTH_LABEL="KIMI_API_KEY"
+export CC_MODEL_AUTH_VALUE="${KIMI_API_KEY:-}"
+export CC_MODEL_CLI="$CLAUDE_CLI"
+export CC_MODEL_PATCH_MARKER="Kimi Coding"
+export CC_MODEL_PROMPT_FILE="$KIMI_PROMPT_FILE"
+cc_model_handle_common_command "${1:-}"
+
+if [ ! -f "$CLAUDE_CLI" ]; then
+  echo "[kimi-code] ❌ Claude Code executable 不存在：$CLAUDE_CLI" >&2
+  echo "         请先运行: cd $HOME/opt && npm install @anthropic-ai/claude-code" >&2
+  exit 1
+fi
+
+# 旧版 JS 包需要品牌 patch；新版 native binary 不再使用 cli.js。
+if [ "${CLAUDE_CLI##*/}" != "claude.exe" ] && ! grep -q "Kimi Coding" "$CLAUDE_CLI" 2>/dev/null; then
+  echo "[kimi-code] ⚠️  cli.js 未 patched，自动修补..." >&2
+  "$HOME/bin/apply-kimi-patch.sh" >&2 || { echo "[kimi-code] patch 失败" >&2; exit 1; }
+fi
+
+# ===== 启动时强制清空 plugin 状态（防手动安装残留 + 防自动同步回流）=====
+# cn/codex/gemini/任何第三方插件在 Kimi 分身里一律不加载
+cc_model_reset_plugins
+
+echo "[kimi-code] model=$MODEL  endpoint=$ANTHROPIC_BASE_URL" >&2
+
+# 追加 Kimi 工具主动性提示（所有会话都注入，用户传的 --append-system-prompt 不覆盖本条）
+KIMI_EXTRA=()
+if [ -f "$KIMI_PROMPT_FILE" ]; then
+  KIMI_EXTRA=(--append-system-prompt "$(cat "$KIMI_PROMPT_FILE")")
+fi
+
+exec "$CLAUDE_CLI" "${KIMI_EXTRA[@]}" "$@"

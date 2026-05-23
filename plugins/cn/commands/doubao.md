@@ -1,6 +1,6 @@
 ---
 description: Send a task directly to Doubao (general Chinese coding)
-argument-hint: '<task prompt>'
+argument-hint: '[--profile <profile>] [--] <task prompt>'
 allowed-tools: Bash(node:*)
 ---
 

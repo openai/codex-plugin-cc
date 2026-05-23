@@ -1,6 +1,6 @@
 ---
-description: Send a task directly to Kimi (128K long context)
-argument-hint: '<task prompt>'
+description: Send a task directly to Kimi (stable Kimi Code route)
+argument-hint: '[--] <task prompt>'
 allowed-tools: Bash(node:*)
 ---
 

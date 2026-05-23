@@ -1,6 +1,6 @@
 {
   "name": "cn-cc",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "Claude Code plugin — route tasks to Chinese AI model backends.",
@@ -9,6 +9,8 @@
     "node": ">=18.18.0"
   },
   "scripts": {
-    "setup": "node plugins/cn/scripts/cn-companion.mjs setup"
+    "setup": "node plugins/cn/scripts/cn-companion.mjs setup",
+    "profiles": "node plugins/cn/scripts/cn-companion.mjs profiles",
+    "test": "node --check plugins/cn/scripts/cn-companion.mjs && node plugins/cn/scripts/cn-companion.test.mjs"
   }
 }

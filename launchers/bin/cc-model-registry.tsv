@@ -1,0 +1,13 @@
+# command	provider	route	default_model	opus	sonnet	haiku	fast	primary_source
+cc-kimi	kimi	anthropic-compatible	kimi-for-coding	kimi-for-coding	kimi-for-coding	kimi-for-coding	kimi-for-coding	https://www.kimi.com/code/docs/en/
+cc-glm	glm	anthropic-compatible	glm-4.7	glm-5.1	glm-4.7	glm-4.5-air	glm-4.5-air	https://docs.z.ai/devpack/tool/claude
+cc-qwen	qwen	anthropic-compatible	qwen3-coder-next	qwen3-coder-plus	qwen3-coder-next	qwen3-coder-flash	qwen3-coder-flash	https://docs.qwencloud.com/coding-plan/tools/claude-code
+cc-deepseek	deepseek	anthropic-compatible	deepseek-v4-pro[1m]	deepseek-v4-pro[1m]	deepseek-v4-pro[1m]	deepseek-v4-flash	deepseek-v4-flash	https://api-docs.deepseek.com/guides/agent_integrations/claude_code
+cc-doubao	doubao	anthropic-compatible	doubao-seed-code-preview-latest	doubao-seed-2.0-code	doubao-seed-code-preview-latest	doubao-seed-2.0-lite	doubao-seed-2.0-lite	https://www.volcengine.com/docs/82379/1928262
+cc-minimax	minimax	anthropic-compatible	MiniMax-M2.7	MiniMax-M2.7	MiniMax-M2.7	MiniMax-M2.5-highspeed	MiniMax-M2.5-highspeed	https://platform.minimax.io/docs/guides/text-ai-coding-tools
+cc-mimo	mimo	anthropic-compatible	mimo-v2-pro	mimo-v2-pro	mimo-v2-pro	mimo-v2-pro	mimo-v2-pro	https://www.mimo-v2.com/docs/integration/claude-code
+cc-stepfun	stepfun	anthropic-compatible	step-3.5-flash-2603	step-3.5-flash-2603	step-3.5-flash-2603	step-3.5-flash	step-3.5-flash	https://platform.stepfun.ai/docs/en/step-plan/integrations/reasoning-api
+cc-longcat	longcat	anthropic-compatible	LongCat-2.0-Preview	LongCat-2.0-Preview	LongCat-2.0-Preview	LongCat-Flash-Lite	LongCat-Flash-Lite	https://longcat.chat/platform/docs/zh/ClaudeCode.html
+cc-gemini	gemini	ccr-openai	gemini-3-flash-preview	gemini-3.1-pro-preview	gemini-3-flash-preview	gemini-3.1-flash-lite-preview	gemini-3.1-flash-lite-preview	https://ai.google.dev/gemini-api/docs/openai
+cc-grok	grok	ccr-openai	grok-4.3	grok-4.3	grok-4.3	grok-code-fast-1	grok-code-fast-1	https://docs.x.ai/developers/models/grok-4.3
+cc-local	local-ollama	ccr-ollama	qwen3-coder:30b	qwen3-coder:30b	qwen3-coder:30b	qwen3-coder:30b	qwen3-coder:30b	local

@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# DeepSeek Code — Claude Code → DeepSeek Anthropic-compatible API
+# Endpoint: https://api.deepseek.com/anthropic
+# Models: deepseek-v4-pro[1m] / deepseek-v4-pro / deepseek-v4-flash
+# Docs: https://api-docs.deepseek.com/ (verified 2026-05-04)
+set -e
+
+REAL_HOME="$HOME"
+source "$REAL_HOME/bin/cc-model-lib.sh"
+export HOME="$REAL_HOME/.claude-envs/deepseek"
+mkdir -p "$HOME/.claude"
+
+# Do not inherit shell-level proxy settings; each cc-* wrapper should decide
+# its own network path explicitly.
+cc_model_unset_proxies
+
+export ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic"
+export ANTHROPIC_AUTH_TOKEN="${DEEPSEEK_API_KEY:-}"
+unset ANTHROPIC_API_KEY ANTHROPIC_API_BASE
+
+MODELS=(
+  deepseek-v4-pro[1m]
+  deepseek-v4-pro
+  deepseek-v4-flash
+)
+if [[ "${1:-}" == "-l" || "${1:-}" == "--list" ]]; then
+  printf '%s\n' "${MODELS[@]}"
+  exit 0
+fi
+
+case "${DEEPSEEK_PROFILE:-agent}" in
+  flash|cheap)
+    DEEPSEEK_DEFAULT_MODEL="deepseek-v4-flash"
+    DEEPSEEK_DEFAULT_OPUS="deepseek-v4-flash"
+    DEEPSEEK_DEFAULT_SONNET="deepseek-v4-flash"
+    DEEPSEEK_DEFAULT_HAIKU="deepseek-v4-flash"
+    DEEPSEEK_DEFAULT_EFFORT="auto"
+    DEEPSEEK_DEFAULT_MAX_OUT="65536"
+    ;;
+  instant)
+    DEEPSEEK_DEFAULT_MODEL="deepseek-v4-flash"
+    DEEPSEEK_DEFAULT_OPUS="deepseek-v4-flash"
+    DEEPSEEK_DEFAULT_SONNET="deepseek-v4-flash"
+    DEEPSEEK_DEFAULT_HAIKU="deepseek-v4-flash"
+    DEEPSEEK_DEFAULT_EFFORT="none"
+    DEEPSEEK_DEFAULT_MAX_OUT="65536"
+    ;;
+  pro|agent|*)
+    DEEPSEEK_DEFAULT_MODEL="deepseek-v4-pro[1m]"
+    DEEPSEEK_DEFAULT_OPUS="deepseek-v4-pro[1m]"
+    DEEPSEEK_DEFAULT_SONNET="deepseek-v4-pro[1m]"
+    DEEPSEEK_DEFAULT_HAIKU="deepseek-v4-flash"
+    DEEPSEEK_DEFAULT_EFFORT="max"
+    DEEPSEEK_DEFAULT_MAX_OUT="262144"
+    ;;
+esac
+
+MODEL="${DEEPSEEK_MODEL:-$DEEPSEEK_DEFAULT_MODEL}"
+if [[ "${1:-}" == "-m" || "${1:-}" == "--model" ]] && [[ -n "${2:-}" ]]; then
+  MODEL="$2"
+  shift 2
+fi
+
+export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1
+
+export ANTHROPIC_MODEL="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="DeepSeek Code · $MODEL"
+
+export ANTHROPIC_CUSTOM_MODEL_OPTIONS_JSON="$(cc_model_json_options "DeepSeek Code")"
+
+export ANTHROPIC_DEFAULT_OPUS_MODEL="${DEEPSEEK_OPUS:-$DEEPSEEK_DEFAULT_OPUS}"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="${DEEPSEEK_SONNET:-$DEEPSEEK_DEFAULT_SONNET}"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="${DEEPSEEK_HAIKU:-$DEEPSEEK_DEFAULT_HAIKU}"
+export ANTHROPIC_SMALL_FAST_MODEL="${DEEPSEEK_FAST:-$DEEPSEEK_DEFAULT_HAIKU}"
+export CLAUDE_CODE_SUBAGENT_MODEL="${DEEPSEEK_SUBAGENT:-$DEEPSEEK_DEFAULT_HAIKU}"
+
+# DeepSeek official Claude Code guidance:
+# - disable nonessential traffic
+# - disable nonstream fallback
+# - default agent effort max
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1
+export CLAUDE_CODE_EFFORT_LEVEL="${DEEPSEEK_REASONING:-$DEEPSEEK_DEFAULT_EFFORT}"
+
+# DeepSeek Anthropic compatibility supports tools, but MCP-specific message
+# types are not supported. Keep deferred tool search off.
+export ENABLE_TOOL_SEARCH=false
+
+# Optional opt-out for thinking; default stays enabled to match official docs.
+if [[ -n "${DEEPSEEK_NO_THINKING:-}" || "${DEEPSEEK_PROFILE:-agent}" == "instant" ]]; then
+  export MAX_THINKING_TOKENS=0
+  export CLAUDE_CODE_DISABLE_THINKING=1
+  export ANTHROPIC_THINKING=disabled
+  export CLAUDE_CODE_EFFORT_LEVEL=none
+  export CLAUDE_CODE_EXTRA_BODY='{"thinking":{"type":"disabled"}}'
+elif [[ "${DEEPSEEK_FORCE_THINKING_BODY:-0}" = "1" ]]; then
+  export CLAUDE_CODE_EXTRA_BODY="{\"thinking\":{\"type\":\"enabled\"},\"output_config\":{\"effort\":\"$CLAUDE_CODE_EFFORT_LEVEL\"}}"
+fi
+
+export API_TIMEOUT_MS="${DEEPSEEK_API_TIMEOUT_MS:-3000000}"
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${DEEPSEEK_MAX_OUTPUT:-$DEEPSEEK_DEFAULT_MAX_OUT}"
+export MAX_MCP_OUTPUT_TOKENS="25000"
+export BASH_DEFAULT_TIMEOUT_MS="600000"
+export BASH_MAX_TIMEOUT_MS="1200000"
+export DISABLE_AUTOUPDATER=1
+export DISABLE_TELEMETRY=1
+export DISABLE_ERROR_REPORTING=1
+export DISABLE_BUG_COMMAND=1
+
+CLAUDE_CLI="$HOME/opt/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+PROMPT_FILE="$HOME/prompts/deepseek-proactive-tools.md"
+export CC_MODEL_COMMAND="cc-deepseek"
+export CC_MODEL_PROVIDER="deepseek"
+export CC_MODEL_SELECTED="$MODEL"
+export CC_MODEL_AUTH_LABEL="DEEPSEEK_API_KEY"
+export CC_MODEL_AUTH_VALUE="${DEEPSEEK_API_KEY:-}"
+export CC_MODEL_CLI="$CLAUDE_CLI"
+export CC_MODEL_PATCH_MARKER="DeepSeek Code"
+export CC_MODEL_PROMPT_FILE="$PROMPT_FILE"
+cc_model_handle_common_command "${1:-}"
+
+if [ ! -f "$CLAUDE_CLI" ]; then
+  echo "[deepseek-code] ❌ Claude Code executable 不存在: $CLAUDE_CLI" >&2
+  echo "                请先在 $HOME/opt 安装 @anthropic-ai/claude-code" >&2
+  exit 1
+fi
+
+if [ "${CLAUDE_CLI##*/}" != "claude.exe" ] && ! grep -q "DeepSeek Code" "$CLAUDE_CLI" 2>/dev/null; then
+  "$HOME/bin/apply-deepseek-patch.sh" >&2 || { echo "[deepseek-code] patch 失败" >&2; exit 1; }
+fi
+
+cc_model_reset_plugins
+
+echo "[deepseek-code] profile=${DEEPSEEK_PROFILE:-agent}  model=$MODEL  endpoint=$ANTHROPIC_BASE_URL" >&2
+[ -z "$ANTHROPIC_AUTH_TOKEN" ] && echo "[deepseek-code] ⚠️  DEEPSEEK_API_KEY 未设" >&2
+
+EXTRA=()
+[ -f "$PROMPT_FILE" ] && EXTRA=(--append-system-prompt "$(cat "$PROMPT_FILE")")
+
+exec "$CLAUDE_CLI" "${EXTRA[@]}" "$@"

@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# Claude Code → MiniMax Coding 完全定制化分身
+# 端点: MINIMAX_REGION=cn → https://api.minimaxi.com/anthropic；global → https://api.minimax.io/anthropic
+# 模型: 服务端真实尊重 model 字段，7 档真实分路由
+#   MiniMax-M2.7 / M2.7-highspeed / M2.5 / M2.5-highspeed / M2.1 / M2.1-highspeed / M2
+# 品牌: MiniMax Orange #FF6900
+# 基准: @anthropic-ai/claude-code v2.1.150 (native binary)
+
+REAL_HOME="$HOME"
+source "$REAL_HOME/bin/cc-model-lib.sh"
+export HOME="$REAL_HOME/.claude-envs/minimax"
+mkdir -p "$HOME/.claude"
+
+# Do not inherit shell-level proxy settings; each cc-* wrapper should decide
+# its own network path explicitly.
+cc_model_unset_proxies
+
+# ===== API =====
+case "${MINIMAX_REGION:-cn}" in
+  global|intl|io) MINIMAX_DEFAULT_BASE_URL="https://api.minimax.io/anthropic" ;;
+  cn|*)           MINIMAX_DEFAULT_BASE_URL="https://api.minimaxi.com/anthropic" ;;
+esac
+export ANTHROPIC_BASE_URL="${MINIMAX_BASE_URL:-$MINIMAX_DEFAULT_BASE_URL}"
+export ANTHROPIC_AUTH_TOKEN="${MINIMAX_API_KEY:-}"
+unset ANTHROPIC_API_KEY ANTHROPIC_API_BASE
+
+# ===== 模型：7 档真实可选 =====
+MODELS=(MiniMax-M2.7 MiniMax-M2.7-highspeed MiniMax-M2.5 MiniMax-M2.5-highspeed MiniMax-M2.1 MiniMax-M2.1-highspeed MiniMax-M2)
+if [[ "$1" == "-l" || "$1" == "--list" ]]; then printf '%s\n' "${MODELS[@]}"; exit 0; fi
+
+case "${MINIMAX_PROFILE:-stable}" in
+  highspeed|payg)
+    MINIMAX_DEFAULT_MODEL="MiniMax-M2.7-highspeed"
+    MINIMAX_DEFAULT_OPUS="MiniMax-M2.7"
+    MINIMAX_DEFAULT_SONNET="MiniMax-M2.7-highspeed"
+    MINIMAX_DEFAULT_HAIKU="MiniMax-M2.5-highspeed"
+    MINIMAX_DEFAULT_SUBAGENT="MiniMax-M2.7-highspeed"
+    ;;
+  cheap|lite)
+    MINIMAX_DEFAULT_MODEL="MiniMax-M2.5-highspeed"
+    MINIMAX_DEFAULT_OPUS="MiniMax-M2.7"
+    MINIMAX_DEFAULT_SONNET="MiniMax-M2.5-highspeed"
+    MINIMAX_DEFAULT_HAIKU="MiniMax-M2.5-highspeed"
+    MINIMAX_DEFAULT_SUBAGENT="MiniMax-M2.5-highspeed"
+    ;;
+  stable|token|*)
+    MINIMAX_DEFAULT_MODEL="MiniMax-M2.7"
+    MINIMAX_DEFAULT_OPUS="MiniMax-M2.7"
+    MINIMAX_DEFAULT_SONNET="MiniMax-M2.7"
+    MINIMAX_DEFAULT_HAIKU="MiniMax-M2.5-highspeed"
+    MINIMAX_DEFAULT_SUBAGENT="MiniMax-M2.7"
+    ;;
+esac
+
+MODEL="${MINIMAX_MODEL:-$MINIMAX_DEFAULT_MODEL}"
+if [[ "$1" == "-m" || "$1" == "--model" ]] && [[ -n "$2" ]]; then MODEL="$2"; shift 2; fi
+case "$MODEL" in
+  MiniMax-*) ;;
+  M*)        MODEL="MiniMax-$MODEL" ;;
+  [0-9]*)    MODEL="MiniMax-M$MODEL" ;;
+esac
+
+# Tier → MiniMax 映射：/model 选 Opus/Sonnet/Haiku 时实际路由不同 MiniMax 模型
+export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1     # 启用官方 agent-teams（同家族 CC sidecar 协作）
+export ANTHROPIC_MODEL="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="$MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="MiniMax Coding · $MODEL"
+
+# /model picker 全档位：把 MODELS 数组序列化成 JSON，patched d96 读取后展开为多条
+export ANTHROPIC_CUSTOM_MODEL_OPTIONS_JSON="$(cc_model_json_options "MiniMax Coding")"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="${MINIMAX_OPUS:-$MINIMAX_DEFAULT_OPUS}"         # 旗舰
+export ANTHROPIC_DEFAULT_SONNET_MODEL="${MINIMAX_SONNET:-$MINIMAX_DEFAULT_SONNET}"   # 均衡
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="${MINIMAX_HAIKU:-$MINIMAX_DEFAULT_HAIKU}"      # 轻量
+export ANTHROPIC_SMALL_FAST_MODEL="${MINIMAX_FAST:-$MINIMAX_DEFAULT_HAIKU}"
+export CLAUDE_CODE_SUBAGENT_MODEL="${MINIMAX_SUBAGENT:-$MINIMAX_DEFAULT_SUBAGENT}"
+
+# ===== 官方文档推荐 env =====
+export API_TIMEOUT_MS="3000000"
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"
+
+# ===== 关 CC 自升级 + 遥测 =====
+export DISABLE_AUTOUPDATER="1"
+export DISABLE_TELEMETRY="1"
+export DISABLE_ERROR_REPORTING="1"
+export DISABLE_BUG_COMMAND="1"
+export ENABLE_TOOL_SEARCH="false"
+
+# ===== 容量/超时（MiniMax Anthropic 兼容 API: max_tokens <= 64000）=====
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${MINIMAX_MAX_OUTPUT:-64000}"
+export MAX_MCP_OUTPUT_TOKENS="25000"
+
+# ===== MiniMax 独有参数（深度适配 v2，使用 CC 真实 env 名）=====
+# parallel_tool_calls：官方 Anthropic 兼容参数表未列出，默认关闭，按需显式启用
+MINIMAX_EXTRA_BODY=""
+MINIMAX_EXTRA_SEP=""
+if [ "${MINIMAX_PARALLEL_TOOLS:-0}" = "1" ]; then
+  MINIMAX_EXTRA_BODY="${MINIMAX_EXTRA_BODY}${MINIMAX_EXTRA_SEP}\"parallel_tool_calls\":true"
+  MINIMAX_EXTRA_SEP=","
+fi
+if [ -n "${MINIMAX_TEMPERATURE:-}" ]; then
+  MINIMAX_EXTRA_BODY="${MINIMAX_EXTRA_BODY}${MINIMAX_EXTRA_SEP}\"temperature\":${MINIMAX_TEMPERATURE}"
+  MINIMAX_EXTRA_SEP=","
+fi
+if [ -n "$MINIMAX_EXTRA_BODY" ]; then
+  export CLAUDE_CODE_EXTRA_BODY="{$MINIMAX_EXTRA_BODY}"
+fi
+unset MINIMAX_EXTRA_BODY MINIMAX_EXTRA_SEP
+# thinking budget（M2 原生 reasoning）
+[ -n "$MINIMAX_THINKING_BUDGET" ] && export MAX_THINKING_TOKENS="$MINIMAX_THINKING_BUDGET"
+
+# ===== 限流重试 wrapper（529 = 集群过载，需指数退避）=====
+export CLAUDE_CODE_MAX_RETRIES="${MINIMAX_MAX_RETRIES:-5}"
+export BASH_DEFAULT_TIMEOUT_MS="600000"
+export BASH_MAX_TIMEOUT_MS="1200000"
+
+# ===== Claude Code executable =====
+CLAUDE_CLI="$HOME/opt/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+MINIMAX_PROMPT_FILE="$HOME/prompts/minimax-proactive-tools.md"
+export CC_MODEL_COMMAND="cc-minimax"
+export CC_MODEL_PROVIDER="minimax"
+export CC_MODEL_SELECTED="$MODEL"
+export CC_MODEL_AUTH_LABEL="MINIMAX_API_KEY"
+export CC_MODEL_AUTH_VALUE="${MINIMAX_API_KEY:-}"
+export CC_MODEL_CLI="$CLAUDE_CLI"
+export CC_MODEL_PATCH_MARKER="MiniMax Coding"
+export CC_MODEL_PROMPT_FILE="$MINIMAX_PROMPT_FILE"
+cc_model_handle_common_command "${1:-}"
+
+if [ ! -f "$CLAUDE_CLI" ]; then
+  echo "[minimax-code] ❌ Claude Code executable 不存在: $CLAUDE_CLI" >&2
+  echo "             请先: cd $HOME/opt && npm install @anthropic-ai/claude-code" >&2
+  exit 1
+fi
+if [ "${CLAUDE_CLI##*/}" != "claude.exe" ] && ! grep -q "MiniMax Coding" "$CLAUDE_CLI" 2>/dev/null; then
+  echo "[minimax-code] ⚠️  cli.js 未 patched，自动修补..." >&2
+  "$HOME/bin/apply-minimax-patch.sh" >&2 || { echo "[minimax-code] patch 失败" >&2; exit 1; }
+fi
+
+# ===== 启动时强制清 plugin =====
+cc_model_reset_plugins
+
+echo "[minimax-code] profile=${MINIMAX_PROFILE:-stable}  model=$MODEL  (opus→$ANTHROPIC_DEFAULT_OPUS_MODEL  sonnet→$ANTHROPIC_DEFAULT_SONNET_MODEL  haiku→$ANTHROPIC_DEFAULT_HAIKU_MODEL)" >&2
+echo "[minimax-code] endpoint=$ANTHROPIC_BASE_URL" >&2
+
+MINIMAX_EXTRA=()
+if [ -f "$MINIMAX_PROMPT_FILE" ]; then
+  MINIMAX_EXTRA=(--append-system-prompt "$(cat "$MINIMAX_PROMPT_FILE")")
+fi
+
+exec "$CLAUDE_CLI" "${MINIMAX_EXTRA[@]}" "$@"
