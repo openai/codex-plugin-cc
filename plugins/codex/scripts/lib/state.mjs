@@ -38,7 +38,17 @@ export function resolveStateDir(cwd) {
   const slug = slugSource.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex").slice(0, 16);
   
-  const pluginDataEnv = process.env.CLAUDE_PLUGIN_DATA ? "CLAUDE_PLUGIN_DATA" : (process.env.GEMINI_PLUGIN_DATA ? "GEMINI_PLUGIN_DATA" : "ANTIGRAVITY_PLUGIN_DATA");
+  let pluginDataEnv = "CLAUDE_PLUGIN_DATA";
+  if (process.env.ANTIGRAVITY_TRAJECTORY_ID) {
+    pluginDataEnv = "ANTIGRAVITY_PLUGIN_DATA";
+  } else if (process.env.GEMINI_TRAJECTORY_ID) {
+    pluginDataEnv = "GEMINI_PLUGIN_DATA";
+  } else if (process.env.CLAUDE_SESSION_ID || process.env.CODEX_COMPANION_SESSION_ID) {
+    pluginDataEnv = "CLAUDE_PLUGIN_DATA";
+  } else {
+    pluginDataEnv = process.env.CLAUDE_PLUGIN_DATA ? "CLAUDE_PLUGIN_DATA" : (process.env.GEMINI_PLUGIN_DATA ? "GEMINI_PLUGIN_DATA" : "ANTIGRAVITY_PLUGIN_DATA");
+  }
+
   const pluginDataDir = process.env[pluginDataEnv];
   const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
   return path.join(stateRoot, `${slug}-${hash}`);

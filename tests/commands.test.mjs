@@ -32,10 +32,10 @@ test("Gemini TOML commands use the installed extension companion with the Gemini
   for (const file of commandFiles) {
     const source = readRoot(path.join("commands", file));
     assert.doesNotMatch(source, /run_command/);
-    assert.doesNotMatch(source, /plugins\/codex\/scripts/);
+    assert.match(source, /plugins\/codex\/scripts/);
     assert.doesNotMatch(source, /current workspace/);
     assert.match(source, /run_shell_command/);
-    assert.match(source, /\$\{HOME\}\/\.gemini\/extensions\/codex\/scripts\/codex-companion\.mjs/);
+    assert.match(source, /\$\{HOME\}\/\.gemini\/extensions\/codex\/plugins\/codex\/scripts\/codex-companion\.mjs/);
   }
 });
 
