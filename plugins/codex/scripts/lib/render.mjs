@@ -1,3 +1,8 @@
+import {
+  appendTaskStatusToken,
+  buildTaskCompleteStatusToken
+} from "./task-status-token.mjs";
+
 function severityRank(severity) {
   switch (severity) {
     case "critical":
@@ -314,12 +319,13 @@ export function renderNativeReviewResult(result, meta) {
 
 export function renderTaskResult(parsedResult, meta) {
   const rawOutput = typeof parsedResult?.rawOutput === "string" ? parsedResult.rawOutput : "";
+  const completeToken = buildTaskCompleteStatusToken();
   if (rawOutput) {
-    return rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
+    return appendTaskStatusToken(rawOutput, completeToken);
   }
 
   const message = String(parsedResult?.failureMessage ?? "").trim() || "Codex did not return a final message.";
-  return `${message}\n`;
+  return appendTaskStatusToken(message, completeToken);
 }
 
 export function renderStatusReport(report) {

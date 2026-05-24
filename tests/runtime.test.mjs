@@ -366,7 +366,7 @@ test("task --resume-last resumes the latest persisted task thread", () => {
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
+  assert.equal(result.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n[[codex-task status=complete]]\n");
 });
 
 test("task-resume-candidate returns the latest rescue thread from the current session", () => {
@@ -577,7 +577,7 @@ test("write task output focuses on the Codex result without generic follow-up hi
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n[[codex-task status=complete]]\n");
 });
 
 test("task --resume acts like --resume-last without leaking the flag into the prompt", () => {
@@ -715,7 +715,7 @@ test("task waits for the main thread to complete before returning the final resu
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n[[codex-task status=complete]]\n");
 });
 
 test("task ignores later subagent messages when choosing the final returned output", () => {
@@ -733,7 +733,7 @@ test("task ignores later subagent messages when choosing the final returned outp
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n[[codex-task status=complete]]\n");
 });
 
 test("task can finish after subagent work even if the parent turn/completed event is missing", () => {
@@ -751,7 +751,7 @@ test("task can finish after subagent work even if the parent turn/completed even
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n[[codex-task status=complete]]\n");
 });
 
 test("task using the shared broker still completes when Codex spawns subagents", () => {
@@ -781,7 +781,7 @@ test("task using the shared broker still completes when Codex spawns subagents",
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n[[codex-task status=complete]]\n");
 });
 
 test("task --background enqueues a detached worker and exposes per-job status", async () => {
@@ -831,6 +831,28 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.equal(resultPayload.job.id, launchPayload.jobId);
   assert.equal(resultPayload.job.status, "completed");
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
+});
+
+test("task --background emits a dispatched token without promising notification", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const launched = run("node", [SCRIPT, "task", "--background", "investigate the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(launched.status, 0, launched.stderr);
+  assert.match(launched.stdout, /^\[\[codex-task status=dispatched id=task-[^\]\s]+\]\]\n/);
+  const jobId = launched.stdout.match(/id=(task-[^\]\s]+)/)?.[1];
+  assert.ok(jobId, "expected dispatched token to include a task job id");
+  assert.match(launched.stdout, new RegExp(`No automatic notification will arrive; poll /codex:status ${jobId}\\.`));
+  assert.doesNotMatch(launched.stdout, /will notify|will be notified|you will be notified/i);
 });
 
 test("review rejects focus text because it is native-review only", () => {

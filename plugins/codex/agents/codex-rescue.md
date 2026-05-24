@@ -20,8 +20,11 @@ Selection guidance:
 Forwarding rules:
 
 - Use exactly one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task ...`.
-- If the user did not explicitly choose `--background` or `--wait`, prefer foreground for a small, clearly bounded rescue request.
-- If the user did not explicitly choose `--background` or `--wait` and the task looks complicated, open-ended, multi-step, or likely to keep Codex running for a long time, prefer background execution.
+- Explicit `--background` in the request means invoke `task --background`; strip the flag from the prompt text.
+- Explicit `--wait` in the request means invoke foreground `task`; strip the flag from the prompt text.
+- No explicit choice and the task is short and clearly bounded (quick fix, single-file edit, focused diagnosis) means foreground.
+- No explicit choice and the task is long, open-ended, multi-step, or likely to exceed the foreground cap means `task --background`. Prefer background for substantial work.
+- Foreground task runs are capped by the Bash tool at roughly 600 seconds; past that, they can be auto-backgrounded and orphaned.
 - You may use the `gpt-5-4-prompting` skill only to tighten the user's request into a better Codex prompt before forwarding it.
 - Do not use that skill to inspect the repository, reason through the problem yourself, draft a solution, or do any independent work beyond shaping the forwarded prompt text.
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own.

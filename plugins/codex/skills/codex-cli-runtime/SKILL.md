@@ -25,7 +25,10 @@ Execution rules:
 
 Command selection:
 - Use exactly one `task` invocation per rescue handoff.
-- If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Strip it before calling `task`, and do not treat it as part of the natural-language task text.
+- If the forwarded request includes `--background`, pass that execution mode through by invoking `task --background`; strip the flag token only from the natural-language prompt text.
+- If the forwarded request includes `--wait`, invoke foreground `task`; do not pass `--wait` to `task`, and strip the flag token only from the natural-language prompt text.
+- Do not drop an explicit execution mode while stripping tokens from prompt text.
+- Foreground task runs are capped by the Bash tool at roughly 600 seconds; past that, they can be auto-backgrounded and orphaned, so long work belongs in `task --background`.
 - If the forwarded request includes `--model`, normalize `spark` to `gpt-5.3-codex-spark` and pass it through to `task`.
 - If the forwarded request includes `--effort`, pass it through to `task`.
 - If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.

@@ -61,6 +61,7 @@ import {
   renderStatusReport,
   renderTaskResult
 } from "./lib/render.mjs";
+import { buildTaskDispatchedStatusToken } from "./lib/task-status-token.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
@@ -551,7 +552,12 @@ function buildTaskRunMetadata({ prompt, resumeLast = false }) {
 }
 
 function renderQueuedTaskLaunch(payload) {
-  return `${payload.title} started in the background as ${payload.jobId}. Check /codex:status ${payload.jobId} for progress.\n`;
+  const statusToken = buildTaskDispatchedStatusToken(payload.jobId);
+  return [
+    statusToken,
+    `${payload.title} dispatched as background job ${payload.jobId}.`,
+    `No automatic notification will arrive; poll /codex:status ${payload.jobId}.`
+  ].join("\n") + "\n";
 }
 
 function getJobKindLabel(kind, jobClass) {

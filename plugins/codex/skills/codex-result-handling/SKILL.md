@@ -16,6 +16,8 @@ When the helper returns Codex output:
 - If Codex made edits, say so explicitly and list the touched files when the helper provides them.
 - For `codex:codex-rescue`, do not turn a failed or incomplete Codex run into a Claude-side implementation attempt. Report the failure and stop.
 - For `codex:codex-rescue`, if Codex was never successfully invoked, do not generate a substitute answer at all.
+- For `codex:codex-rescue`, treat a standalone `[[codex-task status=complete]]` sentinel, or the matching PostToolUse hook context, as authoritative proof that the synchronous subagent has finished and exited. Do not wait for a notification or poll status after that signal.
+- For `codex:codex-rescue`, treat a standalone `[[codex-task status=dispatched id=<jobId>]]` sentinel as the only background-dispatch signal. No automatic notification will arrive; poll `/codex:status <jobId>`.
 - CRITICAL: After presenting review findings, STOP. Do not make any code changes. Do not fix any issues. You MUST explicitly ask the user which issues, if any, they want fixed before touching a single file. Auto-applying fixes from a review is strictly forbidden, even if the fix is obvious.
 - If the helper reports malformed output or a failed Codex run, include the most actionable stderr lines and stop there instead of guessing.
 - If the helper reports that setup or authentication is required, direct the user to `/codex:setup` and do not improvise alternate auth flows.

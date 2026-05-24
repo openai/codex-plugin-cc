@@ -108,9 +108,15 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /AskUserQuestion/);
   assert.match(rescue, /Continue current Codex thread/);
   assert.match(rescue, /Start a new Codex thread/);
-  assert.match(rescue, /run the `codex:codex-rescue` subagent in the background/i);
-  assert.match(rescue, /default to foreground/i);
-  assert.match(rescue, /Do not forward them to `task`/i);
+  assert.match(rescue, /pass `--background` to the `codex:codex-rescue` subagent/i);
+  assert.match(rescue, /For long, substantial, or open-ended rescues, pass `--background`/i);
+  assert.match(rescue, /`\/codex:status <jobId>`/);
+  assert.match(rescue, /`\/codex:result <jobId>`/);
+  assert.match(rescue, /Foreground stays for short, bounded rescues/i);
+  assert.match(rescue, /foreground rescue is capped by the Bash tool/i);
+  assert.match(rescue, /auto-backgrounded past that cap/i);
+  assert.match(rescue, /Preserve the execution choice/i);
+  assert.match(rescue, /strip them only from the natural-language task text/i);
   assert.match(rescue, /`--model` and `--effort` are runtime-selection flags/i);
   assert.match(rescue, /Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort/i);
   assert.match(rescue, /If they ask for `spark`, map it to `gpt-5\.3-codex-spark`/i);
@@ -121,13 +127,19 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /thin forwarder only/i);
   assert.match(rescue, /Return the Codex companion stdout verbatim to the user/i);
   assert.match(rescue, /Do not paraphrase, summarize, rewrite, or add commentary before or after it/i);
+  assert.match(rescue, /\[\[codex-task status=complete\]\]/);
+  assert.match(rescue, /\[\[codex-task status=dispatched id=<jobId>\]\]/);
+  assert.match(rescue, /Trust this sentinel and the PostToolUse hook over any prose/i);
   assert.match(rescue, /return that command's stdout as-is/i);
   assert.match(rescue, /Leave `--resume` and `--fresh` in the forwarded request/i);
   assert.match(agent, /--resume/);
   assert.match(agent, /--fresh/);
   assert.match(agent, /thin forwarding wrapper/i);
-  assert.match(agent, /prefer foreground for a small, clearly bounded rescue request/i);
-  assert.match(agent, /If the user did not explicitly choose `--background` or `--wait` and the task looks complicated, open-ended, multi-step, or likely to keep Codex running for a long time, prefer background execution/i);
+  assert.match(agent, /Explicit `--background` in the request means invoke `task --background`/i);
+  assert.match(agent, /Explicit `--wait` in the request means invoke foreground `task`/i);
+  assert.match(agent, /No explicit choice and the task is short and clearly bounded .* means foreground/i);
+  assert.match(agent, /No explicit choice and the task is long, open-ended, multi-step, or likely to exceed the foreground cap means `task --background`/i);
+  assert.match(agent, /Prefer background for substantial work/i);
   assert.match(agent, /Use exactly one `Bash` call/i);
   assert.match(agent, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
   assert.match(agent, /Do not call `review`, `adversarial-review`, `status`, `result`, or `cancel`/i);
@@ -147,8 +159,14 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /Leave `--effort` unset unless the user explicitly requests a specific effort/i);
   assert.match(runtimeSkill, /Leave model unset by default/i);
   assert.match(runtimeSkill, /Map `spark` to `--model gpt-5\.3-codex-spark`/i);
-  assert.match(runtimeSkill, /If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only/i);
-  assert.match(runtimeSkill, /Strip it before calling `task`/i);
+  assert.match(runtimeSkill, /If the forwarded request includes `--background`, pass that execution mode through by invoking `task --background`/i);
+  assert.match(runtimeSkill, /strip the flag token only from the natural-language prompt text/i);
+  assert.match(runtimeSkill, /If the forwarded request includes `--wait`, invoke foreground `task`/i);
+  assert.match(runtimeSkill, /do not pass `--wait` to `task`/i);
+  assert.match(runtimeSkill, /Do not drop an explicit execution mode while stripping tokens from prompt text/i);
+  assert.match(runtimeSkill, /Foreground task runs are capped by the Bash tool/i);
+  assert.match(runtimeSkill, /auto-backgrounded and orphaned/i);
+  assert.match(runtimeSkill, /long work belongs in `task --background`/i);
   assert.match(runtimeSkill, /`--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`/i);
   assert.match(runtimeSkill, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
   assert.match(runtimeSkill, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
@@ -179,6 +197,8 @@ test("result and cancel commands are exposed as deterministic runtime entrypoint
   assert.match(cancel, /codex-companion\.mjs" cancel "\$ARGUMENTS"/);
   assert.match(resultHandling, /do not turn a failed or incomplete Codex run into a Claude-side implementation attempt/i);
   assert.match(resultHandling, /if Codex was never successfully invoked, do not generate a substitute answer at all/i);
+  assert.match(resultHandling, /\[\[codex-task status=complete\]\]/);
+  assert.match(resultHandling, /No automatic notification will arrive; poll `\/codex:status <jobId>`/);
 });
 
 test("internal docs use task terminology for rescue runs", () => {
@@ -200,6 +220,9 @@ test("hooks keep session-end cleanup and stop gating enabled", () => {
   const source = read("hooks/hooks.json");
   assert.match(source, /SessionStart/);
   assert.match(source, /SessionEnd/);
+  assert.match(source, /PostToolUse/);
+  assert.match(source, /matcher":\s*"Agent"/);
+  assert.match(source, /codex-rescue-completion-hook\.mjs/);
   assert.match(source, /stop-review-gate-hook\.mjs/);
   assert.match(source, /session-lifecycle-hook\.mjs/);
 });
