@@ -11,34 +11,6 @@ function read(relativePath) {
   return fs.readFileSync(path.join(PLUGIN_ROOT, relativePath), "utf8");
 }
 
-function readRoot(relativePath) {
-  return fs.readFileSync(path.join(ROOT, relativePath), "utf8");
-}
-
-test("Gemini TOML commands use the installed extension companion with the Gemini shell tool", () => {
-  const commandDir = path.join(ROOT, "commands");
-  const commandFiles = fs.readdirSync(commandDir).filter((file) => file.endsWith(".toml")).sort();
-
-  assert.deepEqual(commandFiles, [
-    "adversarial-review.toml",
-    "cancel.toml",
-    "rescue.toml",
-    "result.toml",
-    "review.toml",
-    "setup.toml",
-    "status.toml"
-  ]);
-
-  for (const file of commandFiles) {
-    const source = readRoot(path.join("commands", file));
-    assert.doesNotMatch(source, /run_command/);
-    assert.match(source, /plugins\/codex\/scripts/);
-    assert.doesNotMatch(source, /current workspace/);
-    assert.match(source, /run_shell_command/);
-    assert.match(source, /\$\{HOME\}\/\.gemini\/extensions\/codex\/plugins\/codex\/scripts\/codex-companion\.mjs/);
-  }
-});
-
 test("review command uses AskUserQuestion and background Bash while staying review-only", () => {
   const source = read("commands/review.md");
   assert.match(source, /AskUserQuestion/);

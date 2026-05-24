@@ -13,7 +13,8 @@ export function sortJobsNewestFirst(jobs) {
 }
 
 function getCurrentSessionId(options = {}) {
-  return options.env?.[SESSION_ID_ENV] ?? process.env[SESSION_ID_ENV] ?? null;
+  const env = options.env ?? process.env;
+  return env[SESSION_ID_ENV] ?? env.ANTIGRAVITY_TRAJECTORY_ID ?? env.GEMINI_TRAJECTORY_ID ?? null;
 }
 
 function filterJobsForCurrentSession(jobs, options = {}) {

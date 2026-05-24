@@ -1,9 +1,9 @@
 {
-  "name": "@openai/codex-plugin-cc",
+  "name": "@openai/codex-plugin-agy",
   "version": "1.0.4",
   "private": true,
   "type": "module",
-  "description": "Use Codex from Claude Code to review code or delegate tasks.",
+  "description": "Use Codex from Antigravity CLI to review code or delegate tasks.",
   "license": "Apache-2.0",
   "engines": {
     "node": ">=18.18.0"

@@ -68,7 +68,7 @@ const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
-const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
+const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Antigravity turn.";
 
 function printUsage() {
   console.log(
@@ -289,7 +289,7 @@ function isActiveJobStatus(status) {
 }
 
 function getCurrentClaudeSessionId() {
-  return process.env[SESSION_ID_ENV] ?? null;
+  return process.env[SESSION_ID_ENV] ?? process.env.ANTIGRAVITY_TRAJECTORY_ID ?? process.env.GEMINI_TRAJECTORY_ID ?? null;
 }
 
 function filterJobsForCurrentClaudeSession(jobs) {
@@ -538,7 +538,7 @@ function buildTaskRunMetadata({ prompt, resumeLast = false }) {
   if (!resumeLast && String(prompt ?? "").includes(STOP_REVIEW_TASK_MARKER)) {
     return {
       title: "Codex Stop Gate Review",
-      summary: "Stop-gate review of previous Claude turn"
+      summary: "Stop-gate review of previous Antigravity turn"
     };
   }
 

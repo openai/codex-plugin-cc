@@ -40,10 +40,6 @@ function makeVersionFixture() {
     name: "codex",
     version: "1.0.2"
   });
-  writeJson(path.join(root, "gemini-extension.json"), {
-    name: "codex",
-    version: "1.0.2"
-  });
   writeJson(path.join(root, ".claude-plugin", "marketplace.json"), {
     metadata: {
       version: "1.0.2"
@@ -71,7 +67,6 @@ test("bump-version updates every release manifest", () => {
   assert.equal(readJson(path.join(root, "package-lock.json")).version, "1.2.3");
   assert.equal(readJson(path.join(root, "package-lock.json")).packages[""].version, "1.2.3");
   assert.equal(readJson(path.join(root, "plugins", "codex", ".claude-plugin", "plugin.json")).version, "1.2.3");
-  assert.equal(readJson(path.join(root, "gemini-extension.json")).version, "1.2.3");
   assert.equal(readJson(path.join(root, ".claude-plugin", "marketplace.json")).metadata.version, "1.2.3");
   assert.equal(readJson(path.join(root, ".claude-plugin", "marketplace.json")).plugins[0].version, "1.2.3");
 });

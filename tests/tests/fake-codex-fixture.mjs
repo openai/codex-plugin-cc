@@ -582,8 +582,13 @@ rl.on("line", (line) => {
 
 export function buildEnv(binDir) {
   const sep = process.platform === "win32" ? ";" : ":";
+  const cleanEnv = { ...process.env };
+  delete cleanEnv.ANTIGRAVITY_TRAJECTORY_ID;
+  delete cleanEnv.GEMINI_TRAJECTORY_ID;
+  delete cleanEnv.CLAUDE_SESSION_ID;
+  delete cleanEnv.CODEX_COMPANION_SESSION_ID;
   return {
-    ...process.env,
+    ...cleanEnv,
     PATH: `${binDir}${sep}${process.env.PATH}`
   };
 }

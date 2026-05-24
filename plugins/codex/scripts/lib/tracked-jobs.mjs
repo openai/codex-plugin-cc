@@ -59,7 +59,7 @@ export function createJobLogFile(workspaceRoot, jobId, title) {
 
 export function createJobRecord(base, options = {}) {
   const env = options.env ?? process.env;
-  const sessionId = env[options.sessionIdEnv ?? SESSION_ID_ENV];
+  const sessionId = env[options.sessionIdEnv ?? SESSION_ID_ENV] ?? env.ANTIGRAVITY_TRAJECTORY_ID ?? env.GEMINI_TRAJECTORY_ID ?? null;
   return {
     ...base,
     createdAt: nowIso(),

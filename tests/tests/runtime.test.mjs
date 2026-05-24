@@ -2,6 +2,22 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
+
+// Isolate tests from parent terminal environments
+delete process.env.ANTIGRAVITY_TRAJECTORY_ID;
+delete process.env.GEMINI_TRAJECTORY_ID;
+delete process.env.CLAUDE_SESSION_ID;
+delete process.env.CODEX_COMPANION_SESSION_ID;
+delete process.env.ANTIGRAVITY_ENV_FILE;
+delete process.env.GEMINI_ENV_FILE;
+delete process.env.CLAUDE_ENV_FILE;
+delete process.env.ANTIGRAVITY_PROJECT_DIR;
+delete process.env.GEMINI_PROJECT_DIR;
+delete process.env.CLAUDE_PROJECT_DIR;
+delete process.env.ANTIGRAVITY_PLUGIN_DATA;
+delete process.env.GEMINI_PLUGIN_DATA;
+delete process.env.CLAUDE_PLUGIN_DATA;
+
 import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 

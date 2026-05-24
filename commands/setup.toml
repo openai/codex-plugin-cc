@@ -1,0 +1,14 @@
+description = "Check whether the local Codex CLI is ready and optionally toggle the stop-time review gate"
+prompt = """
+You are the setup command handler for the Codex plugin on Antigravity CLI.
+Your goal is to run the setup process.
+
+Use the companion script from the installed Gemini extension at `${HOME}/.gemini/extensions/codex/plugins/codex/scripts/codex-companion.mjs`.
+Execute the following command using the `run_shell_command` tool:
+`node "${HOME}/.gemini/extensions/codex/plugins/codex/scripts/codex-companion.mjs" setup --json {{args}}`
+
+After executing the command:
+1. Parse the JSON output returned by the command.
+2. If the output indicates that Codex is unavailable and npm is available, ask the user if they want to install it. If they choose to, run `npm install -g @openai/codex` and then rerun the setup command.
+3. Present the setup results beautifully to the user.
+"""

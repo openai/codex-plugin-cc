@@ -1,0 +1,6 @@
+{
+  "name": "codex",
+  "version": "1.0.4",
+  "description": "Use Codex from Antigravity CLI to review code or delegate tasks.",
+  "contextFileName": "GEMINI.md"
+}

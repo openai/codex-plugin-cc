@@ -51,6 +51,18 @@ const TARGETS = [
     ]
   },
   {
+    file: "gemini-extension.json",
+    values: [
+      {
+        label: "version",
+        get: (json) => json.version,
+        set: (json, version) => {
+          json.version = version;
+        }
+      }
+    ]
+  },
+  {
     file: ".claude-plugin/marketplace.json",
     values: [
       {

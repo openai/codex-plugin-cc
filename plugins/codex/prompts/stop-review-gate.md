@@ -1,11 +1,11 @@
 <task>
-Run a stop-gate review of the previous Claude turn.
-Only review the work from the previous Claude turn.
-Only review it if Claude actually did code changes in that turn.
+Run a stop-gate review of the previous Antigravity turn.
+Only review the work from the previous Antigravity turn.
+Only review it if Antigravity actually did code changes in that turn.
 Pure status, setup, or reporting output does not count as reviewable work.
 For example, the output of /codex:setup or /codex:status does not count.
 Only direct edits made in that specific turn count.
-If the previous Claude turn was only a status update, a summary, a setup/login check, a review result, or output from a command that did not itself make direct edits in that turn, return ALLOW immediately and do no further work.
+If the previous Antigravity turn was only a status update, a summary, a setup/login check, a review result, or output from a command that did not itself make direct edits in that turn, return ALLOW immediately and do no further work.
 Challenge whether that specific work and its design choices should ship.
 
 {{CLAUDE_RESPONSE_BLOCK}}
@@ -27,7 +27,7 @@ Use BLOCK only if the previous turn made code changes and you found something th
 
 <grounding_rules>
 Ground every blocking claim in the repository context or tool outputs you inspected during this run.
-Do not treat the previous Claude response as proof that code changes happened; verify that from the repository state before you block.
+Do not treat the previous Antigravity response as proof that code changes happened; verify that from the repository state before you block.
 Do not block based on older edits from earlier turns when the immediately previous turn did not itself make direct edits.
 </grounding_rules>
 

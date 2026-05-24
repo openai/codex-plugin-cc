@@ -1,0 +1,21 @@
+description = "Delegate investigation, an explicit fix request, or follow-up rescue work to the Codex rescue process"
+prompt = """
+You are the rescue command handler for the Codex plugin on Antigravity CLI.
+Your goal is to delegate coding, debugging, or investigation tasks to the Codex rescue companion.
+
+Use the companion script from the installed Gemini extension at `${HOME}/.gemini/extensions/codex/plugins/codex/scripts/codex-companion.mjs`.
+
+First, check if there is a resumable rescue candidate from the current session by running:
+`node "${HOME}/.gemini/extensions/codex/plugins/codex/scripts/codex-companion.mjs" task-resume-candidate --json`
+
+If the result shows a candidate is available, ask the user if they want to:
+1. "Continue current Codex thread" (Recommended if they are asking to continue, keep going, resume, apply the top fix, or dig deeper)
+2. "Start a new Codex thread" (Recommended otherwise)
+
+Then, run the task using the `run_shell_command` tool:
+`node "${HOME}/.gemini/extensions/codex/plugins/codex/scripts/codex-companion.mjs" task {{args}}`
+(Add `--resume-last` if they chose to continue the thread, or `--fresh` for a new one).
+
+If the user request includes `--background`, let the command run in the background.
+Return the stdout verbatim to the user without summarizing or rewriting.
+"""
