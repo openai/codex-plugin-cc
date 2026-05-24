@@ -611,6 +611,15 @@ test("foreground task enqueues a detached worker and prints the stored result", 
   assert.equal(result.stdout, storedJob.rendered);
 });
 
+test("foreground task worker wait is not bounded by the default status timeout", () => {
+  const source = fs.readFileSync(SCRIPT, "utf8");
+  const match = source.match(/async function runForegroundTaskWorker[\s\S]*?\n}\n\nasync function handleTask/);
+
+  assert.ok(match, "expected to locate runForegroundTaskWorker");
+  assert.match(match[0], /timeoutMs:\s*Infinity/);
+  assert.match(match[0], /pollIntervalMs:\s*FOREGROUND_TASK_POLL_INTERVAL_MS/);
+});
+
 test("task --resume acts like --resume-last without leaking the flag into the prompt", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -833,6 +842,17 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   const launchPayload = JSON.parse(launched.stdout);
   assert.equal(launchPayload.status, "queued");
   assert.match(launchPayload.jobId, /^task-/);
+
+  const stateDir = resolveStateDir(repo);
+  const launchedState = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const launchedJob = launchedState.jobs.find((candidate) => candidate.id === launchPayload.jobId);
+  assert.ok(Number.isInteger(launchedJob?.pid) && launchedJob.pid > 0, "expected launched job to record worker pid");
+
+  const launchedStoredJob = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${launchPayload.jobId}.json`), "utf8"));
+  assert.ok(
+    Number.isInteger(launchedStoredJob.pid) && launchedStoredJob.pid > 0,
+    "expected stored launched job to record worker pid"
+  );
 
   const waitedStatus = run(
     "node",

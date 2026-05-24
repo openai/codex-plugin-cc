@@ -499,6 +499,7 @@ async function executeTaskRun(request) {
     {
       rawOutput,
       failureMessage,
+      status: result.status,
       reasoningSummary: result.reasoningSummary
     },
     {
@@ -675,7 +676,19 @@ function enqueueBackgroundTask(cwd, job, request) {
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
 
-  spawnDetachedTaskWorker(cwd, job.id);
+  const child = spawnDetachedTaskWorker(cwd, job.id);
+  // PR #346 review: keep the pre-spawn record, then persist the worker pid for cancellation.
+  const spawnedRecord = readStoredJob(job.workspaceRoot, job.id) ?? queuedRecord;
+  if (isActiveJobStatus(spawnedRecord.status)) {
+    writeJobFile(job.workspaceRoot, job.id, {
+      ...spawnedRecord,
+      pid: child.pid ?? null
+    });
+    upsertJob(job.workspaceRoot, {
+      id: job.id,
+      pid: child.pid ?? null
+    });
+  }
 
   return {
     payload: {
@@ -731,6 +744,8 @@ async function runForegroundTaskWorker(cwd, job, request, options = {}) {
   // Foreground tasks run in the same detached worker as background tasks, then wait inline for
   // the stored result so Bash auto-backgrounding and subagent teardown do not kill the Codex turn.
   const snapshot = await waitForSingleJobSnapshot(cwd, job.id, {
+    // PR #346 review: foreground xhigh waits must survive beyond the 240s status default.
+    timeoutMs: Infinity,
     pollIntervalMs: FOREGROUND_TASK_POLL_INTERVAL_MS
   });
   if (snapshot.waitTimedOut) {

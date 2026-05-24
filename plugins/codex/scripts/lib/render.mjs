@@ -320,12 +320,14 @@ export function renderNativeReviewResult(result, meta) {
 export function renderTaskResult(parsedResult, meta) {
   const rawOutput = typeof parsedResult?.rawOutput === "string" ? parsedResult.rawOutput : "";
   const completeToken = buildTaskCompleteStatusToken();
+  // PR #346 review: only successful Codex task exits may stamp the success sentinel.
+  const succeeded = parsedResult?.status === 0 || parsedResult?.exitStatus === 0 || meta?.success === true;
   if (rawOutput) {
-    return appendTaskStatusToken(rawOutput, completeToken);
+    return succeeded ? appendTaskStatusToken(rawOutput, completeToken) : rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
   }
 
   const message = String(parsedResult?.failureMessage ?? "").trim() || "Codex did not return a final message.";
-  return appendTaskStatusToken(message, completeToken);
+  return succeeded ? appendTaskStatusToken(message, completeToken) : `${message}\n`;
 }
 
 export function renderStatusReport(report) {
