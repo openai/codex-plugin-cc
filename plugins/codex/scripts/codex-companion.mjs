@@ -67,6 +67,7 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
+const FOREGROUND_TASK_POLL_INTERVAL_MS = 100;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
@@ -661,17 +662,20 @@ function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
+  // The queued record is written before spawning so the detached worker can always
+  // load its request, and foreground callers can wait on the job immediately.
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
     request
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
+
+  spawnDetachedTaskWorker(cwd, job.id);
 
   return {
     payload: {
@@ -683,6 +687,77 @@ function enqueueBackgroundTask(cwd, job, request) {
     },
     logFile
   };
+}
+
+function ensureTrailingNewline(value) {
+  const output = String(value ?? "");
+  return output.endsWith("\n") ? output : `${output}\n`;
+}
+
+function renderStoredTaskWorkerResult(job, storedJob) {
+  if (typeof storedJob?.rendered === "string" && storedJob.rendered) {
+    return ensureTrailingNewline(storedJob.rendered);
+  }
+  return renderStoredJobResult(job, storedJob);
+}
+
+function resolveStoredTaskExitStatus(job, storedJob) {
+  if (job.status === "completed") {
+    return 0;
+  }
+
+  const storedStatus = Number(storedJob?.result?.status);
+  if (Number.isInteger(storedStatus) && storedStatus !== 0) {
+    return storedStatus;
+  }
+
+  return 1;
+}
+
+function buildStoredTaskWorkerPayload(job, storedJob) {
+  const hasStoredResult =
+    storedJob?.result && typeof storedJob.result === "object" && !Array.isArray(storedJob.result);
+  const storedResult = hasStoredResult ? storedJob.result : {};
+  return {
+    ...storedResult,
+    job,
+    storedJob
+  };
+}
+
+async function runForegroundTaskWorker(cwd, job, request, options = {}) {
+  enqueueBackgroundTask(cwd, job, request);
+
+  // Foreground tasks run in the same detached worker as background tasks, then wait inline for
+  // the stored result so Bash auto-backgrounding and subagent teardown do not kill the Codex turn.
+  const snapshot = await waitForSingleJobSnapshot(cwd, job.id, {
+    pollIntervalMs: FOREGROUND_TASK_POLL_INTERVAL_MS
+  });
+  if (snapshot.waitTimedOut) {
+    outputCommandResult(snapshot, renderJobStatusReport(snapshot.job), options.json);
+    process.exitCode = 1;
+    return;
+  }
+
+  const storedJob = readStoredJob(snapshot.workspaceRoot, snapshot.job.id);
+  const payload = buildStoredTaskWorkerPayload(snapshot.job, storedJob);
+  const exitStatus = resolveStoredTaskExitStatus(snapshot.job, storedJob);
+  const rendered = renderStoredTaskWorkerResult(snapshot.job, storedJob);
+
+  if (
+    snapshot.job.status === "failed" &&
+    !storedJob?.rendered &&
+    storedJob?.errorMessage &&
+    !options.json
+  ) {
+    process.stderr.write(`${storedJob.errorMessage}\n`);
+  } else {
+    outputCommandResult(payload, rendered, options.json);
+  }
+
+  if (exitStatus !== 0) {
+    process.exitCode = exitStatus;
+  }
 }
 
 async function handleReviewCommand(argv, config) {
@@ -738,7 +813,7 @@ async function handleReview(argv) {
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "wait"],
     aliasMap: {
       m: "model"
     }
@@ -780,20 +855,23 @@ async function handleTask(argv) {
     return;
   }
 
+  ensureCodexAvailable(cwd);
+  requireTaskRequest(prompt, resumeLast);
+
   const job = buildTaskJob(workspaceRoot, taskMetadata, write);
-  await runForegroundCommand(
+  const request = buildTaskRequest({
+    cwd,
+    model,
+    effort,
+    prompt,
+    write,
+    resumeLast,
+    jobId: job.id
+  });
+  await runForegroundTaskWorker(
+    cwd,
     job,
-    (progress) =>
-      executeTaskRun({
-        cwd,
-        model,
-        effort,
-        prompt,
-        write,
-        resumeLast,
-        jobId: job.id,
-        onProgress: progress
-      }),
+    request,
     { json: options.json }
   );
 }

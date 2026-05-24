@@ -580,6 +580,37 @@ test("write task output focuses on the Codex result without generic follow-up hi
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n[[codex-task status=complete]]\n");
 });
 
+test("foreground task enqueues a detached worker and prints the stored result", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "--write", "fix the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n[[codex-task status=complete]]\n");
+
+  const stateDir = resolveStateDir(repo);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const job = state.jobs.find((candidate) => candidate.jobClass === "task");
+  assert.ok(job, "expected foreground task to create a tracked task job");
+  assert.equal(job.status, "completed");
+
+  const storedJob = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${job.id}.json`), "utf8"));
+  const log = fs.readFileSync(storedJob.logFile, "utf8");
+  assert.equal(storedJob.request.jobId, job.id);
+  assert.equal(storedJob.request.prompt, "fix the failing test");
+  assert.match(log, /Queued for background execution\./);
+  assert.equal(result.stdout, storedJob.rendered);
+});
+
 test("task --resume acts like --resume-last without leaking the flag into the prompt", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
