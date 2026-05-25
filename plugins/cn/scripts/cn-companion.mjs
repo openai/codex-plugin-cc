@@ -60,6 +60,9 @@ const MODELS = {
 
 const MODEL_NAMES = Object.keys(MODELS);
 const DEFAULT_MODEL = "doubao";
+// Default fan-out pool when `team` is called without --models/--all.
+// Complementary by design: coder (qwen) · Chinese reasoning (glm) · long-context (kimi).
+const DEFAULT_TEAM = ["qwen", "glm", "kimi"];
 const TASK_TIMEOUT_MS = 300_000; // 5 min
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -171,6 +174,108 @@ function parseTaskArgs(argv) {
   }
 
   opts.prompt = promptParts.join(" ").trim();
+  return opts;
+}
+
+// Parse a comma-separated member spec like "qwen:token,glm:max,kimi"
+// into [{ name, profile }]. Bare entries get an empty profile.
+function parseModelsSpec(spec) {
+  return String(spec || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const idx = entry.indexOf(":");
+      const name = (idx === -1 ? entry : entry.slice(0, idx)).toLowerCase();
+      const profile = (idx === -1 ? "" : entry.slice(idx + 1)).toLowerCase();
+      return { name, profile };
+    });
+}
+
+function parseTeamArgs(argv) {
+  const opts = {
+    asJson: false,
+    dangerously: false,
+    dryRun: false,
+    all: false,
+    modelsSpec: "",
+    cwd: process.cwd(),
+    timeout: TASK_TIMEOUT_MS,
+    prompt: "",
+  };
+  const promptParts = [];
+  let parsingOptions = true;
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+
+    if (parsingOptions && arg === "--") {
+      promptParts.push(...argv.slice(i + 1));
+      break;
+    }
+
+    if (parsingOptions && arg === "--json") {
+      opts.asJson = true;
+      continue;
+    }
+    if (parsingOptions && arg === "--dangerously-skip-permissions") {
+      opts.dangerously = true;
+      continue;
+    }
+    if (parsingOptions && arg === "--dry-run") {
+      opts.dryRun = true;
+      continue;
+    }
+    if (parsingOptions && arg === "--all") {
+      opts.all = true;
+      continue;
+    }
+
+    if (parsingOptions && (arg === "--models" || arg.startsWith("--models="))) {
+      const value = arg.includes("=") ? arg.slice("--models=".length) : argv[++i];
+      opts.modelsSpec = value || "";
+      continue;
+    }
+    if (parsingOptions && (arg === "--cwd" || arg.startsWith("--cwd="))) {
+      const value = arg.includes("=") ? arg.slice("--cwd=".length) : argv[++i];
+      opts.cwd = path.resolve(value || process.cwd());
+      continue;
+    }
+    if (parsingOptions && (arg === "--timeout" || arg.startsWith("--timeout="))) {
+      const value = arg.includes("=") ? arg.slice("--timeout=".length) : argv[++i];
+      const seconds = Number.parseInt(value || "", 10);
+      if (Number.isFinite(seconds) && seconds > 0) {
+        opts.timeout = seconds * 1000;
+      }
+      continue;
+    }
+
+    parsingOptions = false;
+    promptParts.push(arg);
+  }
+
+  opts.prompt = promptParts.join(" ").trim();
+
+  let requested;
+  if (opts.all) {
+    requested = MODEL_NAMES.map((name) => ({ name, profile: "" }));
+  } else if (opts.modelsSpec) {
+    requested = parseModelsSpec(opts.modelsSpec);
+  } else {
+    requested = DEFAULT_TEAM.map((name) => ({ name, profile: "" }));
+  }
+
+  // De-duplicate by name+profile while preserving order.
+  const seen = new Set();
+  opts.members = [];
+  for (const member of requested) {
+    const key = `${member.name}:${member.profile}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      opts.members.push(member);
+    }
+  }
+
   return opts;
 }
 
@@ -347,6 +452,150 @@ async function handleTask(argv) {
   }
 }
 
+async function handleTeam(argv) {
+  const { asJson, dangerously, dryRun, cwd, timeout, prompt, members } = parseTeamArgs(argv);
+
+  const fail = (msg) => {
+    if (asJson) { console.log(JSON.stringify({ error: msg })); } else { console.error(msg); }
+    process.exitCode = 1;
+  };
+
+  if (members.length === 0) {
+    fail("No models selected. Use --models <a,b:profile,c>, --all, or rely on the default team.");
+    return;
+  }
+
+  // Validate every member (model name + profile) before running anything.
+  for (const member of members) {
+    if (!MODELS[member.name]) {
+      fail(`Unknown model "${member.name}". Available: ${MODEL_NAMES.join(", ")}`);
+      return;
+    }
+    try {
+      assertProfile(member.name, member.profile);
+    } catch (err) {
+      fail(err.message || String(err));
+      return;
+    }
+  }
+
+  if (!prompt) {
+    fail("No prompt provided.");
+    return;
+  }
+
+  const tag = (member) => (member.profile ? `${member.name}:${member.profile}` : member.name);
+
+  if (dryRun) {
+    const info = {
+      command: "team",
+      members: members.map((m) => ({ model: m.name, profile: m.profile || null })),
+      cwd,
+      timeoutMs: timeout,
+      dangerously,
+      prompt,
+    };
+    if (asJson) {
+      console.log(JSON.stringify(info, null, 2));
+    } else {
+      console.log(`members=${members.map(tag).join(",")}`);
+      console.log(`cwd=${cwd}`);
+      console.log(`timeoutMs=${timeout}`);
+      console.log(`dangerously=${dangerously}`);
+      console.log(`prompt=${prompt}`);
+    }
+    return;
+  }
+
+  // Availability check up front so one offline backend does not abort the rest.
+  const checks = members.map((m) => ({ ...m, ...pingModel(m.name, { profile: m.profile }) }));
+  const available = checks.filter((m) => m.available);
+  const unavailable = checks.filter((m) => !m.available);
+
+  if (available.length === 0) {
+    fail(
+      `No selected models are available: ${unavailable
+        .map((m) => `${m.name} (${m.detail})`)
+        .join("; ")}. Run /cn:setup to check.`
+    );
+    return;
+  }
+
+  if (!asJson) {
+    process.stderr.write(`[cn:team] Fanning out to ${available.length} model(s): ${available.map(tag).join(", ")}...\n`);
+    if (unavailable.length > 0) {
+      process.stderr.write(`[cn:team] Skipping unavailable: ${unavailable.map((m) => m.name).join(", ")}\n`);
+    }
+  }
+
+  // Fan out in parallel; allSettled so a single failure never sinks the batch.
+  const settled = await Promise.allSettled(
+    available.map((m) => runTask(m.name, prompt, { cwd, timeout, dangerously, profile: m.profile }))
+  );
+
+  const results = available.map((m, idx) => {
+    const outcome = settled[idx];
+    if (outcome.status === "fulfilled") {
+      return {
+        model: m.name,
+        profile: m.profile || null,
+        label: MODELS[m.name].label,
+        ok: outcome.value.code === 0,
+        exitCode: outcome.value.code,
+        stdout: outcome.value.stdout,
+        stderr: outcome.value.stderr,
+      };
+    }
+    return {
+      model: m.name,
+      profile: m.profile || null,
+      label: MODELS[m.name].label,
+      ok: false,
+      exitCode: null,
+      stdout: "",
+      stderr: outcome.reason?.message || String(outcome.reason),
+    };
+  });
+
+  const skipped = unavailable.map((m) => ({
+    model: m.name,
+    profile: m.profile || null,
+    label: MODELS[m.name].label,
+    ok: false,
+    skipped: true,
+    detail: m.detail,
+  }));
+
+  const okCount = results.filter((r) => r.ok).length;
+
+  if (asJson) {
+    console.log(JSON.stringify({
+      command: "team",
+      prompt,
+      okCount,
+      ran: results.length,
+      skipped: skipped.length,
+      results,
+      skippedModels: skipped,
+    }, null, 2));
+  } else {
+    for (const r of results) {
+      const label = r.profile ? `${r.model}:${r.profile}` : r.model;
+      console.log(`\n===== [cn:${label}] exit=${r.exitCode} =====`);
+      if (r.stdout) process.stdout.write(r.stdout.endsWith("\n") ? r.stdout : `${r.stdout}\n`);
+      if (!r.ok && r.stderr) process.stderr.write(`[cn:${label}] ${r.stderr.slice(0, 500)}\n`);
+    }
+    for (const s of skipped) {
+      console.log(`\n===== [cn:${s.model}] skipped (unavailable) =====`);
+      console.log(`  ${s.detail}`);
+    }
+    const skipNote = skipped.length ? `, ${skipped.length} skipped` : "";
+    console.log(`\n[cn:team] ${okCount}/${results.length} model(s) succeeded${skipNote}. Review and synthesize the outputs above.`);
+  }
+
+  if (okCount === 0) process.exitCode = 1;
+}
+
 function handlePing(argv) {
   const modelName = (argv[0] || "").toLowerCase();
   if (!modelName || !MODELS[modelName]) {
@@ -378,10 +627,12 @@ function printUsage() {
     "Usage:",
     "  node cn-companion.mjs setup [--json] [--doctor]",
     "  node cn-companion.mjs task --model <name> [--profile <profile>] [--timeout <sec>] [--cwd <dir>] [--json] [--dry-run] [--] <prompt>",
+    "  node cn-companion.mjs team [--models <a,b:profile,c>] [--all] [--timeout <sec>] [--cwd <dir>] [--json] [--dry-run] [--] <prompt>",
     "  node cn-companion.mjs ping <model-name> [--profile <profile>]",
     "  node cn-companion.mjs profiles",
     "",
     `Available models: ${MODEL_NAMES.join(", ")}`,
+    `Default team:     ${DEFAULT_TEAM.join(", ")}`,
   ].join("\n"));
 }
 
@@ -395,6 +646,9 @@ switch (subcommand) {
     break;
   case "task":
     await handleTask(argv);
+    break;
+  case "team":
+    await handleTeam(argv);
     break;
   case "ping":
     handlePing(argv);

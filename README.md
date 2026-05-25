@@ -120,6 +120,22 @@ The `cn-dispatch` agent reads task signals and picks the best model:
 /cn:mimo <prompt>      # Xiaomi MiMo, 1M ctx
 ```
 
+### Team fan-out
+
+Send one task to several backends **in parallel**, then review their outputs together. This is the elastic CN "pool" — supplementary or cross-check work that you synthesize in a single pass.
+
+```bash
+/cn:team 给这段迁移脚本做交叉审查              # default pool: qwen, glm, kimi
+/cn:team --models qwen:token,glm:max,kimi -- 审查这段 Doris SQL
+/cn:team --all 各家模型各写一版实现，我来对比
+```
+
+- Default pool (no `--models`/`--all`): `qwen, glm, kimi` — coder · reasoning · long-context.
+- Pin a profile per member with `model:profile` (e.g. `qwen:token`).
+- `--all` runs every backend; use sparingly (one run per model).
+
+Each backend's output comes back tagged `[cn:<model>]` and is kept verbatim, followed by a synthesis of agreements, differences, and a recommended pick. See [`docs/triangle-workflow.md`](docs/triangle-workflow.md) for how this pool fits a review/frontend/backend triangle.
+
 ### Auto-dispatch
 
 The `cn-dispatch` agent is also triggered automatically by Claude when it detects a task that would benefit from a Chinese model backend. No slash command needed.
@@ -138,6 +154,10 @@ Claude Code (main session, Claude Opus/Sonnet)
   │
   ├─ /cn:kimi "prompt"          ← user-triggered direct
   │    └─ cn-companion.mjs task --model kimi "prompt"
+  │
+  ├─ /cn:team "prompt"          ← fan out to several backends in parallel
+  │    └─ cn-companion.mjs team --models qwen,glm,kimi "prompt"
+  │         └─ cc-qwen / cc-glm / cc-kimi  (parallel) → unified review
   │
   └─ cn-dispatch agent          ← auto-triggered by Claude
        └─ (same flow as /cn:ask)
@@ -196,13 +216,17 @@ plugins/cn/
 │   ├── stepfun.md              # /cn:stepfun
 │   ├── minimax.md              # /cn:minimax
 │   ├── mimo.md                 # /cn:mimo
+│   ├── team.md                 # /cn:team (multi-model fan-out)
 │   └── profiles.md             # /cn:profiles
 ├── skills/
 │   ├── cn-routing/SKILL.md     # Model selection decision matrix
+│   ├── cn-team/SKILL.md        # Fan-out + unified review guidance
 │   └── cn-result-handling/SKILL.md  # Output formatting rules
 └── scripts/
     ├── cn-companion.mjs        # Core runtime
     └── cn-companion.test.mjs   # CLI parser smoke tests
+docs/
+└── triangle-workflow.md        # Review/frontend/backend triangle + CN pool
 launchers/
 ├── bin/                        # Snapshot of the local cc-* wrappers
 └── prompts/                    # Provider-specific appended system prompts

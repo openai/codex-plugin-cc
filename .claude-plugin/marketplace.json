@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Route tasks from Claude Code to Chinese AI model backends — Kimi, Qwen, GLM, Doubao, StepFun, MiniMax, MiMo.",
-    "version": "1.1.0"
+    "version": "1.2.0"
   },
   "plugins": [
     {
       "name": "cn",
       "description": "Route tasks to Chinese AI model backends from Claude Code.",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "author": {
         "name": "LeoLin990405"
       },
