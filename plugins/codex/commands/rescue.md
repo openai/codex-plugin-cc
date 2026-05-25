@@ -15,9 +15,9 @@ Execution mode:
 
 - If the request includes `--background`, pass `--background` to the `codex:codex-rescue` subagent so it invokes companion `task --background`.
 - If the request includes `--wait`, pass `--wait` to the `codex:codex-rescue` subagent so it invokes foreground `task`.
-- If neither flag is present, foreground stays for short, bounded rescues that return the result directly.
+- If neither flag is present, default to `--background` (the safe path: the worker daemonizes and survives; collect the result via `/codex:status` + `/codex:result`). Only stay foreground when `--wait` is explicit AND the rescue is short and clearly bounded.
 - For long, substantial, or open-ended rescues, pass `--background`; the companion returns `[[codex-task status=dispatched id=<jobId>]]`. A dispatched background job has no automatic push notification, so arm a watcher by running `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" status <jobId> --wait --timeout-ms 1800000` via the Bash tool with `run_in_background=true`; it exits and re-invokes Claude when the job reaches a terminal status. If it returns while the job is still running, re-arm the same command. Fetch `/codex:result <jobId>` only after the watcher reports a terminal status.
-- A foreground rescue is capped by the Bash tool at roughly 600 seconds and can be auto-backgrounded past that cap, which orphans the detached Codex result.
+- A foreground rescue running inside the subagent is auto-backgrounded by the harness and then reaped when the subagent ends (observed at ~143s — much sooner than the ~600s direct-Bash cap), which kills the Codex worker mid-run and loses the result. Route anything substantial to `--background`.
 - `--background` and `--wait` are execution flags for Claude Code and the rescue subagent. Preserve the execution choice, and strip them only from the natural-language task text before Codex sees the prompt.
 - `--model` and `--effort` are runtime-selection flags. Preserve them for the forwarded `task` call, but do not treat them as part of the natural-language task text.
 - If the request includes `--resume`, do not ask whether to continue. The user already chose.

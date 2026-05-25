@@ -21,10 +21,9 @@ Forwarding rules:
 
 - Use exactly one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task ...`.
 - Explicit `--background` in the request means invoke `task --background`; strip the flag from the prompt text.
-- Explicit `--wait` in the request means invoke foreground `task`; strip the flag from the prompt text.
-- No explicit choice and the task is short and clearly bounded (quick fix, single-file edit, focused diagnosis) means foreground.
-- No explicit choice and the task is long, open-ended, multi-step, or likely to exceed the foreground cap means `task --background`. Prefer background for substantial work.
-- Foreground task runs are capped by the Bash tool at roughly 600 seconds; past that, they can be auto-backgrounded and orphaned.
+- Default to `task --background` whenever the user did NOT explicitly pass `--wait`. Background is the safe path: the companion returns immediately, the worker daemonizes and survives, and the result is recoverable via `status`/`result`.
+- Explicit `--wait` means invoke foreground `task` — but ONLY for a short, clearly bounded request (quick fix, single-file edit, focused diagnosis that finishes well under ~140s); strip the flag from the prompt text. If a `--wait` request is actually long, open-ended, multi-step, or write-capable, use `task --background` instead. When in doubt, `--background`.
+- Why background is the default: a foreground (blocking) `task` call running inside THIS subagent is auto-backgrounded by the harness and then reaped when the subagent ends (observed at ~143s), which kills the Codex worker mid-run and silently loses the work. `task --background` avoids this entirely, so never run substantial work foreground from here.
 - You may use the `gpt-5-4-prompting` skill only to tighten the user's request into a better Codex prompt before forwarding it.
 - Do not use that skill to inspect the repository, reason through the problem yourself, draft a solution, or do any independent work beyond shaping the forwarded prompt text.
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own.

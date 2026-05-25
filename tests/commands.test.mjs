@@ -113,9 +113,16 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /status <jobId> --wait --timeout-ms 1800000/);
   assert.match(rescue, /run_in_background=true/);
   assert.match(rescue, /`\/codex:result <jobId>`/);
-  assert.match(rescue, /Foreground stays for short, bounded rescues/i);
-  assert.match(rescue, /foreground rescue is capped by the Bash tool/i);
-  assert.match(rescue, /auto-backgrounded past that cap/i);
+  // Fix: a foreground task call inside the subagent is auto-backgrounded and
+  // reaped at ~143s (kills the worker mid-run). Default must be --background.
+  assert.match(rescue, /default to `--background`/i);
+  assert.match(rescue, /Only stay foreground when `--wait` is explicit/i);
+  assert.match(rescue, /running inside the subagent is auto-backgrounded by the harness and then reaped/i);
+  assert.match(rescue, /observed at ~143s/i);
+  assert.doesNotMatch(rescue, /foreground rescue is capped by the Bash tool at roughly 600 seconds/i);
+  assert.match(agent, /Default to `task --background` whenever the user did NOT explicitly pass `--wait`/i);
+  assert.match(agent, /reaped when the subagent ends \(observed at ~143s\)/i);
+  assert.doesNotMatch(agent, /capped by the Bash tool at roughly 600 seconds/i);
   assert.match(rescue, /Preserve the execution choice/i);
   assert.match(rescue, /strip them only from the natural-language task text/i);
   assert.match(rescue, /`--model` and `--effort` are runtime-selection flags/i);
@@ -137,10 +144,10 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /--fresh/);
   assert.match(agent, /thin forwarding wrapper/i);
   assert.match(agent, /Explicit `--background` in the request means invoke `task --background`/i);
-  assert.match(agent, /Explicit `--wait` in the request means invoke foreground `task`/i);
-  assert.match(agent, /No explicit choice and the task is short and clearly bounded .* means foreground/i);
-  assert.match(agent, /No explicit choice and the task is long, open-ended, multi-step, or likely to exceed the foreground cap means `task --background`/i);
-  assert.match(agent, /Prefer background for substantial work/i);
+  assert.match(agent, /Explicit `--wait` means invoke foreground `task`/i);
+  assert.match(agent, /ONLY for a short, clearly bounded request/i);
+  assert.match(agent, /Default to `task --background` whenever the user did NOT explicitly pass `--wait`/i);
+  assert.match(agent, /never run substantial work foreground from here/i);
   assert.match(agent, /Use exactly one `Bash` call/i);
   assert.match(agent, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
   assert.match(agent, /Do not call `review`, `adversarial-review`, `status`, `result`, or `cancel`/i);
