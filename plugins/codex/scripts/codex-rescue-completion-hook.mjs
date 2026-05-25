@@ -21,6 +21,10 @@ const FAILURE_STATUSES = new Set(["failed", "fail", "error", "errored", "cancell
 const ACTIVE_TASK_STATUSES = new Set(["queued", "running"]);
 const BASH_AUTO_BACKGROUND_MARKER = "Command running in background with ID:";
 const BASH_AUTO_BACKGROUND_OUTPUT_PREFIX = "Output is being written to:";
+// PR #346 review: state fallback is only safe when this synchronous return
+// contains invocation-specific evidence that the task was actually backgrounded.
+const BACKGROUND_INTENT_PATTERN =
+  /running in (?:the\s+)?background|backgrounded|dispatched|you'?ll be notified|you will be notified|will notify|will be notified/i;
 
 function buildWatcherContext(jobId) {
   return `codex-rescue background job ${jobId} is RUNNING — there is no automatic push notification. To be notified, arm a watcher: run this via the Bash tool with run_in_background=true:  node "${COMPANION_SCRIPT_PATH}" status ${jobId} --wait --timeout-ms 1800000  — it blocks until the job is terminal, then exits and re-invokes you. If it returns and the job is still running, re-arm the same command. Do NOT treat the job as done until the watcher reports a terminal status.`;
@@ -173,18 +177,21 @@ function buildCompletionContext(input) {
     return buildWatcherContext(token.id);
   }
 
-  // The subagent may paraphrase or drop the dispatched sentinel, so companion
-  // state is the fallback signal for a queued/running rescue task after return.
-  const activeTaskJob = findNewestActiveTaskJob(getHookCwd(input), input?.session_id);
-  if (activeTaskJob) {
-    return buildWatcherContext(activeTaskJob.id);
-  }
-
   // Bash auto-backgrounds commands that exceed the ~600s foreground cap. That
   // synchronous Agent return means the Bash wrapper detached, not that Codex
   // completed, so report the still-running state before any completion claim.
   if (responseText.includes(BASH_AUTO_BACKGROUND_MARKER)) {
     return buildBashAutoBackgroundContext(extractBashAutoBackgroundOutputPath(responseText));
+  }
+
+  // PR #346 review: only consult global companion state after this return says
+  // the task was backgrounded; otherwise an unrelated active task can hide a
+  // sentinel-less failure from the foreground invocation that just returned.
+  if (BACKGROUND_INTENT_PATTERN.test(responseText)) {
+    const activeTaskJob = findNewestActiveTaskJob(getHookCwd(input), input?.session_id);
+    if (activeTaskJob) {
+      return buildWatcherContext(activeTaskJob.id);
+    }
   }
 
   // No success evidence: never claim success here. A failure status or an empty

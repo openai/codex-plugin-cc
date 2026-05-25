@@ -68,6 +68,7 @@ const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json"
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const FOREGROUND_TASK_POLL_INTERVAL_MS = 100;
+const FOREGROUND_TASK_MISSING_JOB_RETRY_MS = 5000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
@@ -157,6 +158,38 @@ function resolveCommandWorkspace(options = {}) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeWorkerPid(pid) {
+  const normalized = Number(pid);
+  return Number.isInteger(normalized) && normalized > 0 ? normalized : null;
+}
+
+function isProcessAlive(pid) {
+  // A pid that answers signal 0 still has a live process table entry. EPERM also
+  // means the process exists but this user cannot signal it.
+  const normalizedPid = normalizeWorkerPid(pid);
+  if (!normalizedPid) {
+    return false;
+  }
+
+  try {
+    process.kill(normalizedPid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+function hasExitedActiveWorker(job) {
+  // Active jobs with a recorded worker pid should keep that worker alive until
+  // the job reaches a terminal state; a missing process means launch failed.
+  const workerPid = normalizeWorkerPid(job?.pid);
+  return Boolean(workerPid && isActiveJobStatus(job?.status) && !isProcessAlive(workerPid));
+}
+
+function isMissingJobError(error) {
+  return String(error?.message ?? "").startsWith("No job found for ");
 }
 
 function shorten(text, limit = 96) {
@@ -317,17 +350,49 @@ function findLatestResumableTaskJob(jobs) {
 async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
   const timeoutMs = Math.max(0, Number(options.timeoutMs) || DEFAULT_STATUS_WAIT_TIMEOUT_MS);
   const pollIntervalMs = Math.max(100, Number(options.pollIntervalMs) || DEFAULT_STATUS_POLL_INTERVAL_MS);
+  const retryMissingJobMs = Math.max(0, Number(options.retryMissingJobMs) || FOREGROUND_TASK_MISSING_JOB_RETRY_MS);
   const deadline = Date.now() + timeoutMs;
-  let snapshot = buildSingleJobSnapshot(cwd, reference);
+  const missingJobDeadline = Date.now() + retryMissingJobMs;
 
-  while (isActiveJobStatus(snapshot.job.status) && Date.now() < deadline) {
-    await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
+  const readSnapshot = () => {
+    try {
+      return buildSingleJobSnapshot(cwd, reference);
+    } catch (error) {
+      if (options.retryMissingJob && isMissingJobError(error) && Date.now() < missingJobDeadline) {
+        return null;
+      }
+      throw error;
+    }
+  };
+
+  let snapshot = readSnapshot();
+
+  while ((!snapshot || isActiveJobStatus(snapshot.job.status)) && Date.now() < deadline) {
+    if (snapshot && options.failWhenWorkerExits && hasExitedActiveWorker(snapshot.job)) {
+      return {
+        ...snapshot,
+        waitTimedOut: false,
+        workerExited: true,
+        timeoutMs
+      };
+    }
+
+    // Foreground task workers write state concurrently with the foreground
+    // waiter. If a transient read sees no parseable job, retry briefly instead
+    // of failing before the queued record becomes readable.
+    const activeDeadline = snapshot ? deadline : Math.min(deadline, missingJobDeadline);
+    await sleep(Math.min(pollIntervalMs, Math.max(0, activeDeadline - Date.now())));
+    snapshot = readSnapshot();
+  }
+
+  if (!snapshot) {
     snapshot = buildSingleJobSnapshot(cwd, reference);
   }
 
   return {
     ...snapshot,
     waitTimedOut: isActiveJobStatus(snapshot.job.status),
+    workerExited: Boolean(options.failWhenWorkerExits && hasExitedActiveWorker(snapshot.job)),
     timeoutMs
   };
 }
@@ -677,9 +742,27 @@ function enqueueBackgroundTask(cwd, job, request) {
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
 
+  // PR #346 review: /codex:cancel can land after the durable queued record is
+  // written but before worker launch; re-read the job and do not spawn a worker
+  // for a record that is already terminal.
+  const latestQueuedRecord = readStoredJob(job.workspaceRoot, job.id) ?? queuedRecord;
+  if (!isActiveJobStatus(latestQueuedRecord.status)) {
+    appendLogLine(logFile, `Skipped background worker launch because job is ${latestQueuedRecord.status}.`);
+    return {
+      payload: {
+        jobId: job.id,
+        status: latestQueuedRecord.status ?? "cancelled",
+        title: job.title,
+        summary: job.summary,
+        logFile
+      },
+      logFile
+    };
+  }
+
   const child = spawnDetachedTaskWorker(cwd, job.id);
   // PR #346 review: keep the pre-spawn record, then persist the worker pid for cancellation.
-  const spawnedRecord = readStoredJob(job.workspaceRoot, job.id) ?? queuedRecord;
+  const spawnedRecord = readStoredJob(job.workspaceRoot, job.id) ?? latestQueuedRecord;
   if (isActiveJobStatus(spawnedRecord.status)) {
     writeJobFile(job.workspaceRoot, job.id, {
       ...spawnedRecord,
@@ -701,6 +784,45 @@ function enqueueBackgroundTask(cwd, job, request) {
     },
     logFile
   };
+}
+
+function buildWorkerExitedError(jobId) {
+  return `background worker exited before completing; check /codex:status ${jobId}`;
+}
+
+function failActiveWorkerJob(workspaceRoot, job, errorMessage) {
+  // Re-read before marking failed so a concurrent cancellation or completion is
+  // not overwritten by the foreground waiter.
+  const latestStoredJob = readStoredJob(workspaceRoot, job.id) ?? {};
+  const latestJob = {
+    ...job,
+    ...latestStoredJob
+  };
+  if (!isActiveJobStatus(latestJob.status)) {
+    return latestJob;
+  }
+
+  const completedAt = nowIso();
+  const failedJob = {
+    ...latestJob,
+    status: "failed",
+    phase: "failed",
+    pid: null,
+    completedAt,
+    errorMessage
+  };
+
+  writeJobFile(workspaceRoot, job.id, failedJob);
+  upsertJob(workspaceRoot, {
+    id: job.id,
+    status: "failed",
+    phase: "failed",
+    pid: null,
+    completedAt,
+    errorMessage
+  });
+  appendLogLine(failedJob.logFile, errorMessage);
+  return failedJob;
 }
 
 function ensureTrailingNewline(value) {
@@ -747,8 +869,23 @@ async function runForegroundTaskWorker(cwd, job, request, options = {}) {
   const snapshot = await waitForSingleJobSnapshot(cwd, job.id, {
     // PR #346 review: foreground xhigh waits must survive beyond the 240s status default.
     timeoutMs: Infinity,
-    pollIntervalMs: FOREGROUND_TASK_POLL_INTERVAL_MS
+    pollIntervalMs: FOREGROUND_TASK_POLL_INTERVAL_MS,
+    retryMissingJob: true,
+    // PR #346 review: an unbounded wait must still fail fast when its detached
+    // worker pid has exited while the job remains queued/running.
+    failWhenWorkerExits: true
   });
+  if (snapshot.workerExited) {
+    const errorMessage = buildWorkerExitedError(snapshot.job.id);
+    const failedJob = failActiveWorkerJob(snapshot.workspaceRoot, snapshot.job, errorMessage);
+    if (options.json) {
+      outputCommandResult({ job: failedJob, errorMessage }, `${errorMessage}\n`, true);
+    } else {
+      process.stderr.write(`${errorMessage}\n`);
+    }
+    process.exitCode = 1;
+    return;
+  }
   if (snapshot.waitTimedOut) {
     outputCommandResult(snapshot, renderJobStatusReport(snapshot.job), options.json);
     process.exitCode = 1;
