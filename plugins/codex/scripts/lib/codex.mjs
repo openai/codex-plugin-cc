@@ -77,8 +77,15 @@ function buildResumeParams(threadId, cwd, options = {}) {
 }
 
 /** @returns {UserInput[]} */
-function buildTurnInput(prompt) {
-  return [{ type: "text", text: prompt, text_elements: [] }];
+function buildTurnInput(prompt, options = {}) {
+  const input = [];
+  const boundaryNote = String(options.boundaryNote ?? "").trim();
+  if (boundaryNote) {
+    // The workspace-boundary notice is ephemeral and exists only in the turn input sent to Codex.
+    input.push({ type: "text", text: boundaryNote, text_elements: [] });
+  }
+  input.push({ type: "text", text: prompt, text_elements: [] });
+  return input;
 }
 
 function shorten(text, limit = 72) {
@@ -1004,7 +1011,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       () =>
         client.request("turn/start", {
           threadId,
-          input: buildTurnInput(prompt),
+          input: buildTurnInput(prompt, { boundaryNote: options.boundaryNote }),
           model: options.model ?? null,
           effort: options.effort ?? null,
           outputSchema: options.outputSchema ?? null

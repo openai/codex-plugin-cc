@@ -725,6 +725,101 @@ syncBuiltinESMExports();
   assert.match(job.errorMessage, /background worker exited before completing/);
 });
 
+test("write task run prepends the workspace-boundary notice to the turn input", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "--write", "fix the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.input.length, 2);
+  assert.equal(fakeState.lastTurnStart.input[0].type, "text");
+  assert.match(fakeState.lastTurnStart.input[0].text, /write access ONLY within/);
+  assert.match(fakeState.lastTurnStart.input[0].text, /Do NOT probe/);
+  assert.match(fakeState.lastTurnStart.input[0].text, /--cwd/);
+  assert.match(fakeState.lastTurnStart.input[0].text, new RegExp(repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.deepEqual(fakeState.lastTurnStart.input[1], {
+    type: "text",
+    text: "fix the failing test",
+    text_elements: []
+  });
+});
+
+test("the workspace-boundary notice is ephemeral for write task runs", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const launched = run("node", [SCRIPT, "task", "--background", "--write", "--json", "implement scoped update"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(launched.status, 0, launched.stderr);
+  const launchPayload = JSON.parse(launched.stdout);
+  const jobFile = path.join(resolveStateDir(repo), "jobs", `${launchPayload.jobId}.json`);
+  const queuedJob = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  assert.equal(queuedJob.request.prompt, "implement scoped update");
+  assert.doesNotMatch(queuedJob.request.prompt, /WORKSPACE:/);
+  assert.doesNotMatch(queuedJob.request.prompt, /write access ONLY within/);
+
+  await waitFor(() => {
+    const storedJob = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+    return storedJob.status === "completed" ? storedJob : null;
+  }, { timeoutMs: 15000 });
+
+  const completedJob = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  assert.equal(completedJob.request.prompt, "implement scoped update");
+  assert.doesNotMatch(completedJob.request.prompt, /WORKSPACE:/);
+
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const taskThread = fakeState.threads.find((thread) => thread.id === fakeState.lastTurnStart.threadId);
+  assert.match(taskThread.name, /^Codex Companion Task: implement scoped update/);
+  assert.doesNotMatch(taskThread.name, /WORKSPACE:/);
+  assert.doesNotMatch(taskThread.name, /write access ONLY within/);
+});
+
+test("read-only task run does not get the workspace-boundary notice", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "diagnose the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.deepEqual(fakeState.lastTurnStart.input, [
+    {
+      type: "text",
+      text: "diagnose the failing test",
+      text_elements: []
+    }
+  ]);
+});
+
 test("task --resume acts like --resume-last without leaking the flag into the prompt", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

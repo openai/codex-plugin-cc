@@ -572,6 +572,8 @@ async function executeTaskRun(request) {
     sandbox: request.write ? "workspace-write" : "read-only",
     onProgress: request.onProgress,
     persistThread: true,
+    // Keep the workspace-boundary notice ephemeral by adding it only to turn input, not stored prompts or thread names.
+    boundaryNote: request.write ? buildWorkspaceBoundaryNotice(workspaceRoot) : null,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
   });
 
@@ -710,6 +712,10 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId
     resumeLast,
     jobId
   };
+}
+
+function buildWorkspaceBoundaryNotice(cwd) {
+  return `WORKSPACE: this run has write access ONLY within ${cwd}. Everything outside ${cwd} is read-only (Codex workspace-write sandbox). Do NOT probe, test, or investigate the sandbox boundary. If completing this task requires creating or modifying files outside ${cwd}, stop immediately and report that it must be re-dispatched with \`--cwd <target-directory>\` — do not attempt workarounds.`;
 }
 
 function readTaskPrompt(cwd, options, positionals) {

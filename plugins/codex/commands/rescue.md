@@ -51,3 +51,9 @@ Operating rules:
 - Leave `--resume` and `--fresh` in the forwarded request. The subagent handles that routing when it builds the `task` command.
 - If the helper reports that Codex is missing or unauthenticated, stop and tell the user to run `/codex:setup`.
 - If the user did not supply a request, ask what Codex should investigate or fix.
+
+Workspace boundary:
+
+- A Codex `task` run can only create or modify files **within its working directory** (the Codex `workspace-write` sandbox is rooted at the run's `--cwd`). Files outside that directory are read-only.
+- The `Agent`-tool `codex:codex-rescue` dispatch inherits **this Claude session's** cwd, and the `Agent` tool cannot change it. So a rescue request that needs to write to a *different* repository will silently fail to write (Codex can only probe, not edit) — do not route cross-repo write work through the subagent.
+- To target a different repository, either run from a Claude session inside that repo, or invoke the companion directly with `--cwd <target-repo>`: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --cwd <target-repo> --write ...`.
