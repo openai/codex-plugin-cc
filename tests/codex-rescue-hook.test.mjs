@@ -53,6 +53,10 @@ function parseHookOutput(result) {
   return JSON.parse(result.stdout);
 }
 
+function expectedWatcherContext(jobId) {
+  return `codex-rescue background job ${jobId} is RUNNING — there is no automatic push notification. To be notified, arm a watcher: run this via the Bash tool with run_in_background=true:  node "${COMPANION}" status ${jobId} --wait --timeout-ms 1800000  — it blocks until the job is terminal, then exits and re-invokes you. If it returns and the job is still running, re-arm the same command. Do NOT treat the job as done until the watcher reports a terminal status.`;
+}
+
 test("codex-rescue hook emits a watcher when companion state has an active task job", () => {
   const workspace = makeTempDir();
   const pluginDataDir = makeTempDir();
@@ -62,6 +66,7 @@ test("codex-rescue hook emits a watcher when companion state has an active task 
       status: "queued",
       title: "Codex Task",
       jobClass: "task",
+      sessionId: "session-main",
       updatedAt: "2026-05-25T10:00:00.000Z"
     },
     {
@@ -76,6 +81,7 @@ test("codex-rescue hook emits a watcher when companion state has an active task 
       status: "running",
       title: "Codex Task",
       jobClass: "task",
+      sessionId: "session-main",
       updatedAt: "2026-05-25T10:05:00.000Z"
     }
   ]);
@@ -84,6 +90,7 @@ test("codex-rescue hook emits a watcher when companion state has an active task 
     {
       hook_event_name: "PostToolUse",
       tool_name: "Agent",
+      session_id: "session-main",
       cwd: workspace,
       tool_input: {
         subagent_type: "codex:codex-rescue"
@@ -106,10 +113,10 @@ test("codex-rescue hook emits a watcher when companion state has an active task 
   assert.deepEqual(payload, {
     hookSpecificOutput: {
       hookEventName: "PostToolUse",
-      additionalContext:
-        `codex-rescue background job task-running-new is RUNNING — there is no automatic push notification. To be notified, arm a watcher: run this via the Bash tool with run_in_background=true:  node ${COMPANION} status task-running-new --wait --timeout-ms 1800000  — it blocks until the job is terminal, then exits and re-invokes you. If it returns and the job is still running, re-arm the same command. Do NOT treat the job as done until the watcher reports a terminal status.`
+      additionalContext: expectedWatcherContext("task-running-new")
     }
   });
+  assert.ok(payload.hookSpecificOutput.additionalContext.includes(`node "${COMPANION}" status task-running-new`));
 });
 
 test("codex-rescue hook injects a complete line when the completion token is present", () => {
@@ -139,6 +146,125 @@ test("codex-rescue hook injects a complete line when the completion token is pre
         "codex-rescue has COMPLETED and exited. The text above is the final result. Do NOT wait for a notification or poll status. If it ran with --write, verify changed files with git status."
     }
   });
+});
+
+test("codex-rescue hook treats the completion token as authoritative over active task state", () => {
+  const workspace = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  seedHookState(workspace, pluginDataDir, [
+    {
+      id: "task-unrelated-running",
+      status: "running",
+      title: "Codex Task",
+      jobClass: "task",
+      sessionId: "other-session",
+      updatedAt: "2026-05-25T10:20:00.000Z"
+    }
+  ]);
+
+  const result = runHook(
+    {
+      hook_event_name: "PostToolUse",
+      tool_name: "Agent",
+      cwd: workspace,
+      tool_input: {
+        subagent_type: "codex:codex-rescue"
+      },
+      tool_response: {
+        status: "completed",
+        agentId: "agent-complete-with-unrelated-active-job",
+        content: [
+          {
+            type: "text",
+            text: "Handled the requested task.\n[[codex-task status=complete]]\n"
+          }
+        ]
+      }
+    },
+    { pluginDataDir }
+  );
+
+  const payload = parseHookOutput(result);
+  assert.equal(
+    payload.hookSpecificOutput.additionalContext,
+    "codex-rescue has COMPLETED and exited. The text above is the final result. Do NOT wait for a notification or poll status. If it ran with --write, verify changed files with git status."
+  );
+  assert.doesNotMatch(payload.hookSpecificOutput.additionalContext, /background job task-unrelated-running/);
+});
+
+test("codex-rescue hook scopes active task state to the current session when present", () => {
+  const workspace = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  seedHookState(workspace, pluginDataDir, [
+    {
+      id: "task-current-session",
+      status: "running",
+      title: "Codex Task",
+      jobClass: "task",
+      sessionId: "session-current",
+      updatedAt: "2026-05-25T10:00:00.000Z"
+    },
+    {
+      id: "task-other-session-newer",
+      status: "running",
+      title: "Codex Task",
+      jobClass: "task",
+      sessionId: "session-other",
+      updatedAt: "2026-05-25T10:30:00.000Z"
+    }
+  ]);
+
+  const scopedResult = runHook(
+    {
+      hook_event_name: "PostToolUse",
+      tool_name: "Agent",
+      session_id: "session-current",
+      cwd: workspace,
+      tool_input: {
+        subagent_type: "codex:codex-rescue"
+      },
+      tool_response: {
+        status: "completed",
+        agentId: "agent-tokenless-current-session",
+        content: [
+          {
+            type: "text",
+            text: "Codex is still running."
+          }
+        ]
+      }
+    },
+    { pluginDataDir }
+  );
+
+  const scopedPayload = parseHookOutput(scopedResult);
+  assert.equal(scopedPayload.hookSpecificOutput.additionalContext, expectedWatcherContext("task-current-session"));
+  assert.doesNotMatch(scopedPayload.hookSpecificOutput.additionalContext, /task-other-session-newer/);
+
+  const unscopedResult = runHook(
+    {
+      hook_event_name: "PostToolUse",
+      tool_name: "Agent",
+      cwd: workspace,
+      tool_input: {
+        subagent_type: "codex:codex-rescue"
+      },
+      tool_response: {
+        status: "completed",
+        agentId: "agent-tokenless-without-session",
+        content: [
+          {
+            type: "text",
+            text: "Codex is still running."
+          }
+        ]
+      }
+    },
+    { pluginDataDir }
+  );
+
+  const unscopedPayload = parseHookOutput(unscopedResult);
+  assert.equal(unscopedPayload.hookSpecificOutput.additionalContext, expectedWatcherContext("task-other-session-newer"));
 });
 
 test("codex-rescue hook reports synchronous tokenless returns neutrally", () => {

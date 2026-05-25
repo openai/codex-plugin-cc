@@ -23,7 +23,7 @@ const BASH_AUTO_BACKGROUND_MARKER = "Command running in background with ID:";
 const BASH_AUTO_BACKGROUND_OUTPUT_PREFIX = "Output is being written to:";
 
 function buildWatcherContext(jobId) {
-  return `codex-rescue background job ${jobId} is RUNNING — there is no automatic push notification. To be notified, arm a watcher: run this via the Bash tool with run_in_background=true:  node ${COMPANION_SCRIPT_PATH} status ${jobId} --wait --timeout-ms 1800000  — it blocks until the job is terminal, then exits and re-invokes you. If it returns and the job is still running, re-arm the same command. Do NOT treat the job as done until the watcher reports a terminal status.`;
+  return `codex-rescue background job ${jobId} is RUNNING — there is no automatic push notification. To be notified, arm a watcher: run this via the Bash tool with run_in_background=true:  node "${COMPANION_SCRIPT_PATH}" status ${jobId} --wait --timeout-ms 1800000  — it blocks until the job is terminal, then exits and re-invokes you. If it returns and the job is still running, re-arm the same command. Do NOT treat the job as done until the watcher reports a terminal status.`;
 }
 
 function buildDispatchedContext(jobId) {
@@ -101,12 +101,18 @@ function compareJobsNewestFirst(left, right) {
   return String(right.updatedAt ?? right.createdAt ?? "").localeCompare(String(left.updatedAt ?? left.createdAt ?? ""));
 }
 
-function findNewestActiveTaskJob(cwd) {
-  return (
-    [...loadState(cwd).jobs]
-      .filter((job) => job?.jobClass === "task" && ACTIVE_TASK_STATUSES.has(String(job.status ?? "")))
-      .sort(compareJobsNewestFirst)[0] ?? null
+function findNewestActiveTaskJob(cwd, sessionId) {
+  const activeTaskJobs = [...loadState(cwd).jobs].filter(
+    (job) => job?.jobClass === "task" && ACTIVE_TASK_STATUSES.has(String(job.status ?? ""))
   );
+  const normalizedSessionId = typeof sessionId === "string" && sessionId.trim() ? sessionId : null;
+  // Companion task jobs are session-owned; when Claude gives us the current
+  // session id, only infer active state from jobs created by this same session.
+  // Older hook inputs had no session_id, so those preserve the unscoped fallback.
+  const candidateJobs = normalizedSessionId
+    ? activeTaskJobs.filter((job) => job?.sessionId === normalizedSessionId)
+    : activeTaskJobs;
+  return candidateJobs.sort(compareJobsNewestFirst)[0] ?? null;
 }
 
 function isFailedOrEmptyReturn(toolResponse, responseText) {
@@ -157,23 +163,25 @@ function buildCompletionContext(input) {
     return null;
   }
 
-  // The subagent may paraphrase or drop the dispatched sentinel, so companion
-  // state is the reliable signal for a queued/running rescue task after return.
-  const activeTaskJob = findNewestActiveTaskJob(getHookCwd(input));
-  if (activeTaskJob) {
-    return buildWatcherContext(activeTaskJob.id);
-  }
-
   const responseText = collectText(toolResponse);
   const token = parseTaskStatusToken(responseText);
-  if (token?.status === "dispatched" && token.id) {
-    return buildDispatchedContext(token.id);
-  }
   // The complete sentinel is the only positive proof of a successful run; the
   // companion stamps it solely on real completion, so it is the lone path that
   // asserts success (PR #346 review P1).
   if (token?.status === "complete") {
     return COMPLETE_CONTEXT;
+  }
+  // Status tokens are emitted by this codex-rescue return, so they are more
+  // authoritative than any task state that may belong to another concurrent run.
+  if (token?.status === "dispatched" && token.id) {
+    return buildDispatchedContext(token.id);
+  }
+
+  // The subagent may paraphrase or drop the dispatched sentinel, so companion
+  // state is the fallback signal for a queued/running rescue task after return.
+  const activeTaskJob = findNewestActiveTaskJob(getHookCwd(input), input?.session_id);
+  if (activeTaskJob) {
+    return buildWatcherContext(activeTaskJob.id);
   }
 
   // Bash auto-backgrounds commands that exceed the ~600s foreground cap. That
