@@ -153,6 +153,7 @@ function main() {
 
   if (!config.stopReviewGate) {
     logNote(runningTaskNote);
+    emitDecision({});
     return;
   }
 
@@ -160,6 +161,7 @@ function main() {
   if (setupNote) {
     logNote(setupNote);
     logNote(runningTaskNote);
+    emitDecision({});
     return;
   }
 
@@ -173,6 +175,7 @@ function main() {
   }
 
   logNote(runningTaskNote);
+  emitDecision({});
 }
 
 try {
