@@ -5,7 +5,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
-import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import {
+  getConfig,
+  loadState,
+  resolveJobFile,
+  resolveJobLogFile,
+  resolveStateDir,
+  resolveStateFile,
+  saveState,
+  setConfig
+} from "../plugins/codex/scripts/lib/state.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -102,4 +111,25 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
       .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
       .sort()
   );
+});
+
+test("default config includes monorepoMode disabled", () => {
+  const workspace = makeTempDir();
+  const config = getConfig(workspace);
+
+  assert.equal(config.stopReviewGate, false);
+  assert.equal(config.monorepoMode, false);
+});
+
+test("setConfig persists monorepoMode independently from stopReviewGate", () => {
+  const workspace = makeTempDir();
+
+  setConfig(workspace, "monorepoMode", true);
+  const config = getConfig(workspace);
+
+  assert.equal(config.monorepoMode, true);
+  assert.equal(config.stopReviewGate, false);
+
+  const reloaded = loadState(workspace).config;
+  assert.equal(reloaded.monorepoMode, true);
 });

@@ -195,6 +195,11 @@ async function buildSetupReport(cwd, actionsTaken = []) {
   if (!config.stopReviewGate) {
     nextSteps.push("Optional: run `/codex:setup --enable-review-gate` to require a fresh review before stop.");
   }
+  if (config.stopReviewGate && !config.monorepoMode) {
+    nextSteps.push(
+      "Optional: run `/codex:setup --enable-monorepo` to make the stop-time review gate also scan sibling git repos under the parent directory."
+    );
+  }
 
   return {
     ready: nodeStatus.available && codexStatus.available && authStatus.loggedIn,
@@ -204,6 +209,7 @@ async function buildSetupReport(cwd, actionsTaken = []) {
     auth: authStatus,
     sessionRuntime: getSessionRuntimeStatus(process.env, workspaceRoot),
     reviewGateEnabled: Boolean(config.stopReviewGate),
+    monorepoModeEnabled: Boolean(config.monorepoMode),
     actionsTaken,
     nextSteps
   };
@@ -212,11 +218,20 @@ async function buildSetupReport(cwd, actionsTaken = []) {
 async function handleSetup(argv) {
   const { options } = parseCommandInput(argv, {
     valueOptions: ["cwd"],
-    booleanOptions: ["json", "enable-review-gate", "disable-review-gate"]
+    booleanOptions: [
+      "json",
+      "enable-review-gate",
+      "disable-review-gate",
+      "enable-monorepo",
+      "disable-monorepo"
+    ]
   });
 
   if (options["enable-review-gate"] && options["disable-review-gate"]) {
     throw new Error("Choose either --enable-review-gate or --disable-review-gate.");
+  }
+  if (options["enable-monorepo"] && options["disable-monorepo"]) {
+    throw new Error("Choose either --enable-monorepo or --disable-monorepo.");
   }
 
   const cwd = resolveCommandCwd(options);
@@ -229,6 +244,16 @@ async function handleSetup(argv) {
   } else if (options["disable-review-gate"]) {
     setConfig(workspaceRoot, "stopReviewGate", false);
     actionsTaken.push(`Disabled the stop-time review gate for ${workspaceRoot}.`);
+  }
+
+  if (options["enable-monorepo"]) {
+    setConfig(workspaceRoot, "monorepoMode", true);
+    actionsTaken.push(
+      `Enabled monorepo mode for ${workspaceRoot}: stop-time review gate now also scans sibling git repos under the parent directory.`
+    );
+  } else if (options["disable-monorepo"]) {
+    setConfig(workspaceRoot, "monorepoMode", false);
+    actionsTaken.push(`Disabled monorepo mode for ${workspaceRoot}.`);
   }
 
   const finalReport = await buildSetupReport(cwd, actionsTaken);

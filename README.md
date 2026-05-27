@@ -221,6 +221,19 @@ When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted
 > [!WARNING]
 > The review gate can create a long-running Claude/Codex loop and may drain usage limits quickly. Only enable it when you plan to actively monitor the session.
 
+#### Monorepo mode (multiple sibling git repos)
+
+By default the review gate only reviews the workspace identified by `git rev-parse --show-toplevel` from the session's cwd. In a layout where several independent git repositories live under one parent directory (a common pattern for monorepos managed with submodules-like checkouts, or simply by convention), changes Claude makes in a *sibling* repo are never seen by the gate.
+
+Enable monorepo mode on the primary repo to make the `Stop` hook also scan the parent directory for sibling git repos and run a review in each one that has the gate enabled and has uncommitted changes:
+
+```bash
+/codex:setup --enable-monorepo
+/codex:setup --disable-monorepo
+```
+
+Setup must still be run separately in each sibling repo to enable the gate for it (`/codex:setup --enable-review-gate`). The hook respects each sibling's own state — a repo whose gate is off is skipped.
+
 ## Typical Flows
 
 ### Review Before Shipping

@@ -20,7 +20,8 @@ function defaultState() {
   return {
     version: STATE_VERSION,
     config: {
-      stopReviewGate: false
+      stopReviewGate: false,
+      monorepoMode: false
     },
     jobs: []
   };

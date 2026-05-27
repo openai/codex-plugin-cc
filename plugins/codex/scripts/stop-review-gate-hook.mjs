@@ -139,6 +139,71 @@ function runStopReview(cwd, input = {}) {
   }
 }
 
+/**
+ * Discover sibling git repositories under the parent of [workspaceRoot].
+ * Used when monorepo mode is enabled: each sibling has its own state and
+ * is reviewed independently, so changes outside the cwd's repo are not
+ * silently skipped by the stop-time gate.
+ *
+ * Depth is fixed at 1 (immediate children of the parent dir) — recursive
+ * scanning is intentionally avoided to keep the hook fast and predictable.
+ */
+function discoverSiblingWorkspaces(workspaceRoot) {
+  try {
+    const parent = path.dirname(workspaceRoot);
+    if (!parent || parent === workspaceRoot) {
+      return [];
+    }
+    const entries = fs.readdirSync(parent, { withFileTypes: true });
+    const siblings = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const candidate = path.join(parent, entry.name);
+      if (candidate === workspaceRoot) continue;
+      // Treat both `.git/` dirs and worktree `.git` files as a git repo.
+      const gitMarker = path.join(candidate, ".git");
+      if (fs.existsSync(gitMarker)) {
+        siblings.push(candidate);
+      }
+    }
+    return siblings;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Return true when the workspace has uncommitted changes (tracked or
+ * untracked). If git is unavailable or the directory is not a repo, the
+ * function returns false so the hook does not waste a Codex review on
+ * an empty diff.
+ */
+function workspaceHasChanges(workspaceRoot) {
+  const result = spawnSync("git", ["status", "--porcelain"], {
+    cwd: workspaceRoot,
+    encoding: "utf8"
+  });
+  if (result.status !== 0) {
+    return false;
+  }
+  return String(result.stdout ?? "").trim().length > 0;
+}
+
+function reviewWorkspace(workspaceRoot, input) {
+  const setupNote = buildSetupNote(workspaceRoot);
+  if (setupNote) {
+    return { ok: true, note: setupNote };
+  }
+  const review = runStopReview(workspaceRoot, input);
+  if (!review.ok) {
+    return {
+      ok: false,
+      reason: `[${path.basename(workspaceRoot)}] ${review.reason}`
+    };
+  }
+  return { ok: true };
+}
+
 function main() {
   const input = readHookInput();
   const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
@@ -156,18 +221,38 @@ function main() {
     return;
   }
 
-  const setupNote = buildSetupNote(cwd);
-  if (setupNote) {
-    logNote(setupNote);
-    logNote(runningTaskNote);
-    return;
+  // Build the list of workspaces to review. The primary workspace is
+  // always included to preserve existing single-repo behavior. When
+  // monorepo mode is enabled, sibling git repos under the parent dir
+  // are added if their own state has the gate enabled *and* they have
+  // uncommitted changes (otherwise Codex would just respond ALLOW for
+  // an empty diff and waste tokens).
+  const workspaces = [workspaceRoot];
+  if (config.monorepoMode) {
+    for (const sibling of discoverSiblingWorkspaces(workspaceRoot)) {
+      const siblingConfig = getConfig(sibling);
+      if (!siblingConfig.stopReviewGate) continue;
+      if (!workspaceHasChanges(sibling)) continue;
+      workspaces.push(sibling);
+    }
   }
 
-  const review = runStopReview(cwd, input);
-  if (!review.ok) {
+  const failures = [];
+  for (const ws of workspaces) {
+    const result = reviewWorkspace(ws, input);
+    if (result.note) {
+      logNote(result.note);
+    }
+    if (!result.ok) {
+      failures.push(result.reason);
+    }
+  }
+
+  if (failures.length > 0) {
+    const combined = failures.join("\n\n");
     emitDecision({
       decision: "block",
-      reason: runningTaskNote ? `${runningTaskNote} ${review.reason}` : review.reason
+      reason: runningTaskNote ? `${runningTaskNote} ${combined}` : combined
     });
     return;
   }
