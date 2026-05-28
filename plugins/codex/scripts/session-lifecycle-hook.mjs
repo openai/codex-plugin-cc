@@ -50,12 +50,18 @@ function cleanupSessionJobs(cwd, sessionId) {
   }
 
   const state = loadState(workspaceRoot);
-  const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
-  if (removedJobs.length === 0) {
+  const sessionJobs = state.jobs.filter((job) => job.sessionId === sessionId);
+  if (sessionJobs.length === 0) {
     return;
   }
 
-  for (const job of removedJobs) {
+  for (const job of sessionJobs) {
+    // Background jobs are explicitly dispatched to outlive the session that
+    // started them. Leave them running and leave their state entry intact so
+    // any session in the workspace can still poll for status/results.
+    if (job.background) {
+      continue;
+    }
     const stillRunning = job.status === "queued" || job.status === "running";
     if (!stillRunning) {
       continue;
@@ -69,8 +75,23 @@ function cleanupSessionJobs(cwd, sessionId) {
 
   saveState(workspaceRoot, {
     ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
+    jobs: state.jobs.filter((job) => job.sessionId !== sessionId || job.background)
   });
+}
+
+function hasActiveBackgroundJobs(cwd) {
+  if (!cwd) {
+    return false;
+  }
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const stateFile = resolveStateFile(workspaceRoot);
+  if (!fs.existsSync(stateFile)) {
+    return false;
+  }
+  const state = loadState(workspaceRoot);
+  return state.jobs.some(
+    (job) => job.background && (job.status === "queued" || job.status === "running")
+  );
 }
 
 function handleSessionStart(input) {
@@ -95,11 +116,20 @@ async function handleSessionEnd(input) {
   const sessionDir = brokerSession?.sessionDir ?? null;
   const pid = brokerSession?.pid ?? null;
 
+  cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
+
+  // Detached background workers depend on the broker for codex app-server
+  // calls. If any background jobs are still active in this workspace, leave
+  // the broker running — a later SessionEnd (or the workers themselves) will
+  // tear it down when nothing depends on it anymore.
+  if (hasActiveBackgroundJobs(cwd)) {
+    return;
+  }
+
   if (brokerEndpoint) {
     await sendBrokerShutdown(brokerEndpoint);
   }
 
-  cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
   teardownBrokerSession({
     endpoint: brokerEndpoint,
     pidFile,

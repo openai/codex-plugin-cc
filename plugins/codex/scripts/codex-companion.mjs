@@ -660,6 +660,7 @@ function enqueueBackgroundTask(cwd, job, request) {
     ...job,
     status: "queued",
     phase: "queued",
+    background: true,
     pid: child.pid ?? null,
     logFile,
     request
