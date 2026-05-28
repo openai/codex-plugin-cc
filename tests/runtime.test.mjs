@@ -1787,6 +1787,138 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   assert.equal(otherJob.logFile, otherSessionLog);
 });
 
+test("session end preserves background jobs and their broker so workers survive their dispatching session", async (t) => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const backgroundLog = path.join(jobsDir, "background.log");
+  const foregroundLog = path.join(jobsDir, "foreground.log");
+  const backgroundJobFile = path.join(jobsDir, "task-background.json");
+  const foregroundJobFile = path.join(jobsDir, "review-foreground.json");
+  fs.writeFileSync(backgroundLog, "background\n", "utf8");
+  fs.writeFileSync(foregroundLog, "foreground\n", "utf8");
+  fs.writeFileSync(backgroundJobFile, JSON.stringify({ id: "task-background" }, null, 2), "utf8");
+  fs.writeFileSync(foregroundJobFile, JSON.stringify({ id: "review-foreground" }, null, 2), "utf8");
+
+  const backgroundSleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    cwd: repo,
+    detached: true,
+    stdio: "ignore"
+  });
+  backgroundSleeper.unref();
+  const foregroundSleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    cwd: repo,
+    detached: true,
+    stdio: "ignore"
+  });
+  foregroundSleeper.unref();
+
+  t.after(() => {
+    for (const proc of [backgroundSleeper, foregroundSleeper]) {
+      try {
+        process.kill(-proc.pid, "SIGTERM");
+      } catch {
+        try {
+          process.kill(proc.pid, "SIGTERM");
+        } catch {
+          // Ignore missing process.
+        }
+      }
+    }
+  });
+
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "task-background",
+            status: "running",
+            title: "Codex Task",
+            sessionId: "sess-current",
+            background: true,
+            pid: backgroundSleeper.pid,
+            logFile: backgroundLog,
+            createdAt: "2026-03-18T15:30:00.000Z",
+            updatedAt: "2026-03-18T15:31:00.000Z"
+          },
+          {
+            id: "review-foreground",
+            status: "running",
+            title: "Codex Review",
+            sessionId: "sess-current",
+            pid: foregroundSleeper.pid,
+            logFile: foregroundLog,
+            createdAt: "2026-03-18T15:32:00.000Z",
+            updatedAt: "2026-03-18T15:33:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      CODEX_COMPANION_SESSION_ID: "sess-current"
+    },
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      session_id: "sess-current",
+      cwd: repo
+    })
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+
+  // Foreground job killed + pruned from state.
+  await waitFor(() => {
+    try {
+      process.kill(foregroundSleeper.pid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  });
+
+  // Background job still alive — its worker outlives the session that started it.
+  assert.equal(
+    (() => {
+      try {
+        process.kill(backgroundSleeper.pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    })(),
+    true,
+    "background job worker should not be terminated by SessionEnd"
+  );
+
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.deepEqual(
+    state.jobs.map((job) => job.id),
+    ["task-background"],
+    "background job stays in state so later sessions can poll it"
+  );
+  assert.equal(fs.existsSync(backgroundJobFile), true, "background job file preserved");
+  assert.equal(fs.existsSync(backgroundLog), true, "background log preserved");
+});
+
 test("stop hook runs a stop-time review task and blocks on findings when the review gate is enabled", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
