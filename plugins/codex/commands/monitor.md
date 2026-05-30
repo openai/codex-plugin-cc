@@ -28,7 +28,6 @@ Extract any runtime flags from `$ARGUMENTS` to forward (everything except `--res
 - `--model <value>` if present → append `--model <value>` to every command below
 - `--effort <value>` if present → append `--effort <value>` to every command below
 
-
 Run:
 ```bash
 CLAUDE_PLUGIN_DATA="${CLAUDE_PLUGIN_DATA}" node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" monitor --list-sessions --json
@@ -45,7 +44,6 @@ CLAUDE_PLUGIN_DATA="${CLAUDE_PLUGIN_DATA}" node "${CLAUDE_PLUGIN_ROOT}/scripts/c
 **1 session** — auto-resume it, no question needed:
 ```bash
 
-=======
 CLAUDE_PLUGIN_DATA="${CLAUDE_PLUGIN_DATA}" node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" monitor --resume-session <that-session-id> [--model <value>] [--effort <value>]
 ```
 

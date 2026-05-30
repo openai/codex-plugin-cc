@@ -1263,14 +1263,18 @@ async function handleShift(argv) {
 
   // Create git-diff markdown file in project root
   const now = new Date().toISOString().slice(0, 10);
-  const diffStat = spawnSync("git", ["diff", "--stat", "HEAD"], { cwd, encoding: "utf8" });
-  const diffFull = spawnSync("git", ["diff", "HEAD"], { cwd, encoding: "utf8" });
+  const SHIFT_EXCLUDE = [":(exclude).codex-shift-*.md"];
+  const diffStat = spawnSync("git", ["diff", "--stat", "HEAD", "--", ".", ...SHIFT_EXCLUDE], { cwd, encoding: "utf8" });
+  const diffFull = spawnSync("git", ["diff", "HEAD", "--", ".", ...SHIFT_EXCLUDE], { cwd, encoding: "utf8" });
   const logRecent = spawnSync("git", ["log", "--oneline", "-10"], { cwd, encoding: "utf8" });
-
   const untrackedResult = spawnSync(
-    "git", ["ls-files", "--others", "--exclude-standard"], { cwd, encoding: "utf8" }
+    "git",
+    ["ls-files", "--others", "--exclude-standard", "--exclude=.codex-shift-*.md"],
+    { cwd, encoding: "utf8" }
   );
-  const untrackedFiles = (untrackedResult.stdout ?? "").trim().split("\n").filter(Boolean);
+  const untrackedFiles = (untrackedResult.stdout ?? "").trim().split("\n")
+    .filter(Boolean)
+    .filter((f) => !/^\.codex-shift-.*\.md$/.test(f));
 
   // Build untracked diff by running git diff --no-index /dev/null <file> for each
   const untrackedDiffParts = [];
