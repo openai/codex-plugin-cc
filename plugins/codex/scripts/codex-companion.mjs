@@ -1240,25 +1240,29 @@ async function handleShift(argv) {
 
   const contextBlock = formatCompactForPrompt(compact);
 
-  // Resolve Codex threadId: prefer the tracked job from the chosen shift session,
-  // then fall back to the current Claude session's most recent job.
+  // Resolve Codex threadId.
+  // When a specific session is selected, only use that session's tracked job —
+  // never fall back to another session's thread, which would send the wrong context.
+  // Cross-session fallback is only allowed in "merge all" mode (no --session flag).
   let threadId = null;
-  if (chosenSession?.codexJobId) {
-    const trackedJob = readStoredJob(workspaceRoot, chosenSession.codexJobId);
-    threadId = trackedJob?.threadId ?? null;
-  }
-  if (!threadId) {
-    // Fallback: look across all sessions' tracked jobs
+  if (chosenSession) {
+    if (chosenSession.codexJobId) {
+      const trackedJob = readStoredJob(workspaceRoot, chosenSession.codexJobId);
+      threadId = trackedJob?.threadId ?? null;
+    }
+    // If still null the monitor hasn't reported a thread yet — leave threadId null
+    // and let the output below tell the user rather than using an unrelated thread.
+  } else {
+    // Merge-all mode: search all sessions newest-first, then fall back to current session
     for (const s of allSessions) {
       if (!s.codexJobId) continue;
       const storedJob = readStoredJob(workspaceRoot, s.codexJobId);
       if (storedJob?.threadId) { threadId = storedJob.threadId; break; }
     }
-  }
-  if (!threadId) {
-    // Last resort: current Claude session filter
-    const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
-    threadId = jobs.find((job) => job.threadId)?.threadId ?? null;
+    if (!threadId) {
+      const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
+      threadId = jobs.find((job) => job.threadId)?.threadId ?? null;
+    }
   }
 
   // Create git-diff markdown file in project root
