@@ -1276,9 +1276,10 @@ async function handleShift(argv) {
     .filter(Boolean)
     .filter((f) => !/^\.codex-shift-.*\.md$/.test(f));
 
-  // Build untracked diff by running git diff --no-index /dev/null <file> for each
+  // Build untracked diff by running git diff --no-index /dev/null <file> for each.
+  // All files are included; no silent truncation.
   const untrackedDiffParts = [];
-  for (const file of untrackedFiles.slice(0, 20)) {
+  for (const file of untrackedFiles) {
     const fileDiff = spawnSync("git", ["diff", "--no-index", "/dev/null", file], { cwd, encoding: "utf8" });
     if (fileDiff.stdout) untrackedDiffParts.push(fileDiff.stdout.trim());
   }
