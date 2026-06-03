@@ -211,6 +211,203 @@ test("task reports the actual Codex auth error when the run is rejected", () => 
   assert.match(result.stderr, /authentication expired; run codex login/);
 });
 
+const IMAGEGEN_RESULT_B64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+function setupImagegenRepo(binDir, behavior) {
+  const repo = makeTempDir();
+  installFakeCodex(binDir, behavior);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  return repo;
+}
+
+test("imagegen writes the captured base64 image and interrupts the post-image tail", () => {
+  const binDir = makeTempDir();
+  const repo = setupImagegenRepo(binDir, "imagegen");
+  const outPath = path.join(repo, "out", "fox.png");
+
+  const result = run("node", [SCRIPT, "imagegen", "--out", outPath, "a small fox charm"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    timeout: 20000
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Saved image:/);
+  // The bytes must come from the item's base64 result, not from copying savedPath
+  // (the fixture stores distinct sentinel bytes at savedPath).
+  const written = fs.readFileSync(outPath);
+  assert.ok(
+    written.equals(Buffer.from(IMAGEGEN_RESULT_B64, "base64")),
+    "image bytes must equal the decoded base64 result"
+  );
+
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.ok(fakeState.lastInterrupt, "the turn must be interrupted after the image arrived");
+  assert.equal(
+    fakeState.lastInterrupt.turnId,
+    fakeState.lastTurnStart.turnId,
+    "the in-flight image turn must be the one interrupted"
+  );
+});
+
+test("imagegen --json reports the saved image payload", () => {
+  const binDir = makeTempDir();
+  const repo = setupImagegenRepo(binDir, "imagegen");
+  const outPath = path.join(repo, "p.png");
+
+  const result = run("node", [SCRIPT, "imagegen", "--out", outPath, "--json", "a fox"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    timeout: 20000
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.status, 0);
+  assert.equal(payload.outPath, outPath);
+  assert.equal(typeof payload.savedPath, "string");
+  assert.equal(payload.revisedPrompt, "A tiny test image.");
+});
+
+test("imagegen forwards --image references as localImage inputs", () => {
+  const binDir = makeTempDir();
+  const repo = setupImagegenRepo(binDir, "imagegen");
+  const refA = path.join(repo, "a.png");
+  const refB = path.join(repo, "b.png");
+  fs.writeFileSync(refA, "x");
+  fs.writeFileSync(refB, "y");
+
+  const result = run(
+    "node",
+    [SCRIPT, "imagegen", "--out", path.join(repo, "o.png"), "--image", `${refA},${refB}`, "edit it"],
+    { cwd: repo, env: buildEnv(binDir), timeout: 20000 }
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  const input = fakeState.lastTurnStart.input;
+  assert.equal(input[0].type, "text");
+  const localImages = input.filter((item) => item.type === "localImage");
+  assert.equal(localImages.length, 2);
+  assert.equal(localImages[0].path, refA);
+  assert.equal(localImages[1].path, refB);
+});
+
+test("imagegen fails fast when the turn completes without an image", () => {
+  const binDir = makeTempDir();
+  const repo = setupImagegenRepo(binDir, "imagegen-no-image");
+
+  const result = run("node", [SCRIPT, "imagegen", "--out", path.join(repo, "x.png"), "a fox"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    timeout: 20000
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /without generating an image/);
+});
+
+test("imagegen surfaces the actual Codex error message", () => {
+  const binDir = makeTempDir();
+  const repo = setupImagegenRepo(binDir, "imagegen-error");
+
+  const result = run("node", [SCRIPT, "imagegen", "--out", path.join(repo, "x.png"), "a fox"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    timeout: 20000
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /image generation is not available for this account/);
+});
+
+test("imagegen times out when Codex never produces an image", () => {
+  const binDir = makeTempDir();
+  const repo = setupImagegenRepo(binDir, "imagegen-silent");
+
+  const result = run("node", [SCRIPT, "imagegen", "--out", path.join(repo, "x.png"), "a fox"], {
+    cwd: repo,
+    env: { ...buildEnv(binDir), CODEX_PLUGIN_IMAGE_TIMEOUT_MS: "800" },
+    timeout: 20000
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /produced no image within/);
+});
+
+test("imagegen copies savedPath when the item carries no base64", () => {
+  const binDir = makeTempDir();
+  const repo = setupImagegenRepo(binDir, "imagegen-saved-only");
+  const outPath = path.join(repo, "saved.png");
+
+  const result = run("node", [SCRIPT, "imagegen", "--out", outPath, "a fox"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    timeout: 20000
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(fs.readFileSync(outPath, "utf8"), /SAVED_FALLBACK_SENTINEL/);
+});
+
+test("imagegen refuses to overwrite an existing --out unless --force is given", () => {
+  const binDir = makeTempDir();
+  const repo = setupImagegenRepo(binDir, "imagegen");
+  const outPath = path.join(repo, "exists.png");
+  fs.writeFileSync(outPath, "original");
+
+  const refused = run("node", [SCRIPT, "imagegen", "--out", outPath, "a fox"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    timeout: 20000
+  });
+  assert.notEqual(refused.status, 0);
+  assert.match(refused.stderr, /Refusing to overwrite/);
+  assert.equal(fs.readFileSync(outPath, "utf8"), "original", "the existing file must be untouched");
+
+  const forced = run("node", [SCRIPT, "imagegen", "--out", outPath, "--force", "a fox"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    timeout: 20000
+  });
+  assert.equal(forced.status, 0, forced.stderr);
+  assert.ok(fs.readFileSync(outPath).equals(Buffer.from(IMAGEGEN_RESULT_B64, "base64")));
+});
+
+test("imagegen --background runs as a tracked job and saves the image", async () => {
+  const binDir = makeTempDir();
+  const repo = setupImagegenRepo(binDir, "imagegen");
+  const outPath = path.join(repo, "bg-fox.png");
+
+  const launched = run("node", [SCRIPT, "imagegen", "--background", "--out", outPath, "--json", "a small fox charm"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    timeout: 20000
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const launchPayload = JSON.parse(launched.stdout);
+  assert.equal(launchPayload.status, "queued");
+  assert.match(launchPayload.jobId, /^image-/);
+
+  const waited = run(
+    "node",
+    [SCRIPT, "status", launchPayload.jobId, "--wait", "--timeout-ms", "15000", "--json"],
+    { cwd: repo, env: buildEnv(binDir), timeout: 20000 }
+  );
+  assert.equal(waited.status, 0, waited.stderr);
+  const waitedPayload = JSON.parse(waited.stdout);
+  assert.equal(waitedPayload.job.id, launchPayload.jobId);
+  assert.equal(waitedPayload.job.status, "completed");
+  assert.ok(
+    fs.readFileSync(outPath).equals(Buffer.from(IMAGEGEN_RESULT_B64, "base64")),
+    "the background job must write the captured image bytes"
+  );
+});
+
 test("review accepts the quoted raw argument style for built-in base-branch review", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

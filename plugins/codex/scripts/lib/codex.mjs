@@ -34,6 +34,8 @@
  *   onProgress: ProgressReporter | null
  * }} TurnCaptureState
  */
+import fs from "node:fs";
+import path from "node:path";
 import { readJsonFile } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
@@ -1083,6 +1085,242 @@ export function parseStructuredOutput(rawOutput, fallback = {}) {
 
 export function readOutputSchema(schemaPath) {
   return readJsonFile(schemaPath);
+}
+
+// ── Managed image generation ─────────────────────────────────────────────────
+// codex app-server can generate images: the active provider advertises
+// `imageGeneration` and the model emits an `imageGeneration` thread item that
+// carries the base64 PNG (`result`) and a `savedPath`. The catch is that after
+// producing the image the model often keeps going, running shell commands to
+// verify or convert the file, which makes a plain task turn look like it hangs.
+// The managed path below captures the image item the moment it arrives, writes
+// the bytes to the requested path, then interrupts the turn so the wasteful tail
+// never runs. The single app-server connection is serialized by the broker, so
+// image jobs never run concurrently (the failure mode that triggers 403/429).
+
+const DEFAULT_IMAGE_TIMEOUT_MS = 180000;
+
+function resolveImageTimeoutMs(optionValue) {
+  if (typeof optionValue === "number" && Number.isFinite(optionValue) && optionValue > 0) {
+    return optionValue;
+  }
+  const raw = process.env.CODEX_PLUGIN_IMAGE_TIMEOUT_MS;
+  if (raw != null && raw !== "") {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return DEFAULT_IMAGE_TIMEOUT_MS;
+}
+
+function composeImagePrompt(prompt) {
+  return (
+    "Use your built-in image generation to create the image described below, " +
+    "then stop. Do not run shell commands, write code, or open files.\n\n" +
+    prompt
+  );
+}
+
+/** @returns {UserInput[]} */
+function buildImageTurnInput(prompt, images = [], cwd = process.cwd()) {
+  /** @type {UserInput[]} */
+  const input = [{ type: "text", text: composeImagePrompt(prompt), text_elements: [] }];
+  for (const ref of Array.isArray(images) ? images : []) {
+    if (typeof ref === "string" && ref.trim()) {
+      input.push({ type: "localImage", path: path.resolve(cwd, ref.trim()) });
+    }
+  }
+  return input;
+}
+
+// Write the generated image to `outPath`, preferring the inline base64 bytes and
+// falling back to the app-server's own `savedPath`. Returns null until the item
+// actually carries image data (the `item/started` event has an empty result), so
+// the caller only settles once a real image exists.
+function saveImageFromItem(item, outPath) {
+  const savedPath = typeof item?.savedPath === "string" && item.savedPath ? item.savedPath : null;
+  const base64 = typeof item?.result === "string" && item.result.length > 0 ? item.result : null;
+  if (!base64 && !(savedPath && fs.existsSync(savedPath))) {
+    return null;
+  }
+  const revisedPrompt = typeof item?.revisedPrompt === "string" ? item.revisedPrompt : null;
+  let written = null;
+  if (outPath) {
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
+    if (base64) {
+      fs.writeFileSync(outPath, Buffer.from(base64, "base64"));
+      written = outPath;
+    } else if (savedPath) {
+      fs.copyFileSync(savedPath, outPath);
+      written = outPath;
+    }
+  }
+  return { outPath: written ?? savedPath, savedPath, revisedPrompt };
+}
+
+async function captureImageTurn(client, threadId, input, options = {}) {
+  const previousHandler = client.notificationHandler;
+  const timeoutMs = resolveImageTimeoutMs(options.timeoutMs);
+  let turnId = null;
+  let settled = false;
+  let resolveDone;
+  let rejectDone;
+  const done = new Promise((resolve, reject) => {
+    resolveDone = resolve;
+    rejectDone = reject;
+  });
+
+  const timer = setTimeout(() => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    const seconds = Math.round(timeoutMs / 1000);
+    rejectDone(
+      new Error(
+        `Codex produced no image within ${seconds}s. Set CODEX_PLUGIN_IMAGE_TIMEOUT_MS to adjust the window.`
+      )
+    );
+  }, timeoutMs);
+  timer.unref?.();
+
+  const settleOk = (result) => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    clearTimeout(timer);
+    resolveDone(result);
+  };
+  const settleErr = (error) => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    clearTimeout(timer);
+    rejectDone(error);
+  };
+
+  // Stop the turn so the model's post-image shell tail never runs. Fire and
+  // forget: the image is already captured and written, and withAppServer closes
+  // the connection on return, so settlement must never block on this RPC.
+  const stopTurn = () => {
+    if (turnId) {
+      client.request("turn/interrupt", { threadId, turnId }).catch(() => {});
+    }
+  };
+
+  client.setNotificationHandler((message) => {
+    try {
+      if (settled) {
+        return;
+      }
+      // The broker connection is shared and serialized; only act on our own
+      // thread so a sibling or subagent turn is never captured or interrupted.
+      const eventThreadId = message?.params?.threadId ?? message?.params?.thread?.id ?? null;
+      if (eventThreadId && eventThreadId !== threadId) {
+        return;
+      }
+      // Learn the turn id from notifications (turn/started carries it under
+      // params.turn.id, item events under params.turnId), so the interrupt can
+      // fire even if the image item arrives before the turn/start response.
+      if (!turnId) {
+        turnId = extractTurnId(message);
+      }
+      const method = message?.method;
+      const item = message?.params?.item;
+      if ((method === "item/completed" || method === "item/started") && item?.type === "imageGeneration") {
+        const saved = saveImageFromItem(item, options.outPath ?? null);
+        if (saved) {
+          emitProgress(options.onProgress, "Image ready; stopping the turn.", "completing");
+          settleOk({ ...saved, threadId, turnId });
+          stopTurn();
+        }
+        return;
+      }
+      if (method === "turn/completed") {
+        const status = message?.params?.turn?.status;
+        // Our own interrupt resolves the turn as "interrupted"; that is success.
+        if (status !== "interrupted") {
+          settleErr(new Error(`Codex finished the turn (${status ?? "unknown"}) without generating an image.`));
+        }
+        return;
+      }
+      if (method === "error") {
+        const err = message?.params?.error;
+        settleErr(new Error((err && typeof err.message === "string" && err.message) || "Codex image turn failed."));
+      }
+    } catch {
+      // Ignore handler errors; the timeout is the backstop.
+    }
+  });
+
+  try {
+    const response = await client.request("turn/start", {
+      threadId,
+      input,
+      model: options.model ?? null,
+      effort: options.effort ?? null,
+      outputSchema: null
+    });
+    if (!turnId) {
+      turnId = response.turn?.id ?? null;
+    }
+    // Surface the turn id so a tracked job persists it for graceful `/codex:cancel`.
+    if (turnId) {
+      emitProgress(options.onProgress, `Image turn started (${turnId}).`, "starting", { threadId, turnId });
+    }
+    if (response.turn?.status && response.turn.status !== "inProgress" && !settled) {
+      settleErr(new Error("Codex finished the turn without generating an image."));
+    }
+    return await done;
+  } finally {
+    clearTimeout(timer);
+    client.setNotificationHandler(previousHandler ?? null);
+  }
+}
+
+export async function runAppServerImageGen(cwd, options = {}) {
+  const prompt = options.prompt?.trim();
+  if (!prompt) {
+    throw new Error("An image prompt is required for image generation.");
+  }
+  const outPath = options.outPath ? path.resolve(cwd, options.outPath) : null;
+  if (outPath && !options.overwrite && fs.existsSync(outPath)) {
+    throw new Error(`Refusing to overwrite ${outPath}. Pass --force to replace it.`);
+  }
+
+  return withAppServer(cwd, async (client) => {
+    emitProgress(options.onProgress, "Starting Codex image thread.", "starting");
+    // read-only: the managed path decodes the base64 and writes the file itself,
+    // and the prompt forbids shell/file actions, so the model needs no write
+    // access to the workspace. This matches the task and review paths.
+    const startResponse = await startThread(client, cwd, {
+      model: options.model,
+      sandbox: "read-only",
+      ephemeral: true
+    });
+    const threadId = startResponse.thread.id;
+    emitProgress(options.onProgress, `Thread ready (${threadId}).`, "starting", { threadId });
+
+    const input = buildImageTurnInput(prompt, options.images, cwd);
+    const result = await captureImageTurn(client, threadId, input, {
+      outPath,
+      model: options.model,
+      effort: options.effort,
+      timeoutMs: options.timeoutMs,
+      onProgress: options.onProgress
+    });
+
+    return {
+      threadId,
+      turnId: result.turnId,
+      outPath: result.outPath,
+      savedPath: result.savedPath,
+      revisedPrompt: result.revisedPrompt
+    };
+  });
 }
 
 export { DEFAULT_CONTINUE_PROMPT, TASK_THREAD_PREFIX };

@@ -380,7 +380,8 @@ rl.on("line", (line) => {
 	          turnId,
 	          model: message.params.model ?? null,
 	          effort: message.params.effort ?? null,
-	          prompt
+	          prompt,
+	          input: message.params.input ?? null
 	        };
 	        saveState(state);
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
@@ -533,6 +534,29 @@ rl.on("line", (line) => {
 	          interruptibleTurns.set(turnId, { threadId: thread.id, timer });
 	        } else if (BEHAVIOR === "slow-task") {
 	          emitTurnCompletedLater(thread.id, turnId, items, 400);
+	        } else if (BEHAVIOR === "imagegen" || BEHAVIOR === "imagegen-saved-only") {
+	          // result carries a real PNG (RESULT_B64); savedPath holds DISTINCT
+	          // sentinel bytes, so a test can prove the written bytes came from the
+	          // item's base64 result and not from copying savedPath.
+	          // imagegen-saved-only sends an empty result to exercise the copy fallback.
+	          const RESULT_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+	          const savedPath = path.join(path.dirname(STATE_PATH), "fake-image-" + turnId + ".png");
+	          fs.writeFileSync(savedPath, "SAVED_FALLBACK_SENTINEL\\n");
+	          const resultField = BEHAVIOR === "imagegen-saved-only" ? "" : RESULT_B64;
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          send({ method: "item/started", params: { threadId: thread.id, turnId, item: { type: "imageGeneration", id: "ig_" + turnId, status: "in_progress", revisedPrompt: null, result: "" } } });
+	          send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "imageGeneration", id: "ig_" + turnId, status: "completed", revisedPrompt: "A tiny test image.", result: resultField, savedPath } } });
+	          // Intentionally NO turn/completed: emulate the post-image tail loop so
+	          // the client must interrupt the turn after capturing the image.
+	        } else if (BEHAVIOR === "imagegen-no-image") {
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+	        } else if (BEHAVIOR === "imagegen-error") {
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          send({ method: "error", params: { error: { message: "image generation is not available for this account" } } });
+	        } else if (BEHAVIOR === "imagegen-silent") {
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          // no item and no completion: exercise the startup-timeout backstop.
 	        } else {
 	          emitTurnCompleted(thread.id, turnId, items);
 	        }

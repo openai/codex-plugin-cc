@@ -17,6 +17,7 @@ import {
     interruptAppServerTurn,
     parseStructuredOutput,
     readOutputSchema,
+    runAppServerImageGen,
     runAppServerReview,
     runAppServerTurn
   } from "./lib/codex.mjs";
@@ -59,7 +60,8 @@ import {
   renderJobStatusReport,
   renderSetupReport,
   renderStatusReport,
-  renderTaskResult
+  renderTaskResult,
+  renderImageGenResult
 } from "./lib/render.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -69,6 +71,7 @@ const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
+const IMAGE_JOB_TITLE = "Codex Image";
 
 function printUsage() {
   console.log(
@@ -78,6 +81,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs imagegen [--background] [--out <path>] [--force] [--image <ref[,ref...]>] [--model <model>] [prompt]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
@@ -558,6 +562,9 @@ function getJobKindLabel(kind, jobClass) {
   if (kind === "adversarial-review") {
     return "adversarial-review";
   }
+  if (jobClass === "image") {
+    return "image";
+  }
   return jobClass === "review" ? "review" : "rescue";
 }
 
@@ -822,18 +829,107 @@ async function handleTaskWorker(argv) {
       logFile: storedJob.logFile ?? null
     }
   );
+  const runner =
+    storedJob.jobClass === "image"
+      ? () => executeImageGenRun({ ...request, onProgress: progress })
+      : () => executeTaskRun({ ...request, onProgress: progress });
   await runTrackedJob(
     {
       ...storedJob,
       workspaceRoot,
       logFile
     },
-    () =>
-      executeTaskRun({
-        ...request,
-        onProgress: progress
-      }),
+    runner,
     { logFile }
+  );
+}
+
+async function executeImageGenRun(request) {
+  ensureCodexAvailable(request.cwd);
+
+  const result = await runAppServerImageGen(request.cwd, {
+    prompt: request.prompt,
+    images: request.images,
+    model: request.model,
+    outPath: request.outPath,
+    overwrite: request.overwrite,
+    onProgress: request.onProgress
+  });
+
+  const rendered = renderImageGenResult(result, { title: IMAGE_JOB_TITLE });
+  const payload = {
+    status: 0,
+    threadId: result.threadId,
+    outPath: result.outPath,
+    savedPath: result.savedPath,
+    revisedPrompt: result.revisedPrompt
+  };
+
+  return {
+    exitStatus: 0,
+    threadId: result.threadId,
+    turnId: result.turnId,
+    payload,
+    rendered,
+    summary: `Image saved to ${result.outPath ?? result.savedPath ?? "(unknown path)"}.`,
+    jobTitle: IMAGE_JOB_TITLE,
+    jobClass: "image",
+    write: true
+  };
+}
+
+function buildImageGenJob(workspaceRoot, summary) {
+  return createCompanionJob({
+    prefix: "image",
+    kind: "image",
+    title: IMAGE_JOB_TITLE,
+    workspaceRoot,
+    jobClass: "image",
+    summary,
+    write: true
+  });
+}
+
+function buildImageGenRequest({ cwd, model, prompt, images, outPath, overwrite, jobId }) {
+  return { cwd, model, prompt, images, outPath, overwrite, jobId };
+}
+
+async function handleImageGen(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["model", "cwd", "out", "image", "prompt-file"],
+    booleanOptions: ["json", "background", "force"],
+    aliasMap: { m: "model", o: "out" }
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveCommandWorkspace(options);
+  const model = normalizeRequestedModel(options.model);
+  const prompt = readTaskPrompt(cwd, options, positionals).trim();
+  if (!prompt) {
+    throw new Error("Provide an image prompt (positional text, --prompt-file, or piped stdin).");
+  }
+  const outPath = options.out ? path.resolve(cwd, options.out) : null;
+  const images = options.image
+    ? options.image.split(",").map((value) => value.trim()).filter(Boolean)
+    : [];
+  const overwrite = Boolean(options.force);
+  const summary = `Image: ${shorten(prompt, 80)}`;
+
+  if (options.background) {
+    ensureCodexAvailable(cwd);
+    const job = buildImageGenJob(workspaceRoot, summary);
+    const request = buildImageGenRequest({ cwd, model, prompt, images, outPath, overwrite, jobId: job.id });
+    const { payload } = enqueueBackgroundTask(cwd, job, request);
+    outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
+    return;
+  }
+
+  const job = buildImageGenJob(workspaceRoot, summary);
+  await runForegroundCommand(
+    job,
+    (progress) =>
+      executeImageGenRun({ cwd, model, prompt, images, outPath, overwrite, jobId: job.id, onProgress: progress }),
+    { json: options.json }
   );
 }
 
@@ -999,6 +1095,9 @@ async function main() {
       break;
     case "task":
       await handleTask(argv);
+      break;
+    case "imagegen":
+      await handleImageGen(argv);
       break;
     case "task-worker":
       await handleTaskWorker(argv);

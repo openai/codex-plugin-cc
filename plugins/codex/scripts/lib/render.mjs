@@ -322,6 +322,20 @@ export function renderTaskResult(parsedResult, meta) {
   return `${message}\n`;
 }
 
+export function renderImageGenResult(result, meta = {}) {
+  const title = meta.title ?? "Codex Image";
+  const outPath = result?.outPath ?? result?.savedPath ?? null;
+  const lines = [`# ${title}`, ""];
+  lines.push(outPath ? `Saved image: ${outPath}` : "No image was saved.");
+  if (result?.savedPath && result.savedPath !== outPath) {
+    lines.push(`Codex copy: ${result.savedPath}`);
+  }
+  if (result?.revisedPrompt) {
+    lines.push("", "Revised prompt:", result.revisedPrompt);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
 export function renderStatusReport(report) {
   const lines = [
     "# Codex Status",
