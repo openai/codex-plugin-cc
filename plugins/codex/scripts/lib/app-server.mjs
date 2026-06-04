@@ -249,16 +249,24 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       this.proc.stdin.end();
       setTimeout(() => {
         if (this.proc && !this.proc.killed && this.proc.exitCode === null) {
-          // Reap the entire process tree on every platform. The direct child
-          // spawns grandchildren that must also be terminated: on Windows the
-          // shell wrapper (cmd.exe) and its node child, and on POSIX the codex
-          // app-server's MCP servers. A bare `kill(SIGTERM)` on the direct
-          // child leaves those grandchildren orphaned to init.
-          try {
-            terminateProcessTree(this.proc.pid);
-          } catch {
-            // Best-effort cleanup inside an unref'd timer — swallow errors
-            // to avoid crashing the host process during shutdown.
+          if (process.platform !== "win32" && !this.options.detachProcessGroup) {
+            // POSIX direct child: it shares the parent's process group and is
+            // not a group leader, so terminateProcessTree's `kill(-pid)` would
+            // hit ESRCH and never fall back to signalling the child. Signal it
+            // directly, as the pre-detach POSIX path did.
+            this.proc.kill("SIGTERM");
+          } else {
+            // Reap the whole tree: on Windows the shell wrapper (cmd.exe) and
+            // its node child via taskkill /T, and on a detached POSIX group
+            // leader the codex app-server plus its MCP children via the
+            // `kill(-pid)` group signal. A bare child SIGTERM would leave
+            // those grandchildren orphaned to init.
+            try {
+              terminateProcessTree(this.proc.pid);
+            } catch {
+              // Best-effort cleanup inside an unref'd timer — swallow errors
+              // to avoid crashing the host process during shutdown.
+            }
           }
         }
       }, 50).unref?.();
