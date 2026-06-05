@@ -1011,6 +1011,15 @@ async function main() {
 
 main().catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
+  // Emit structured JSON envelope to stdout so codex-rescue agent can capture errors.
+  // The agent prompt instructs Codex to return stdout as-is, but it only captures stdout.
+  // Without this, the agent sees empty output when the companion fails.
+  const envelope = JSON.stringify({
+    status: "error",
+    error: message,
+    exitCode: 1
+  });
+  process.stdout.write(`${envelope}\n`);
   process.stderr.write(`${message}\n`);
   process.exitCode = 1;
 });

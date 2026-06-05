@@ -52,13 +52,28 @@ function cleanCodexStderr(stderr) {
     .join("\n");
 }
 
+/**
+ * On Windows, sandboxed execution modes are not supported by the Codex CLI.
+ * This function coerces the sandbox mode to "danger-full-access" on Windows
+ * to prevent runtime failures.
+ * @param {string | null} sandbox - The requested sandbox mode.
+ * @returns {string} - The coerced sandbox mode.
+ */
+function coerceWindowsSandbox(sandbox) {
+  if (process.platform !== "win32") {
+    return sandbox ?? "read-only";
+  }
+  // On Windows, all sandbox modes except "danger-full-access" fail.
+  return "danger-full-access";
+}
+
 /** @returns {ThreadStartParams} */
 function buildThreadParams(cwd, options = {}) {
   return {
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
-    sandbox: options.sandbox ?? "read-only",
+    sandbox: coerceWindowsSandbox(options.sandbox),
     serviceName: SERVICE_NAME,
     ephemeral: options.ephemeral ?? true,
     experimentalRawEvents: false
@@ -72,7 +87,7 @@ function buildResumeParams(threadId, cwd, options = {}) {
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
-    sandbox: options.sandbox ?? "read-only"
+    sandbox: coerceWindowsSandbox(options.sandbox)
   };
 }
 
