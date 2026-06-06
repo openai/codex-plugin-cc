@@ -434,6 +434,7 @@ async function executeReviewRun(request) {
       model: request.model,
       sandbox: "read-only",
       maxInvestigationTurns: request.maxInvestigationTurns,
+      turnIdleTimeoutMs: request.turnIdleTimeoutMs,
       onProgress: request.onProgress
     });
   } else {
@@ -446,10 +447,27 @@ async function executeReviewRun(request) {
       onProgress: request.onProgress
     });
   }
-  const parsed = parseStructuredOutput(result.finalMessage, {
+  // Parse first, then decide. A run can carry a non-zero status / error from a
+  // transient reconnect yet still have produced valid structured output (the
+  // turn recovered) — mirror of fix #1 at the finalize boundary. Only report a
+  // failure when the run errored AND we have no usable structured verdict;
+  // otherwise the leftover prose would be JSON-parsed into a misleading
+  // "invalid JSON" error, or a recovered valid verdict would be discarded.
+  const runErrored = Boolean(result.error) || result.status !== 0;
+  const structured = parseStructuredOutput(result.finalMessage, {
     status: result.status,
     failureMessage: result.error?.message ?? result.stderr
   });
+  const parsed = (runErrored && !structured.parsed)
+    ? {
+        parsed: null,
+        parseError: null,
+        failed: true,
+        failureMessage:
+          result.error?.message ?? result.stderr ?? "Codex run failed before producing output.",
+        rawOutput: result.finalMessage ?? ""
+      }
+    : structured;
   const payload = {
     review: reviewName,
     target,
@@ -468,6 +486,8 @@ async function executeReviewRun(request) {
     result: parsed.parsed,
     rawOutput: parsed.rawOutput,
     parseError: parsed.parseError,
+    failed: parsed.failed ?? false,
+    failureMessage: parsed.failureMessage ?? null,
     reasoningSummary: result.reasoningSummary
   };
   if (result.investigation) {
@@ -485,7 +505,7 @@ async function executeReviewRun(request) {
       reasoningSummary: result.reasoningSummary,
       investigation: result.investigation ?? null
     }),
-    summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
+    summary: parsed.parsed?.summary ?? parsed.failureMessage ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
     jobTitle: `Codex ${reviewName}`,
     jobClass: "review",
     targetLabel: context.target.label
@@ -719,7 +739,7 @@ function enqueueBackgroundTask(cwd, job, request) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd", "max-investigation-turns"],
+    valueOptions: ["base", "scope", "model", "cwd", "max-investigation-turns", "turn-idle-timeout"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
       m: "model"
@@ -733,6 +753,15 @@ async function handleReviewCommand(argv, config) {
       throw new Error(`--max-investigation-turns must be a positive integer (got: ${rawMaxTurns})`);
     }
     maxInvestigationTurns = Number(rawMaxTurns);
+  }
+
+  const rawIdleTimeout = options["turn-idle-timeout"];
+  let turnIdleTimeoutMs;
+  if (rawIdleTimeout !== undefined) {
+    if (!/^[1-9][0-9]*$/.test(String(rawIdleTimeout))) {
+      throw new Error(`--turn-idle-timeout must be a positive integer (seconds) (got: ${rawIdleTimeout})`);
+    }
+    turnIdleTimeoutMs = Number(rawIdleTimeout) * 1000;
   }
 
   const cwd = resolveCommandCwd(options);
@@ -764,6 +793,7 @@ async function handleReviewCommand(argv, config) {
         focusText,
         reviewName: config.reviewName,
         maxInvestigationTurns,
+        turnIdleTimeoutMs,
         onProgress: progress
       }),
     { json: options.json }

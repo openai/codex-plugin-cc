@@ -1,6 +1,6 @@
 ---
 description: Run a Codex review that challenges the implementation approach and design choices
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--max-investigation-turns N] [focus ...]'
+argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--max-investigation-turns N] [--turn-idle-timeout SECONDS] [focus ...]'
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
@@ -44,6 +44,7 @@ Argument handling:
 - It does not support `--scope staged` or `--scope unstaged`.
 - Unlike `/codex:review`, it can still take extra focus text after the flags.
 - For very large diffs that exceed the inline threshold, Codex investigates the diff with read-only commands across multiple turns. Use `--max-investigation-turns N` (default 10) to raise or lower the cap.
+- If a turn stalls with no output for `--turn-idle-timeout SECONDS` (default 180), the run aborts gracefully with a clear failure instead of hanging. Lower it to fail faster on a flaky connection; raise it for very slow turns.
 
 Foreground flow:
 - Run:

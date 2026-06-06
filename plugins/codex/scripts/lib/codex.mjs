@@ -43,6 +43,13 @@ const SERVICE_NAME = "claude_code_codex_plugin";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
 const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
+// A turn that produces no notifications and no response for this long is
+// treated as a stalled upstream connection and aborted, instead of the RPC
+// promise hanging forever (it only settles on a response or a full socket
+// close, neither of which happens on a half-dead "Reconnecting..." link).
+// The timer is reset on every progress notification, so a slow-but-healthy
+// turn running many commands is never killed — only true silence triggers it.
+const DEFAULT_TURN_IDLE_TIMEOUT_MS = 180_000;
 
 function cleanCodexStderr(stderr) {
   return stderr
@@ -554,7 +561,55 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
 
+  // Idle watchdog: the turn/start RPC and the completion promise only settle on
+  // a server response or a full socket close. A half-dead "Reconnecting..."
+  // link delivers neither, so without this the turn would hang forever. We
+  // reject after `idleTimeoutMs` of total silence, re-arming on every progress
+  // notification so a slow-but-active turn is never killed.
+  const idleTimeoutMs = Number.isFinite(options.turnIdleTimeoutMs) && options.turnIdleTimeoutMs > 0
+    ? options.turnIdleTimeoutMs
+    : null;
+  let idleTimer = null;
+  let idleReject = null;
+  let settled = false;
+  const idlePromise = idleTimeoutMs
+    ? new Promise((_resolve, reject) => { idleReject = reject; })
+    : null;
+  const armIdle = () => {
+    if (!idleTimeoutMs || settled) {
+      return;
+    }
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+    }
+    idleTimer = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      const seconds = Math.round(idleTimeoutMs / 1000);
+      // Best-effort interrupt so the app-server can release the turn; do NOT
+      // await it (the same dead link could make it hang too).
+      if (state.turnId) {
+        try {
+          client.request("turn/interrupt", { threadId, turnId: state.turnId }).catch(() => {});
+        } catch {
+          // ignore — interrupt is best-effort
+        }
+      }
+      idleReject?.(new Error(`Turn idle for ${seconds}s; aborting (upstream connection appears stalled).`));
+    }, idleTimeoutMs);
+    idleTimer.unref?.();
+  };
+  const clearIdle = () => {
+    settled = true;
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  };
+
   client.setNotificationHandler((message) => {
+    armIdle();
     if (!state.turnId) {
       state.bufferedNotifications.push(message);
       return;
@@ -576,7 +631,10 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   });
 
   try {
-    const response = await startRequest();
+    armIdle();
+    const response = idlePromise
+      ? await Promise.race([startRequest(), idlePromise])
+      : await startRequest();
     options.onResponse?.(response, state);
     state.turnId = response.turn?.id ?? null;
     if (state.turnId) {
@@ -597,8 +655,11 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       completeTurn(state, response.turn);
     }
 
-    return await state.completion;
+    return idlePromise
+      ? await Promise.race([state.completion, idlePromise])
+      : await state.completion;
   } finally {
+    clearIdle();
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
   }
@@ -1051,6 +1112,9 @@ export async function runAppServerInvestigation(cwd, options = {}) {
   const maxInvestigationTurns = Number.isFinite(options.maxInvestigationTurns) && options.maxInvestigationTurns > 0
     ? Math.floor(options.maxInvestigationTurns)
     : DEFAULT_MAX_INVESTIGATION_TURNS;
+  const turnIdleTimeoutMs = Number.isFinite(options.turnIdleTimeoutMs) && options.turnIdleTimeoutMs > 0
+    ? options.turnIdleTimeoutMs
+    : DEFAULT_TURN_IDLE_TIMEOUT_MS;
   const sandbox = options.sandbox ?? "read-only";
 
   return withAppServer(cwd, async (client) => {
@@ -1087,7 +1151,7 @@ export async function runAppServerInvestigation(cwd, options = {}) {
               effort: options.effort ?? null,
               outputSchema: null
             }),
-          { onProgress: options.onProgress }
+          { onProgress: options.onProgress, turnIdleTimeoutMs }
         );
       } catch (transportError) {
         return {
@@ -1116,7 +1180,18 @@ export async function runAppServerInvestigation(cwd, options = {}) {
         aggregatedFileChanges.push(change);
       }
 
-      if (turnState.error) {
+      // The app-server multiplexes transient retry notices (e.g.
+      // "Reconnecting... 1/5") onto the same `error` notification channel as
+      // fatal turn failures, and the capture state records the last one seen
+      // without clearing it. A reconnect that recovers still drives the turn
+      // to turn/completed with an agent message, so treating any `error` as a
+      // hard abort would skip the schema-enforced finalize turn and hand the
+      // raw investigation prose to the JSON parser. Only abort when the turn
+      // produced no usable output — i.e. it did not recover.
+      const turnHadAgentMessage = Boolean(turnState.lastAgentMessage);
+      const turnRecovered = turnHadAgentMessage && turnState.finalTurn?.status === "completed";
+
+      if (turnState.error && !turnRecovered) {
         return {
           status: buildResultStatus(turnState),
           threadId,
@@ -1140,7 +1215,6 @@ export async function runAppServerInvestigation(cwd, options = {}) {
       // run with outputSchema=null so the app-server does not always tag
       // messages with that phase — leading to runaway turns where the model
       // keeps insisting it has converged but the loop refuses to listen.
-      const turnHadAgentMessage = Boolean(turnState.lastAgentMessage);
       const converged = turnCommandCount === 0 && turnHadAgentMessage;
       if (converged) {
         break;
@@ -1184,7 +1258,7 @@ export async function runAppServerInvestigation(cwd, options = {}) {
               effort: options.effort ?? null,
               outputSchema: options.outputSchema ?? null
             }),
-          { onProgress: options.onProgress }
+          { onProgress: options.onProgress, turnIdleTimeoutMs }
         );
       } catch (transportError) {
         return {

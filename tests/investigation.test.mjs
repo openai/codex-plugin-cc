@@ -273,6 +273,114 @@ test("phase-1 hard error (transport throw) aborts before phase-2 finalize", asyn
   }
 });
 
+test("turn that never responds is aborted by the idle timeout (no infinite hang)", async () => {
+  // Production hang: turn 1 runs fine, then the next turn/start is sent but the
+  // half-dead upstream never responds — no `turn/started`, no completion. The
+  // RPC promise has no timeout, so the loop would await forever (observed as
+  // "stuck at Investigation turn 2"). An idle timeout must abort it gracefully.
+  const cwd = makeTempDir("codex-inv-test-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    // Recon turn 1: makes progress, does NOT converge (has commands).
+    fake.queueTurnResponse({
+      commands: [{ command: "git diff", exitCode: 0 }],
+      finalAnswer: null
+    });
+    // Recon turn 2: the server receives turn/start but never responds.
+    fake.queueTurnHang();
+
+    const start = Date.now();
+    const result = await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      turnIdleTimeoutMs: 300
+    });
+    const elapsed = Date.now() - start;
+
+    assert.ok(result.error, "a timed-out run must carry an error");
+    assert.match(result.error.message, /idle|timed out|timeout/i, "error should explain the idle timeout");
+    assert.equal(result.status, 1, "idle-timeout path returns non-zero status");
+    assert.ok(elapsed < 15000, `must abort promptly, not hang (took ${elapsed}ms)`);
+  } finally {
+    fake.close();
+  }
+});
+
+test("a turn that keeps emitting progress is NOT killed by the idle timeout", async () => {
+  // Regression guard: the idle timer must reset on every progress notification,
+  // so a healthy turn running many commands (longer than the idle window in
+  // aggregate, but never silent for that long) must not be aborted.
+  const cwd = makeTempDir("codex-inv-test-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    // Turn 1: several commands, then converges on turn 2 with a summary.
+    fake.queueTurnResponse({
+      commands: [
+        { command: "c1", exitCode: 0 },
+        { command: "c2", exitCode: 0 },
+        { command: "c3", exitCode: 0 }
+      ],
+      finalAnswer: null
+    });
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Done." } });
+    fake.queueTurnResponse({ finalAnswer: { text: STRUCTURED_REVIEW } });
+
+    const result = await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] },
+      turnIdleTimeoutMs: 300
+    });
+
+    assert.equal(result.error ?? null, null, "a healthy turn must not be timed out");
+    assert.equal(result.finalMessage, STRUCTURED_REVIEW, "should reach finalize normally");
+  } finally {
+    fake.close();
+  }
+});
+
+test("transient reconnect during recon recovers and still reaches finalize", async () => {
+  // The app-server multiplexes transient retry notices ("Reconnecting... N/5")
+  // onto the same `error` notification channel as fatal turn failures. A
+  // reconnect that recovers still drives the turn to turn/completed with an
+  // agent message. The loop must NOT treat that as a fatal abort — doing so
+  // skips the schema-enforced finalize turn and hands the raw investigation
+  // prose to the JSON parser (observed: `Unexpected token 'I', "Investigat"...`).
+  const cwd = makeTempDir("codex-inv-test-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    // Recon turn 1: ran commands, hit a transient reconnect, still produced a
+    // summary agent message and completed (i.e. it recovered).
+    fake.queueTurnResponse({
+      commands: [{ command: "git diff", exitCode: 0 }],
+      finalAnswer: { text: "Investigation complete. I'm ready for finalization." },
+      turnError: { message: "Reconnecting... 1/5" }
+    });
+    // Recon turn 2: 0 commands + agent message => converges.
+    fake.queueTurnResponse({
+      commands: [],
+      finalAnswer: { text: "Confirmed, ready." }
+    });
+    // Finalize turn 3: structured JSON.
+    fake.queueTurnResponse({
+      finalAnswer: { text: STRUCTURED_REVIEW }
+    });
+
+    const result = await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      outputSchema: { type: "object", required: ["verdict"] }
+    });
+
+    const starts = fake.requests.filter((r) => r.method === "turn/start");
+    assert.equal(starts.length, 3, "should run 2 recon + 1 finalize (finalize NOT skipped)");
+    assert.equal(result.finalMessage, STRUCTURED_REVIEW,
+      "finalMessage should be the structured JSON, not the investigation prose");
+  } finally {
+    fake.close();
+  }
+});
+
 test("finalize turn that runs commands triggers one strict-prompt retry", async () => {
   // Production observation: the model occasionally emits a tool-call stub
   // during finalize (e.g. {"cmd": "wc -l ..."}) instead of the structured
@@ -629,6 +737,78 @@ test("inline-diff path does not call runAppServerInvestigation", async () => {
   }
 });
 
+test("self-collect run failure renders as failure, not a fake JSON parse error (e2e)", async () => {
+  // Reproduces the production failure: the connection to the upstream drops
+  // mid-investigation (the `turn/start` request rejects, modelling a closed
+  // socket). The companion must report the transport failure reason, NOT
+  // JSON.parse the leftover prose and surface a misleading parse error.
+  const cwd = makeSelfCollectGitFixture();
+  const fake = setupFakeCodex({ cwd });
+  try {
+    fake.queueTurnRpcError({
+      message: "stream disconnected before completion: error sending request"
+    });
+
+    const result = runCompanion(
+      ["adversarial-review", "--base", "main", "--scope", "branch", "--cwd", cwd, "--json"],
+      fake.env
+    );
+
+    assert.notEqual(result.status, 0, "a failed run should exit non-zero");
+    const payload = JSON.parse(result.stdout.trim());
+    assert.equal(payload.failed, true, "payload should be flagged failed");
+    assert.match(payload.failureMessage ?? "", /stream disconnected/, "failure reason preserved");
+    assert.equal(payload.parseError, null, "must NOT produce a JSON parse error for a transport failure");
+  } finally {
+    fake.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("finalize turn that recovered from a transient reconnect keeps its valid verdict (e2e)", async () => {
+  // Regression guard for the finalize boundary: a transient reconnect during
+  // the finalize turn sets `error` (so status becomes 1), but the turn still
+  // emitted valid structured JSON. The companion must render that verdict, NOT
+  // discard it as "could not complete the review" — the mirror of fix #1.
+  const cwd = makeSelfCollectGitFixture();
+  const fake = setupFakeCodex({ cwd });
+  try {
+    // Recon turn 1: commands, no converge.
+    fake.queueTurnResponse({ commands: [{ command: "git diff main...HEAD", exitCode: 0 }], finalAnswer: null });
+    // Recon turn 2: converges.
+    fake.queueTurnResponse({ commands: [], finalAnswer: { text: "Investigation done." } });
+    // Finalize turn: valid JSON AND a transient reconnect error (recovered).
+    fake.queueTurnResponse({
+      finalAnswer: {
+        text: JSON.stringify({
+          verdict: "needs-attention",
+          summary: "Found risk in src/f1.js.",
+          findings: [{
+            severity: "high", title: "Unguarded export", file: "src/f1.js",
+            line_start: 1, line_end: 1, confidence: 0.7,
+            body: "Module exports v1 with no validation.", recommendation: "Add validation."
+          }],
+          next_steps: []
+        })
+      },
+      turnError: { message: "Reconnecting... 1/5" }
+    });
+
+    const result = runCompanion(
+      ["adversarial-review", "--base", "main", "--scope", "branch", "--cwd", cwd, "--json"],
+      fake.env
+    );
+
+    const payload = JSON.parse(result.stdout.trim());
+    assert.notEqual(payload.failed, true, "a recovered finalize turn must NOT be flagged failed");
+    assert.equal(payload.result?.verdict, "needs-attention", "valid verdict must be preserved");
+    assert.equal(payload.parseError, null, "valid JSON should parse cleanly");
+  } finally {
+    fake.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 // -------------------------------------------------------------------
 // Unit tests for runAppServerInvestigation (continued from above)
 // -------------------------------------------------------------------
@@ -848,6 +1028,15 @@ test("--max-investigation-turns rejects malformed numeric tokens", () => {
       `value ${JSON.stringify(value)} should trigger the validation error`
     );
   }
+});
+
+test("invalid --turn-idle-timeout raises a clear error", () => {
+  const r = spawnSync("node",
+    [COMPANION_PATH, "adversarial-review", "--turn-idle-timeout", "abc"],
+    { encoding: "utf8", timeout: 30000 }
+  );
+  assert.notEqual(r.status, 0, "should exit non-zero on invalid flag value");
+  assert.match(r.stderr, /must be a positive integer/, "error message should explain the validation failure");
 });
 
 // -------------------------------------------------------------------

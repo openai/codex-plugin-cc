@@ -385,6 +385,14 @@ rl.on("line", (line) => {
             break;
           }
 
+          if (entry && entry.hangNoResponse) {
+            // Model a half-dead upstream: the request is received but the
+            // server never replies (no result, no turn/started, no
+            // turn/completed). The client-side turn/start promise stays
+            // pending forever -- this is the real "stuck at turn N" signature.
+            break;
+          }
+
           send({ id: message.id, result: { turn: buildTurn(turnId) } });
           send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 
@@ -682,6 +690,14 @@ export function setupFakeCodex({ cwd } = {}) {
       const state = readState();
       if (!state.queue) { state.queue = []; }
       state.queue.push({ rpcError: { message } });
+      writeState(state);
+    },
+    queueTurnHang() {
+      // The server receives the turn/start but never responds, modelling a
+      // half-dead upstream connection. Used to exercise the idle timeout.
+      const state = readState();
+      if (!state.queue) { state.queue = []; }
+      state.queue.push({ hangNoResponse: true });
       writeState(state);
     },
     // `requests` re-reads the state file each access; assign to a local variable for repeated use.

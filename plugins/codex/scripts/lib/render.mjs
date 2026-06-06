@@ -219,6 +219,28 @@ function appendInvestigationBanner(lines, meta) {
 }
 
 export function renderReviewResult(parsedResult, meta) {
+  if (parsedResult.failed) {
+    // The run failed before producing a structured verdict (transport drop,
+    // idle timeout, soft turn error). Report the real reason rather than
+    // parsing the leftover prose as JSON and surfacing a misleading parse error.
+    const lines = [
+      `# Codex ${meta.reviewLabel}`,
+      "",
+      "Codex could not complete the review.",
+      "",
+      `- Reason: ${parsedResult.failureMessage ?? "Codex run failed before producing output."}`
+    ];
+    appendInvestigationBanner(lines, meta);
+
+    if (parsedResult.rawOutput) {
+      lines.push("", "Partial investigation output:", "", "```text", parsedResult.rawOutput, "```");
+    }
+
+    appendReasoningSection(lines, meta.reasoningSummary ?? parsedResult.reasoningSummary);
+
+    return `${lines.join("\n").trimEnd()}\n`;
+  }
+
   if (!parsedResult.parsed) {
     const lines = [
       `# Codex ${meta.reviewLabel}`,
