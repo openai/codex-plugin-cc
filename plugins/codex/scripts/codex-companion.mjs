@@ -444,6 +444,7 @@ async function executeReviewRun(request) {
       model: request.model,
       sandbox: "read-only",
       outputSchema: readOutputSchema(REVIEW_SCHEMA),
+      turnIdleTimeoutMs: request.turnIdleTimeoutMs,
       onProgress: request.onProgress
     });
   }

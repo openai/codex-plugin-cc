@@ -1031,6 +1031,10 @@ export async function runAppServerTurn(cwd, options = {}) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
   }
 
+  const turnIdleTimeoutMs = Number.isFinite(options.turnIdleTimeoutMs) && options.turnIdleTimeoutMs > 0
+    ? options.turnIdleTimeoutMs
+    : DEFAULT_TURN_IDLE_TIMEOUT_MS;
+
   return withAppServer(cwd, async (client) => {
     let threadId;
 
@@ -1073,7 +1077,7 @@ export async function runAppServerTurn(cwd, options = {}) {
           effort: options.effort ?? null,
           outputSchema: options.outputSchema ?? null
         }),
-      { onProgress: options.onProgress }
+      { onProgress: options.onProgress, turnIdleTimeoutMs }
     );
 
     return {
