@@ -385,6 +385,13 @@ rl.on("line", (line) => {
 	        saveState(state);
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
 
+        if (BEHAVIOR === "never-completes") {
+          // Emit nothing further: no items, no turn/completed, no final_answer.
+          // The turn ACK was already sent, so the client must rely on its own
+          // stall guard rather than hang forever.
+          break;
+        }
+
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)
           : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));

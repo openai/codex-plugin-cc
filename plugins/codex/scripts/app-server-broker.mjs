@@ -71,6 +71,29 @@ async function main() {
   let activeStreamThreadIds = null;
   const sockets = new Set();
 
+  // Idle self-shutdown: the broker is keyed per-cwd and is only reaped on a
+  // later ensureBrokerSession for the SAME cwd. A broker for a cwd that is never
+  // revisited (deleted worktree, ended session) would otherwise run forever and
+  // accumulate as orphaned processes. Exit after IDLE_MS with no connected
+  // clients so the leak self-heals; the companion transparently respawns one on
+  // the next task. Env-overridable for long idle gaps.
+  const IDLE_MS = Number(process.env.CODEX_COMPANION_BROKER_IDLE_MS) || 1_800_000;
+  let idleTimer = null;
+  function armIdle() {
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+    }
+    idleTimer = setTimeout(async () => {
+      if (sockets.size > 0 || activeRequestSocket || activeStreamSocket) {
+        armIdle();
+        return;
+      }
+      await shutdown(server);
+      process.exit(0);
+    }, IDLE_MS);
+    idleTimer.unref?.();
+  }
+
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
       activeRequestSocket = null;
@@ -117,10 +140,12 @@ async function main() {
 
   const server = net.createServer((socket) => {
     sockets.add(socket);
+    armIdle();
     socket.setEncoding("utf8");
     let buffer = "";
 
     socket.on("data", async (chunk) => {
+      armIdle();
       buffer += chunk;
       let newlineIndex = buffer.indexOf("\n");
       while (newlineIndex !== -1) {
@@ -225,6 +250,7 @@ async function main() {
     socket.on("close", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      armIdle();
     });
 
     socket.on("error", () => {
@@ -244,6 +270,7 @@ async function main() {
   });
 
   server.listen(listenTarget.path);
+  armIdle();
 }
 
 main().catch((error) => {

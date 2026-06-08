@@ -554,7 +554,25 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
 
+  // The completion promise resolves only on a terminal `turn/completed`
+  // notification (or the inferred-completion heuristic) and is otherwise
+  // uncoupled from time and from the app-server process. A wedged turn (e.g. a
+  // hung MCP server that never emits another notification) or an app-server that
+  // dies mid-turn would leave `await state.completion` hanging forever, which
+  // surfaces as a "stuck" Codex run. Bound the wait three ways so it always
+  // fails toward "didn't finish" instead of hanging:
+  //   - STALL_MS:   no inbound traffic at all for this long => treat as stalled.
+  //   - CEILING_MS: absolute backstop on a single turn.
+  //   - exit:       app-server process death rejects immediately.
+  // Both timeouts are env-overridable for genuinely long turns.
+  const CEILING_MS = Number(process.env.CODEX_COMPANION_TURN_TIMEOUT_MS) || 1_800_000;
+  const STALL_MS = Number(process.env.CODEX_COMPANION_TURN_STALL_MS) || 600_000;
+  let lastActivity = Date.now();
+  let ceilingTimer = null;
+  let stallTimer = null;
+
   client.setNotificationHandler((message) => {
+    lastActivity = Date.now();
     if (!state.turnId) {
       state.bufferedNotifications.push(message);
       return;
@@ -573,6 +591,37 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     }
 
     applyTurnNotification(state, message);
+  });
+
+  const ceiling = new Promise((_resolve, reject) => {
+    ceilingTimer = setTimeout(() => {
+      reject(
+        new Error(
+          `Codex turn exceeded the ${Math.round(CEILING_MS / 1000)}s ceiling without completing (raise CODEX_COMPANION_TURN_TIMEOUT_MS for long turns). Treating as stalled.`
+        )
+      );
+    }, CEILING_MS);
+    ceilingTimer.unref?.();
+  });
+
+  const stall = new Promise((_resolve, reject) => {
+    stallTimer = setInterval(() => {
+      if (Date.now() - lastActivity >= STALL_MS) {
+        reject(
+          new Error(
+            `Codex turn produced no activity for ${Math.round(STALL_MS / 1000)}s (raise CODEX_COMPANION_TURN_STALL_MS for long silent turns) — likely a hung MCP server or wedged turn. Treating as stalled.`
+          )
+        );
+      }
+    }, Math.min(STALL_MS, 30_000));
+    stallTimer.unref?.();
+  });
+
+  const exit = client.exitPromise.then(() => {
+    if (state.completed) {
+      return state;
+    }
+    throw client.exitError ?? new Error("codex app-server exited before the turn completed.");
   });
 
   try {
@@ -597,9 +646,19 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       completeTurn(state, response.turn);
     }
 
-    return await state.completion;
+    // state.completion wins under normal operation; the guards only fire on a
+    // wedge, an over-long turn, or app-server death. Promise.race attaches a
+    // handler to every racer, so a guard rejecting after the race already
+    // settled does not surface as an unhandledRejection.
+    return await Promise.race([state.completion, ceiling, stall, exit]);
   } finally {
     clearCompletionTimer(state);
+    if (ceilingTimer) {
+      clearTimeout(ceilingTimer);
+    }
+    if (stallTimer) {
+      clearInterval(stallTimer);
+    }
     client.setNotificationHandler(previousHandler ?? null);
   }
 }

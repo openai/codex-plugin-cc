@@ -2121,3 +2121,63 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
   assert.equal(payload.sessionRuntime.mode, "shared");
   assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
 });
+
+test("task fails fast instead of hanging when the turn never completes", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "never-completes");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const start = Date.now();
+  const result = run("node", [SCRIPT, "task", "do something"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      // Short stall window so the test is fast; the broker it spawns also
+      // self-cleans quickly rather than lingering past the test.
+      CODEX_COMPANION_TURN_STALL_MS: "500",
+      CODEX_COMPANION_BROKER_IDLE_MS: "1000"
+    }
+  });
+  const elapsedMs = Date.now() - start;
+
+  // Without the watchdog this hangs forever on `await state.completion`.
+  assert.notEqual(result.status, 0);
+  assert.match(`${result.stdout}\n${result.stderr}`, /no activity|stall/i);
+  assert.ok(elapsedMs < 30000, `expected a fast stall failure, took ${elapsedMs}ms`);
+});
+
+test("broker self-shuts-down after the idle window with no clients", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const broker = path.join(PLUGIN_ROOT, "scripts", "app-server-broker.mjs");
+  const sessionDir = makeTempDir();
+  const endpoint = `unix:${path.join(sessionDir, "broker.sock")}`;
+  const child = spawn(
+    "node",
+    [broker, "serve", "--endpoint", endpoint, "--cwd", repo, "--pid-file", path.join(sessionDir, "broker.pid")],
+    {
+      env: { ...buildEnv(binDir), CODEX_COMPANION_BROKER_IDLE_MS: "400" },
+      stdio: "ignore"
+    }
+  );
+
+  const exitCode = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("broker did not self-shut-down within the idle window"));
+    }, 10000);
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      resolve(code);
+    });
+  });
+
+  assert.equal(exitCode, 0);
+});
