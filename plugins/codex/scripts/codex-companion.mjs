@@ -17,6 +17,7 @@ import {
     interruptAppServerTurn,
     parseStructuredOutput,
     readOutputSchema,
+    resolveReviewTurnIdleTimeoutMs,
     runAppServerInvestigation,
     runAppServerReview,
     runAppServerTurn
@@ -835,13 +836,17 @@ async function handleReviewCommand(argv, config) {
   }
 
   const rawIdleTimeout = options["turn-idle-timeout"];
-  let turnIdleTimeoutMs;
+  let explicitIdleTimeoutMs;
   if (rawIdleTimeout !== undefined) {
     if (!/^[1-9][0-9]*$/.test(String(rawIdleTimeout))) {
       throw new Error(`--turn-idle-timeout must be a positive integer (seconds) (got: ${rawIdleTimeout})`);
     }
-    turnIdleTimeoutMs = Number(rawIdleTimeout) * 1000;
+    explicitIdleTimeoutMs = Number(rawIdleTimeout) * 1000;
   }
+  // Reviews always get an idle watchdog (default when no flag is given), so a
+  // stalled review never hangs forever. /codex:task deliberately does NOT, so a
+  // long-thinking task is not aborted; it passes no timeout to runAppServerTurn.
+  const turnIdleTimeoutMs = resolveReviewTurnIdleTimeoutMs(explicitIdleTimeoutMs);
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);

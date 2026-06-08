@@ -43,13 +43,32 @@ const SERVICE_NAME = "claude_code_codex_plugin";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
 const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
-// A turn that produces no notifications and no response for this long is
+// A REVIEW turn that produces no notifications and no response for this long is
 // treated as a stalled upstream connection and aborted, instead of the RPC
 // promise hanging forever (it only settles on a response or a full socket
 // close, neither of which happens on a half-dead "Reconnecting..." link).
 // The timer is reset on every progress notification, so a slow-but-healthy
 // turn running many commands is never killed — only true silence triggers it.
+//
+// This default is REVIEW-ONLY. It must NOT be injected by the shared
+// runAppServerTurn/runAppServerInvestigation runners, because /codex:task also
+// calls runAppServerTurn: a long-thinking or long-single-command task would
+// otherwise be aborted at this threshold with no task-level way to raise or
+// disable it. Review callers opt in via resolveReviewTurnIdleTimeoutMs(); the
+// runners pass whatever they are given straight through to captureTurn, which
+// arms no watchdog for an absent/invalid value.
 const DEFAULT_TURN_IDLE_TIMEOUT_MS = 180_000;
+
+/**
+ * Resolve the idle-watchdog timeout for REVIEW turns. Returns the review
+ * default when no explicit positive value is supplied. Task runs do not call
+ * this and therefore run without an idle watchdog.
+ * @param {number | null | undefined} explicitMs
+ * @returns {number}
+ */
+export function resolveReviewTurnIdleTimeoutMs(explicitMs) {
+  return Number.isFinite(explicitMs) && explicitMs > 0 ? explicitMs : DEFAULT_TURN_IDLE_TIMEOUT_MS;
+}
 
 function cleanCodexStderr(stderr) {
   return stderr
@@ -1031,9 +1050,10 @@ export async function runAppServerTurn(cwd, options = {}) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
   }
 
-  const turnIdleTimeoutMs = Number.isFinite(options.turnIdleTimeoutMs) && options.turnIdleTimeoutMs > 0
-    ? options.turnIdleTimeoutMs
-    : DEFAULT_TURN_IDLE_TIMEOUT_MS;
+  // Pass-through only: no implicit default. captureTurn arms no watchdog when
+  // turnIdleTimeoutMs is absent/invalid. Review callers supply the default via
+  // resolveReviewTurnIdleTimeoutMs(); task runs intentionally pass nothing.
+  const turnIdleTimeoutMs = options.turnIdleTimeoutMs;
 
   return withAppServer(cwd, async (client) => {
     let threadId;
@@ -1116,9 +1136,9 @@ export async function runAppServerInvestigation(cwd, options = {}) {
   const maxInvestigationTurns = Number.isFinite(options.maxInvestigationTurns) && options.maxInvestigationTurns > 0
     ? Math.floor(options.maxInvestigationTurns)
     : DEFAULT_MAX_INVESTIGATION_TURNS;
-  const turnIdleTimeoutMs = Number.isFinite(options.turnIdleTimeoutMs) && options.turnIdleTimeoutMs > 0
-    ? options.turnIdleTimeoutMs
-    : DEFAULT_TURN_IDLE_TIMEOUT_MS;
+  // Pass-through only (see runAppServerTurn): the review caller supplies the
+  // watchdog default via resolveReviewTurnIdleTimeoutMs().
+  const turnIdleTimeoutMs = options.turnIdleTimeoutMs;
   const sandbox = options.sandbox ?? "read-only";
 
   return withAppServer(cwd, async (client) => {

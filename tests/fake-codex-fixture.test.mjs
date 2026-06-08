@@ -2,8 +2,40 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { setupFakeCodex } from "./fake-codex-fixture.mjs";
-import { runAppServerTurn } from "../plugins/codex/scripts/lib/codex.mjs";
+import { resolveReviewTurnIdleTimeoutMs, runAppServerTurn } from "../plugins/codex/scripts/lib/codex.mjs";
 import { makeTempDir } from "./helpers.mjs";
+
+test("resolveReviewTurnIdleTimeoutMs defaults the review watchdog and honors explicit values", () => {
+  // The 180s idle watchdog is a REVIEW concern (a stalled review should not hang
+  // forever). It must NOT be baked into the shared runAppServerTurn default,
+  // because /codex:task also calls runAppServerTurn and a long-thinking task
+  // would then be aborted at 180s with no task-level knob. The default lives in
+  // this review-only helper instead.
+  assert.equal(resolveReviewTurnIdleTimeoutMs(undefined), 180_000, "review default is 180s");
+  assert.equal(resolveReviewTurnIdleTimeoutMs(300), 300, "explicit ms passes through");
+  assert.equal(resolveReviewTurnIdleTimeoutMs(0), 180_000, "zero/invalid falls back to the review default");
+});
+
+test("runAppServerTurn passes through an absent idle timeout (task path arms no watchdog)", async () => {
+  // Regression guard for the task path: executeTaskRun calls runAppServerTurn
+  // without turnIdleTimeoutMs. runAppServerTurn must NOT inject the review
+  // default — it passes the absent value straight to captureTurn, which arms no
+  // watchdog for undefined. A normal turn therefore completes cleanly with no
+  // idle-timeout error. (The review default lives in resolveReviewTurnIdleTimeoutMs;
+  // the explicit-timeout abort is covered by the inline-review hang test below.)
+  const cwd = makeTempDir("codex-queue-test-");
+  const handle = setupFakeCodex({ cwd });
+  try {
+    handle.queueTurnResponse({ commands: [], finalAnswer: { text: "task done" } });
+
+    const result = await runAppServerTurn(cwd, { prompt: "long-running task, no watchdog" });
+
+    assert.equal(result.finalMessage, "task done", "task turn should complete normally with no timeout");
+    assert.equal(result.error ?? null, null, "no idle-timeout error when no watchdog is configured");
+  } finally {
+    handle.close();
+  }
+});
 
 test("queue-driven fake: final answer is returned via runAppServerTurn", async () => {
   const cwd = makeTempDir("codex-queue-test-");
