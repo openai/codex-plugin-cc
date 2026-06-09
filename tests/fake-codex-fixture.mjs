@@ -218,7 +218,7 @@ function structuredReviewPayload(prompt) {
 
 function taskPayload(prompt, resume) {
   if (prompt.includes("<task>") && prompt.includes("Only review the work from the previous Claude turn.")) {
-    if (BEHAVIOR === "adversarial-clean") {
+    if (BEHAVIOR === "adversarial-clean" || BEHAVIOR === "gate-recovered") {
       return "ALLOW: No blocking issues found in the previous turn.";
     }
     return "BLOCK: Missing empty-state guard in src/app.js:4-6.";
@@ -607,6 +607,19 @@ rl.on("line", (line) => {
 	          interruptibleTurns.set(turnId, { threadId: thread.id, timer });
 	        } else if (BEHAVIOR === "slow-task") {
 	          emitTurnCompletedLater(thread.id, turnId, items, 400);
+	        } else if (BEHAVIOR === "gate-recovered") {
+	          // Recovered transient: emit the agent message, then a stale "error"
+	          // notice, then turn/completed. The turn still has usable output, so the
+	          // companion must exit 0 (resolveRunExitStatus) and the gate must parse
+	          // the ALLOW answer rather than block on a phantom failure.
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          for (const entry of items) {
+	            if (entry && entry.completed) {
+	              send({ method: "item/completed", params: { threadId: thread.id, turnId, item: entry.completed } });
+	            }
+	          }
+	          send({ method: "error", params: { threadId: thread.id, turnId, error: { message: "Reconnecting... 1/5" } } });
+	          send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
 	        } else {
 	          emitTurnCompleted(thread.id, turnId, items);
 	        }

@@ -1936,6 +1936,38 @@ test("stop hook allows the stop when the review gate is enabled and the stop-tim
   assert.equal(allowed.stdout.trim(), "");
 });
 
+test("stop hook parses the ALLOW answer when the stop-time review task recovered from a transient error", () => {
+  // Regression: a gate review that survives a transient "Reconnecting..." notice
+  // still completes with a valid ALLOW answer. The task must exit 0 so the hook
+  // parses ALLOW/BLOCK instead of false-positive blocking on "task failed".
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "gate-recovered");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const result = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: JSON.stringify({
+      cwd: repo,
+      session_id: "sess-stop-recovered",
+      last_assistant_message: "I completed the refactor."
+    })
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "", "a recovered ALLOW review must NOT block the session");
+});
+
 test("stop hook does not block when Codex is unavailable even if the review gate is enabled", () => {
   const repo = makeTempDir();
   initGitRepo(repo);
