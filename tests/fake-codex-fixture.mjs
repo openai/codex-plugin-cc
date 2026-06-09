@@ -344,26 +344,48 @@ rl.on("line", (line) => {
         }
         const turnId = nextTurnId(state);
         send({ id: message.id, result: { turn: buildTurn(turnId), reviewThreadId: reviewThread.id } });
-        emitTurnCompleted(reviewThread.id, turnId, [
-          {
-            started: { type: "enteredReviewMode", id: turnId, review: "current changes" }
-          },
-          ...(BEHAVIOR === "with-reasoning"
-            ? [
-                {
-                  completed: {
-                    type: "reasoning",
-                    id: "reasoning_" + turnId,
-                    summary: [{ text: "Reviewed the changed files and checked the likely regression paths." }],
-                    content: []
-                  }
-                }
-              ]
-            : []),
-          {
-            completed: { type: "exitedReviewMode", id: turnId, review: nativeReviewText(message.params.target) }
-          }
-        ]);
+
+        // Queue-driven mode lets a test script the review text and inject a
+        // transient (recovered) error to exercise the recovered-status path.
+        const reviewEntry =
+          BEHAVIOR === "queue-driven" && state.queue && state.queue.length > 0
+            ? state.queue.shift()
+            : null;
+        if (reviewEntry) {
+          saveState(state);
+        }
+        const reviewText = reviewEntry && typeof reviewEntry.reviewText === "string"
+          ? reviewEntry.reviewText
+          : nativeReviewText(message.params.target);
+
+        send({ method: "turn/started", params: { threadId: reviewThread.id, turn: buildTurn(turnId) } });
+        send({
+          method: "item/started",
+          params: { threadId: reviewThread.id, turnId, item: { type: "enteredReviewMode", id: turnId, review: "current changes" } }
+        });
+        if (BEHAVIOR === "with-reasoning") {
+          send({
+            method: "item/completed",
+            params: {
+              threadId: reviewThread.id,
+              turnId,
+              item: {
+                type: "reasoning",
+                id: "reasoning_" + turnId,
+                summary: [{ text: "Reviewed the changed files and checked the likely regression paths." }],
+                content: []
+              }
+            }
+          });
+        }
+        send({
+          method: "item/completed",
+          params: { threadId: reviewThread.id, turnId, item: { type: "exitedReviewMode", id: turnId, review: reviewText } }
+        });
+        if (reviewEntry && reviewEntry.turnError) {
+          send({ method: "error", params: { threadId: reviewThread.id, turnId, error: { message: reviewEntry.turnError.message } } });
+        }
+        send({ method: "turn/completed", params: { threadId: reviewThread.id, turn: buildTurn(turnId, "completed") } });
         break;
       }
 
