@@ -14,6 +14,7 @@
  *   threadTurnIds: Map<string, string>,
  *   threadLabels: Map<string, string>,
  *   turnId: string | null,
+ *   pendingTurnId: string | null,
  *   bufferedNotifications: AppServerNotification[],
  *   completion: Promise<TurnCaptureState>,
  *   resolveCompletion: (state: TurnCaptureState) => void,
@@ -335,6 +336,7 @@ function createTurnCaptureState(threadId, options = {}) {
     threadTurnIds: new Map(),
     threadLabels: new Map(),
     turnId: null,
+    pendingTurnId: null,
     bufferedNotifications: [],
     completion,
     resolveCompletion,
@@ -608,9 +610,10 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       const seconds = Math.round(idleTimeoutMs / 1000);
       // Best-effort interrupt so the app-server can release the turn; do NOT
       // await it (the same dead link could make it hang too).
-      if (state.turnId) {
+      const interruptTurnId = state.turnId ?? state.pendingTurnId;
+      if (interruptTurnId) {
         try {
-          client.request("turn/interrupt", { threadId, turnId: state.turnId }).catch(() => {});
+          client.request("turn/interrupt", { threadId, turnId: interruptTurnId }).catch(() => {});
         } catch {
           // ignore — interrupt is best-effort
         }
@@ -628,11 +631,22 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   };
 
   client.setNotificationHandler((message) => {
-    armIdle();
     if (!state.turnId) {
+      // Buffering window: the turn/start RPC reply has not set state.turnId yet.
+      // Capture the turn id from a turn/started for our thread so the idle
+      // watchdog can still interrupt (Defect C). Re-arm here — these early
+      // notifications are almost always our own.
+      armIdle();
+      if (message.method === "turn/started" && extractThreadId(message) === state.threadId) {
+        state.pendingTurnId = message.params?.turn?.id ?? state.pendingTurnId;
+      }
       state.bufferedNotifications.push(message);
       return;
     }
+
+    // Preserve existing behavior for this task: re-arm on all post-buffer
+    // traffic. (Task 2 replaces this with a belonging-gated re-arm.)
+    armIdle();
 
     if (message.method === "thread/started" || message.method === "thread/name/updated") {
       applyTurnNotification(state, message);

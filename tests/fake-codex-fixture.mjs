@@ -415,6 +415,15 @@ rl.on("line", (line) => {
             break;
           }
 
+          if (entry && entry.hangAfterStarted) {
+            // Announce the turn so the client buffers a turn/started carrying the
+            // id (populating pendingTurnId), but never send the turn/start RPC
+            // result and never complete the turn. Models a delayed RPC reply on a
+            // half-dead link, exercising Defect C.
+            send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+            break;
+          }
+
           send({ id: message.id, result: { turn: buildTurn(turnId) } });
           send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 
@@ -733,6 +742,12 @@ export function setupFakeCodex({ cwd } = {}) {
       const state = readState();
       if (!state.queue) { state.queue = []; }
       state.queue.push({ hangNoResponse: true });
+      writeState(state);
+    },
+    queueTurnHangAfterStarted() {
+      const state = readState();
+      if (!state.queue) { state.queue = []; }
+      state.queue.push({ hangAfterStarted: true });
       writeState(state);
     },
     // `requests` re-reads the state file each access; assign to a local variable for repeated use.

@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 
 import { setupFakeCodex } from "./fake-codex-fixture.mjs";
 import { runAppServerInvestigation } from "../plugins/codex/scripts/lib/codex.mjs";
@@ -601,7 +603,6 @@ test("recon turn 1 sends the investigate prompt; turn 2+ sends the continuation 
 
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -1228,5 +1229,45 @@ test("native review that recovered from a transient reconnect is NOT marked fail
   } finally {
     fake.close();
     rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("idle watchdog interrupts with the buffered turn id when the turn/start RPC reply is delayed (Defect C)", async () => {
+  const cwd = makeTempDir("codex-inv-test-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    // Recon turn 1: progresses (has commands), does not converge.
+    fake.queueTurnResponse({ commands: [{ command: "git diff", exitCode: 0 }], finalAnswer: null });
+    // Recon turn 2: emits turn/started, then withholds the RPC result and never
+    // completes — so the watchdog fires while state.turnId is still null.
+    fake.queueTurnHangAfterStarted();
+
+    const result = await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      turnIdleTimeoutMs: 300
+    });
+
+    assert.ok(result.error, "a stalled turn must abort with an error");
+    assert.match(result.error.message, /idle|timeout|timed out/i);
+
+    // The fixture must have received a turn/interrupt carrying the turn id it
+    // announced via turn/started — proving the watchdog did not skip the
+    // interrupt just because state.turnId was null (Defect C). turn_2 is the
+    // hung turn's id (turn_1 was recon turn 1). The interrupt is fire-and-forget
+    // and lands on the fixture exactly as withAppServer's client.close() is
+    // resolving, so the fixture's synchronous saveState can land a beat after
+    // the call returns; poll the state file briefly for it to appear.
+    const statePath = path.join(fake.binDir, "fake-codex-state.json");
+    let state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    const deadline = Date.now() + 2000;
+    while (!state.lastInterrupt && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    }
+    assert.ok(state.lastInterrupt, "watchdog must send turn/interrupt even before the turn/start RPC reply");
+    assert.equal(state.lastInterrupt.turnId, "turn_2", "interrupt must carry the buffered turn id");
+  } finally {
+    fake.close();
   }
 });
