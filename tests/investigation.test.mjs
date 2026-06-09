@@ -1278,9 +1278,13 @@ test("foreign-thread chatter does not re-arm the current turn's idle watchdog (D
   try {
     // Recon turn 1: emits turn/started, then a long stream of foreign-thread
     // notifications spaced UNDER the idle window, then never completes OUR turn.
-    // Spans ~2.5s so the buggy (re-arm-on-foreign) path cannot time out before
-    // chatter stops; the fixed path times out promptly at the idle window.
-    fake.queueTurnResponse({ foreignChatterThenHang: { count: 50, everyMs: 50 } });
+    // Spans ~4s so the buggy (re-arm-on-foreign) path cannot time out until
+    // chatter stops (~4s + the 300ms idle window ≈ 4.3s); the fixed path times
+    // out promptly ~300ms after turn/started. The 2500ms ceiling sits between
+    // the two with wide margins on both sides (≈1.8s of buggy-side headroom and
+    // ≈2s of tolerance for subprocess-startup jitter on the fixed side), so the
+    // assertion discriminates without being flaky on a loaded machine.
+    fake.queueTurnResponse({ foreignChatterThenHang: { count: 80, everyMs: 50 } });
 
     const start = Date.now();
     const result = await runAppServerInvestigation(fake.cwd, {
@@ -1292,7 +1296,7 @@ test("foreign-thread chatter does not re-arm the current turn's idle watchdog (D
 
     assert.ok(result.error, "stuck turn must time out despite foreign chatter");
     assert.match(result.error.message, /idle|timeout|timed out/i);
-    assert.ok(elapsed < 1500, `watchdog must fire at the idle window, not be held open by foreign chatter (took ${elapsed}ms)`);
+    assert.ok(elapsed < 2500, `watchdog must fire at the idle window, not be held open by foreign chatter (took ${elapsed}ms)`);
   } finally {
     fake.close();
   }

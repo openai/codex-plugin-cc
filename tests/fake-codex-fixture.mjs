@@ -406,6 +406,12 @@ rl.on("line", (line) => {
               saveState(state);
               break;
             }
+            // Only the normal completion paths below (delayCompletedMs / the
+            // synchronous turn/completed) clear serializedBusyThread. Do NOT
+            // combine serialize with hang/error entries (cueThenHang,
+            // hangNoResponse, hangAfterStarted, foreignChatterThenHang,
+            // rpcError) when a SUBSEQUENT queued turn is expected to open — those
+            // branches break early and leave the thread marked busy on purpose.
             serializedBusyThread = thread.id;
           }
 
