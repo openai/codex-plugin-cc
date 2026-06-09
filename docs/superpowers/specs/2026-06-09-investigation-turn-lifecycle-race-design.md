@@ -99,20 +99,22 @@ simply stops advancing on a premature inferred completion.
 |-------|---------|--------|
 | `pendingTurnId` (new) | Turn id captured from a buffered `turn/started` for our thread, before the `turn/start` RPC reply sets `state.turnId`. Watchdog interrupts with `state.turnId ?? state.pendingTurnId`. | C |
 | `sawSubagentWork` (new, boolean) | Latches `true` the first time a `collabAgentToolCall` or a subagent `turn/started` is seen. Hard-gates whether fallback inference is *ever* eligible. | A |
-| `quietTimer` (replaces the 250ms `completionTimer` role) | Re-arming "no activity" timer; fires inferred completion only after a full quiet window with no `turn/completed`. | A |
+| `inferredCompletionQuietMs` (new, number) | The quiet-window duration for this turn; resolved from the `inferredCompletionQuietMs` option, else `CODEX_INFERRED_COMPLETION_QUIET_MS`, else the ~15s default. | A |
+| `completionTimer` (existing field, re-purposed) | The inference timer handle. Now armed with the quiet window (`inferredCompletionQuietMs`) instead of a flat 250ms, and re-arms on belonging activity. Same field, new arming policy. | A |
 
 **Two independent timers, never sharing a handle:**
 
 - **Idle watchdog** (`idleTimer`, existing, default `DEFAULT_TURN_IDLE_TIMEOUT_MS
   = 180_000`): fail-fast for a *dead connection*; **rejects** the turn. Re-armed
   only by belonging traffic (Defect B).
-- **Quiet / inference timer** (`quietTimer`, default ~15s, injectable): *success*
-  fallback for the subagent case where the main thread never emits
-  `turn/completed`; **resolves** the turn. Armed only when `sawSubagentWork` is
-  true.
+- **Quiet / inference timer** (the `completionTimer` field, default ~15s,
+  injectable): *success* fallback for the subagent case where the main thread
+  never emits `turn/completed`; **resolves** the turn. Armed only when
+  `sawSubagentWork` is true.
 
 The watchdog still owns true-idle failure; the quiet timer only ever produces an
-inferred *success*, and only in the subagent case.
+inferred *success*, and only in the subagent case. ("quiet timer" is prose for
+the re-purposed `completionTimer` field — no separate handle is introduced.)
 
 ### Defect A — demote inference to a guarded fallback
 
@@ -143,6 +145,34 @@ inferred *success*, and only in the subagent case.
 This preserves the subagent / collab hang that inference was added to prevent: a
 subagent turn that never emits a main-thread `turn/completed` still resolves,
 just after a real quiet window instead of a 250ms readiness-cue race.
+
+**Why keep inference at all, given the evidence run had no subagents?** (Design
+challenge, recorded for the record.) The reported failure was a *plain* recon
+turn, and the fix for it is entirely "wait for the real `turn/completed`" — the
+`sawSubagentWork`-gated quiet window never becomes eligible on that path. So the
+fallback machinery (the quiet timer, the `CODEX_INFERRED_COMPLETION_QUIET_MS`
+env var) exists only for the `/codex:task` collab flow, which is orthogonal to
+the reported defect. We deliberately keep it rather than removing inference
+because the original `scheduleInferredCompletion` was added to stop a real hang:
+subagent / collab turns do not always emit a main-thread `turn/completed`, and
+`runAppServerTurn` (task path) shares `captureTurn`. A narrower alternative —
+inference only in `runAppServerTurn` and an unconditional wait-for-`turn/completed`
+in the investigation recon loop — was considered and rejected: it would fork
+`captureTurn`'s completion logic by caller, duplicating the subtlest part of the
+state machine. Keeping one gated fallback in `captureTurn`, exercised by both
+callers, is the smaller long-term surface. The cost is that ~half the new test
+surface covers the task/collab path, not the investigation path.
+
+**Naming:** the inference timer is referred to as the *quiet timer* in prose, but
+the implementation keeps the existing state field name `completionTimer` (it is
+the same handle, now armed with the quiet window instead of 250ms). No new field
+is introduced for it.
+
+**`finalAnswerSeen` after the fix:** it is still *written* in `recordItem` but no
+longer *read* by the completion gate (the old `scheduleInferredCompletion` was
+its only reader). It is retained, not deleted, because it is part of the
+documented `TurnCaptureState` shape and may be read by future telemetry; the plan
+notes this explicitly so it is not mistaken for a live trigger.
 
 ### Defect B — re-arm only for belonging traffic
 

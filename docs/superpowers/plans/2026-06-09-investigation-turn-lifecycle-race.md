@@ -37,7 +37,7 @@
 | File | Responsibility | Change |
 |------|----------------|--------|
 | `plugins/codex/scripts/lib/codex.mjs` | turn capture + watchdog | All three production fixes |
-| `tests/fake-codex-fixture.mjs` | fake app-server | Add per-thread serialization + delayed-completion to `queue-driven`; expose a `serialize` toggle and `delayCompletedMs` on queue entries |
+| `tests/fake-codex-fixture.mjs` | fake app-server | Add to `queue-driven`: `hangAfterStarted` + `cueThenHang` + `delayCompletedMs` + `lateFinalAnswer` queue entries; an opt-in `serialize` toggle whose busy-thread `turn/start` hangs (never opens), modelling the production race |
 | `tests/investigation.test.mjs` | in-process lifecycle tests | Defect A repro + plain-recon-no-infer + Defect B |
 | `tests/runtime.test.mjs` | subprocess tests | Defect C interrupt assertion + env-var quiet-window override regression |
 | `docs/superpowers/specs/2026-06-09-investigation-turn-lifecycle-race-design.md` | spec | (already committed) |
@@ -63,62 +63,85 @@ Write the list of currently-failing test names into the PR description / scratch
 
 This is first because it is the smallest, self-contained change and unblocks the watchdog edits the other tasks build on.
 
+> **REVIEW FIX (finding #1):** The original draft tested `node SCRIPT review --turn-idle-timeout 1`. That path is wrong on two counts: `/codex:review` (inline) goes through `runAppServerReview` → `review/start` (NOT `turn/start`, so a `turn/start`-case fixture branch is dead code for it), and `runAppServerReview`'s `captureTurn` call passes **no** `turnIdleTimeoutMs` (codex.mjs:1004) so the inline review path arms **no watchdog at all** — `--turn-idle-timeout` is silently ignored, the interrupt is never reached, and `lastInterrupt` stays null regardless of the fix. Defect C is only reachable where a `turn/start` is issued AND the watchdog is armed: the **investigation** path. The test below uses `runAppServerInvestigation` in-process with `turnIdleTimeoutMs` set, and a new `hangAfterStarted` queue entry (a variant of the existing `queueTurnHang`, which emits no `turn/started` and so can't populate `pendingTurnId`).
+
 **Files:**
 - Modify: `plugins/codex/scripts/lib/codex.mjs` — `@typedef` (~10-36), `createTurnCaptureState` (~331-356), `captureTurn` watchdog callback (~604-621) and notification handler (~630-650)
-- Modify: `tests/runtime.test.mjs` (new test near the other subagent/idle tests)
+- Modify: `tests/fake-codex-fixture.mjs` — add a `hangAfterStarted` queue entry + a `queueTurnHangAfterStarted()` handle method
+- Modify: `tests/investigation.test.mjs` (new test near the other idle tests)
 
-- [ ] **Step 1: Write the failing test (subprocess, asserts `turn/interrupt` is sent with the buffered turn id)**
+- [ ] **Step 1: Write the failing test (in-process investigation path, asserts `turn/interrupt` carries the buffered turn id)**
 
-Add to `tests/runtime.test.mjs`. This uses a new fixture behavior `idle-after-started` (added in Step 3) that emits `turn/started` but then never completes the turn and never returns the `turn/start` RPC result — so the watchdog must fire while `state.turnId` is still null and fall back to `pendingTurnId`.
+Add to `tests/investigation.test.mjs`. The `hangAfterStarted` entry (added in Step 3) emits `turn/started` (so the client buffers it and can capture `pendingTurnId`) but then never sends the `turn/start` RPC result and never completes the turn — so the watchdog must fire while `state.turnId` is still null and fall back to `pendingTurnId`.
+
+The interrupt is fire-and-forget, but it is reliably observable: `runAppServerInvestigation` returns through `withAppServer`, which `await`s `client.close()`; `close()` calls `stdin.end()` (flushing the queued `turn/interrupt` line to the fixture) and only SIGTERMs after a 50ms unref'd timer, so the fixture processes the interrupt and persists `state.lastInterrupt` before the test inspects it. No polling needed, but read state AFTER the call resolves.
 
 ```js
-test("idle watchdog interrupts using the buffered turn id when the turn/start RPC reply is delayed", () => {
-  const repo = makeTempDir();
-  const binDir = makeTempDir();
-  installFakeCodex(binDir, "idle-after-started");
-  initGitRepo(repo);
-  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
-  run("git", ["add", "README.md"], { cwd: repo });
-  run("git", ["commit", "-m", "init"], { cwd: repo });
-  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+test("idle watchdog interrupts with the buffered turn id when the turn/start RPC reply is delayed (Defect C)", async () => {
+  const cwd = makeTempDir("codex-inv-test-");
+  const fake = setupFakeCodex({ cwd });
+  try {
+    // Recon turn 1: progresses (has commands), does not converge.
+    fake.queueTurnResponse({ commands: [{ command: "git diff", exitCode: 0 }], finalAnswer: null });
+    // Recon turn 2: emits turn/started, then withholds the RPC result and never
+    // completes — so the watchdog fires while state.turnId is still null.
+    fake.queueTurnHangAfterStarted();
 
-  // Review path arms the idle watchdog; force a short window so the test is fast.
-  const result = run("node", [SCRIPT, "review", "--turn-idle-timeout", "1"], {
-    cwd: repo,
-    env: buildEnv(binDir)
-  });
+    const result = await runAppServerInvestigation(fake.cwd, {
+      investigatePrompt: "Investigate.",
+      finalizePrompt: "Finalize.",
+      turnIdleTimeoutMs: 300
+    });
 
-  // The review fails (idle timeout), but the fake server must have received a
-  // turn/interrupt carrying the turn id it announced via turn/started — proving
-  // the watchdog did not skip the interrupt just because state.turnId was null.
-  const statePath = path.join(binDir, "fake-codex-state.json");
-  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
-  assert.ok(state.lastInterrupt, "watchdog must send turn/interrupt even before the turn/start RPC reply");
-  assert.equal(state.lastInterrupt.turnId, "turn_1", "interrupt must carry the buffered turn id");
+    assert.ok(result.error, "a stalled turn must abort with an error");
+    assert.match(result.error.message, /idle|timeout|timed out/i);
+
+    // The fixture must have received a turn/interrupt carrying the turn id it
+    // announced via turn/started — proving the watchdog did not skip the
+    // interrupt just because state.turnId was null (Defect C). turn_2 is the
+    // hung turn's id (turn_1 was recon turn 1).
+    const statePath = path.join(fake.binDir, "fake-codex-state.json");
+    const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.ok(state.lastInterrupt, "watchdog must send turn/interrupt even before the turn/start RPC reply");
+    assert.equal(state.lastInterrupt.turnId, "turn_2", "interrupt must carry the buffered turn id");
+  } finally {
+    fake.close();
+  }
 });
 ```
 
+Note: `investigation.test.mjs` must import `fs` and `path` (`import fs from "node:fs"; import path from "node:path";`) — add them if not already present at the top of the file.
+
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `node --test tests/runtime.test.mjs 2>&1 | grep -A3 "buffered turn id"`
-Expected: FAIL — either the behavior `idle-after-started` is unknown (no interrupt recorded) or `state.lastInterrupt` is null because the current code skips `turn/interrupt` when `state.turnId` is null.
+Run: `node --test tests/investigation.test.mjs 2>&1 | grep -A3 "Defect C"`
+Expected: FAIL — `queueTurnHangAfterStarted` is unknown, or (once Step 3 lands but before Step 5) `state.lastInterrupt` is null because the current watchdog skips `turn/interrupt` when `state.turnId` is null.
 
-- [ ] **Step 3: Add the `idle-after-started` behavior to the fixture**
+- [ ] **Step 3: Add the `hangAfterStarted` queue entry + handle method to the fixture**
 
-In `tests/fake-codex-fixture.mjs`, inside the `turn/start` case, add a branch BEFORE the `queue-driven` branch (so it is checked first). Place it right after `const thread = ensureThread(...)`/`nextTurnId` is available — mirror how other behavior branches obtain `thread` and `turnId`. Concretely, add this just above the `if (BEHAVIOR === "queue-driven") {` line (~395), using the same `thread`/`turnId` acquisition the synchronous path uses:
+In `tests/fake-codex-fixture.mjs`, inside the `queue-driven` `turn/start` handler, the existing `hangNoResponse` branch (~410-416) returns BEFORE sending `turn/started`. Add a sibling branch immediately after it that DOES announce the turn first. The `turnId` is computed at ~399 (`const turnId = nextTurnId(state);`) before the queue entry is shifted, so it is in scope:
 
 ```js
-        if (BEHAVIOR === "idle-after-started") {
-          const turnId = nextTurnId(state);
-          // Announce the turn (so the client buffers a turn/started carrying the
-          // id) but never send the turn/start RPC result and never complete the
-          // turn. Models a delayed RPC reply on a half-dead link.
-          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
-          break;
-        }
+          if (entry && entry.hangAfterStarted) {
+            // Announce the turn so the client buffers a turn/started carrying the
+            // id (populating pendingTurnId), but never send the turn/start RPC
+            // result and never complete the turn. Models a delayed RPC reply on a
+            // half-dead link, exercising Defect C.
+            send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+            break;
+          }
 ```
 
-Note: `thread` is resolved earlier in the `turn/start` case (`const thread = ensureThread(state, message.params.threadId)` / the queue-driven path uses `ensureThread`). Verify `thread` is in scope at the insertion point; if the synchronous path resolves `thread` lower, move this branch just below that resolution. The branch must `break` without sending `{ id: message.id, result: ... }`.
+Then add a handle method on `setupFakeCodex`'s returned object, next to `queueTurnHang` (~730):
+
+```js
+    queueTurnHangAfterStarted() {
+      const state = readState();
+      if (!state.queue) { state.queue = []; }
+      state.queue.push({ hangAfterStarted: true });
+      writeState(state);
+    },
+```
 
 - [ ] **Step 4: Add `pendingTurnId` to the typedef and state**
 
@@ -230,7 +253,7 @@ to:
 
 - [ ] **Step 6: Run the test to verify it passes**
 
-Run: `node --test tests/runtime.test.mjs 2>&1 | grep -A3 "buffered turn id"`
+Run: `node --test tests/investigation.test.mjs 2>&1 | grep -A3 "Defect C"`
 Expected: PASS.
 
 - [ ] **Step 7: Run the full suite to confirm no net-new failures**
@@ -241,7 +264,7 @@ Expected: failing total equals the Task 0 baseline (≈7), no new names.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add plugins/codex/scripts/lib/codex.mjs tests/fake-codex-fixture.mjs tests/runtime.test.mjs
+git add plugins/codex/scripts/lib/codex.mjs tests/fake-codex-fixture.mjs tests/investigation.test.mjs
 git commit --no-verify -m "fix(codex): interrupt with buffered turn id when turn/start RPC reply is delayed (Defect C)"
 ```
 
@@ -413,40 +436,43 @@ This task changes the inference trigger. It does NOT yet reproduce the end-to-en
 - Modify: `plugins/codex/scripts/lib/codex.mjs` — module constant (~60 area), `@typedef`, `createTurnCaptureState`, `scheduleInferredCompletion` (~393-414), `recordItem` (~427-453), `applyTurnNotification` `turn/started` (~525-530), and `captureTurn`/`runAppServerInvestigation` option threading
 - Modify: `tests/investigation.test.mjs` (new test)
 
+> **REVIEW FIX (finding #3):** The original draft used `delayCompletedMs: 120` with a 20ms quiet window and asserted the run *succeeds* — but the real `turn/completed` at ~120ms arrives before old code's 250ms cue-based inference, so old code reaches finalize the same way and the assertions held for buggy AND fixed code (non-discriminating). The corrected test below makes the readiness cue the ONLY completion signal the turn ever sends — no real `turn/completed` at all. If the gate were absent (old code), the 250ms cue-based inference fires and the run wrongly "succeeds"; with the `sawSubagentWork` gate (fixed), a plain turn never infers, so the idle watchdog must abort. Asserting `result.error` is set therefore fails on old code and passes only on the fix.
+
 - [ ] **Step 1: Write the failing test — a plain recon turn must NOT infer completion from a readiness cue**
 
-Add to `tests/investigation.test.mjs`. With a plain (no-subagent) recon turn that emits a `final_answer` readiness cue but the fixture is told to delay `turn/completed`, the loop must wait for the real `turn/completed` rather than inferring early. We assert the recon turn still converges correctly (verdict preserved) and that inference did not short-circuit it. Uses a new `delayCompletedMs` entry flag (Step 6 of Task 4 adds serialization; the delay flag is added here in Step 3).
+Add to `tests/investigation.test.mjs`. A plain (no-subagent) recon turn emits a `final_answer` readiness cue and then nothing else — never a real `turn/completed`. Because no subagent work occurred, inference is ineligible, so the loop waits for a `turn/completed` that never comes and the idle watchdog aborts. Uses a new `cueThenHang` entry flag (added in Step 3) and a short idle timeout to keep the test fast. The quiet window is set BELOW the idle timeout so that, on the unfixed code, cue-based inference would fire first and the run would (wrongly) not error — making the assertion discriminate.
 
 ```js
-test("plain recon turn waits for turn/completed and does not infer on a readiness cue (Defect A)", async () => {
+test("plain recon turn does not infer completion from a readiness cue (Defect A gate)", async () => {
   const cwd = makeTempDir("codex-inv-test-");
   const fake = setupFakeCodex({ cwd });
   try {
-    // Recon turn 1: a final-answer "ready" cue, but turn/completed is delayed.
-    // No subagent work => inference must be INELIGIBLE; the loop waits for the
-    // real turn/completed. Converges (0 commands + agent message) once complete.
+    // Recon turn 1: emits a "ready for finalize" final_answer cue, then goes
+    // silent — NO real turn/completed, NO subagent work. A plain turn must wait
+    // for turn/completed (which never arrives) -> idle watchdog aborts.
     fake.queueTurnResponse({
       commands: [],
       finalAnswer: { text: "I'm ready for finalize." },
-      delayCompletedMs: 120
+      cueThenHang: true
     });
-    // Finalize turn 2: structured JSON.
-    fake.queueTurnResponse({ finalAnswer: { text: STRUCTURED_REVIEW } });
 
     const result = await runAppServerInvestigation(fake.cwd, {
       investigatePrompt: "Investigate.",
       finalizePrompt: "Finalize.",
       outputSchema: { type: "object", required: ["verdict"] },
-      // Tiny quiet window proves that EVEN IF inference were eligible it could
-      // not have fired before turn/completed; the point is it must be ineligible
-      // for a plain turn regardless.
-      inferredCompletionQuietMs: 20
+      // Quiet window well below the idle timeout: on UNFIXED code, cue-based
+      // inference (now using this window) would fire at 60ms and the run would
+      // not error. On FIXED code, a plain turn never infers, so only the idle
+      // watchdog (400ms) ends it -> result.error is set.
+      inferredCompletionQuietMs: 60,
+      turnIdleTimeoutMs: 400
     });
 
+    assert.ok(result.error, "a plain turn with no real turn/completed must time out, not infer");
+    assert.match(result.error.message, /idle|timeout|timed out/i);
+    // Finalize must NOT have been dispatched (the recon turn never completed).
     const starts = fake.requests.filter((r) => r.method === "turn/start");
-    assert.equal(starts.length, 2, "1 recon + 1 finalize");
-    assert.equal(result.finalMessage, STRUCTURED_REVIEW);
-    assert.equal(result.error ?? null, null);
+    assert.equal(starts.length, 1, "finalize must not be dispatched when recon never completed");
   } finally {
     fake.close();
   }
@@ -455,12 +481,25 @@ test("plain recon turn waits for turn/completed and does not infer on a readines
 
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `node --test tests/investigation.test.mjs 2>&1 | grep -A3 "does not infer on a readiness cue"`
-Expected: FAIL — `inferredCompletionQuietMs` is not yet threaded (ignored), and `delayCompletedMs` is unknown to the fixture. (Before the fix, the readiness cue + 250ms inference may also advance early, but the proximate failure is the unknown options/flag.)
+Run: `node --test tests/investigation.test.mjs 2>&1 | grep -A3 "Defect A gate"`
+Expected: FAIL — `cueThenHang` is unknown to the fixture and `inferredCompletionQuietMs` is not yet threaded. Once the fixture flag lands but BEFORE the gate fix, it fails differently: the unfixed `scheduleInferredCompletion` (gated only on `finalAnswerSeen`) infers at the quiet window and the run succeeds with no error — so `assert.ok(result.error)` fails. That is the discriminating failure that the Step 4-7 gate fix resolves.
 
-- [ ] **Step 3: Add `delayCompletedMs` support to the queue-driven fixture**
+- [ ] **Step 3: Add `cueThenHang` (and `delayCompletedMs`, used by Task 4) support to the queue-driven fixture**
 
-In `tests/fake-codex-fixture.mjs`, inside the `queue-driven` branch, replace the final `turn/completed` send (~442):
+In `tests/fake-codex-fixture.mjs`, inside the `queue-driven` branch: (a) after the `finalAnswer` send (~431-432), add a branch that suppresses the turn's completion entirely; (b) replace the final `turn/completed` send (~442) so a delayed-completion variant is available for Task 4.
+
+(a) After the `if (entry && entry.finalAnswer) { ... }` block (~429-432), add:
+
+```js
+          if (entry && entry.cueThenHang) {
+            // Emit only the readiness cue (already sent above); never send a real
+            // turn/completed. Exercises the Defect A gate: a plain turn must not
+            // infer completion from the cue.
+            break;
+          }
+```
+
+(b) Replace the final `turn/completed` send (~442):
 
 ```js
           send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
@@ -761,8 +800,8 @@ And change the `captureTurn` options (~1113) to:
 
 - [ ] **Step 9: Run the new test to verify it passes**
 
-Run: `node --test tests/investigation.test.mjs 2>&1 | grep -A3 "does not infer on a readiness cue"`
-Expected: PASS.
+Run: `node --test tests/investigation.test.mjs 2>&1 | grep -A3 "Defect A gate"`
+Expected: PASS — `result.error` is set (idle timeout), 1 turn/start, finalize not dispatched.
 
 - [ ] **Step 10: Run the full suite — watch the subagent task test specifically**
 
@@ -780,15 +819,17 @@ git commit --no-verify -m "fix(codex): demote inferred completion to a subagent-
 
 ## Task 4: Defect A part 2 — end-to-end repro via per-thread serialization
 
-This proves the headline bug: with the app-server serializing turns per thread, a premature finalize dispatch queues behind a still-open recon turn and the run hangs to the watchdog. Old behavior: timeout error. Fixed behavior (Task 3): recon waits for real `turn/completed`, finalize lands on an idle thread, verdict survives.
+This proves the headline bug end-to-end: with the app-server serializing turns per thread, a premature finalize dispatch arrives while the recon turn is still open, the app-server never opens a turn for it (RPC never returns), and the run hangs to the watchdog. Old behavior: `result.error` (idle timeout). Fixed behavior (Task 3): recon waits for its real `turn/completed`, finalize lands on an idle thread, verdict survives.
+
+> **REVIEW FIX (finding #2):** The original draft modeled serialization as *queue-and-drain* — defer the busy-thread `turn/start` and run it when the prior turn completes. That does NOT match production: the evidence shows the app-server **never opened a turn** for the queued finalize ("no run_turn span, RPC never returned"), even after recon ended. With queue-and-drain, old code *also* succeeds (finalize just runs later), so `assert(result.error == null)` passes on buggy code too — non-discriminating. The corrected model below makes a `turn/start` that arrives **while its thread is busy HANG** (no response, no notifications), matching the evidence. The original draft also used `delayCompletedMs: 150` < old code's 250ms inference window, so recon completed *before* inference could misfire and the race never triggered; the corrected timing uses `delayCompletedMs: 600` (> 250) so the unfixed inference fires first and dispatches finalize into the busy thread. This also lets us drop the entire `pendingStarts` / `markThreadBusy` / `runQueuedTurn` machinery — the synchronous handler body stays intact; we only add a module-scoped busy-thread guard.
 
 **Files:**
-- Modify: `tests/fake-codex-fixture.mjs` — teach `queue-driven` to serialize turns per thread (opt-in)
+- Modify: `tests/fake-codex-fixture.mjs` — add an opt-in module-scoped "busy thread hangs new turn/start" guard + `lateFinalAnswer`
 - Modify: `tests/investigation.test.mjs` (new test)
 
 - [ ] **Step 1: Write the failing test — readiness cue, then a delayed real verdict + completion, under serialization**
 
-Add to `tests/investigation.test.mjs`:
+Add to `tests/investigation.test.mjs`. The recon turn emits a readiness cue immediately, then streams the real verdict and its real `turn/completed` only at ~600ms. Old code (250ms cue-based inference) dispatches the finalize `turn/start` at ~250ms — while recon is still busy — so finalize hangs and the run errors at the watchdog. Fixed code (plain turns never infer) waits for recon's 600ms `turn/completed`, then dispatches finalize onto the now-idle thread, which succeeds.
 
 ```js
 test("a verdict streamed after a readiness cue is captured, not discarded (Defect A end-to-end)", async () => {
@@ -796,14 +837,15 @@ test("a verdict streamed after a readiness cue is captured, not discarded (Defec
   const fake = setupFakeCodex({ cwd });
   try {
     fake.enableSerialization();
-    // Recon turn 1: emits a "ready for finalize" cue immediately, but the REAL
-    // verdict message and turn/completed arrive ~150ms later. Under
-    // serialization the finalize turn/start cannot open until this completes.
+    // Recon turn 1: a "ready for finalize" cue immediately, then the REAL verdict
+    // (~300ms) and the REAL turn/completed (~600ms). delayCompletedMs (600) is
+    // ABOVE the unfixed 250ms inference window, so unfixed code dispatches
+    // finalize while recon is still busy -> finalize hangs -> watchdog error.
     fake.queueTurnResponse({
       commands: [],
       finalAnswer: { text: "I'm ready for finalize." },
-      lateFinalAnswer: { text: "Investigation complete. Verdict ready.", afterMs: 150 },
-      delayCompletedMs: 150
+      lateFinalAnswer: { text: "Investigation complete. Verdict ready.", afterMs: 300 },
+      delayCompletedMs: 600
     });
     // Finalize turn 2: schema-enforced structured JSON.
     fake.queueTurnResponse({ finalAnswer: { text: STRUCTURED_REVIEW } });
@@ -812,14 +854,15 @@ test("a verdict streamed after a readiness cue is captured, not discarded (Defec
       investigatePrompt: "Investigate.",
       finalizePrompt: "Finalize.",
       outputSchema: { type: "object", required: ["verdict"] },
-      turnIdleTimeoutMs: 2000,
-      inferredCompletionQuietMs: 50
+      turnIdleTimeoutMs: 2000
+      // No inferredCompletionQuietMs override: a plain recon turn must never
+      // infer regardless of the window. The fix is the sawSubagentWork gate.
     });
 
-    const starts = fake.requests.filter((r) => r.method === "turn/start");
-    assert.equal(starts.length, 2, "recon must complete before finalize is dispatched");
-    assert.equal(result.error ?? null, null, "must NOT hang to the watchdog");
+    assert.equal(result.error ?? null, null, "fixed code must NOT hang to the watchdog");
     assert.equal(result.finalMessage, STRUCTURED_REVIEW, "verdict from finalize is preserved");
+    const starts = fake.requests.filter((r) => r.method === "turn/start");
+    assert.equal(starts.length, 2, "recon completes, then finalize is dispatched onto an idle thread");
   } finally {
     fake.close();
   }
@@ -829,74 +872,56 @@ test("a verdict streamed after a readiness cue is captured, not discarded (Defec
 - [ ] **Step 2: Run it to verify it fails**
 
 Run: `node --test tests/investigation.test.mjs 2>&1 | grep -A4 "end-to-end"`
-Expected: FAIL — `enableSerialization`/`lateFinalAnswer` are unknown. (After Step 3-4 wire them, with Task 3 already applied the test passes; to see it fail for the RIGHT reason, you can temporarily revert Task 3's gate — optional.)
+Expected: FAIL — `enableSerialization`/`lateFinalAnswer` are unknown. To confirm it discriminates: after Step 3-4 wire the fixture, temporarily revert Task 3's `sawSubagentWork` gate (restore the old `scheduleInferredCompletion`) and re-run — it must FAIL with `result.error` set (finalize hung on the busy thread). Restore the fix and it passes. (This revert check is the proof the test catches the bug; it is optional but recommended.)
 
-- [ ] **Step 3: Add serialization + `lateFinalAnswer` to the fixture**
+- [ ] **Step 3: Add the busy-thread hang guard + `lateFinalAnswer` to the fixture**
 
 In `tests/fake-codex-fixture.mjs`:
 
-(a) In the fixture template source, add a per-thread busy map and a pending-start queue near the top of the generated script (next to `const interruptibleTurns = new Map();` ~17):
+(a) In the fixture template source, add a module-scoped busy-thread variable next to `const interruptibleTurns = new Map();` (~17):
 
 ```js
 	const interruptibleTurns = new Map();
-	const threadBusy = new Map();
-	const pendingStarts = [];
+	let serializedBusyThread = null;
 ```
 
-(b) Add a helper (in the template, near `emitTurnCompleted` ~147) that runs a queued `turn/start` only when its thread is free, and drains the queue when a turn completes:
-
-```js
-function threadIsBusy(threadId) {
-  return threadBusy.get(threadId) === true;
-}
-
-function markThreadBusy(threadId, busy) {
-  threadBusy.set(threadId, busy);
-  if (!busy) {
-    const next = pendingStarts.findIndex((p) => !threadIsBusy(p.threadId));
-    if (next >= 0) {
-      const job = pendingStarts.splice(next, 1)[0];
-      job.run();
-    }
-  }
-}
-```
-
-(c) In the `queue-driven` `turn/start` handler, when serialization is enabled (a flag persisted in state, see Step 4), wrap the body so that if the thread is busy the job is deferred. The existing code records the request at ~397 (`state.requests.push(...)`) but only persists state later via `nextTurnId`. In the serialize branch we defer before that save, so **persist the recorded request first** or the `fake.requests` assertions lose it. At the top of the `if (BEHAVIOR === "queue-driven") {` block (~395), after the existing `state.requests.push({ method: "turn/start", params: message.params });`, add:
+(b) In the `queue-driven` `turn/start` handler, right after the existing request push (`state.requests.push({ method: "turn/start", params: message.params });` ~397), add the busy guard. When serialization is on and the thread already has an in-flight (delayed) turn, model the app-server NOT opening a turn — record the request but send nothing and never respond:
 
 ```js
           if (state.serialize) {
-            saveState(state);   // persist the just-recorded request before deferring
-            const job = {
-              threadId: thread.id,
-              run: () => runQueuedTurn(message, thread)
-            };
-            if (threadIsBusy(thread.id)) {
-              pendingStarts.push(job);
-            } else {
-              job.run();
+            if (serializedBusyThread === thread.id) {
+              // A turn is already open on this thread. The real app-server queues
+              // this turn/start and (in the bug) never opens it: no result, no
+              // turn/started, no turn/completed. Persist the recorded request,
+              // then hang.
+              saveState(state);
+              break;
             }
-            break;
+            serializedBusyThread = thread.id;
           }
 ```
 
-(Note: `runQueuedTurn` reloads state, so it does NOT re-push the request — the push happened here once. Ensure the extracted `runQueuedTurn` body does not also push to `state.requests`; that line stays in the enqueue path only.)
+The thread is freed wherever the real `turn/completed` is sent (see (c)). A synchronous (non-delayed) turn sets and clears `serializedBusyThread` within the same handler tick, so it never blocks a later turn — only a `delayCompletedMs` turn holds the thread busy across event-loop ticks, which is exactly the recon turn in this test.
 
-Then extract the existing synchronous body (from `const turnId = nextTurnId(state);` at ~399 through the final `turn/completed`/`break` at ~442-443) into a function `runQueuedTurn(message, thread)` defined in the template.
-
-**Correctness — reload state inside the job.** A deferred job runs later (via the `markThreadBusy(..., false)` drain), so it must NOT close over the `state` snapshot from enqueue time. Make `runQueuedTurn` reload fresh state at entry and persist as it goes:
+(c) Free the thread when the turn completes. In the `delayCompletedMs` branch added in Task 3 Step 3(b), clear the flag inside the `setTimeout` immediately before sending `turn/completed`; in the immediate branch, clear it immediately before the synchronous `turn/completed`. Update that block to:
 
 ```js
-function runQueuedTurn(message, thread) {
-  const state = loadState();
-  const turnId = nextTurnId(state);   // re-reads/saves state internally
-  // ... (the rest of the previously-synchronous body, using this fresh `state`) ...
-}
+          if (entry && entry.delayCompletedMs) {
+            const completedTurnId = turnId;
+            setTimeout(() => {
+              if (state.serialize) { serializedBusyThread = null; }
+              send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(completedTurnId, "completed") } });
+            }, entry.delayCompletedMs);
+          } else {
+            if (state.serialize) { serializedBusyThread = null; }
+            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+          }
+          break;
 ```
 
-The `threadBusy` map and `pendingStarts` array are module-scoped in the subprocess (in-memory, not persisted) — correct, since a single app-server subprocess handles the whole investigation. Inside `runQueuedTurn`: call `markThreadBusy(thread.id, true)` right after `send({ method: "turn/started", ... })`, and call `markThreadBusy(thread.id, false)` immediately before each path that sends the real `turn/completed` (both the delayed and immediate branches from Task 3 Step 3). For the `delayCompletedMs` branch, call `markThreadBusy(thread.id, false)` inside the `setTimeout` right before sending `turn/completed`. The `entry` shifted off `state.queue` must be read from the freshly-loaded `state` inside `runQueuedTurn`, not captured earlier.
+Note: the `cueThenHang` branch from Task 3 Step 3(a) breaks WITHOUT clearing `serializedBusyThread`. That is fine — `cueThenHang` is only used by the Task 3 gate test, which does not call `enableSerialization()`, so `serializedBusyThread` stays null there.
 
-(d) Add `lateFinalAnswer` emission inside `runQueuedTurn`, right after the `finalAnswer` send (~431):
+(d) Add `lateFinalAnswer` emission in the `queue-driven` handler, right after the `finalAnswer` send block (~429-432):
 
 ```js
           if (entry && entry.lateFinalAnswer) {
@@ -919,12 +944,12 @@ In `setupFakeCodex` (~683), add `serialize: false` to `initialState`, and add a 
     },
 ```
 
-In the fixture template's `loadState()` default (~21) and anywhere state is rehydrated, ensure `serialize` is read from disk (it already round-trips through `JSON.parse(readFileSync)` since the whole object is persisted). Confirm the template reads `state.serialize` (set in the handler in Step 3c) — it does, because `state` is `loadState()` per message.
+`state.serialize` round-trips through `loadState()` (the whole object is JSON-persisted), so the per-message handler reads it correctly. The module-scoped `serializedBusyThread` is in-memory in the single app-server subprocess — correct, since one subprocess handles the whole investigation.
 
 - [ ] **Step 5: Run the test to verify it passes**
 
 Run: `node --test tests/investigation.test.mjs 2>&1 | grep -A4 "end-to-end"`
-Expected: PASS — 2 turn/start requests, no error, `finalMessage === STRUCTURED_REVIEW`.
+Expected: PASS — no error, `finalMessage === STRUCTURED_REVIEW`, 2 turn/start requests.
 
 - [ ] **Step 6: Sanity — existing queue-driven tests still pass (serialization is opt-in)**
 
@@ -935,7 +960,7 @@ Expected: the existing queue-driven tests (which never call `enableSerialization
 
 ```bash
 git add tests/fake-codex-fixture.mjs tests/investigation.test.mjs
-git commit --no-verify -m "test(codex): reproduce the finalize-queue hang end-to-end via per-thread serialization (Defect A)"
+git commit --no-verify -m "test(codex): reproduce the finalize-queue hang end-to-end via busy-thread serialization (Defect A)"
 ```
 
 ---
@@ -1046,5 +1071,6 @@ git commit --no-verify -m "docs(codex): sync TurnCaptureState typedef with new c
 
 - **Spec coverage:** Defect A → Tasks 3+4; Defect B → Task 2; Defect C → Task 1; injectable/env-overridable quiet window → Task 3 (constant+resolver) and Task 5 (override regression); "no net-new failures vs 7 baseline" → Tasks 0 and 6.
 - **Order rationale:** C and B touch the watchdog/handler with minimal logic; doing them first means Task 3's larger inference rewrite lands on an already-corrected handler. A's end-to-end repro (Task 4) depends on the gate from Task 3.
-- **Type consistency:** the new fields are `pendingTurnId`, `sawSubagentWork`, `inferredCompletionQuietMs`; the new functions are `resolveInferredCompletionQuietMs`, `inferenceEligible`, `maybeRearmInferredCompletion`. Use these exact names across tasks.
-- **Watch-out:** in Task 3 Step 10, the default 15s window can slow the subprocess subagent test until Task 5 injects the env override. If the suite's per-test timeout is shorter than 15s, apply Task 5 Steps 1-2 early.
+- **Type consistency:** the new fields are `pendingTurnId`, `sawSubagentWork`, `inferredCompletionQuietMs`; the new functions are `resolveInferredCompletionQuietMs`, `inferenceEligible`, `maybeRearmInferredCompletion`; the new env var is `CODEX_INFERRED_COMPLETION_QUIET_MS`; new fixture entry flags are `hangAfterStarted`, `cueThenHang`, `delayCompletedMs`, `lateFinalAnswer`, plus the `serialize` toggle / `enableSerialization()` handle method and `queueTurnHangAfterStarted()`. Use these exact names across tasks.
+- **Watch-out:** in Task 3's full-suite step, the default 15s window can slow the subprocess subagent test (`...even if the parent turn/completed event is missing`) until Task 5 injects the env override. If the suite's per-test timeout is shorter than 15s, apply Task 5 Steps 1-2 early.
+- **Review fixes applied (post-adversarial-review):** finding #1 — Defect C test moved from the watchdog-less `review`/`review-start` path to the investigation/`turn/start` path with `turnIdleTimeoutMs` armed (Task 1). Findings #2/#3 — the two Defect A tests re-timed so they fail on unfixed code: Task 3's gate test withholds the real `turn/completed` entirely; Task 4 models a busy-thread `turn/start` as a HANG (not queue-and-drain) with `delayCompletedMs: 600` > the old 250ms inference. Findings #4/#5 — rationale + naming/`finalAnswerSeen` notes added to the spec.
