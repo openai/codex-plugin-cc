@@ -312,6 +312,13 @@ codex-alice
 codex-bob
 ```
 
+> **Note:** the aliases are pure convenience for you in interactive shells —
+> switching accounts by typing `codex-alice` instead of
+> `CODEX_HOME=$HOME/.codex-alice codex`. The only **mandatory** step is logging
+> each account in once, into its own home (`codex-alice login`). The plugin
+> never uses your aliases: it reads the `CODEX_HOME` environment variable
+> directly, as described below.
+
 #### How the plugin handles it
 
 The plugin honors the same variable: invoking the companion with a different
