@@ -69,7 +69,7 @@ async function withIsolatedState(fn) {
   }
 }
 
-function startSession(cwd, { codexHome, recordFile, busy } = {}) {
+function startSession(cwd, { codexHome, recordFile, busy, busyAfterStatus } = {}) {
   const env = { ...process.env };
   delete env.CODEX_HOME;
   delete env.FAKE_BROKER_BUSY;
@@ -81,6 +81,9 @@ function startSession(cwd, { codexHome, recordFile, busy } = {}) {
   }
   if (busy) {
     env.FAKE_BROKER_BUSY = "1";
+  }
+  if (busyAfterStatus) {
+    env.FAKE_BROKER_BUSY_AFTER_STATUS = "1";
   }
   // Generous readiness timeout: under parallel test-runner load a node child
   // can take several seconds to start; 5s flaked on busy machines.
@@ -162,6 +165,30 @@ test("account switch never kills a busy broker — falls back to null and keeps 
       // Same-account callers keep reusing it as before.
       const sameAccount = await startSession(cwd, { codexHome: homeA });
       assert.equal(sameAccount?.pid, first.pid);
+    } finally {
+      stopBroker(first);
+      for (const dir of [homeA, homeB]) {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+});
+
+test("a turn starting between the idle probe and the shutdown makes the broker refuse (ifIdle)", async () => {
+  await withIsolatedState(async (cwd) => {
+    const homeA = makeTempDir("codex-home-a-");
+    const homeB = makeTempDir("codex-home-b-");
+    let first;
+    try {
+      // Broker reports idle to the status probe, then becomes busy before the
+      // shutdown lands — the exact probe->shutdown race.
+      first = await startSession(cwd, { codexHome: homeA, busyAfterStatus: true });
+      assert.ok(first);
+
+      const second = await startSession(cwd, { codexHome: homeB });
+      assert.equal(second, null, "refused ifIdle shutdown must fall back to null");
+      assert.equal(isPidAlive(first.pid), true, "broker with the late-starting turn must survive");
+      assert.equal(loadBrokerSession(cwd)?.codexHome, homeA);
     } finally {
       stopBroker(first);
       for (const dir of [homeA, homeB]) {

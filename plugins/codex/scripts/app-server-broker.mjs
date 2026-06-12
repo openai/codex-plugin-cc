@@ -158,7 +158,15 @@ async function main() {
         }
 
         if (message.id !== undefined && message.method === "broker/shutdown") {
-          send(socket, { id: message.id, result: {} });
+          // `ifIdle` makes the shutdown atomic with the busy check (single
+          // event loop): a turn that started after a caller's idle probe makes
+          // the broker refuse, instead of dropping that in-flight work.
+          const busyNow = Boolean(activeRequestSocket || activeStreamSocket);
+          if (message.params?.ifIdle && busyNow) {
+            send(socket, { id: message.id, result: { shutdown: false, busy: true } });
+            continue;
+          }
+          send(socket, { id: message.id, result: { shutdown: true } });
           await shutdown(server);
           process.exit(0);
         }

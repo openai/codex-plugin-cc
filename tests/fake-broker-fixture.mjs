@@ -25,18 +25,28 @@ if (process.env.FAKE_BROKER_RECORD) {
 }
 
 const busy = process.env.FAKE_BROKER_BUSY === "1";
+// Simulates the probe->shutdown race: report idle on broker/status, then act
+// busy by the time the (ifIdle) shutdown arrives.
+const busyAfterStatus = process.env.FAKE_BROKER_BUSY_AFTER_STATUS === "1";
+let statusProbed = false;
 
 const server = net.createServer((socket) => {
   socket.setEncoding("utf8");
   socket.on("data", (chunk) => {
     if (chunk.includes("broker/shutdown")) {
-      socket.write(`${JSON.stringify({ id: 1, result: {} })}\n`);
+      const busyNow = busy || (busyAfterStatus && statusProbed);
+      if (busyNow && chunk.includes("ifIdle")) {
+        socket.write(`${JSON.stringify({ id: 1, result: { shutdown: false, busy: true } })}\n`);
+        return;
+      }
+      socket.write(`${JSON.stringify({ id: 1, result: { shutdown: true } })}\n`);
       socket.end();
       server.close(() => process.exit(0));
       return;
     }
     if (chunk.includes("broker/status")) {
       socket.write(`${JSON.stringify({ id: 1, result: { busy } })}\n`);
+      statusProbed = true;
     }
   });
 });
