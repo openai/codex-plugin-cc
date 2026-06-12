@@ -111,12 +111,23 @@ async function isBrokerEndpointReady(endpoint) {
 }
 
 export async function ensureBrokerSession(cwd, options = {}) {
+  // Account-aware reuse: the broker (and the `codex app-server` it manages)
+  // inherits CODEX_HOME once, at spawn time, so a live broker started under one
+  // account would otherwise silently serve every later call in this workspace —
+  // ignoring the caller's CODEX_HOME and breaking multi-account fallback.
+  // When the caller's CODEX_HOME differs from the one the session was created
+  // with, shut the old broker down gracefully and start a fresh one.
+  const desiredCodexHome = (options.env ?? process.env).CODEX_HOME ?? "";
   const existing = loadBrokerSession(cwd);
-  if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
+  const existingReady = existing ? await isBrokerEndpointReady(existing.endpoint) : false;
+  if (existing && existingReady && (existing.codexHome ?? "") === desiredCodexHome) {
     return existing;
   }
 
   if (existing) {
+    if (existingReady && (existing.codexHome ?? "") !== desiredCodexHome) {
+      await sendBrokerShutdown(existing.endpoint);
+    }
     teardownBrokerSession({
       endpoint: existing.endpoint ?? null,
       pidFile: existing.pidFile ?? null,
@@ -164,7 +175,8 @@ export async function ensureBrokerSession(cwd, options = {}) {
     pidFile,
     logFile,
     sessionDir,
-    pid: child.pid ?? null
+    pid: child.pid ?? null,
+    codexHome: desiredCodexHome
   };
   saveBrokerSession(cwd, session);
   return session;
