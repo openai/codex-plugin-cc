@@ -24,6 +24,8 @@ if (process.env.FAKE_BROKER_RECORD) {
   fs.writeFileSync(process.env.FAKE_BROKER_RECORD, process.env.CODEX_HOME ?? "");
 }
 
+const busy = process.env.FAKE_BROKER_BUSY === "1";
+
 const server = net.createServer((socket) => {
   socket.setEncoding("utf8");
   socket.on("data", (chunk) => {
@@ -31,6 +33,10 @@ const server = net.createServer((socket) => {
       socket.write(`${JSON.stringify({ id: 1, result: {} })}\n`);
       socket.end();
       server.close(() => process.exit(0));
+      return;
+    }
+    if (chunk.includes("broker/status")) {
+      socket.write(`${JSON.stringify({ id: 1, result: { busy } })}\n`);
     }
   });
 });

@@ -163,6 +163,16 @@ async function main() {
           process.exit(0);
         }
 
+        // Answered before the busy gate so callers can probe safely while a
+        // turn is in flight (used by account-aware broker rotation).
+        if (message.id !== undefined && message.method === "broker/status") {
+          send(socket, {
+            id: message.id,
+            result: { busy: Boolean(activeRequestSocket || activeStreamSocket) }
+          });
+          continue;
+        }
+
         if (message.id === undefined) {
           continue;
         }

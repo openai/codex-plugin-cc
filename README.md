@@ -279,15 +279,9 @@ useful when one account hits its 5h/weekly usage window and another has idle
 capacity (for example, a Business workspace where some seats belong to
 teammates who don't use Codex day-to-day).
 
-Log each account in once, into its own home:
+#### Setup
 
-```bash
-codex login                                  # default account -> ~/.codex
-CODEX_HOME="$HOME/.codex-alice" codex login  # second account  -> ~/.codex-alice
-CODEX_HOME="$HOME/.codex-bob" codex login    # third account   -> ~/.codex-bob
-```
-
-For interactive shells, aliases keep this ergonomic:
+Add one alias per account to your shell profile:
 
 ```bash
 # ~/.zshrc / ~/.bashrc
@@ -296,9 +290,37 @@ alias codex-alice='CODEX_HOME=$HOME/.codex-alice codex'
 alias codex-bob='CODEX_HOME=$HOME/.codex-bob codex'
 ```
 
+Then:
+
+```bash
+source ~/.zshrc
+```
+
+Log each account in once, into its own home:
+
+```bash
+codex-main login    # default account -> ~/.codex
+codex-alice login   # second account  -> ~/.codex-alice
+codex-bob login     # third account   -> ~/.codex-bob
+```
+
+From then on, each alias is a fully independent Codex:
+
+```bash
+codex-main
+codex-alice
+codex-bob
+```
+
+#### How the plugin handles it
+
 The plugin honors the same variable: invoking the companion with a different
-`CODEX_HOME` runs that turn on that account, restarting the per-workspace
-broker when the account changes (same account keeps reusing the warm broker).
+`CODEX_HOME` runs that turn on that account. The per-workspace broker is
+account-aware — it restarts when the account changes **and the broker is idle**;
+if it is mid-task for the previous account, the new call runs on a directly
+spawned app server instead (in-flight work is never interrupted) and the
+rotation happens on the next idle call. Same-account calls keep reusing the
+warm broker.
 
 Two gotchas worth knowing:
 

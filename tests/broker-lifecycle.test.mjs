@@ -69,14 +69,18 @@ async function withIsolatedState(fn) {
   }
 }
 
-function startSession(cwd, { codexHome, recordFile } = {}) {
+function startSession(cwd, { codexHome, recordFile, busy } = {}) {
   const env = { ...process.env };
   delete env.CODEX_HOME;
+  delete env.FAKE_BROKER_BUSY;
   if (codexHome !== undefined) {
     env.CODEX_HOME = codexHome;
   }
   if (recordFile) {
     env.FAKE_BROKER_RECORD = recordFile;
+  }
+  if (busy) {
+    env.FAKE_BROKER_BUSY = "1";
   }
   return ensureBrokerSession(cwd, { scriptPath: FAKE_BROKER, env, timeoutMs: 5000 });
 }
@@ -129,6 +133,36 @@ test("switching CODEX_HOME shuts down the old broker and spawns one with the new
       stopBroker(first);
       stopBroker(second);
       for (const dir of [homeA, homeB, path.dirname(recordB)]) {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+});
+
+test("account switch never kills a busy broker — falls back to null and keeps it serving", async () => {
+  await withIsolatedState(async (cwd) => {
+    const homeA = makeTempDir("codex-home-a-");
+    const homeB = makeTempDir("codex-home-b-");
+    let first;
+    try {
+      // Broker for account A that reports itself busy (mid-turn).
+      first = await startSession(cwd, { codexHome: homeA, busy: true });
+      assert.ok(first);
+
+      // A caller with account B must NOT shut it down: null means "run direct".
+      const second = await startSession(cwd, { codexHome: homeB });
+      assert.equal(second, null, "busy broker must not be rotated");
+
+      // The busy broker is untouched and still owned by account A.
+      assert.equal(isPidAlive(first.pid), true, "busy broker must stay alive");
+      assert.equal(loadBrokerSession(cwd)?.codexHome, homeA);
+
+      // Same-account callers keep reusing it as before.
+      const sameAccount = await startSession(cwd, { codexHome: homeA });
+      assert.equal(sameAccount?.pid, first.pid);
+    } finally {
+      stopBroker(first);
+      for (const dir of [homeA, homeB]) {
         fs.rmSync(dir, { recursive: true, force: true });
       }
     }

@@ -40,6 +40,59 @@ export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
   return false;
 }
 
+// Keep in sync with BROKER_BUSY_RPC_CODE in lib/app-server.mjs (importing it
+// here would create a circular dependency: app-server.mjs imports this module).
+const BROKER_BUSY_RPC_CODE = -32001;
+
+/**
+ * Probe whether the broker is currently serving a request or streaming turn.
+ * Uses the `broker/status` RPC (answered before the busy gate). Brokers from
+ * older plugin versions don't implement it: when busy their gate rejects the
+ * probe with BROKER_BUSY_RPC_CODE (busy), and when idle they forward it to the
+ * app server which rejects the unknown method (idle) — both interpretable.
+ * Timeouts are treated as busy so an unresponsive broker is never killed
+ * mid-turn by account rotation.
+ */
+export async function isBrokerBusy(endpoint, timeoutMs = 1500) {
+  return await new Promise((resolve) => {
+    const socket = connectToEndpoint(endpoint);
+    let buffer = "";
+    let settled = false;
+    const finish = (busy) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        socket.destroy();
+        resolve(busy);
+      }
+    };
+    const timer = setTimeout(() => finish(true), timeoutMs);
+    socket.setEncoding("utf8");
+    socket.on("connect", () => {
+      socket.write(`${JSON.stringify({ id: 1, method: "broker/status", params: {} })}\n`);
+    });
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      const newlineIndex = buffer.indexOf("\n");
+      if (newlineIndex === -1) {
+        return;
+      }
+      try {
+        const message = JSON.parse(buffer.slice(0, newlineIndex));
+        if (message.error) {
+          finish(message.error.code === BROKER_BUSY_RPC_CODE);
+          return;
+        }
+        finish(Boolean(message.result?.busy));
+      } catch {
+        finish(true);
+      }
+    });
+    socket.on("error", () => finish(true));
+    socket.on("close", () => finish(true));
+  });
+}
+
 export async function sendBrokerShutdown(endpoint) {
   await new Promise((resolve) => {
     const socket = connectToEndpoint(endpoint);
@@ -126,6 +179,13 @@ export async function ensureBrokerSession(cwd, options = {}) {
 
   if (existing) {
     if (existingReady && (existing.codexHome ?? "") !== desiredCodexHome) {
+      if (await isBrokerBusy(existing.endpoint)) {
+        // The old account's broker is mid-turn. Never kill in-flight work:
+        // return null so this call falls back to a directly spawned app
+        // server with the caller's env (SpawnedCodexAppServerClient), and the
+        // account rotation happens on the next call that finds the broker idle.
+        return null;
+      }
       await sendBrokerShutdown(existing.endpoint);
     }
     teardownBrokerSession({
