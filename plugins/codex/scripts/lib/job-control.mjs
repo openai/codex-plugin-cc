@@ -58,6 +58,19 @@ function isProgressBlockTitle(line) {
   );
 }
 
+// True for a raw log line that is a streamable progress message — i.e. a
+// timestamped line that is not a block title. Block bodies (the assistant
+// message, the final output, reasoning, etc.) are unprefixed continuation
+// lines and return false, so callers tailing the log for live progress do not
+// echo the full result (which is rendered separately on stdout).
+export function isStreamableProgressLine(line) {
+  if (typeof line !== "string" || !line.startsWith("[")) {
+    return false;
+  }
+  const stripped = stripLogPrefix(line);
+  return Boolean(stripped) && !isProgressBlockTitle(stripped);
+}
+
 export function readJobProgressPreview(logFile, maxLines = DEFAULT_MAX_PROGRESS_LINES) {
   if (!logFile || !fs.existsSync(logFile)) {
     return [];

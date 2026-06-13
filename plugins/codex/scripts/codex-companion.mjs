@@ -35,6 +35,7 @@ import {
 import {
   buildSingleJobSnapshot,
   buildStatusSnapshot,
+  isStreamableProgressLine,
   readStoredJob,
   resolveCancelableJob,
   resolveResultJob,
@@ -718,8 +719,26 @@ function streamJobLogTail(logFile, fromOffset) {
     const length = stat.size - fromOffset;
     const buffer = Buffer.alloc(length);
     fs.readSync(fd, buffer, 0, length, fromOffset);
-    process.stderr.write(buffer.toString("utf8"));
-    return stat.size;
+    const chunk = buffer.toString("utf8");
+    // Only consume complete lines; leave any partial trailing line for the next
+    // poll so a line is never split or filtered on incomplete content.
+    const lastNewline = chunk.lastIndexOf("\n");
+    if (lastNewline === -1) {
+      return fromOffset;
+    }
+    const consumed = chunk.slice(0, lastNewline + 1);
+    // Echo only progress lines — never the persisted block bodies (assistant
+    // message, Final output, reasoning), which are rendered on stdout instead.
+    // Streaming them here would duplicate Codex's answer onto stderr (#372).
+    const progress = consumed
+      .split("\n")
+      .filter((line) => isStreamableProgressLine(line))
+      .map((line) => `${line}\n`)
+      .join("");
+    if (progress) {
+      process.stderr.write(progress);
+    }
+    return fromOffset + Buffer.byteLength(consumed, "utf8");
   } catch {
     return fromOffset;
   } finally {
