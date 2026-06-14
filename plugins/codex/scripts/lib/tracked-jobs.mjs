@@ -151,6 +151,52 @@ export async function runTrackedJob(job, runner, options = {}) {
   writeJobFile(job.workspaceRoot, job.id, runningRecord);
   upsertJob(job.workspaceRoot, runningRecord);
 
+  // Crash safety: if this worker dies before recording a terminal state — SIGTERM/SIGINT/
+  // SIGHUP, an uncaught error, or a plain process exit while still "running" — flush a
+  // terminal `failed:interrupted` record so status/result never see a permanent "running"
+  // ghost. (SIGKILL/OOM cannot be trapped here; those are caught by the pid-liveness
+  // reconcile in job-control.mjs. Defense in depth.)
+  let settled = false;
+  const finalizeInterrupted = () => {
+    if (settled) {
+      return;
+    }
+    const existing = readStoredJobOrNull(job.workspaceRoot, job.id);
+    if (!existing || (existing.status !== "running" && existing.status !== "queued")) {
+      return;
+    }
+    settled = true;
+    const patch = {
+      status: "failed",
+      phase: "failed:interrupted",
+      pid: null,
+      completedAt: nowIso(),
+      errorMessage: "Worker process terminated before completion."
+    };
+    try {
+      writeJobFile(job.workspaceRoot, job.id, { ...existing, ...patch });
+      upsertJob(job.workspaceRoot, { id: job.id, ...patch });
+    } catch {
+      // best-effort
+    }
+  };
+  const onSignal = (signal) => {
+    finalizeInterrupted();
+    process.exit(signal === "SIGINT" ? 130 : 143);
+  };
+  const trappedSignals = ["SIGTERM", "SIGINT", "SIGHUP"];
+  process.on("exit", finalizeInterrupted);
+  for (const signal of trappedSignals) {
+    process.on(signal, onSignal);
+  }
+  const disarm = () => {
+    settled = true;
+    process.removeListener("exit", finalizeInterrupted);
+    for (const signal of trappedSignals) {
+      process.removeListener(signal, onSignal);
+    }
+  };
+
   try {
     const execution = await runner();
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
@@ -200,5 +246,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       completedAt
     });
     throw error;
+  } finally {
+    disarm();
   }
 }

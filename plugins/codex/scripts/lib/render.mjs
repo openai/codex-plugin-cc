@@ -1,3 +1,23 @@
+import fs from "node:fs";
+
+// When a job has no captured result payload (e.g. it died before producing one and was
+// reconciled to failed:orphaned), surface the tail of its log so the user still gets the
+// real work / partial output instead of an empty "No result" message.
+function readLogTail(logFile, maxLines = 40) {
+  if (!logFile || !fs.existsSync(logFile)) {
+    return null;
+  }
+  try {
+    const lines = fs
+      .readFileSync(logFile, "utf8")
+      .split(/\r?\n/)
+      .filter((line) => line.length > 0);
+    return lines.length ? lines.slice(-maxLines).join("\n") : null;
+  } catch {
+    return null;
+  }
+}
+
 function severityRank(severity) {
   switch (severity) {
     case "critical":
@@ -440,6 +460,11 @@ export function renderStoredJobResult(job, storedJob) {
     lines.push("", storedJob.errorMessage);
   } else {
     lines.push("", "No captured result payload was stored for this job.");
+  }
+
+  const logTail = readLogTail(job.logFile ?? storedJob?.logFile);
+  if (logTail) {
+    lines.push("", "--- last log lines (no result payload was captured) ---", logTail);
   }
 
   return `${lines.join("\n").trimEnd()}\n`;

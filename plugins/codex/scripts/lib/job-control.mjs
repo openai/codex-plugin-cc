@@ -1,8 +1,8 @@
 import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
-import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
+import { getConfig, listJobs, readJobFile, resolveJobFile, upsertJob, writeJobFile } from "./state.mjs";
+import { nowIso, SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
@@ -210,10 +210,65 @@ function matchJobReference(jobs, reference, predicate = () => true) {
   throw new Error(`No job found for "${reference}". Run /codex:status to list known jobs.`);
 }
 
+const ACTIVE_STATUSES = new Set(["queued", "running"]);
+
+// Liveness probe: signal 0 is delivered to a live pid, throws ESRCH for a dead one.
+// EPERM means the process exists but we may not signal it — still alive.
+function isPidAlive(pid) {
+  if (!Number.isFinite(pid)) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+// A job whose worker pid is dead while its stored status is still active is an ORPHAN:
+// the worker died (crash, SIGKILL, OOM, broker drop, parent teardown) without recording
+// a terminal state, so status/result would report `running` forever. Reconcile it to a
+// durable `failed:orphaned` record. Idempotent — once reconciled, status is no longer
+// active, so later reads skip it. This is what makes status/result honest about liveness.
+function reconcileJob(workspaceRoot, job) {
+  if (!job || !ACTIVE_STATUSES.has(job.status) || !Number.isFinite(job.pid)) {
+    return job;
+  }
+  if (job.pid === process.pid || isPidAlive(job.pid)) {
+    return job;
+  }
+  const patch = {
+    id: job.id,
+    status: "failed",
+    phase: "failed:orphaned",
+    pid: null,
+    completedAt: nowIso(),
+    errorMessage:
+      "Worker process exited without recording completion (orphaned — reconciled by a status/result check)."
+  };
+  try {
+    upsertJob(workspaceRoot, patch);
+    const jobFile = resolveJobFile(workspaceRoot, job.id);
+    if (fs.existsSync(jobFile)) {
+      writeJobFile(workspaceRoot, job.id, { ...readJobFile(jobFile), ...patch });
+    }
+  } catch {
+    // Best-effort persistence; still return the reconciled view so the caller stays honest.
+  }
+  return { ...job, ...patch };
+}
+
+// Reconciling read: the single source of truth for "what is actually alive". Every
+// job-reading resolver routes through this so a dead worker can never masquerade as running.
+function listJobsReconciled(workspaceRoot) {
+  return listJobs(workspaceRoot).map((job) => reconcileJob(workspaceRoot, job));
+}
+
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
-  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), options));
+  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobsReconciled(workspaceRoot), options));
   const maxJobs = options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS;
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
 
@@ -241,7 +296,7 @@ export function buildStatusSnapshot(cwd, options = {}) {
 
 export function buildSingleJobSnapshot(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  const jobs = sortJobsNewestFirst(listJobsReconciled(workspaceRoot));
   const selected = matchJobReference(jobs, reference);
   if (!selected) {
     throw new Error(`No job found for "${reference}". Run /codex:status to inspect known jobs.`);
@@ -255,7 +310,9 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
 
 export function resolveResultJob(cwd, reference) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot)));
+  const jobs = sortJobsNewestFirst(
+    reference ? listJobsReconciled(workspaceRoot) : filterJobsForCurrentSession(listJobsReconciled(workspaceRoot))
+  );
   const selected = matchJobReference(
     jobs,
     reference,
@@ -280,7 +337,7 @@ export function resolveResultJob(cwd, reference) {
 
 export function resolveCancelableJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  const jobs = sortJobsNewestFirst(listJobsReconciled(workspaceRoot));
   const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
 
   if (reference) {
