@@ -1,6 +1,6 @@
 # Codex plugin for Claude Code
 
-Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex.
+Use Codex from inside Claude Code as a second model family — to critique a design before you build it, adversarially review completed work, or delegate a task to Codex.
 
 This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
 they already have.
@@ -9,9 +9,11 @@ they already have.
 
 ## What You Get
 
-- `/codex:review` for a normal read-only Codex review
-- `/codex:adversarial-review` for a steerable challenge review
-- `/codex:rescue`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work and manage background jobs
+Codex is a **second model family** you reach for in two situations, plus a workhorse for delegation:
+
+- `/codex:critique` — hand it a **design, before you build it**. Codex reads the code *and* queries the live database, then attacks the design where the data doesn't back it up.
+- `/codex:adversarial-review` — an adversarial review of **completed work**. The one review command: it challenges the approach, not just the diff.
+- `/codex:rescue`, `/codex:status`, `/codex:result`, and `/codex:cancel` — delegate a task to Codex and manage background jobs.
 
 ## Requirements
 
@@ -62,41 +64,32 @@ If Codex is installed but not logged in yet, run:
 After install, you should see:
 
 - the slash commands listed below
-- the `codex:codex-rescue` subagent in `/agents`
+- the `codex:codex-rescue` and `codex:codex-critique` subagents in `/agents`
 
 One simple first run is:
 
 ```bash
-/codex:review --background
+/codex:adversarial-review --background
 /codex:status
 /codex:result
 ```
 
 ## Usage
 
-### `/codex:review`
+### `/codex:critique`
 
-Runs a normal Codex review on your current work. It gives you the same quality of code review as running `/review` inside Codex directly.
+Hands Codex a **design — before you build it** — for an independent, second-family critique. Codex has full read access to the repository *and*, where a database or MCP tool is available, the live data. It verifies each load-bearing claim in the design against the code (`file:line`) and the data (the actual query and its result), and leads with where the design does *not* hold up.
 
-> [!NOTE]
-> Code review especially for multi-file changes might take a while. It's generally recommended to run it in the background.
+Reach for this when Claude has produced or endorsed a design and you want a different model to attack it before it gets built — not to review a finished diff (that's [`/codex:adversarial-review`](#codexadversarial-review)) and not to run a task (that's [`/codex:rescue`](#codexrescue)).
 
-Use it when you want:
-
-- a review of your current uncommitted changes
-- a review of your branch compared to a base branch like `main`
-
-Use `--base <ref>` for branch review. It also supports `--wait` and `--background`. It is not steerable and does not take custom focus text. Use [`/codex:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
-
-Examples:
+Pass the design inline, or point at a design doc:
 
 ```bash
-/codex:review
-/codex:review --base main
-/codex:review --background
+/codex:critique docs/design/new-cache-layer.md
+/codex:critique --focus "the n is tiny — does the data even support this split?" we plan to ...
 ```
 
-This command is read-only and will not perform any changes. When run in the background you can use [`/codex:status`](#codexstatus) to check on the progress and [`/codex:cancel`](#codexcancel) to cancel the ongoing task.
+It is read-only and runs in the background by default — it reads the whole repo and queries the database, so it usually runs long. Use [`/codex:status`](#codexstatus) and [`/codex:result`](#codexresult) to follow it.
 
 ### `/codex:adversarial-review`
 
@@ -104,8 +97,8 @@ Runs a **steerable** review that questions the chosen implementation and design.
 
 It can be used to pressure-test assumptions, tradeoffs, failure modes, and whether a different approach would have been safer or simpler.
 
-It uses the same review target selection as `/codex:review`, including `--base <ref>` for branch review.
-It also supports `--wait` and `--background`. Unlike `/codex:review`, it can take extra focus text after the flags.
+It reviews your current uncommitted changes by default, or your branch against a base with `--base <ref>`.
+It also supports `--wait` and `--background`, and takes extra focus text after the flags to steer what it scrutinizes.
 
 Use it when you want:
 
@@ -223,10 +216,16 @@ When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted
 
 ## Typical Flows
 
+### Critique A Design Before Building
+
+```bash
+/codex:critique docs/design/new-cache-layer.md
+```
+
 ### Review Before Shipping
 
 ```bash
-/codex:review
+/codex:adversarial-review
 ```
 
 ### Hand A Problem To Codex
