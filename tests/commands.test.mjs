@@ -72,7 +72,12 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
 
 test("continue is not exposed as a user-facing command", () => {
   const commandFiles = fs.readdirSync(path.join(PLUGIN_ROOT, "commands")).sort();
-  assert.deepEqual(commandFiles, [
+  // The real invariant: `continue` is folded into `rescue`, never its own command.
+  assert.equal(commandFiles.includes("continue.md"), false);
+  // The upstream command set must all still be present. This fork may ADD commands
+  // (e.g. critique.md) on top — that must not break this guard, and the guard must
+  // not have to be re-edited on every upstream sync.
+  for (const expected of [
     "adversarial-review.md",
     "cancel.md",
     "rescue.md",
@@ -80,7 +85,9 @@ test("continue is not exposed as a user-facing command", () => {
     "review.md",
     "setup.md",
     "status.md"
-  ]);
+  ]) {
+    assert.equal(commandFiles.includes(expected), true, `missing command: ${expected}`);
+  }
 });
 
 test("rescue command absorbs continue semantics", () => {
