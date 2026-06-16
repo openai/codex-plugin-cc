@@ -584,21 +584,6 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
 
-  // If the app-server connection dies after startRequest() resolves, nothing
-  // else rejects state.completion (it is resolved only by completeTurn). Wire
-  // the previously-dead rejectCompletion to the client exit so a process death
-  // mid-turn surfaces immediately instead of hanging until the deadline.
-  let exitRaceSettled = false;
-  client.exitPromise.then(() => {
-    if (exitRaceSettled || state.completed) {
-      return;
-    }
-    exitRaceSettled = true;
-    state.rejectCompletion(
-      client.exitError ?? new Error("codex app-server exited before the turn completed.")
-    );
-  });
-
   client.setNotificationHandler((message) => {
     if (!state.turnId) {
       state.bufferedNotifications.push(message);
@@ -643,14 +628,27 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     }
 
     // Bound the await so it can never outlast a dead process or a runaway turn:
-    //   1. state.completion — resolves on turn/completed (or inferred), and now
-    //      REJECTS on a mid-turn process death via the rejectCompletion handler
-    //      wired to client.exitPromise above (previously dead code).
-    //   2. deadline         — hard per-turn budget (resolveTurnTimeoutMs:
-    //      option > CODEX_TURN_TIMEOUT_MS env > default, resolved at call time).
-    // No separate exitPromise branch is raced here: routing the exit through
-    // rejectCompletion keeps a single rejection source and avoids a dangling
-    // rejected promise after the turn has already settled.
+    //   1. state.completion — resolves on turn/completed (or inferred). Wire the
+    //      previously-dead rejectCompletion to the client exit so an app-server
+    //      death AFTER startRequest resolved rejects the await immediately
+    //      instead of hanging until the deadline. Registered HERE rather than
+    //      before startRequest: if startRequest itself rejects (e.g. broker-busy
+    //      from turn/start, or the app-server exiting while that request is
+    //      pending), it propagates directly and state.completion is never
+    //      observed — wiring the exit earlier would reject an unobserved promise
+    //      and surface as an unhandled rejection.
+    //   2. deadline — hard per-turn budget (resolveTurnTimeoutMs: option >
+    //      CODEX_TURN_TIMEOUT_MS env > default, resolved at call time).
+    let exitRaceSettled = false;
+    client.exitPromise.then(() => {
+      if (exitRaceSettled || state.completed) {
+        return;
+      }
+      exitRaceSettled = true;
+      state.rejectCompletion(
+        client.exitError ?? new Error("codex app-server exited before the turn completed.")
+      );
+    });
     const turnTimeoutMs = resolveTurnTimeoutMs(options);
     let deadlineTimer = null;
     const deadline = new Promise((_resolve, reject) => {

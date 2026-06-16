@@ -719,9 +719,25 @@ function enqueueBackgroundTask(cwd, job, request) {
   };
 }
 
+// Set the per-turn budget for a FOREGROUND command (codex.mjs reads
+// CODEX_TURN_TIMEOUT_MS at call time). Precedence: explicit --turn-timeout-ms
+// flag > a pre-set CODEX_TURN_TIMEOUT_MS env (e.g. settings.json) > the
+// foreground default just under the host Bash ceiling, so a stalled turn
+// returns a structured timeout instead of being SIGKILLed with no output.
+// Only call this on a foreground path: a detached background worker inherits
+// the parent env, so capping it here would shrink the background budget too.
+function applyForegroundTurnBudget(options) {
+  const explicit = Number(options["turn-timeout-ms"]);
+  if (Number.isFinite(explicit) && explicit > 0) {
+    process.env.CODEX_TURN_TIMEOUT_MS = String(explicit);
+  } else if (!process.env.CODEX_TURN_TIMEOUT_MS) {
+    process.env.CODEX_TURN_TIMEOUT_MS = String(FOREGROUND_TURN_TIMEOUT_MS);
+  }
+}
+
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+    valueOptions: ["base", "scope", "model", "cwd", "turn-timeout-ms"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
       m: "model"
@@ -746,6 +762,12 @@ async function handleReviewCommand(argv, config) {
     jobClass: "review",
     summary: metadata.summary
   });
+  // Review turns run foreground (--wait) through the same path as tasks; give
+  // them the same foreground budget so a stall returns a structured timeout
+  // instead of hitting the host Bash ceiling with an empty result.
+  if (!options.background) {
+    applyForegroundTurnBudget(options);
+  }
   await runForegroundCommand(
     job,
     (progress) =>
@@ -814,18 +836,10 @@ async function handleTask(argv) {
     return;
   }
 
-  // Foreground turn budget. codex.mjs reads CODEX_TURN_TIMEOUT_MS. Precedence:
-  // explicit --turn-timeout-ms flag, then a pre-set CODEX_TURN_TIMEOUT_MS env
-  // (e.g. from settings.json), else the foreground default just under the Bash
-  // ceiling so a stall returns a structured timeout instead of a SIGKILL.
-  // This runs only on the foreground path; the background branch returned above
-  // and its detached worker inherits the parent env unchanged (full budget).
-  const explicitTurnTimeout = Number(options["turn-timeout-ms"]);
-  if (Number.isFinite(explicitTurnTimeout) && explicitTurnTimeout > 0) {
-    process.env.CODEX_TURN_TIMEOUT_MS = String(explicitTurnTimeout);
-  } else if (!process.env.CODEX_TURN_TIMEOUT_MS) {
-    process.env.CODEX_TURN_TIMEOUT_MS = String(FOREGROUND_TURN_TIMEOUT_MS);
-  }
+  // Foreground turn budget (see applyForegroundTurnBudget). Runs only on the
+  // foreground path; the background branch returned above and its detached
+  // worker inherits the parent env unchanged (full default budget).
+  applyForegroundTurnBudget(options);
 
   const job = buildTaskJob(workspaceRoot, taskMetadata, write);
   await runForegroundCommand(
