@@ -66,6 +66,16 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
+// Full per-turn budget for background/detached jobs (no external Bash ceiling
+// to collide with). codex.mjs reads CODEX_TURN_TIMEOUT_MS; this is the value we
+// thread down for background runs when the user hasn't overridden it.
+const DEFAULT_TURN_TIMEOUT_MS = 600000;
+// Foreground runs are invoked by Claude Code's Bash tool, which SIGKILLs node
+// at its own timeout (default 120000ms) and returns nothing. Set the runtime
+// turn budget just below that so the foreground turn fails fast with a
+// structured "turn timed out — re-run with --background" message that carries
+// any partial output, instead of being killed with an empty result.
+const FOREGROUND_TURN_TIMEOUT_MS = 110000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
@@ -679,9 +689,25 @@ function enqueueBackgroundTask(cwd, job, request) {
   };
 }
 
+// Set the per-turn budget for a FOREGROUND command (codex.mjs reads
+// CODEX_TURN_TIMEOUT_MS at call time). Precedence: explicit --turn-timeout-ms
+// flag > a pre-set CODEX_TURN_TIMEOUT_MS env (e.g. settings.json) > the
+// foreground default just under the host Bash ceiling, so a stalled turn
+// returns a structured timeout instead of being SIGKILLed with no output.
+// Only call this on a foreground path: a detached background worker inherits
+// the parent env, so capping it here would shrink the background budget too.
+function applyForegroundTurnBudget(options) {
+  const explicit = Number(options["turn-timeout-ms"]);
+  if (Number.isFinite(explicit) && explicit > 0) {
+    process.env.CODEX_TURN_TIMEOUT_MS = String(explicit);
+  } else if (!process.env.CODEX_TURN_TIMEOUT_MS) {
+    process.env.CODEX_TURN_TIMEOUT_MS = String(FOREGROUND_TURN_TIMEOUT_MS);
+  }
+}
+
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+    valueOptions: ["base", "scope", "model", "cwd", "turn-timeout-ms"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
       m: "model"
@@ -706,6 +732,12 @@ async function handleReviewCommand(argv, config) {
     jobClass: "review",
     summary: metadata.summary
   });
+  // Review turns run foreground (--wait) through the same path as tasks; give
+  // them the same foreground budget so a stall returns a structured timeout
+  // instead of hitting the host Bash ceiling with an empty result.
+  if (!options.background) {
+    applyForegroundTurnBudget(options);
+  }
   await runForegroundCommand(
     job,
     (progress) =>
@@ -731,7 +763,7 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "turn-timeout-ms"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
     aliasMap: {
       m: "model"
@@ -773,6 +805,11 @@ async function handleTask(argv) {
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
   }
+
+  // Foreground turn budget (see applyForegroundTurnBudget). Runs only on the
+  // foreground path; the background branch returned above and its detached
+  // worker inherits the parent env unchanged (full default budget).
+  applyForegroundTurnBudget(options);
 
   const job = buildTaskJob(workspaceRoot, taskMetadata, write);
   await runForegroundCommand(
