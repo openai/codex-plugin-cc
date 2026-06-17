@@ -51,6 +51,10 @@ export function parseArgs(argv, config = {}) {
       }
 
       positionals.push(token);
+      if (stopParsingOptionsAfterFirstPositional) {
+        positionals.push(...argv.slice(index + 1));
+        break;
+      }
       continue;
     }
 
@@ -73,6 +77,10 @@ export function parseArgs(argv, config = {}) {
     }
 
     positionals.push(token);
+    if (stopParsingOptionsAfterFirstPositional) {
+      positionals.push(...argv.slice(index + 1));
+      break;
+    }
   }
 
   return { options, positionals };
