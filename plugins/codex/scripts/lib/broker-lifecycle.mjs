@@ -21,6 +21,36 @@ export function resolveSessionId(options = {}) {
   return env[SESSION_ID_ENV] ?? null;
 }
 
+function brokerSessionOwners(session) {
+  const owners = [];
+  if (Array.isArray(session?.sessionIds)) {
+    owners.push(...session.sessionIds);
+  }
+  if (session?.sessionId) {
+    owners.push(session.sessionId);
+  }
+  return [...new Set(owners.filter(Boolean))];
+}
+
+export function hasBrokerSessionOwners(session) {
+  return brokerSessionOwners(session).length > 0;
+}
+
+function withBrokerSessionOwner(session, sessionId) {
+  if (!sessionId) {
+    return session;
+  }
+  const owners = brokerSessionOwners(session);
+  if (!owners.includes(sessionId)) {
+    owners.push(sessionId);
+  }
+  return {
+    ...session,
+    sessionId: owners[0] ?? sessionId,
+    sessionIds: owners
+  };
+}
+
 export function createBrokerSessionDir(prefix = "cxc-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
@@ -122,7 +152,11 @@ async function isBrokerEndpointReady(endpoint) {
 export async function ensureBrokerSession(cwd, options = {}) {
   const existing = loadBrokerSession(cwd);
   if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
-    return existing;
+    const withOwner = withBrokerSessionOwner(existing, resolveSessionId(options));
+    if (withOwner !== existing) {
+      saveBrokerSession(cwd, withOwner);
+    }
+    return withOwner;
   }
 
   if (existing) {
@@ -176,8 +210,9 @@ export async function ensureBrokerSession(cwd, options = {}) {
     pid: child.pid ?? null,
     sessionId: resolveSessionId(options)
   };
-  saveBrokerSession(cwd, session);
-  return session;
+  const withOwner = withBrokerSessionOwner(session, session.sessionId);
+  saveBrokerSession(cwd, withOwner);
+  return withOwner;
 }
 
 export async function teardownBrokersForSession(sessionId, { killProcess = null } = {}) {
@@ -202,7 +237,17 @@ export async function teardownBrokersForSession(sessionId, { killProcess = null 
     } catch {
       continue;
     }
-    if (!session || session.sessionId !== sessionId) {
+    const owners = brokerSessionOwners(session);
+    if (!owners.includes(sessionId)) {
+      continue;
+    }
+    const remainingOwners = owners.filter((owner) => owner !== sessionId);
+    if (remainingOwners.length > 0) {
+      fs.writeFileSync(
+        stateFile,
+        `${JSON.stringify({ ...session, sessionId: remainingOwners[0], sessionIds: remainingOwners }, null, 2)}\n`,
+        "utf8"
+      );
       continue;
     }
 

@@ -1,12 +1,20 @@
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
+import { createBrokerEndpoint, parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 import { resolveStateRoot } from "../plugins/codex/scripts/lib/state.mjs";
-import { resolveSessionId, teardownBrokersForSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import {
+  ensureBrokerSession,
+  loadBrokerSession,
+  resolveSessionId,
+  saveBrokerSession,
+  teardownBrokersForSession
+} from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { handleSessionEnd } from "../plugins/codex/scripts/session-lifecycle-hook.mjs";
 
 const stateRootForTest = resolveStateRoot;
@@ -77,6 +85,35 @@ function withPluginData(fn) {
   });
 }
 
+async function withReadyBroker(fn) {
+  const sessionDir = makeTempDir();
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const target = parseBrokerEndpoint(endpoint);
+  const requests = [];
+  const server = net.createServer((socket) => {
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      requests.push(chunk);
+      socket.write(`${JSON.stringify({ id: 1, result: {} })}\n`);
+      socket.end();
+    });
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(target.path, () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+
+  try {
+    return await fn({ endpoint, requests, sessionDir });
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
 test("teardownBrokersForSession tears down a broker registered for a different cwd", async () => {
   await withPluginData(async () => {
     const stateRoot = stateRootForTest();
@@ -128,6 +165,69 @@ test("teardownBrokersForSession is a no-op for empty sessionId", async () => {
   await withPluginData(async () => {
     const count = await teardownBrokersForSession("", { killProcess: () => {} });
     assert.equal(count, 0);
+  });
+});
+
+test("reusing a ready broker transfers cleanup ownership to the later session", async () => {
+  await withPluginData(async () => {
+    await withReadyBroker(async ({ endpoint, requests, sessionDir }) => {
+      const cwd = makeTempDir();
+      const pidFile = path.join(sessionDir, "broker.pid");
+      const logFile = path.join(sessionDir, "broker.log");
+      fs.writeFileSync(pidFile, "12345\n");
+      fs.writeFileSync(logFile, "");
+      saveBrokerSession(cwd, {
+        endpoint,
+        pidFile,
+        logFile,
+        sessionDir,
+        pid: 12345,
+        sessionId: "A"
+      });
+
+      const reused = await ensureBrokerSession(cwd, { env: { CODEX_COMPANION_SESSION_ID: "B" } });
+      assert.equal(reused.endpoint, endpoint);
+      assert.deepEqual(loadBrokerSession(cwd).sessionIds, ["A", "B"]);
+
+      const killed = [];
+      assert.equal(await teardownBrokersForSession("A", { killProcess: (pid) => killed.push(pid) }), 0);
+      assert.deepEqual(killed, []);
+      assert.equal(loadBrokerSession(cwd).sessionId, "B");
+      assert.deepEqual(loadBrokerSession(cwd).sessionIds, ["B"]);
+      assert.equal(requests.length, 0);
+
+      assert.equal(await teardownBrokersForSession("B", { killProcess: (pid) => killed.push(pid) }), 1);
+      assert.deepEqual(killed, [12345]);
+      assert.equal(loadBrokerSession(cwd), null);
+      assert.equal(requests.length, 1);
+    });
+  });
+});
+
+test("handleSessionEnd removes only the ending owner from a shared cwd broker", async () => {
+  await withPluginData(async () => {
+    await withReadyBroker(async ({ endpoint, requests, sessionDir }) => {
+      const cwd = makeTempDir();
+      const pidFile = path.join(sessionDir, "broker.pid");
+      const logFile = path.join(sessionDir, "broker.log");
+      fs.writeFileSync(pidFile, "12345\n");
+      fs.writeFileSync(logFile, "");
+      saveBrokerSession(cwd, {
+        endpoint,
+        pidFile,
+        logFile,
+        sessionDir,
+        pid: 12345,
+        sessionId: "A",
+        sessionIds: ["A", "B"]
+      });
+
+      await handleSessionEnd({ cwd, session_id: "A" });
+
+      assert.equal(loadBrokerSession(cwd).sessionId, "B");
+      assert.deepEqual(loadBrokerSession(cwd).sessionIds, ["B"]);
+      assert.equal(requests.length, 0);
+    });
   });
 });
 

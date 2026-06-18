@@ -9,6 +9,7 @@ import { terminateProcessTree } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
   clearBrokerSession,
+  hasBrokerSessionOwners,
   LOG_FILE_ENV,
   loadBrokerSession,
   PID_FILE_ENV,
@@ -83,6 +84,12 @@ function handleSessionStart(input) {
 
 export async function handleSessionEnd(input) {
   const cwd = input.cwd || process.cwd();
+  const sessionId = input.session_id || process.env[SESSION_ID_ENV];
+  cleanupSessionJobs(cwd, sessionId);
+  if (sessionId) {
+    await teardownBrokersForSession(sessionId, { killProcess: terminateProcessTree });
+  }
+
   const brokerSession =
     loadBrokerSession(cwd) ??
     (process.env[BROKER_ENDPOINT_ENV]
@@ -92,6 +99,9 @@ export async function handleSessionEnd(input) {
           logFile: process.env[LOG_FILE_ENV] ?? null
         }
       : null);
+  if (sessionId && hasBrokerSessionOwners(brokerSession)) {
+    return;
+  }
   const brokerEndpoint = brokerSession?.endpoint ?? null;
   const pidFile = brokerSession?.pidFile ?? null;
   const logFile = brokerSession?.logFile ?? null;
@@ -102,7 +112,6 @@ export async function handleSessionEnd(input) {
     await sendBrokerShutdown(brokerEndpoint);
   }
 
-  cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
   teardownBrokerSession({
     endpoint: brokerEndpoint,
     pidFile,
@@ -112,11 +121,6 @@ export async function handleSessionEnd(input) {
     killProcess: terminateProcessTree
   });
   clearBrokerSession(cwd);
-
-  const sessionId = input.session_id || process.env[SESSION_ID_ENV];
-  if (sessionId) {
-    await teardownBrokersForSession(sessionId, { killProcess: terminateProcessTree });
-  }
 }
 
 async function main() {
