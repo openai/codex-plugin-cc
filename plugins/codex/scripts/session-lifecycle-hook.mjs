@@ -35,7 +35,28 @@ function appendEnvVar(name, value) {
   if (!process.env.CLAUDE_ENV_FILE || value == null || value === "") {
     return;
   }
-  fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `export ${name}=${shellEscape(value)}\n`, "utf8");
+  const line = `export ${name}=${shellEscape(value)}`;
+  // Claude Code re-runs SessionStart on every resume/compact and reuses CLAUDE_ENV_FILE, so a
+  // blind append accumulates duplicate `export` lines across restarts (#322). After enough
+  // restarts every Bash-tool command is prefixed with N copies of these exports, which spams logs
+  // and — on long Windows sessions — corrupts the inlined command so the Bash tool returns no
+  // output. Stay append-only (the hooks run in parallel and the docs require append so sibling
+  // SessionStart hooks don't clobber each other's CLAUDE_ENV_FILE writes), but skip only when the
+  // current value is already the effective (last) export for this name. If a different value is
+  // last (e.g. another session wrote after us), re-append so the current value wins; the same value
+  // re-firing is a no-op, so it cannot accumulate.
+  try {
+    if (fs.existsSync(process.env.CLAUDE_ENV_FILE)) {
+      const priorExports = fs
+        .readFileSync(process.env.CLAUDE_ENV_FILE, "utf8")
+        .split("\n")
+        .filter((existingLine) => existingLine.startsWith(`export ${name}=`));
+      if (priorExports.length > 0 && priorExports[priorExports.length - 1] === line) {
+        return;
+      }
+    }
+  } catch {}
+  fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `${line}\n`, "utf8");
 }
 
 function cleanupSessionJobs(cwd, sessionId) {
