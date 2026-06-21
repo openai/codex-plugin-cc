@@ -59,22 +59,22 @@ export const DEFAULT_TURN_IDLE_TIMEOUT_MS = 900000;
 /**
  * Resolve the inter-event idle window (ms) after which a silent turn is salvaged.
  * This is an inter-event gap, NOT a total-duration ceiling: it resets on every
- * notification that belongs to the turn. Blank / non-finite / negative values fall
- * back to the default; an explicit value (including 0, which disables the watchdog)
- * is preserved. Avoid `Number(value) || DEFAULT` here - it would turn 0 into the default.
+ * notification that belongs to the turn. The whole trimmed value must be a decimal
+ * integer of milliseconds; anything else (blank, negative, decimal, or unit-suffixed
+ * like "15m" / "0ms") falls back to the default rather than parseInt's lenient numeric
+ * prefix. An explicit 0 is preserved and disables the watchdog. Avoid `Number(value) ||
+ * DEFAULT` here - it would turn 0 into the default.
  * @param {NodeJS.ProcessEnv} [env]
  * @returns {number}
  */
 export function resolveTurnIdleMs(env = process.env) {
   const raw = env?.[TURN_IDLE_TIMEOUT_ENV];
-  if (raw === undefined || raw === null || String(raw).trim() === "") {
+  const trimmed = raw == null ? "" : String(raw).trim();
+  if (!/^\d+$/.test(trimmed)) {
     return DEFAULT_TURN_IDLE_TIMEOUT_MS;
   }
-  const parsed = Number.parseInt(String(raw).trim(), 10);
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    return DEFAULT_TURN_IDLE_TIMEOUT_MS;
-  }
-  return parsed;
+  const parsed = Number.parseInt(trimmed, 10);
+  return Number.isFinite(parsed) ? parsed : DEFAULT_TURN_IDLE_TIMEOUT_MS;
 }
 
 function cleanCodexStderr(stderr) {

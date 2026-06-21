@@ -2273,6 +2273,12 @@ test("resolveTurnIdleMs parses the idle window strictly with 0 meaning disabled"
   // 0 is an explicit, valid opt-out and must survive (not collapse to the default).
   assert.equal(resolveTurnIdleMs({ [ENV]: "0" }), 0);
   assert.equal(resolveTurnIdleMs({ [ENV]: "1500" }), 1500);
+  // Unit-suffixed or decimal values must NOT parse to their numeric prefix - otherwise "15m"
+  // would become a 15ms watchdog and "0ms" would silently disable it; they fall back to default.
+  assert.equal(resolveTurnIdleMs({ [ENV]: "15m" }), DEFAULT_TURN_IDLE_TIMEOUT_MS);
+  assert.equal(resolveTurnIdleMs({ [ENV]: "0ms" }), DEFAULT_TURN_IDLE_TIMEOUT_MS);
+  assert.equal(resolveTurnIdleMs({ [ENV]: "900000ms" }), DEFAULT_TURN_IDLE_TIMEOUT_MS);
+  assert.equal(resolveTurnIdleMs({ [ENV]: "1.5" }), DEFAULT_TURN_IDLE_TIMEOUT_MS);
 });
 
 test("task salvages a stalled turn when Codex goes idle without terminal events", () => {
