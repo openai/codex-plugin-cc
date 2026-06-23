@@ -340,6 +340,35 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
   const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
   if (activeTask) {
+    // Check if the process is actually alive before blocking
+    if (activeTask.pid) {
+      try {
+        process.kill(activeTask.pid, 0);
+      } catch (err) {
+        // Process is dead but job status wasn't updated — mark it as failed and clean up
+        if (err.code === "ESRCH" || err.code === "EPERM") {
+          await upsertJob(workspaceRoot, {
+            id: activeTask.id,
+            status: "failed",
+            phase: "failed",
+            pid: null,
+            completedAt: new Date().toISOString(),
+            errorMessage: "Process exited unexpectedly while job status was 'running'."
+          });
+          // Re-fetch jobs after the update
+          const updatedJobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
+          const newActiveTask = updatedJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
+          if (!newActiveTask) {
+            // Zombie job was cleaned up, proceed normally
+          } else {
+            throw new Error(`Task ${newActiveTask.id} is still running. Use /codex:status before continuing it.`);
+          }
+        } else {
+          throw new Error(`Task ${activeTask.id} is still running. Use /codex:status before continuing it.`);
+        }
+        return null;
+      }
+    }
     throw new Error(`Task ${activeTask.id} is still running. Use /codex:status before continuing it.`);
   }
 
@@ -488,7 +517,7 @@ async function executeTaskRun(request) {
     defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
     model: request.model,
     effort: request.effort,
-    sandbox: request.write ? "workspace-write" : "read-only",
+    sandbox: request.fullAccess ? "danger-full-access" : (request.write ? "workspace-write" : "read-only"),
     onProgress: request.onProgress,
     persistThread: true,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
@@ -762,7 +791,7 @@ async function handleReview(argv) {
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    booleanOptions: ["json", "write", "full-access", "resume-last", "resume", "fresh", "background"],
     aliasMap: {
       m: "model"
     }

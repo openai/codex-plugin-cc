@@ -1,12 +1,62 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile, loadState, saveState } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
 export function nowIso() {
   return new Date().toISOString();
+}
+
+/**
+ * Check if a process with the given PID is still alive.
+ * Uses signal 0 (existence check) to avoid side effects.
+ * @param {number} pid
+ * @returns {boolean}
+ */
+export function isProcessAlive(pid) {
+  if (!Number.isFinite(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    // Signal 0 checks if process exists without sending any signal
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    // ESRCH = no such process   — process does not exist
+    // EPERM = permission denied  — process exists but we can't signal it
+    return e.code === "EPERM";
+  }
+}
+
+/**
+ * Sweep all jobs in state and mark zombie (dead PID) jobs as failed.
+ * This prevents zombie "running" jobs from blocking new task submissions.
+ * @param {string} cwd - workspace root
+ * @returns {Promise<number>} - number of jobs marked as failed
+ */
+export async function sweepZombieJobs(cwd) {
+  const state = loadState(cwd);
+  let zombiesFixed = 0;
+  const now = nowIso();
+
+  for (const job of state.jobs) {
+    if (job.status === "running" && job.pid) {
+      if (!isProcessAlive(job.pid)) {
+        console.warn(`[tracked-jobs] Zombie job detected: ${job.id} (PID ${job.pid}). Marking as failed.`);
+        job.status = "failed";
+        job.endedAt = now;
+        job.error = "Process died unexpectedly — marked failed by zombie sweep";
+        zombiesFixed++;
+      }
+    }
+  }
+
+  if (zombiesFixed > 0) {
+    saveState(cwd, state);
+  }
+  return zombiesFixed;
 }
 
 function normalizeProgressEvent(value) {
@@ -140,6 +190,11 @@ function readStoredJobOrNull(workspaceRoot, jobId) {
 }
 
 export async function runTrackedJob(job, runner, options = {}) {
+  // FIX #216: Clean up zombie jobs before starting a new one.
+  // If a previous job's worker process died without updating state,
+  // its record stays stuck in "running" — blocking new tasks.
+  await sweepZombieJobs(job.workspaceRoot);
+
   const runningRecord = {
     ...job,
     status: "running",
