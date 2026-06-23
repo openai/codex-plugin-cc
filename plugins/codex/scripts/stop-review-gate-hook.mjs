@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 
 import { getCodexAvailability } from "./lib/codex.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
-import { getConfig, listJobs } from "./lib/state.mjs";
+import { getConfig, setConfig, listJobs } from "./lib/state.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
 import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
@@ -17,6 +17,7 @@ const STOP_REVIEW_TIMEOUT_MS = 15 * 60 * 1000;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
+const GATE_ROUNDS_CONFIG_KEY = "stopReviewGateRoundsBySession";
 
 function readHookInput() {
   const raw = fs.readFileSync(0, "utf8").trim();
@@ -35,6 +36,40 @@ function logNote(message) {
     return;
   }
   process.stderr.write(`${message}\n`);
+}
+
+// Optional cap on how many consecutive stop-gate rounds run in one session.
+// Unset or 0 keeps the previous unbounded behavior.
+function getMaxRounds() {
+  const raw = process.env.CODEX_REVIEW_GATE_MAX_ROUNDS;
+  if (raw == null || raw === "") {
+    return 0;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function gateSessionId(input) {
+  return input.session_id || process.env[SESSION_ID_ENV] || "default";
+}
+
+function readGateRounds(workspaceRoot, sessionId) {
+  const rounds = getConfig(workspaceRoot)[GATE_ROUNDS_CONFIG_KEY];
+  if (!rounds || typeof rounds !== "object") {
+    return 0;
+  }
+  return Number(rounds[sessionId]) || 0;
+}
+
+function writeGateRounds(workspaceRoot, sessionId, count) {
+  const current = getConfig(workspaceRoot)[GATE_ROUNDS_CONFIG_KEY];
+  const next = current && typeof current === "object" ? { ...current } : {};
+  if (count > 0) {
+    next[sessionId] = count;
+  } else {
+    delete next[sessionId];
+  }
+  setConfig(workspaceRoot, GATE_ROUNDS_CONFIG_KEY, next);
 }
 
 function filterJobsForCurrentSession(jobs, input = {}) {
@@ -163,8 +198,24 @@ function main() {
     return;
   }
 
+  const sessionId = gateSessionId(input);
+  const maxRounds = getMaxRounds();
+  // A fresh user turn (not a gate-induced continuation) starts a new count.
+  const priorRounds = input.stop_hook_active ? readGateRounds(workspaceRoot, sessionId) : 0;
+
+  if (maxRounds > 0 && priorRounds >= maxRounds) {
+    writeGateRounds(workspaceRoot, sessionId, 0);
+    logNote(
+      `Codex stop-time review gate reached its limit of ${maxRounds} round(s) for this session; allowing the stop. ` +
+        "Set CODEX_REVIEW_GATE_MAX_ROUNDS to adjust, or run /codex:review --wait manually for another pass."
+    );
+    logNote(runningTaskNote);
+    return;
+  }
+
   const review = runStopReview(cwd, input);
   if (!review.ok) {
+    writeGateRounds(workspaceRoot, sessionId, priorRounds + 1);
     emitDecision({
       decision: "block",
       reason: runningTaskNote ? `${runningTaskNote} ${review.reason}` : review.reason
@@ -172,6 +223,7 @@ function main() {
     return;
   }
 
+  writeGateRounds(workspaceRoot, sessionId, 0);
   logNote(runningTaskNote);
 }
 
