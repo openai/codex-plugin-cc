@@ -6,6 +6,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
+import { runCommand, terminateProcessTree } from "./process.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
@@ -110,7 +111,66 @@ async function isBrokerEndpointReady(endpoint) {
   }
 }
 
+function readPidFile(pidFile) {
+  if (!pidFile || !fs.existsSync(pidFile)) {
+    return null;
+  }
+  const value = Number(fs.readFileSync(pidFile, "utf8").trim());
+  return Number.isFinite(value) ? value : null;
+}
+
+function getProcessCommand(pid, options = {}) {
+  const runCommandImpl = options.runCommandImpl ?? runCommand;
+  const platform = options.platform ?? process.platform;
+  const result =
+    platform === "win32"
+      ? runCommandImpl(
+          "powershell",
+          [
+            "-NoProfile",
+            "-Command",
+            `$process = Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}"; if ($process) { $process.CommandLine }`
+          ],
+          {
+            cwd: options.cwd,
+            env: options.env
+          }
+        )
+      : runCommandImpl("ps", ["-p", String(pid), "-o", "command="], {
+          cwd: options.cwd,
+          env: options.env
+        });
+  if (result.error || result.status !== 0) {
+    return null;
+  }
+  return result.stdout.trim();
+}
+
+function isExpectedBrokerProcess({ pid, endpoint = null, pidFile = null, platform = process.platform, runCommandImpl = runCommand }) {
+  if (!Number.isFinite(pid)) {
+    return false;
+  }
+
+  const recordedPid = readPidFile(pidFile);
+  if (recordedPid !== null && recordedPid !== pid) {
+    return false;
+  }
+
+  const command = getProcessCommand(pid, { platform, runCommandImpl });
+  if (!command) {
+    return false;
+  }
+
+  return (
+    command.includes("app-server-broker.mjs") &&
+    command.includes("serve") &&
+    (!endpoint || command.includes(endpoint)) &&
+    (!pidFile || command.includes(pidFile))
+  );
+}
+
 export async function ensureBrokerSession(cwd, options = {}) {
+  const killProcess = options.killProcess ?? terminateProcessTree;
   const existing = loadBrokerSession(cwd);
   if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
     return existing;
@@ -123,7 +183,10 @@ export async function ensureBrokerSession(cwd, options = {}) {
       logFile: existing.logFile ?? null,
       sessionDir: existing.sessionDir ?? null,
       pid: existing.pid ?? null,
-      killProcess: options.killProcess ?? null
+      killProcess,
+      validateProcess: options.validateProcess,
+      platform: options.platform,
+      runCommandImpl: options.runCommandImpl
     });
     clearBrokerSession(cwd);
   }
@@ -154,7 +217,10 @@ export async function ensureBrokerSession(cwd, options = {}) {
       logFile,
       sessionDir,
       pid: child.pid ?? null,
-      killProcess: options.killProcess ?? null
+      killProcess,
+      validateProcess: options.validateProcess,
+      platform: options.platform,
+      runCommandImpl: options.runCommandImpl
     });
     return null;
   }
@@ -170,8 +236,18 @@ export async function ensureBrokerSession(cwd, options = {}) {
   return session;
 }
 
-export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null }) {
-  if (Number.isFinite(pid) && killProcess) {
+export function teardownBrokerSession({
+  endpoint = null,
+  pidFile,
+  logFile,
+  sessionDir = null,
+  pid = null,
+  killProcess = terminateProcessTree,
+  validateProcess = isExpectedBrokerProcess,
+  platform = process.platform,
+  runCommandImpl = runCommand
+}) {
+  if (Number.isFinite(pid) && validateProcess({ pid, endpoint, pidFile, platform, runCommandImpl })) {
     try {
       killProcess(pid);
     } catch {
