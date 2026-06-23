@@ -1,7 +1,30 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 
-import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import { isProcessAlive, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+
+test("isProcessAlive returns false for null and invalid pids", () => {
+  assert.equal(isProcessAlive(null), false);
+  assert.equal(isProcessAlive(undefined), false);
+  assert.equal(isProcessAlive(0), false);
+  assert.equal(isProcessAlive(-5), false);
+  assert.equal(isProcessAlive(Number.NaN), false);
+  assert.equal(isProcessAlive("123"), false);
+});
+
+test("isProcessAlive returns true for the current process", () => {
+  assert.equal(isProcessAlive(process.pid), true);
+});
+
+test("isProcessAlive returns false after a child has exited", async () => {
+  const child = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
+  const pid = child.pid;
+  await new Promise((resolve) => child.on("exit", resolve));
+  // Give the kernel a moment to fully reap the entry on Linux/macOS.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(isProcessAlive(pid), false);
+});
 
 test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;
