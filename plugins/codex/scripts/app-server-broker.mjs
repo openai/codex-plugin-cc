@@ -6,7 +6,7 @@ import path from "node:path";
 import process from "node:process";
 
 import { parseArgs } from "./lib/args.mjs";
-import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
+import { BROKER_BUSY_RPC_CODE, CodexAppServerClient, stripAnsi } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
@@ -128,13 +128,14 @@ async function main() {
         buffer = buffer.slice(newlineIndex + 1);
         newlineIndex = buffer.indexOf("\n");
 
-        if (!line.trim()) {
+        const cleaned = stripAnsi(line).trim();
+        if (!cleaned) {
           continue;
         }
 
         let message;
         try {
-          message = JSON.parse(line);
+          message = JSON.parse(cleaned);
         } catch (error) {
           send(socket, {
             id: null,

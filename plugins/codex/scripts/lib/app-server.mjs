@@ -16,6 +16,30 @@ import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
 import { terminateProcessTree } from "./process.mjs";
 
+/**
+ * Strip ANSI/VT escape sequences per ECMA-48 that may leak from the shell
+ * environment into the JSONL stream. Covers the full standard repertoire:
+ *
+ *  - CSI:    ESC [ <param bytes 0x30–0x3F>* <intermediate bytes 0x20–0x2F>* <final 0x40–0x7E>
+ *            param bytes include digits, ;, :, <, =, >, ? — not just [0-9;?]
+ *            e.g. ESC[?2004h (bracketed paste), ESC[>4;2m (modifyOtherKeys), ESC[200~ (paste wrapper)
+ *  - OSC:    ESC ] <any> (BEL | ESC \)
+ *            e.g. ESC]0;title BEL (terminal title), ESC]133;A BEL (shell integration)
+ *  - String: ESC [P|X|^|_] <any> (BEL | ESC \)
+ *            DCS (ESC P), SOS (ESC X), PM (ESC ^), APC (ESC _)
+ *            e.g. ESC P ... ESC \ (tmux passthrough, Sixel graphics)
+ *  - Simple: ESC <intermediate bytes 0x20–0x2F>* <final byte 0x30–0x7E>
+ *            Fp (0x30–0x3F): ESC 7/8 (save/restore cursor), ESC = / ESC > (keypad modes)
+ *            Fe (0x40–0x5F): ESC c (reset), ESC M (reverse index), ESC D/E (index/NEL)
+ *            Fs (0x60–0x7E): standardized single functions
+ *  - Lone ESC: fallback — strips any bare ESC not matched above (e.g. truncated sequences)
+ */
+const ANSI_ESCAPE_RE =
+  /\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]|\x1b[PX^_].*?(?:\x07|\x1b\\)|\x1b\].*?(?:\x07|\x1b\\)|\x1b[\x20-\x2f]*[\x30-\x7e]|\x1b/g;
+export function stripAnsi(line) {
+  return line.replace(ANSI_ESCAPE_RE, "");
+}
+
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
 
@@ -116,15 +140,16 @@ class AppServerClientBase {
   }
 
   handleLine(line) {
-    if (!line.trim()) {
+    const cleaned = stripAnsi(line).trim();
+    if (!cleaned) {
       return;
     }
 
     let message;
     try {
-      message = JSON.parse(line);
+      message = JSON.parse(cleaned);
     } catch (error) {
-      this.handleExit(createProtocolError(`Failed to parse codex app-server JSONL: ${error.message}`, { line }));
+      this.handleExit(createProtocolError(`Failed to parse codex app-server JSONL: ${error.message}`, { line: cleaned }));
       return;
     }
 
