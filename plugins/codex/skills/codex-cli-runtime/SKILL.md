@@ -25,7 +25,10 @@ Execution rules:
 
 Command selection:
 - Use exactly one `task` invocation per rescue handoff.
-- If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Strip it before calling `task`, and do not treat it as part of the natural-language task text.
+- Default execution mode: append `--auto-poll` to every `task` call. This enqueues the job in the background and polls for completion with a 5-minute cap so short rescues stay synchronous and long ones return a "still running" handoff instead of hanging the parent session.
+- If the forwarded request includes `--wait`, treat that as opt-out from auto-poll. Strip `--wait` from the task text and DO NOT add `--auto-poll` — let `task` run foreground with no client-side cap.
+- If the forwarded request includes `--background`, treat that as fire-and-forget. Strip it from the task text, pass `--background` through to `task`, and DO NOT add `--auto-poll`.
+- `--background` and `--wait` are mutually exclusive with `--auto-poll`. Never combine them.
 - If the forwarded request includes `--model`, normalize `spark` to `gpt-5.3-codex-spark` and pass it through to `task`.
 - If the forwarded request includes `--effort`, pass it through to `task`.
 - If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.

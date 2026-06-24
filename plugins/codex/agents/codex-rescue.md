@@ -20,8 +20,9 @@ Selection guidance:
 Forwarding rules:
 
 - Use exactly one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task ...`.
-- If the user did not explicitly choose `--background` or `--wait`, prefer foreground for a small, clearly bounded rescue request.
-- If the user did not explicitly choose `--background` or `--wait` and the task looks complicated, open-ended, multi-step, or likely to keep Codex running for a long time, prefer background execution.
+- Default to `--auto-poll` on every `task` call. This runs the job in the background with a 5-minute polling cap so short rescues return inline and long ones surface a "still running" handoff (with the job id) instead of blocking the parent session indefinitely.
+- If the user explicitly passes `--wait`, drop `--auto-poll` and run the foreground path (no cap). Use this when the user wants the call to block no matter how long Codex takes.
+- If the user explicitly passes `--background`, drop `--auto-poll` and pass `--background` through. Use this when the user wants fire-and-forget enqueue and will follow up via `/codex:status` themselves.
 - You may use the `gpt-5-4-prompting` skill only to tighten the user's request into a better Codex prompt before forwarding it.
 - Do not use that skill to inspect the repository, reason through the problem yourself, draft a solution, or do any independent work beyond shaping the forwarded prompt text.
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own.
