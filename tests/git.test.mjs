@@ -132,7 +132,7 @@ test("collectReviewContext falls back to lightweight context for larger adversar
   fs.writeFileSync(path.join(cwd, "c.js"), 'export const value = "SELF_COLLECT_MARKER_C";\n');
 
   const target = resolveReviewTarget(cwd, {});
-  const context = collectReviewContext(cwd, target);
+  const context = collectReviewContext(cwd, target, { maxInlineFiles: 2 });
 
   assert.equal(context.inputMode, "self-collect");
   assert.equal(context.fileCount, 3);
@@ -173,11 +173,51 @@ test("collectReviewContext keeps untracked file content in lightweight working t
   fs.writeFileSync(path.join(cwd, "new-risk.js"), 'export const value = "UNTRACKED_RISK_MARKER";\n');
 
   const target = resolveReviewTarget(cwd, {});
-  const context = collectReviewContext(cwd, target);
+  const context = collectReviewContext(cwd, target, { maxInlineFiles: 2 });
 
   assert.equal(context.inputMode, "self-collect");
   assert.equal(context.fileCount, 3);
   assert.doesNotMatch(context.content, /TRACKED_MARKER_[AB]/);
   assert.match(context.content, /## Untracked Files/);
   assert.match(context.content, /UNTRACKED_RISK_MARKER/);
+});
+
+test("collectReviewContext keeps inline diffs for medium-sized adversarial reviews under default limits", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  const fileNames = Array.from({ length: 11 }, (_, i) => `mod-${i}.js`);
+  for (const name of fileNames) {
+    fs.writeFileSync(path.join(cwd, name), `export const value = "${name}-v1";\n`);
+  }
+  run("git", ["add", ...fileNames], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  for (const name of fileNames) {
+    fs.writeFileSync(path.join(cwd, name), `export const value = "INLINE_DEFAULT_${name}";\n`);
+  }
+
+  const target = resolveReviewTarget(cwd, {});
+  const context = collectReviewContext(cwd, target);
+
+  assert.equal(context.inputMode, "inline-diff");
+  assert.equal(context.fileCount, 11);
+  assert.match(context.collectionGuidance, /primary evidence/i);
+  assert.match(context.content, /INLINE_DEFAULT_mod-0\.js/);
+});
+
+test("collectReviewContext respects maxInlineFiles override forcing self-collect", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "a.js"), "export const value = 'v1';\n");
+  fs.writeFileSync(path.join(cwd, "b.js"), "export const value = 'v1';\n");
+  run("git", ["add", "a.js", "b.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "a.js"), "export const value = 'OVERRIDE_MARKER_A';\n");
+  fs.writeFileSync(path.join(cwd, "b.js"), "export const value = 'OVERRIDE_MARKER_B';\n");
+
+  const target = resolveReviewTarget(cwd, {});
+  const context = collectReviewContext(cwd, target, { maxInlineFiles: 1 });
+
+  assert.equal(context.inputMode, "self-collect");
+  assert.equal(context.fileCount, 2);
+  assert.doesNotMatch(context.content, /OVERRIDE_MARKER_[AB]/);
 });

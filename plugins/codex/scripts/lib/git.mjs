@@ -5,8 +5,8 @@ import { isProbablyText } from "./fs.mjs";
 import { formatCommandFailure, runCommand, runCommandChecked } from "./process.mjs";
 
 const MAX_UNTRACKED_BYTES = 24 * 1024;
-const DEFAULT_INLINE_DIFF_MAX_FILES = 2;
-const DEFAULT_INLINE_DIFF_MAX_BYTES = 256 * 1024;
+const DEFAULT_INLINE_DIFF_MAX_FILES = 50;
+const DEFAULT_INLINE_DIFF_MAX_BYTES = 1024 * 1024;
 
 function git(cwd, args, options = {}) {
   return runCommand("git", args, { cwd, ...options });
