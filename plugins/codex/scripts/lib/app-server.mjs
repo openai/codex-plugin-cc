@@ -22,6 +22,20 @@ const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"))
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
 
+const DEFAULT_RPC_TIMEOUT_MS = 30_000;
+
+function resolveRpcTimeoutMs() {
+  const raw = process.env.CODEX_APP_SERVER_RPC_TIMEOUT_MS;
+  if (raw === undefined || raw === "") {
+    return DEFAULT_RPC_TIMEOUT_MS;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return DEFAULT_RPC_TIMEOUT_MS;
+  }
+  return parsed;
+}
+
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
   title: "Codex Plugin",
@@ -92,7 +106,26 @@ class AppServerClientBase {
     this.nextId += 1;
 
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, method });
+      const timeoutMs = resolveRpcTimeoutMs();
+      let timer = null;
+      const wrappedResolve = (value) => {
+        if (timer) clearTimeout(timer);
+        resolve(value);
+      };
+      const wrappedReject = (err) => {
+        if (timer) clearTimeout(timer);
+        reject(err);
+      };
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => {
+          if (this.pending.get(id)?.reject === wrappedReject) {
+            this.pending.delete(id);
+          }
+          reject(new Error(`codex app-server ${method} request timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+        timer.unref?.();
+      }
+      this.pending.set(id, { resolve: wrappedResolve, reject: wrappedReject, method });
       this.sendMessage({ id, method, params });
     });
   }

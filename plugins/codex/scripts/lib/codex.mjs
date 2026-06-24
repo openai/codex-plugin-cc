@@ -556,11 +556,54 @@ function applyTurnNotification(state, message) {
   }
 }
 
+const DEFAULT_TURN_IDLE_TIMEOUT_MS = 240_000;
+
+function resolveTurnIdleTimeoutMs() {
+  const raw = process.env.CODEX_TURN_IDLE_TIMEOUT_MS;
+  if (raw === undefined || raw === "") {
+    return DEFAULT_TURN_IDLE_TIMEOUT_MS;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return DEFAULT_TURN_IDLE_TIMEOUT_MS;
+  }
+  return parsed;
+}
+
 async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
 
+  const idleTimeoutMs = resolveTurnIdleTimeoutMs();
+  let idleTimer = null;
+  const clearIdle = () => {
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  };
+  const armIdle = () => {
+    if (idleTimeoutMs <= 0 || state.completed) {
+      return;
+    }
+    clearIdle();
+    idleTimer = setTimeout(() => {
+      idleTimer = null;
+      if (state.completed) {
+        return;
+      }
+      state.completed = true;
+      clearCompletionTimer(state);
+      const tid = state.turnId ?? "(pending)";
+      state.rejectCompletion(
+        new Error(`codex turn idle timeout after ${idleTimeoutMs}ms (thread=${state.threadId}, turn=${tid})`)
+      );
+    }, idleTimeoutMs);
+    idleTimer.unref?.();
+  };
+
   client.setNotificationHandler((message) => {
+    armIdle();
     if (!state.turnId) {
       state.bufferedNotifications.push(message);
       return;
@@ -581,8 +624,11 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     applyTurnNotification(state, message);
   });
 
+  armIdle();
+
   try {
     const response = await startRequest();
+    armIdle();
     options.onResponse?.(response, state);
     state.turnId = response.turn?.id ?? null;
     if (state.turnId) {
@@ -605,6 +651,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
 
     return await state.completion;
   } finally {
+    clearIdle();
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
   }
