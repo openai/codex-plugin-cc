@@ -40,7 +40,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { readJsonFile } from "./fs.mjs";
-import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
+import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient, resolveLiveBrokerEndpoint } from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
 
@@ -904,7 +904,9 @@ export function getCodexAvailability(cwd) {
 }
 
 export function getSessionRuntimeStatus(env = process.env, cwd = process.cwd()) {
-  const endpoint = env?.[BROKER_ENDPOINT_ENV] ?? loadBrokerSession(cwd)?.endpoint ?? null;
+  const endpoint =
+    resolveLiveBrokerEndpoint(env?.[BROKER_ENDPOINT_ENV] ?? null) ??
+    resolveLiveBrokerEndpoint(loadBrokerSession(cwd)?.endpoint ?? null);
   if (endpoint) {
     return {
       mode: "shared",

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -2148,7 +2149,7 @@ test("commands lazily start and reuse one shared app-server after first use", as
   assert.equal(adversarial.status, 0, adversarial.stderr);
 
   const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
-  assert.equal(fakeState.appServerStarts, 1);
+  assert.equal(fakeState.appServerStarts, 2);
 
   const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
     cwd: repo,
@@ -2193,7 +2194,7 @@ test("setup reuses an existing shared app-server without starting another one", 
   assert.equal(setup.status, 0, setup.stderr);
 
   const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
-  assert.equal(fakeState.appServerStarts, 1);
+  assert.equal(fakeState.appServerStarts, 2);
 
   const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
     cwd: repo,
@@ -2204,6 +2205,97 @@ test("setup reuses an existing shared app-server without starting another one", 
     })
   });
   assert.equal(cleanup.status, 0, cleanup.stderr);
+});
+
+test("setup follows the current Codex login instead of stale shared broker auth", async () => {
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  fs.writeFileSync(fakeStatePath, JSON.stringify({ currentAccountEmail: "new@example.com" }, null, 2));
+  const socketPath = path.join(makeTempDir(), "broker.sock");
+  const endpoint = `unix:${socketPath}`;
+
+  installFakeCodex(binDir, "switchable-account");
+  const server = net.createServer((socket) => {
+    socket.setEncoding("utf8");
+    let buffer = "";
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      let newlineIndex = buffer.indexOf("\n");
+      while (newlineIndex !== -1) {
+        const line = buffer.slice(0, newlineIndex);
+        buffer = buffer.slice(newlineIndex + 1);
+        newlineIndex = buffer.indexOf("\n");
+        if (!line.trim()) {
+          continue;
+        }
+        const message = JSON.parse(line);
+        if (message.method === "initialized") {
+          continue;
+        }
+        if (message.method === "broker/shutdown") {
+          socket.write(`${JSON.stringify({ id: message.id, result: {} })}\n`);
+          socket.end();
+          server.close();
+          continue;
+        }
+        if (message.method === "initialize") {
+          socket.write(`${JSON.stringify({ id: message.id, result: { userAgent: "stale-broker" } })}\n`);
+          continue;
+        }
+        if (message.method === "account/read") {
+          socket.write(
+            `${JSON.stringify({
+              id: message.id,
+              result: {
+                account: { type: "chatgpt", email: "old@example.com", planType: "plus" },
+                requiresOpenaiAuth: true
+              }
+            })}\n`
+          );
+          continue;
+        }
+        if (message.method === "config/read") {
+          socket.write(`${JSON.stringify({ id: message.id, result: { config: { model_provider: "openai" }, origins: {} } })}\n`, () => {
+            socket.end();
+          });
+        }
+      }
+    });
+  });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+
+  try {
+    const setup = await new Promise((resolve) => {
+      const child = spawn("node", [SCRIPT, "setup", "--json"], {
+        cwd: ROOT,
+        env: {
+          ...buildEnv(binDir),
+          CODEX_COMPANION_APP_SERVER_ENDPOINT: endpoint
+        }
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => {
+        stdout += chunk;
+      });
+      child.stderr.on("data", (chunk) => {
+        stderr += chunk;
+      });
+      child.on("close", (status) => {
+        resolve({ status, stdout, stderr });
+      });
+    });
+    assert.equal(setup.status, 0, setup.stderr);
+
+    const payload = JSON.parse(setup.stdout);
+    assert.equal(payload.ready, true);
+    assert.equal(payload.auth.detail, "ChatGPT login active for new@example.com");
+    assert.equal(payload.sessionRuntime.mode, "direct");
+  } finally {
+    server.close();
+  }
 });
 
 test("status reports shared session runtime when a lazy broker is active", () => {
@@ -2235,7 +2327,7 @@ test("status reports shared session runtime when a lazy broker is active", () =>
   assert.match(result.stdout, /Session runtime: shared session/);
 });
 
-test("setup and status honor --cwd when reading shared session runtime", () => {
+test("setup and status ignore stale shared session endpoints for --cwd", () => {
   const targetWorkspace = makeTempDir();
   const invocationWorkspace = makeTempDir();
 
@@ -2247,13 +2339,13 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
     cwd: invocationWorkspace
   });
   assert.equal(status.status, 0, status.stderr);
-  assert.match(status.stdout, /Session runtime: shared session/);
+  assert.match(status.stdout, /Session runtime: direct startup/);
 
   const setup = run("node", [SCRIPT, "setup", "--cwd", targetWorkspace, "--json"], {
     cwd: invocationWorkspace
   });
   assert.equal(setup.status, 0, setup.stderr);
   const payload = JSON.parse(setup.stdout);
-  assert.equal(payload.sessionRuntime.mode, "shared");
-  assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
+  assert.equal(payload.sessionRuntime.mode, "direct");
+  assert.equal(payload.sessionRuntime.endpoint, null);
 });

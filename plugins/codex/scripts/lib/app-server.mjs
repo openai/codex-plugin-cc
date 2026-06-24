@@ -13,7 +13,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
+import { clearBrokerSession, ensureBrokerSession, loadBrokerSession, sendBrokerShutdown } from "./broker-lifecycle.mjs";
 import { terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
@@ -21,6 +21,23 @@ const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"))
 
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
+
+export function resolveLiveBrokerEndpoint(endpoint) {
+  if (!endpoint) {
+    return null;
+  }
+
+  try {
+    const target = parseBrokerEndpoint(endpoint);
+    if (target.kind === "unix" && !fs.existsSync(target.path)) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+
+  return endpoint;
+}
 
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
@@ -332,23 +349,93 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
   }
 }
 
+function accountFingerprint(accountResponse) {
+  const account = accountResponse?.account ?? null;
+  if (account?.type === "chatgpt") {
+    return `chatgpt:${String(account.email ?? "").trim().toLowerCase()}`;
+  }
+  if (account?.type === "apiKey") {
+    return "apiKey";
+  }
+  if (accountResponse?.requiresOpenaiAuth === false) {
+    return "no-openai-auth";
+  }
+  if (accountResponse?.requiresOpenaiAuth === true) {
+    return "openai-auth:none";
+  }
+  return null;
+}
+
+async function readAccountFingerprint(client) {
+  try {
+    return accountFingerprint(await client.request("account/read", { refreshToken: false }));
+  } catch {
+    return null;
+  }
+}
+
+async function replacementForStaleBroker(cwd, brokerClient, brokerEndpoint, options = {}) {
+  const brokerAccount = await readAccountFingerprint(brokerClient);
+  if (!brokerAccount) {
+    return null;
+  }
+
+  const directClient = new SpawnedCodexAppServerClient(cwd, options);
+  await directClient.initialize();
+
+  const currentAccount = await readAccountFingerprint(directClient);
+  if (!currentAccount || currentAccount === brokerAccount) {
+    await directClient.close().catch(() => {});
+    return null;
+  }
+
+  await brokerClient.close().catch(() => {});
+  await sendBrokerShutdown(brokerEndpoint).catch(() => {});
+  clearBrokerSession(cwd);
+  return directClient;
+}
+
 export class CodexAppServerClient {
   static async connect(cwd, options = {}) {
     let brokerEndpoint = null;
+    let shouldValidateBrokerAccount = false;
     if (!options.disableBroker) {
-      brokerEndpoint = options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
+      brokerEndpoint = resolveLiveBrokerEndpoint(options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null);
+      shouldValidateBrokerAccount = Boolean(brokerEndpoint);
       if (!brokerEndpoint && options.reuseExistingBroker) {
-        brokerEndpoint = loadBrokerSession(cwd)?.endpoint ?? null;
+        brokerEndpoint = resolveLiveBrokerEndpoint(loadBrokerSession(cwd)?.endpoint ?? null);
+        shouldValidateBrokerAccount = Boolean(brokerEndpoint);
+      }
+      if (!brokerEndpoint && !options.reuseExistingBroker) {
+        brokerEndpoint = resolveLiveBrokerEndpoint(loadBrokerSession(cwd)?.endpoint ?? null);
+        shouldValidateBrokerAccount = Boolean(brokerEndpoint);
       }
       if (!brokerEndpoint && !options.reuseExistingBroker) {
         const brokerSession = await ensureBrokerSession(cwd, { env: options.env });
         brokerEndpoint = brokerSession?.endpoint ?? null;
+        shouldValidateBrokerAccount = false;
       }
     }
     const client = brokerEndpoint
       ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
       : new SpawnedCodexAppServerClient(cwd, options);
     await client.initialize();
+    if (brokerEndpoint && shouldValidateBrokerAccount && client.transport === "broker") {
+      const directClient = await replacementForStaleBroker(cwd, client, brokerEndpoint, options);
+      if (directClient) {
+        if (options.reuseExistingBroker) {
+          return directClient;
+        }
+        await directClient.close().catch(() => {});
+        const brokerSession = await ensureBrokerSession(cwd, { env: options.env });
+        const nextEndpoint = brokerSession?.endpoint ?? null;
+        const nextClient = nextEndpoint
+          ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint: nextEndpoint })
+          : new SpawnedCodexAppServerClient(cwd, options);
+        await nextClient.initialize();
+        return nextClient;
+      }
+    }
     return client;
   }
 }
