@@ -9,7 +9,9 @@ user-invocable: false
 Use this skill only inside the `codex:codex-rescue` subagent.
 
 Primary helper:
-- `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task "<raw arguments>"`
+- `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task "<raw arguments>" </dev/null`
+
+The `</dev/null` redirect is mandatory. Without it the codex-companion node process can hang reading from stdin (Codex skill execution often hangs in Claude Code with "Reading additional input from stdin..." errors when stdin is left attached to the parent shell).
 
 Execution rules:
 - The rescue subagent is a forwarder, not an orchestrator. Its only job is to invoke `task` once and return that stdout unchanged.
