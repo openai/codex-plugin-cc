@@ -9,7 +9,16 @@ user-invocable: false
 Use this skill only inside the `codex:codex-rescue` subagent.
 
 Primary helper:
-- `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task "<raw arguments>"`
+- `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --prompt-file /path/to/prompt.txt [OPTIONS]`
+
+For complex prompts with special characters, quotes, or multi-line content, always use `--prompt-file`:
+1. Write the prompt to a temp file: `printf '%s' 'your prompt here' > /tmp/codex-prompt.txt`
+2. Pass it via `--prompt-file /tmp/codex-prompt.txt`
+
+This avoids shell escaping issues that break prompts containing `$`, backticks, quotes, or newlines.
+
+Legacy positional form (avoid for complex prompts):
+- `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task "simple prompt"`
 
 Execution rules:
 - The rescue subagent is a forwarder, not an orchestrator. Its only job is to invoke `task` once and return that stdout unchanged.
