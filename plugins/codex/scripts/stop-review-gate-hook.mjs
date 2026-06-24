@@ -19,7 +19,65 @@ const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
 function readHookInput() {
-  const raw = fs.readFileSync(0, "utf8").trim();
+  const RETRY_DELAY_MS = 10;
+  const CHUNK_SIZE = 4096;
+  // Time-based deadline for the first byte to arrive. Hooks are always
+  // invoked with stdin piped, so data *will* come — but the writer may be
+  // delayed (e.g. the parent process hasn't flushed yet). 5 s is generous
+  // enough to cover slow writers; the hook's own kill-timeout is the
+  // ultimate backstop if stdin never materialises.
+  const PRE_DATA_TIMEOUT_MS = 5_000;
+  const canAtomicsSleep =
+    typeof SharedArrayBuffer === "function" &&
+    typeof Atomics !== "undefined" &&
+    typeof Atomics.wait === "function";
+  const sleepBuffer = canAtomicsSleep ? new Int32Array(new SharedArrayBuffer(4)) : null;
+
+  function sleepSync(ms) {
+    if (sleepBuffer) {
+      Atomics.wait(sleepBuffer, 0, 0, ms);
+    } else {
+      const start = Date.now();
+      while (Date.now() - start < ms) { /* busy-wait fallback */ }
+    }
+  }
+
+  // Use low-level readSync to accumulate chunks across EAGAIN retries.
+  // readFileSync can consume a prefix of stdin before throwing EAGAIN,
+  // so retrying it would lose bytes already read.
+  const chunks = [];
+  const buf = Buffer.alloc(CHUNK_SIZE);
+  const startTime = Date.now();
+
+  // Loop until EOF (bytesRead === 0). Before any data arrives, a
+  // time-based deadline prevents mistaking delayed stdin for empty input.
+  // Once data has started, keep retrying indefinitely to avoid feeding
+  // truncated JSON to JSON.parse.
+  while (true) {
+    let bytesRead;
+    try {
+      bytesRead = fs.readSync(0, buf, 0, CHUNK_SIZE);
+    } catch (err) {
+      if (err?.code === "EAGAIN") {
+        if (chunks.length === 0 && Date.now() - startTime >= PRE_DATA_TIMEOUT_MS) {
+          break;
+        }
+        sleepSync(RETRY_DELAY_MS);
+        continue;
+      }
+      throw err;
+    }
+
+    if (bytesRead === 0) {
+      break;
+    }
+
+    // Copy the chunk — buf is reused across iterations, so subarray
+    // would be a view into the same memory that gets overwritten.
+    chunks.push(Buffer.from(buf.subarray(0, bytesRead)));
+  }
+
+  const raw = Buffer.concat(chunks).toString("utf8").trim();
   if (!raw) {
     return {};
   }
