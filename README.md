@@ -63,6 +63,7 @@ After install, you should see:
 
 - the slash commands listed below
 - the `codex:codex-rescue` subagent in `/agents`
+- three internal skills used by the rescue subagent: `codex-cli-runtime`, `codex-result-handling`, and `gpt-5-4-prompting` (these are not user-invocable)
 
 One simple first run is:
 
