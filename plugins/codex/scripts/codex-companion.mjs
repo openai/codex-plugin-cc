@@ -249,6 +249,16 @@ function buildAdversarialReviewPrompt(context, focusText) {
   });
 }
 
+const VALID_SANDBOX_MODES = new Set(["read-only", "workspace-write", "danger-full-access"]);
+
+function resolveSandbox(explicit, fallback = "read-only") {
+  const value = explicit ?? process.env.CODEX_SANDBOX ?? fallback;
+  if (!VALID_SANDBOX_MODES.has(value)) {
+    throw new Error(`Invalid sandbox mode "${value}". Must be one of: ${[...VALID_SANDBOX_MODES].join(", ")}`);
+  }
+  return value;
+}
+
 function ensureCodexAvailable(cwd) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
@@ -359,6 +369,7 @@ async function executeReviewRun(request) {
   ensureCodexAvailable(request.cwd);
   ensureGitRepository(request.cwd);
 
+  const sandbox = resolveSandbox(request.sandbox);
   const target = resolveReviewTarget(request.cwd, {
     base: request.base,
     scope: request.scope
@@ -370,6 +381,7 @@ async function executeReviewRun(request) {
     const result = await runAppServerReview(request.cwd, {
       target: reviewTarget,
       model: request.model,
+      sandbox,
       onProgress: request.onProgress
     });
     const payload = {
@@ -411,7 +423,7 @@ async function executeReviewRun(request) {
   const result = await runAppServerTurn(context.repoRoot, {
     prompt,
     model: request.model,
-    sandbox: "read-only",
+    sandbox,
     outputSchema: readOutputSchema(REVIEW_SCHEMA),
     onProgress: request.onProgress
   });
@@ -488,7 +500,7 @@ async function executeTaskRun(request) {
     defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
     model: request.model,
     effort: request.effort,
-    sandbox: request.write ? "workspace-write" : "read-only",
+    sandbox: resolveSandbox(request.sandbox, request.write ? "workspace-write" : "read-only"),
     onProgress: request.onProgress,
     persistThread: true,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
@@ -601,13 +613,14 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, sandbox, resumeLast, jobId }) {
   return {
     cwd,
     model,
     effort,
     prompt,
     write,
+    sandbox,
     resumeLast,
     jobId
   };
@@ -711,10 +724,11 @@ function enqueueBackgroundTask(cwd, job, request) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+    valueOptions: ["base", "scope", "model", "sandbox", "cwd"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
-      m: "model"
+      m: "model",
+      s: "sandbox"
     }
   });
 
@@ -744,6 +758,7 @@ async function handleReviewCommand(argv, config) {
         base: options.base,
         scope: options.scope,
         model: options.model,
+        sandbox: options.sandbox,
         focusText,
         reviewName: config.reviewName,
         onProgress: progress
@@ -761,10 +776,11 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
+    valueOptions: ["model", "effort", "sandbox", "cwd", "prompt-file"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
     aliasMap: {
-      m: "model"
+      m: "model",
+      s: "sandbox"
     }
   });
 
@@ -785,6 +801,8 @@ async function handleTask(argv) {
     resumeLast
   });
 
+  const sandbox = resolveSandbox(options.sandbox, write ? "workspace-write" : "read-only");
+
   if (options.background) {
     ensureCodexAvailable(cwd);
     requireTaskRequest(prompt, resumeLast);
@@ -796,6 +814,7 @@ async function handleTask(argv) {
       effort,
       prompt,
       write,
+      sandbox,
       resumeLast,
       jobId: job.id
     });
@@ -814,6 +833,7 @@ async function handleTask(argv) {
         effort,
         prompt,
         write,
+        sandbox,
         resumeLast,
         jobId: job.id,
         onProgress: progress
