@@ -6,8 +6,9 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { commitJjChange, initGitRepo, initJjRepo, initJjRepoWithCommit, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { binaryAvailable } from "../plugins/codex/scripts/lib/process.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -15,6 +16,7 @@ const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
+const JJ_SKIP = !binaryAvailable("jj").available && "jj binary not available";
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   const start = Date.now();
@@ -28,12 +30,31 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   throw new Error("Timed out waiting for condition.");
 }
 
+function setupDivergedJjRepoForReview(repo) {
+  initJjRepo(repo);
+  fs.writeFileSync(path.join(repo, "base.js"), "// base\n");
+  commitJjChange(repo, "base change");
+  const baseId = run("jj", ["log", "-r", "@-", "--no-graph", "-T", "change_id.short(8)"], { cwd: repo }).stdout.trim();
+  run("jj", ["bookmark", "create", "main", "-r", "@-"], { cwd: repo });
+
+  fs.writeFileSync(path.join(repo, "feature.js"), "// feature\n");
+  commitJjChange(repo, "feature change");
+  const featureId = run("jj", ["log", "-r", "@-", "--no-graph", "-T", "change_id.short(8)"], { cwd: repo }).stdout.trim();
+
+  run("jj", ["new", baseId], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "main-only.js"), "// main advance\n");
+  commitJjChange(repo, "main advance");
+  run("jj", ["bookmark", "move", "main", "--to", "@-"], { cwd: repo });
+  run("jj", ["edit", featureId], { cwd: repo });
+}
+
 test("setup reports ready when fake codex is installed and authenticated", () => {
+  const workspace = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
-    cwd: ROOT,
+    cwd: workspace,
     env: buildEnv(binDir)
   });
 
@@ -45,12 +66,13 @@ test("setup reports ready when fake codex is installed and authenticated", () =>
 });
 
 test("setup is ready without npm when Codex is already installed and authenticated", () => {
+  const workspace = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
   fs.symlinkSync(process.execPath, path.join(binDir, "node"));
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
-    cwd: ROOT,
+    cwd: workspace,
     env: {
       ...process.env,
       PATH: binDir
@@ -66,11 +88,12 @@ test("setup is ready without npm when Codex is already installed and authenticat
 });
 
 test("setup trusts app-server API key auth even when login status alone would fail", () => {
+  const workspace = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir, "api-key-account-only");
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
-    cwd: ROOT,
+    cwd: workspace,
     env: buildEnv(binDir)
   });
 
@@ -84,11 +107,12 @@ test("setup trusts app-server API key auth even when login status alone would fa
 });
 
 test("setup is ready when the active provider does not require OpenAI login", () => {
+  const workspace = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir, "provider-no-auth");
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
-    cwd: ROOT,
+    cwd: workspace,
     env: buildEnv(binDir)
   });
 
@@ -102,11 +126,12 @@ test("setup is ready when the active provider does not require OpenAI login", ()
 });
 
 test("setup treats custom providers with app-server-ready config as ready", () => {
+  const workspace = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir, "env-key-provider");
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
-    cwd: ROOT,
+    cwd: workspace,
     env: buildEnv(binDir)
   });
 
@@ -120,11 +145,12 @@ test("setup treats custom providers with app-server-ready config as ready", () =
 });
 
 test("setup reports not ready when app-server config read fails", () => {
+  const workspace = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir, "config-read-fails");
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
-    cwd: ROOT,
+    cwd: workspace,
     env: buildEnv(binDir)
   });
 
@@ -364,6 +390,48 @@ test("review accepts the quoted raw argument style for built-in base-branch revi
   assert.equal(result.status, 0);
   assert.match(result.stdout, /Reviewed changes against main/);
   assert.match(result.stdout, /No material issues found/);
+});
+
+test("review uses native custom review/start target with jj instructions", { skip: JJ_SKIP }, () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initJjRepoWithCommit(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "updated\n");
+
+  const result = run("node", [SCRIPT, "review"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Reviewed custom target/);
+
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(state.lastReviewStart?.target?.type, "custom");
+  assert.match(state.lastReviewStart?.target?.instructions ?? "", /Jujutsu \(jj\), not git/);
+  assert.match(state.lastReviewStart?.target?.instructions ?? "", /working copy commit/);
+});
+
+test("review uses merge-base jj instructions for branch reviews", { skip: JJ_SKIP }, () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  setupDivergedJjRepoForReview(repo);
+
+  const result = run("node", [SCRIPT, "review", "--base", "main"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const instructions = state.lastReviewStart?.target?.instructions ?? "";
+  assert.equal(state.lastReviewStart?.target?.type, "custom");
+  assert.match(instructions, /common ancestor \(fork point\) of main and @/);
+  assert.doesNotMatch(instructions, /changes from main to @/);
 });
 
 test("adversarial review renders structured findings over app-server turn/start", () => {
