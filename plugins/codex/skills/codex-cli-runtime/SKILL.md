@@ -25,6 +25,7 @@ Execution rules:
 
 Command selection:
 - Use exactly one `task` invocation per rescue handoff.
+- Pass `timeout: 600000` (the 10-minute Bash maximum) on the `Bash` call that invokes `task`. The default 2-minute Bash timeout kills Codex mid-turn on large-diff rescues.
 - If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Strip it before calling `task`, and do not treat it as part of the natural-language task text.
 - If the forwarded request includes `--model`, normalize `spark` to `gpt-5.3-codex-spark` and pass it through to `task`.
 - If the forwarded request includes `--effort`, pass it through to `task`.
