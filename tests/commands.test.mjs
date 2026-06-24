@@ -192,8 +192,9 @@ test("internal docs use task terminology for rescue runs", () => {
   const promptingSkill = read("skills/gpt-5-4-prompting/SKILL.md");
   const promptRecipes = read("skills/gpt-5-4-prompting/references/codex-prompt-recipes.md");
 
-  assert.match(runtimeSkill, /codex-companion\.mjs" task "<raw arguments>"/);
+  assert.match(runtimeSkill, /codex-companion\.mjs" task --prompt-file/);
   assert.match(runtimeSkill, /Use `task` for every rescue request/i);
+  assert.match(runtimeSkill, /Always use `--prompt-file` instead of positional arguments/i);
   assert.match(runtimeSkill, /task --resume-last/i);
   assert.match(promptingSkill, /Use `task` when the task is diagnosis/i);
   assert.match(promptRecipes, /Codex task prompts/i);

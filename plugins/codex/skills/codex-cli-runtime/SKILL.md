@@ -9,7 +9,19 @@ user-invocable: false
 Use this skill only inside the `codex:codex-rescue` subagent.
 
 Primary helper:
-- `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task "<raw arguments>"`
+- `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --prompt-file /tmp/codex-prompt.txt [flags]`
+
+Prompt passing:
+- Always use `--prompt-file` instead of positional arguments for shell-safe prompt passing.
+- Write the prompt to a temp file first, then reference it:
+  ```bash
+  cat << 'EOF' > /tmp/codex-prompt.txt
+  Fix the authentication bug in src/auth.ts where tokens expire prematurely
+  EOF
+  node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --prompt-file /tmp/codex-prompt.txt --write
+  ```
+- This avoids shell escaping issues with quotes, backticks, dollar signs, and special characters in prompts.
+- Positional arguments (`task "prompt text"`) still work but are fragile when prompts contain shell metacharacters.
 
 Execution rules:
 - The rescue subagent is a forwarder, not an orchestrator. Its only job is to invoke `task` once and return that stdout unchanged.
