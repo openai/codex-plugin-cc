@@ -71,6 +71,48 @@ async function main() {
   let activeStreamThreadIds = null;
   const sockets = new Set();
 
+  // Idle self-shutdown: a broker is spawned detached+unref'd per session and is reused by
+  // endpoint-readiness, keyed by cwd. When a session ends (or crashes, or its host process is
+  // replaced) the broker keeps its app-server child alive with no client connected, and is never
+  // torn down because teardown only ever targets the *current* cwd's stale entry. Across sessions in
+  // distinct cwds these accumulate. Exit when no client has been connected for an idle window so a
+  // dead session's broker reaps itself. Disabled when the window is <= 0.
+  //
+  // Why this never races a live broker: a client connects per logical operation and disconnects when
+  // it finishes (the broker sits CLIENTLESS between turns and is reused via endpoint-readiness, not a
+  // held socket). A long-running turn keeps its socket connected for the whole turn, so sockets.size
+  // stays > 0 and the timer never arms. The window therefore only elapses after a genuine idle gap
+  // (no turn for IDLE_SHUTDOWN_MS), after which a fresh respawn is cheap. Keep the default well above
+  // expected inter-turn think-time — do NOT lower it toward reconnect latency.
+  const IDLE_SHUTDOWN_ENV = "CODEX_BROKER_IDLE_SHUTDOWN_MS"; // value-constant, mirrors PID_FILE_ENV/LOG_FILE_ENV
+  const IDLE_SHUTDOWN_MS = (() => {
+    const raw = Number(process.env[IDLE_SHUTDOWN_ENV]);
+    return Number.isFinite(raw) ? raw : 30 * 60 * 1000; // default 30 min; set 0 (or negative) to disable
+  })();
+  let idleTimer = null;
+  let serverRef = null;
+
+  function clearIdleTimer() {
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  }
+
+  function armIdleTimer() {
+    clearIdleTimer();
+    if (IDLE_SHUTDOWN_MS <= 0 || sockets.size > 0 || !serverRef) {
+      return;
+    }
+    idleTimer = setTimeout(() => {
+      // Re-check under the timer: only exit if still idle (no client reconnected meanwhile).
+      if (sockets.size === 0) {
+        shutdown(serverRef).then(() => process.exit(0));
+      }
+    }, IDLE_SHUTDOWN_MS);
+    idleTimer.unref?.(); // never keep the process alive solely for this timer
+  }
+
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
       activeRequestSocket = null;
@@ -103,8 +145,11 @@ async function main() {
     for (const socket of sockets) {
       socket.end();
     }
+    // Stop accepting new connections BEFORE any async teardown, so a client connecting during
+    // appClient.close() can't slip past the idle-path re-check and get dropped mid-handshake.
+    const serverClosed = new Promise((resolve) => server.close(resolve));
     await appClient.close().catch(() => {});
-    await new Promise((resolve) => server.close(resolve));
+    await serverClosed;
     if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
       fs.unlinkSync(listenTarget.path);
     }
@@ -117,6 +162,7 @@ async function main() {
 
   const server = net.createServer((socket) => {
     sockets.add(socket);
+    clearIdleTimer(); // a client is connected; cancel any pending idle shutdown
     socket.setEncoding("utf8");
     let buffer = "";
 
@@ -225,11 +271,13 @@ async function main() {
     socket.on("close", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      armIdleTimer(); // last client gone -> start the idle countdown to self-reap
     });
 
     socket.on("error", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      armIdleTimer();
     });
   });
 
@@ -243,7 +291,10 @@ async function main() {
     process.exit(0);
   });
 
-  server.listen(listenTarget.path);
+  serverRef = server;
+  server.listen(listenTarget.path, () => {
+    armIdleTimer(); // a broker spawned but never connected to should also self-reap
+  });
 }
 
 main().catch((error) => {
