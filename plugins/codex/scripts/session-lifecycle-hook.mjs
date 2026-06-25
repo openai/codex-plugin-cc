@@ -13,7 +13,14 @@ import {
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
+import {
+  loadState,
+  readJobFile,
+  resolveJobFile,
+  resolveStateFile,
+  saveState,
+  writeJobFile
+} from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -74,10 +81,96 @@ function cleanupSessionJobs(cwd, sessionId) {
   });
 }
 
+// SessionEnd only cleans the *current* session, and on Windows that hook
+// frequently never fires (abrupt terminal close / crash / window reload). So
+// dead-pid brokers and ghost "running"/"queued" job records from prior sessions
+// accumulate, making `/codex:status` report phantom jobs and (if `activeTask`
+// ever points at one) blocking new dispatches. SessionStart already runs, so use
+// it to self-heal prior-session orphans.
+function isPidAlive(pid) {
+  if (!Number.isFinite(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM => the process exists but we may not signal it; treat as alive.
+    return error?.code === "EPERM";
+  }
+}
+
+function reapStaleJobs(cwd) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const stateFile = resolveStateFile(workspaceRoot);
+  if (!fs.existsSync(stateFile)) {
+    return;
+  }
+
+  const state = loadState(workspaceRoot);
+  let changed = false;
+  for (const job of state.jobs) {
+    const active = job.status === "queued" || job.status === "running";
+    if (!active || isPidAlive(job.pid)) {
+      continue;
+    }
+    job.status = "failed";
+    job.pid = null;
+    changed = true;
+    // Keep the per-job record consistent with the neutralized state entry.
+    try {
+      const jobFile = resolveJobFile(workspaceRoot, job.id);
+      if (fs.existsSync(jobFile)) {
+        const record = readJobFile(jobFile);
+        record.status = "failed";
+        record.pid = null;
+        writeJobFile(workspaceRoot, job.id, record);
+      }
+    } catch {
+      // Ignore per-job file write failures during self-heal.
+    }
+  }
+
+  if (changed) {
+    saveState(workspaceRoot, state);
+  }
+}
+
+function reapOrphanBroker(cwd) {
+  const existing = loadBrokerSession(cwd);
+  if (!existing || isPidAlive(existing.pid)) {
+    return;
+  }
+  // The persisted broker's owning process is gone — tear down its stale endpoint
+  // so the next task spawns a fresh broker instead of probing a dead one.
+  teardownBrokerSession({
+    endpoint: existing.endpoint ?? null,
+    pidFile: existing.pidFile ?? null,
+    logFile: existing.logFile ?? null,
+    sessionDir: existing.sessionDir ?? null,
+    pid: existing.pid ?? null,
+    killProcess: terminateProcessTree
+  });
+  clearBrokerSession(cwd);
+}
+
 function handleSessionStart(input) {
   appendEnvVar(SESSION_ID_ENV, input.session_id);
   appendEnvVar(TRANSCRIPT_PATH_ENV, input.transcript_path);
   appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
+
+  // Best-effort self-heal of prior-session orphans; never block startup.
+  const cwd = input.cwd || process.cwd();
+  try {
+    reapStaleJobs(cwd);
+  } catch {
+    // Ignore self-heal failures.
+  }
+  try {
+    reapOrphanBroker(cwd);
+  } catch {
+    // Ignore self-heal failures.
+  }
 }
 
 async function handleSessionEnd(input) {

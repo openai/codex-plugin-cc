@@ -12,6 +12,20 @@ export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
 const BROKER_STATE_FILE = "broker.json";
 
+// APT local patch (re: openai/codex-plugin-cc broker readiness race).
+// Upstream waits a fixed 2000ms for a freshly-spawned `codex app-server` to bind
+// its endpoint, then gives up and lets the caller spawn a duplicate. On Windows a
+// cold app-server (Defender on-open scan + MCP fleet init) routinely needs longer,
+// so the fixed timer loses the race intermittently. Make both windows env-tunable
+// and raise the win32 defaults; ensureBrokerSession also now waits on child
+// liveness so a healthy-but-slow broker is never torn down prematurely.
+const DEFAULT_BROKER_READY_TIMEOUT_MS =
+  Number(process.env.CODEX_COMPANION_BROKER_TIMEOUT_MS) ||
+  (process.platform === "win32" ? 15000 : 4000);
+const DEFAULT_BROKER_REUSE_PROBE_MS =
+  Number(process.env.CODEX_COMPANION_BROKER_REUSE_PROBE_MS) ||
+  (process.platform === "win32" ? 750 : 250);
+
 export function createBrokerSessionDir(prefix = "cxc-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
@@ -21,7 +35,7 @@ function connectToEndpoint(endpoint) {
   return net.createConnection({ path: target.path });
 }
 
-export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
+export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000, child = null) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const ready = await new Promise((resolve) => {
@@ -34,6 +48,12 @@ export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
     });
     if (ready) {
       return true;
+    }
+    // APT local patch: if the spawned broker has already exited there is nothing
+    // left to bind the endpoint, so stop waiting immediately instead of burning
+    // the remainder of the (now longer) timeout.
+    if (child && child.exitCode !== null) {
+      return false;
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
@@ -104,7 +124,7 @@ async function isBrokerEndpointReady(endpoint) {
     return false;
   }
   try {
-    return await waitForBrokerEndpoint(endpoint, 150);
+    return await waitForBrokerEndpoint(endpoint, DEFAULT_BROKER_REUSE_PROBE_MS);
   } catch {
     return false;
   }
@@ -146,7 +166,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
     env: options.env ?? process.env
   });
 
-  const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
+  const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? DEFAULT_BROKER_READY_TIMEOUT_MS, child);
   if (!ready) {
     teardownBrokerSession({
       endpoint,
