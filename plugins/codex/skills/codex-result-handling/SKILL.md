@@ -19,3 +19,18 @@ When the helper returns Codex output:
 - CRITICAL: After presenting review findings, STOP. Do not make any code changes. Do not fix any issues. You MUST explicitly ask the user which issues, if any, they want fixed before touching a single file. Auto-applying fixes from a review is strictly forbidden, even if the fix is obvious.
 - If the helper reports malformed output or a failed Codex run, include the most actionable stderr lines and stop there instead of guessing.
 - If the helper reports that setup or authentication is required, direct the user to `/codex:setup` and do not improvise alternate auth flows.
+
+# Background Task Collection
+
+When a Codex task is launched with `--background`, its results are not immediately available. To prevent silent loss of background task results:
+
+- If the helper reports a background job was started (status `queued` with a job ID), inform the user that they must explicitly collect results later.
+- Tell the user to run `/codex:status <job-id>` to check progress, or `/codex:status <job-id> --wait` to block until completion.
+- Tell the user to run `/codex:result <job-id>` to retrieve the full output once the job completes.
+- Do not assume background tasks complete successfully. Always prompt the user to verify completion.
+- If the user starts a background task and then ends the conversation without collecting results, warn them that the job output may be lost if not retrieved.
+- When presenting background job launch confirmation, always include the exact commands needed to collect results:
+  - Check status: `/codex:status <job-id>`
+  - Wait for completion: `/codex:status <job-id> --wait`
+  - Get results: `/codex:result <job-id>`
+- Background jobs persist across Claude sessions within the same repository, but results should be collected promptly to avoid confusion with newer jobs.
