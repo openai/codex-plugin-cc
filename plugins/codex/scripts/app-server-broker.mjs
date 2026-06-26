@@ -8,6 +8,7 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
+import { clearBrokerSession } from "./lib/broker-lifecycle.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 
@@ -107,6 +108,12 @@ async function main() {
     idleTimer = setTimeout(() => {
       // Re-check under the timer: only exit if still idle (no client reconnected meanwhile).
       if (sockets.size === 0) {
+        // Clear the persisted broker.json for this cwd BEFORE exiting. Unlike SIGTERM/RPC shutdown
+        // (driven by a caller that also manages session state), this self-exit is autonomous: if we
+        // left broker.json pointing at the now-removed socket, a later `reuseExistingBroker: true`
+        // caller (e.g. `codex setup --json`) would load the stale endpoint without re-probing and
+        // report ready:false / connect ENOENT until something else cleans state.
+        try { clearBrokerSession(cwd); } catch { /* best-effort; teardown still proceeds */ }
         shutdown(serverRef).then(() => process.exit(0));
       }
     }, IDLE_SHUTDOWN_MS);

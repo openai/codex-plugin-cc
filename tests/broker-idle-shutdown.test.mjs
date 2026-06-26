@@ -8,6 +8,10 @@ import { fileURLToPath } from "node:url";
 
 import { makeTempDir } from "./helpers.mjs";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
+import {
+  saveBrokerSession,
+  loadBrokerSession
+} from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 
 const BROKER = fileURLToPath(
   new URL("../plugins/codex/scripts/app-server-broker.mjs", import.meta.url)
@@ -22,8 +26,12 @@ function brokerEnv(binDir, idleMs) {
   return { ...buildEnv(binDir), CODEX_BROKER_IDLE_SHUTDOWN_MS: String(idleMs) };
 }
 
-function spawnBroker(env, endpoint) {
-  return spawn(process.execPath, [BROKER, "serve", "--endpoint", endpoint], {
+function spawnBroker(env, endpoint, cwd) {
+  const args = [BROKER, "serve", "--endpoint", endpoint];
+  if (cwd) {
+    args.push("--cwd", cwd);
+  }
+  return spawn(process.execPath, args, {
     env,
     stdio: ["ignore", "ignore", "ignore"]
   });
@@ -144,5 +152,37 @@ test("unset env falls back to the (long) default, not disabled or instant-exit",
     await waitForExit(child, IDLE),
     false,
     "with the env unset the broker uses the long (30-min) default and must NOT exit quickly"
+  );
+});
+
+test("idle self-exit clears the persisted broker.json for the cwd", async (t) => {
+  // Regression for the reuseExistingBroker:true stale-endpoint path: after an autonomous idle exit,
+  // broker.json must NOT be left pointing at the removed socket (else `codex setup --json` and other
+  // reuse callers load a dead endpoint without re-probing).
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  try { fs.symlinkSync(process.execPath, path.join(binDir, "node")); } catch { /* may exist */ }
+  const sockDir = makeTempDir("cxc-idle-");
+  const workspace = makeTempDir("cxc-ws-"); // the broker --cwd; broker.json is keyed off this
+  const sock = path.join(sockDir, "broker.sock");
+
+  // Seed a persisted broker session for this workspace, as ensureBrokerSession would have.
+  saveBrokerSession(workspace, { endpoint: `unix:${sock}`, pidFile: null, logFile: null, sessionDir: sockDir, pid: null });
+  assert.notEqual(loadBrokerSession(workspace), null, "precondition: broker.json exists before idle exit");
+
+  const child = spawnBroker(brokerEnv(binDir, IDLE), `unix:${sock}`, workspace);
+  t.after(() => {
+    try { child.kill("SIGKILL"); } catch { /* gone */ }
+    try { fs.rmSync(sockDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    try { fs.rmSync(workspace, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  assert.equal(await waitForSocket(sock), true);
+  assert.equal(await waitForExit(child, IDLE * 5), true, "broker should idle-exit");
+  // After the autonomous idle exit, the persisted session must be cleared.
+  assert.equal(
+    loadBrokerSession(workspace),
+    null,
+    "broker.json must be cleared after idle self-exit so reuse callers don't load a dead endpoint"
   );
 });
