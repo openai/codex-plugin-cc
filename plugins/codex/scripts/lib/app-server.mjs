@@ -186,7 +186,11 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   }
 
   async initialize() {
-    this.proc = spawn("codex", ["app-server"], {
+    const args = ["app-server"];
+    if (this.options.model) {
+      args.push("-c", `model=${JSON.stringify(String(this.options.model))}`);
+    }
+    this.proc = spawn("codex", args, {
       cwd: this.cwd,
       env: this.options.env,
       stdio: ["pipe", "pipe", "pipe"],
