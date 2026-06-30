@@ -7,8 +7,9 @@ test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;
   const outcome = terminateProcessTree(1234, {
     platform: "win32",
-    runCommandImpl(command, args) {
-      captured = { command, args };
+    env: { PATH: "C:\\Windows\\System32", SHELL: "C:\\Program Files\\Git\\bin\\bash.exe" },
+    runCommandImpl(command, args, options) {
+      captured = { command, args, options };
       return {
         command,
         args,
@@ -26,7 +27,16 @@ test("terminateProcessTree uses taskkill on Windows", () => {
 
   assert.deepEqual(captured, {
     command: "taskkill",
-    args: ["/PID", "1234", "/T", "/F"]
+    args: ["/PID", "1234", "/T", "/F"],
+    options: {
+      cwd: undefined,
+      env: {
+        PATH: "C:\\Windows\\System32",
+        SHELL: "C:\\Program Files\\Git\\bin\\bash.exe",
+        MSYS_NO_PATHCONV: "1",
+        MSYS2_ARG_CONV_EXCL: "*"
+      }
+    }
   });
   assert.equal(outcome.delivered, true);
   assert.equal(outcome.method, "taskkill");

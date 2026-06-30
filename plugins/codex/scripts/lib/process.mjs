@@ -54,6 +54,14 @@ function looksLikeMissingProcessMessage(text) {
   return /not found|no running instance|cannot find|does not exist|no such process/i.test(text);
 }
 
+function envWithoutMsysPathConversion(env) {
+  return {
+    ...(env ?? process.env),
+    MSYS_NO_PATHCONV: "1",
+    MSYS2_ARG_CONV_EXCL: "*"
+  };
+}
+
 export function terminateProcessTree(pid, options = {}) {
   if (!Number.isFinite(pid)) {
     return { attempted: false, delivered: false, method: null };
@@ -66,7 +74,8 @@ export function terminateProcessTree(pid, options = {}) {
   if (platform === "win32") {
     const result = runCommandImpl("taskkill", ["/PID", String(pid), "/T", "/F"], {
       cwd: options.cwd,
-      env: options.env
+      // Keep taskkill's /PID and /T flags intact when Claude Code runs under Git Bash/MSYS.
+      env: envWithoutMsysPathConversion(options.env)
     });
 
     if (!result.error && result.status === 0) {
