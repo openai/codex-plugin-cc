@@ -14,12 +14,14 @@ import {
     getCodexAuthStatus,
     getCodexAvailability,
     getSessionRuntimeStatus,
+    importExternalAgentSession,
     interruptAppServerTurn,
     parseStructuredOutput,
     readOutputSchema,
     runAppServerReview,
     runAppServerTurn
   } from "./lib/codex.mjs";
+import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
@@ -78,6 +80,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
@@ -610,6 +613,33 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId
   };
 }
 
+function renderTransferResult(payload) {
+  const lines = [
+    "Transferred the Claude session into a Codex thread with visible turn history.",
+    `Codex session ID: ${payload.threadId}`,
+    `Resume in Codex: ${payload.resumeCommand}`
+  ];
+  return `${lines.join("\n")}\n`;
+}
+
+async function executeTransfer(cwd, options = {}) {
+  const sourcePath = resolveClaudeSessionPath(cwd, {
+    source: options.source
+  });
+  const result = await importExternalAgentSession(cwd, { sourcePath });
+  const payload = {
+    threadId: result.threadId,
+    resumeCommand: `codex resume ${result.threadId}`,
+    sourcePath,
+    sessionId: path.basename(sourcePath, ".jsonl")
+  };
+
+  return {
+    payload,
+    rendered: renderTransferResult(payload)
+  };
+}
+
 function readTaskPrompt(cwd, options, positionals) {
   if (options["prompt-file"]) {
     return fs.readFileSync(path.resolve(cwd, options["prompt-file"]), "utf8");
@@ -790,6 +820,19 @@ async function handleTask(argv) {
       }),
     { json: options.json }
   );
+}
+
+async function handleTransfer(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "source"],
+    booleanOptions: ["json"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const { payload, rendered } = await executeTransfer(cwd, {
+    source: options.source
+  });
+  outputCommandResult(payload, rendered, options.json);
 }
 
 async function handleTaskWorker(argv) {
@@ -999,6 +1042,9 @@ async function main() {
       break;
     case "task":
       await handleTask(argv);
+      break;
+    case "transfer":
+      await handleTransfer(argv);
       break;
     case "task-worker":
       await handleTaskWorker(argv);
