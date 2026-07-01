@@ -141,6 +141,13 @@ function runStopReview(cwd, input = {}) {
 
 function main() {
   const input = readHookInput();
+  // Prevent infinite Stop-hook loops: Claude Code sets stop_hook_active=true on a
+  // Stop event that fires because a previous Stop hook blocked. Re-running the
+  // review here (and re-blocking, or crashing) would loop until the block cap.
+  // Honor the contract and allow the turn to end on the continuation pass.
+  if (input.stop_hook_active) {
+    return;
+  }
   const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
