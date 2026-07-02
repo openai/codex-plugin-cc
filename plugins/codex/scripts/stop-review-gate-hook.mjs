@@ -102,6 +102,15 @@ function parseStopReviewOutput(rawOutput) {
   };
 }
 
+function tryParseVerdict(stdout) {
+  try {
+    const payload = JSON.parse(String(stdout ?? ""));
+    return parseStopReviewOutput(payload?.rawOutput);
+  } catch {
+    return null;
+  }
+}
+
 function runStopReview(cwd, input = {}) {
   const scriptPath = path.join(SCRIPT_DIR, "codex-companion.mjs");
   const prompt = buildStopReviewPrompt(input);
@@ -124,6 +133,14 @@ function runStopReview(cwd, input = {}) {
   }
 
   if (result.status !== 0) {
+    // The companion prints its JSON payload before setting a non-zero exit
+    // code, so a turn that failed AFTER streaming a final verdict still
+    // carries it in rawOutput. Never discard a BLOCK we actually received;
+    // fail open only when no verdict is present.
+    const salvaged = tryParseVerdict(result.stdout);
+    if (salvaged?.outcome === REVIEW_BLOCK) {
+      return salvaged;
+    }
     const detail = String(result.stderr || result.stdout || "").trim();
     return {
       outcome: REVIEW_INFRA_ERROR,
@@ -180,8 +197,11 @@ function main() {
     // Fail open on infrastructure failures so a transient Codex problem cannot
     // turn into an unbounded Stop-hook rewake loop (#248, #306). We warn on
     // stderr but do NOT block, letting the session end normally.
+    // Embedded error details often end with a period; strip it so splicing
+    // into the sentence below does not produce "..".
+    const reason = String(review.reason ?? "").trim().replace(/\.$/, "");
     logNote(
-      `Codex stop-time review could not complete — ${review.reason}. Allowing the stop instead of blocking; ` +
+      `Codex stop-time review could not complete — ${reason}. Allowing the stop instead of blocking; ` +
         "run /codex:review --wait manually or bypass the gate."
     );
     logNote(runningTaskNote);

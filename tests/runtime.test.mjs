@@ -2144,6 +2144,42 @@ test("stop hook fails open (does not block) when the stop-time review hits an in
   assert.match(allowed.stderr, /could not complete/i);
   assert.match(allowed.stderr, /Allowing the stop instead of blocking/i);
   assert.match(allowed.stderr, /rate limit|429/i);
+  // Period-terminated error details must not produce ".." when spliced into the warning.
+  assert.doesNotMatch(allowed.stderr, /\.\. Allowing/);
+});
+
+test("stop hook still blocks when the review turn fails after emitting a BLOCK verdict", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "stop-gate-block-then-error");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const blocked = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: JSON.stringify({
+      cwd: repo,
+      session_id: "sess-stop-salvage",
+      last_assistant_message: "I completed the refactor and updated the retry logic."
+    })
+  });
+
+  // The companion exits non-zero (turn ended "failed") but its payload still
+  // carries the BLOCK verdict that was streamed before the failure. A verdict
+  // we actually received must be honored, not discarded as an infra error.
+  assert.equal(blocked.status, 0, blocked.stderr);
+  const payload = JSON.parse(blocked.stdout);
+  assert.equal(payload.decision, "block");
+  assert.match(payload.reason, /Missing empty-state guard/i);
 });
 
 test("commands lazily start and reuse one shared app-server after first use", async () => {
