@@ -2116,6 +2116,36 @@ test("stop hook runs the actual task when auth status looks stale", () => {
   assert.match(payload.reason, /Missing empty-state guard/i);
 });
 
+test("stop hook fails open (does not block) when the stop-time review hits an infrastructure error", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "stop-gate-infra");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const allowed = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: JSON.stringify({ cwd: repo, session_id: "sess-stop-infra" })
+  });
+
+  // A transient Codex/infra failure must fail OPEN: no block decision on stdout,
+  // just a stderr warning. Blocking here would loop the Stop hook forever (#248, #306).
+  assert.equal(allowed.status, 0, allowed.stderr);
+  assert.equal(allowed.stdout.trim(), "");
+  assert.match(allowed.stderr, /could not complete/i);
+  assert.match(allowed.stderr, /Allowing the stop instead of blocking/i);
+  assert.match(allowed.stderr, /rate limit|429/i);
+});
+
 test("commands lazily start and reuse one shared app-server after first use", async () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
