@@ -73,6 +73,25 @@ export function parseArgs(argv, config = {}) {
   return { options, positionals };
 }
 
+export const CODEX_PLUGIN_ARGS_ENV = "CODEX_PLUGIN_CC_ARGS";
+
+/**
+ * Reads extra codex CLI arguments from the CODEX_PLUGIN_CC_ARGS environment
+ * variable and returns them as an argv array. These are prepended to every
+ * codex invocation (e.g. `codex -c model_provider=my-provider app-server`),
+ * letting users force global config overrides without editing config.toml.
+ *
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {string[]}
+ */
+export function getCodexPassthroughArgs(env = process.env) {
+  const raw = env?.[CODEX_PLUGIN_ARGS_ENV];
+  if (typeof raw !== "string" || !raw.trim()) {
+    return [];
+  }
+  return splitRawArgumentString(raw);
+}
+
 export function splitRawArgumentString(raw) {
   const tokens = [];
   let current = "";
