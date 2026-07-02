@@ -247,12 +247,30 @@ function taskPayload(prompt, resume) {
   return "Handled the requested task.\\nTask prompt accepted.";
 }
 
-const args = process.argv.slice(2);
-if (args[0] === "--version") {
+const rawArgs = process.argv.slice(2);
+// Extract positionals, skipping any leading global flags (e.g. \`-c key=value\`)
+// that the plugin may prepend from CODEX_PLUGIN_CC_ARGS.
+function extractPositionals(tokens) {
+  const positionals = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (token === "-c" || token === "--config") {
+      i++;
+      continue;
+    }
+    if (token.startsWith("-")) {
+      continue;
+    }
+    positionals.push(token);
+  }
+  return positionals;
+}
+const args = extractPositionals(rawArgs);
+if (rawArgs.includes("--version")) {
   console.log("codex-cli test");
   process.exit(0);
 }
-if (args[0] === "app-server" && args[1] === "--help") {
+if (args[0] === "app-server" && rawArgs.includes("--help")) {
   console.log("fake app-server help");
   process.exit(0);
 }
@@ -272,6 +290,7 @@ if (args[0] !== "app-server") {
 }
 const bootState = loadState();
 bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
+bootState.lastBootArgs = rawArgs;
 saveState(bootState);
 
 const rl = readline.createInterface({ input: process.stdin });

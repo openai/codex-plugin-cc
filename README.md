@@ -285,6 +285,27 @@ Your configuration will be picked up based on:
 
 Check out the Codex docs for more [configuration options](https://developers.openai.com/codex/config-reference).
 
+### Passing Extra Codex CLI Arguments
+
+If you want the plugin to forward extra arguments to every Codex launch, set the `CODEX_PLUGIN_CC_ARGS` environment variable in your shell. Whatever you put there is parsed like a shell command line and prepended to each `codex` invocation the plugin makes (the app-server runtime and the availability checks).
+
+This is the easiest way to force a custom provider without editing `config.toml`:
+
+```bash
+export CODEX_PLUGIN_CC_ARGS='-c model_provider=my-provider'
+```
+
+results in the plugin running `codex -c model_provider=my-provider app-server`.
+
+You can pass multiple flags, and quoting is supported:
+
+```bash
+export CODEX_PLUGIN_CC_ARGS="-c model_provider=my-provider -c 'base_url=https://example/v1'"
+```
+
+> [!NOTE]
+> The variable is read when a Codex runtime is started. If a shared runtime is already active for the session, change the value and start a fresh session (or cancel the running jobs) so the new arguments take effect.
+
 ### Moving The Work Over To Codex
 
 Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/codex:result` or `/codex:status` or by selecting it from the list.
