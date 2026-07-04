@@ -16,7 +16,10 @@ export function runCommand(command, args = [], options = {}) {
   return {
     command,
     args,
-    status: result.status ?? 0,
+    // A process killed by a signal reports status === null. Treat that as a
+    // failure (not success) so runCommandChecked/binaryAvailable don't silently
+    // accept truncated output; the signal itself is preserved below.
+    status: result.status ?? (result.signal ? 1 : 0),
     signal: result.signal ?? null,
     stdout: result.stdout ?? "",
     stderr: result.stderr ?? "",
