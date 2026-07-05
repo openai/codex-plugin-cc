@@ -4,8 +4,8 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { makeTempDir } from "./helpers.mjs";
-import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import { makeTempDir, initGitRepo } from "./helpers.mjs";
+import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState, listJobs, clearTerminalJobs } from "../plugins/codex/scripts/lib/state.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -42,6 +42,7 @@ test("resolveStateDir uses CLAUDE_PLUGIN_DATA when it is provided", () => {
 
 test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", () => {
   const workspace = makeTempDir();
+  initGitRepo(workspace);
   const stateFile = resolveStateFile(workspace);
   fs.mkdirSync(path.dirname(stateFile), { recursive: true });
 
@@ -102,4 +103,103 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
       .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
       .sort()
   );
+});
+
+test("listJobs automatically garbage collects completed/failed jobs older than 30 minutes", () => {
+  const workspace = makeTempDir();
+  initGitRepo(workspace);
+  const stateFile = resolveStateFile(workspace);
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+
+  const now = Date.now();
+  const jobs = [
+    {
+      id: "job-running-old",
+      status: "running",
+      updatedAt: new Date(now - 40 * 60 * 1000).toISOString(),
+      createdAt: new Date(now - 40 * 60 * 1000).toISOString()
+    },
+    {
+      id: "job-completed-old",
+      status: "completed",
+      updatedAt: new Date(now - 40 * 60 * 1000).toISOString(),
+      createdAt: new Date(now - 40 * 60 * 1000).toISOString()
+    },
+    {
+      id: "job-completed-fresh",
+      status: "completed",
+      updatedAt: new Date(now - 10 * 60 * 1000).toISOString(),
+      createdAt: new Date(now - 10 * 60 * 1000).toISOString()
+    }
+  ];
+
+  for (const job of jobs) {
+    fs.writeFileSync(resolveJobFile(workspace, job.id), JSON.stringify(job), "utf8");
+    fs.writeFileSync(resolveJobLogFile(workspace, job.id), "log\n", "utf8");
+  }
+
+  saveState(workspace, {
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs
+  });
+
+  // Old completed job should be GC'ed, old running job and fresh completed job should remain.
+  const activeJobs = listJobs(workspace);
+  assert.equal(activeJobs.length, 2);
+  assert.equal(activeJobs.some((j) => j.id === "job-running-old"), true);
+  assert.equal(activeJobs.some((j) => j.id === "job-completed-fresh"), true);
+  assert.equal(activeJobs.some((j) => j.id === "job-completed-old"), false);
+
+  assert.equal(fs.existsSync(resolveJobFile(workspace, "job-completed-old")), false);
+  assert.equal(fs.existsSync(resolveJobFile(workspace, "job-completed-fresh")), true);
+  assert.equal(fs.existsSync(resolveJobFile(workspace, "job-running-old")), true);
+});
+
+test("clearTerminalJobs removes all completed/failed/stopped jobs but keeps running ones", () => {
+  const workspace = makeTempDir();
+  initGitRepo(workspace);
+  const stateFile = resolveStateFile(workspace);
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+
+  const now = Date.now();
+  const jobs = [
+    {
+      id: "job-running",
+      status: "running",
+      updatedAt: new Date(now).toISOString(),
+      createdAt: new Date(now).toISOString()
+    },
+    {
+      id: "job-completed",
+      status: "completed",
+      updatedAt: new Date(now).toISOString(),
+      createdAt: new Date(now).toISOString()
+    },
+    {
+      id: "job-failed",
+      status: "failed",
+      updatedAt: new Date(now).toISOString(),
+      createdAt: new Date(now).toISOString()
+    }
+  ];
+
+  for (const job of jobs) {
+    fs.writeFileSync(resolveJobFile(workspace, job.id), JSON.stringify(job), "utf8");
+    fs.writeFileSync(resolveJobLogFile(workspace, job.id), "log\n", "utf8");
+  }
+
+  saveState(workspace, {
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs
+  });
+
+  const activeJobs = clearTerminalJobs(workspace);
+  assert.equal(activeJobs.length, 1);
+  assert.equal(activeJobs[0].id, "job-running");
+
+  assert.equal(fs.existsSync(resolveJobFile(workspace, "job-completed")), false);
+  assert.equal(fs.existsSync(resolveJobFile(workspace, "job-failed")), false);
+  assert.equal(fs.existsSync(resolveJobFile(workspace, "job-running")), true);
 });

@@ -147,7 +147,32 @@ export function upsertJob(cwd, jobPatch) {
 }
 
 export function listJobs(cwd) {
-  return loadState(cwd).jobs;
+  const state = loadState(cwd);
+  const now = Date.now();
+  const nextJobs = state.jobs.filter((job) => {
+    if (job.status !== "running" && job.updatedAt) {
+      const updatedTime = Date.parse(job.updatedAt);
+      if (Number.isFinite(updatedTime) && now - updatedTime > 30 * 60 * 1000) {
+        return false;
+      }
+    }
+    return true;
+  });
+  if (nextJobs.length !== state.jobs.length) {
+    state.jobs = nextJobs;
+    saveState(cwd, state);
+  }
+  return nextJobs;
+}
+
+export function clearTerminalJobs(cwd) {
+  const state = loadState(cwd);
+  const nextJobs = state.jobs.filter((job) => job.status === "running");
+  if (nextJobs.length !== state.jobs.length) {
+    state.jobs = nextJobs;
+    saveState(cwd, state);
+  }
+  return nextJobs;
 }
 
 export function setConfig(cwd, key, value) {

@@ -27,6 +27,7 @@ import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
+  clearTerminalJobs,
   generateJobId,
   getConfig,
   listJobs,
@@ -778,6 +779,9 @@ async function handleTask(argv) {
   const fresh = Boolean(options.fresh);
   if (resumeLast && fresh) {
     throw new Error("Choose either --resume/--resume-last or --fresh.");
+  }
+  if (fresh) {
+    clearTerminalJobs(cwd);
   }
   const write = Boolean(options.write);
   const taskMetadata = buildTaskRunMetadata({
