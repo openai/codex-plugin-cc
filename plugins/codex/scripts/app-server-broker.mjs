@@ -100,6 +100,7 @@ async function main() {
   }
 
   async function shutdown(server) {
+    intentionalShutdown = true;
     for (const socket of sockets) {
       socket.end();
     }
@@ -114,6 +115,25 @@ async function main() {
   }
 
   appClient.setNotificationHandler(routeNotification);
+
+  // If the child app-server dies, do not linger: a broker without its child
+  // still answers initialize probes locally, so reuse checks pass and the
+  // next real turn fails with "connection closed" (see #402).
+  // Tear down instead so probes fail honestly (ECONNREFUSED/ENOENT), which
+  // the client's direct-retry path already handles.
+  let serverStarted = false;
+  let intentionalShutdown = false;
+  appClient.exitPromise.then(async () => {
+    if (!serverStarted || intentionalShutdown) {
+      return;
+    }
+    try {
+      await shutdown(server);
+    } catch {
+      // Best effort — exiting is the important part.
+    }
+    process.exit(1);
+  });
 
   const server = net.createServer((socket) => {
     sockets.add(socket);
@@ -244,6 +264,7 @@ async function main() {
   });
 
   server.listen(listenTarget.path);
+  serverStarted = true;
 }
 
 main().catch((error) => {

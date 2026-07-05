@@ -619,9 +619,18 @@ async function withAppServer(cwd, fn) {
     return result;
   } catch (error) {
     const brokerRequested = client?.transport === "broker" || Boolean(process.env[BROKER_ENDPOINT_ENV]);
+    // "connection closed" is the shape of a broker whose child app-server
+    // died between turns (#402): no rpcCode, no errno — just the handleExit
+    // message. Treat it as a broker failure worth a direct retry.
+    const brokerConnectionClosed =
+      brokerRequested &&
+      error?.rpcCode === undefined &&
+      error?.code === undefined &&
+      /connection closed/i.test(error?.message ?? "");
     const shouldRetryDirect =
       (client?.transport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE) ||
-      (brokerRequested && (error?.code === "ENOENT" || error?.code === "ECONNREFUSED"));
+      (brokerRequested && (error?.code === "ENOENT" || error?.code === "ECONNREFUSED")) ||
+      brokerConnectionClosed;
 
     if (client) {
       await client.close().catch(() => {});
