@@ -13,7 +13,7 @@ import {
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
+import { loadState, removeJobArtifacts, resolveStateFile, saveState } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -58,19 +58,59 @@ function cleanupSessionJobs(cwd, sessionId) {
 
   for (const job of removedJobs) {
     const stillRunning = job.status === "queued" || job.status === "running";
-    if (!stillRunning) {
-      continue;
+    if (stillRunning) {
+      try {
+        terminateProcessTree(job.pid ?? Number.NaN);
+      } catch {
+        // Ignore teardown failures during session shutdown.
+      }
     }
-    try {
-      terminateProcessTree(job.pid ?? Number.NaN);
-    } catch {
-      // Ignore teardown failures during session shutdown.
-    }
+    // We own these jobs and are deliberately removing them. saveState's GC
+    // now protects active jobs' files (for other sessions' sake), so delete
+    // our own artifacts explicitly — otherwise killed jobs leak .json/.log.
+    removeJobArtifacts(workspaceRoot, job);
   }
 
   saveState(workspaceRoot, {
     ...state,
     jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
+  });
+}
+
+function isQueuedOrRunning(job) {
+  return job?.status === "queued" || job?.status === "running";
+}
+
+function hasOtherActiveSessionJobs(cwd, sessionId) {
+  if (!cwd) {
+    return false;
+  }
+
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const stateFile = resolveStateFile(workspaceRoot);
+  if (!fs.existsSync(stateFile)) {
+    return false;
+  }
+
+  // Read the state file directly rather than via loadState(), which maps
+  // read/parse failures to an empty default. An unreadable state file means
+  // we cannot prove sole ownership of the broker — fail closed and skip
+  // teardown rather than risk killing another session's live work.
+  let state;
+  try {
+    state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  } catch {
+    return true;
+  }
+  const jobs = Array.isArray(state?.jobs) ? state.jobs : [];
+  return jobs.some((job) => {
+    if (!isQueuedOrRunning(job)) {
+      return false;
+    }
+    if (!sessionId || !job.sessionId) {
+      return true;
+    }
+    return job.sessionId !== sessionId;
   });
 }
 
@@ -96,12 +136,17 @@ async function handleSessionEnd(input) {
   const logFile = brokerSession?.logFile ?? null;
   const sessionDir = brokerSession?.sessionDir ?? null;
   const pid = brokerSession?.pid ?? null;
+  const sessionId = input.session_id || process.env[SESSION_ID_ENV] || null;
+
+  cleanupSessionJobs(cwd, sessionId);
+  if (hasOtherActiveSessionJobs(cwd, sessionId)) {
+    return;
+  }
 
   if (brokerEndpoint) {
     await sendBrokerShutdown(brokerEndpoint);
   }
 
-  cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
   teardownBrokerSession({
     endpoint: brokerEndpoint,
     pidFile,

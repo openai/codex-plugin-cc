@@ -89,7 +89,13 @@ export function loadBrokerSession(cwd) {
 export function saveBrokerSession(cwd, session) {
   const stateDir = resolveStateDir(cwd);
   fs.mkdirSync(stateDir, { recursive: true });
-  fs.writeFileSync(resolveBrokerStateFile(cwd), `${JSON.stringify(session, null, 2)}\n`, "utf8");
+  // Atomic write (tmp + rename), matching saveState: a concurrent reader in
+  // another session must never parse a half-written broker.json, conclude
+  // "no broker", and spawn a duplicate.
+  const stateFile = resolveBrokerStateFile(cwd);
+  const tmpFile = `${stateFile}.${process.pid}.tmp`;
+  fs.writeFileSync(tmpFile, `${JSON.stringify(session, null, 2)}\n`, "utf8");
+  fs.renameSync(tmpFile, stateFile);
 }
 
 export function clearBrokerSession(cwd) {
