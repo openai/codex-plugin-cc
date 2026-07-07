@@ -118,7 +118,23 @@ function runStopReview(cwd, input = {}) {
   }
 
   if (result.status !== 0) {
-    const detail = String(result.stderr || result.stdout || "").trim();
+    // Prefer the real error from the companion's JSON stdout: stderr often
+    // contains only Node runtime noise (e.g. DEP0190) that masks the cause.
+    let detail = "";
+    try {
+      const payload = JSON.parse(result.stdout);
+      detail = String(payload?.rendered ?? "").trim();
+    } catch {
+      // stdout was not JSON; fall through to stderr/stdout below.
+    }
+    if (!detail) {
+      const stderrClean = String(result.stderr || "")
+        .split(/\r?\n/)
+        .filter((line) => !/DeprecationWarning|--trace-deprecation/.test(line))
+        .join("\n")
+        .trim();
+      detail = stderrClean || String(result.stdout || "").trim();
+    }
     return {
       ok: false,
       reason: detail
