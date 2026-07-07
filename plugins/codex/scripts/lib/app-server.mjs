@@ -67,6 +67,7 @@ class AppServerClientBase {
     this.notificationHandler = null;
     this.lineBuffer = "";
     this.transport = "unknown";
+    this.applicationRequestSent = false;
 
     this.exitPromise = new Promise((resolve) => {
       this.resolveExit = resolve;
@@ -86,6 +87,9 @@ class AppServerClientBase {
   request(method, params) {
     if (this.closed) {
       throw new Error("codex app-server client is closed.");
+    }
+    if (method !== "initialize") {
+      this.applicationRequestSent = true;
     }
 
     const id = this.nextId;

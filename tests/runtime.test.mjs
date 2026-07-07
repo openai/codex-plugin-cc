@@ -845,6 +845,116 @@ test("task forwards model selection and reasoning effort to app-server turn/star
   assert.equal(fakeState.lastTurnStart.effort, "low");
 });
 
+test("task does not retry direct after broker connection closes during an in-flight turn", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const brokerDir = fs.realpathSync(createBrokerSessionDir("cxc-test-"));
+  const endpoint = createBrokerEndpoint(brokerDir);
+  const socketPath = endpoint.startsWith("unix:") ? endpoint.slice(5) : endpoint;
+  const methodsLog = path.join(brokerDir, "received-methods.log");
+  const stubLog = path.join(brokerDir, "stub.log");
+  const stubScript = `
+    const net = require("node:net");
+    const fs = require("node:fs");
+    const [sock, log] = process.argv.slice(1);
+    const server = net.createServer((socket) => {
+      socket.setEncoding("utf8");
+      let buffered = "";
+      socket.on("data", (chunk) => {
+        buffered += chunk;
+        let idx;
+        while ((idx = buffered.indexOf("\\n")) !== -1) {
+          const line = buffered.slice(0, idx);
+          buffered = buffered.slice(idx + 1);
+          if (!line.trim()) continue;
+          let message;
+          try { message = JSON.parse(line); } catch { continue; }
+          if (message.method) fs.appendFileSync(log, message.method + "\\n");
+          if (message.method === "initialize") {
+            socket.write(JSON.stringify({ id: message.id, result: { userAgent: "test-broker" } }) + "\\n");
+            continue;
+          }
+          if (message.method === "initialized") {
+            continue;
+          }
+          if (message.method === "thread/start") {
+            socket.write(JSON.stringify({ id: message.id, result: { thread: { id: "thr-broker" } } }) + "\\n");
+            continue;
+          }
+          if (message.method === "thread/name/set") {
+            socket.write(JSON.stringify({ id: message.id, result: {} }) + "\\n");
+            continue;
+          }
+          if (message.method === "turn/start") {
+            socket.destroy();
+            server.close(() => process.exit(0));
+          }
+        }
+      });
+    });
+    server.on("error", (error) => {
+      fs.appendFileSync(log + ".error", error.stack || String(error));
+      process.exit(1);
+    });
+    server.listen(sock);
+  `;
+  const stubFd = fs.openSync(stubLog, "a");
+  const brokerProcess = spawn(process.execPath, ["-e", stubScript, socketPath, methodsLog], {
+    cwd: repo,
+    detached: true,
+    stdio: ["ignore", stubFd, stubFd]
+  });
+  fs.closeSync(stubFd);
+  let brokerExit = null;
+  brokerProcess.on("exit", (code, signal) => {
+    brokerExit = { code, signal };
+  });
+  brokerProcess.unref();
+  t.after(() => {
+    try {
+      process.kill(brokerProcess.pid, "SIGKILL");
+    } catch {
+      // Ignore missing process.
+    }
+    fs.rmSync(brokerDir, { recursive: true, force: true });
+  });
+  await waitFor(() => {
+    if (fs.existsSync(socketPath)) {
+      return true;
+    }
+    if (brokerExit) {
+      const stderr = fs.existsSync(stubLog) ? fs.readFileSync(stubLog, "utf8") : "";
+      const startupError = fs.existsSync(`${methodsLog}.error`) ? fs.readFileSync(`${methodsLog}.error`, "utf8") : "";
+      throw new Error(`Stub broker exited before listening: ${JSON.stringify(brokerExit)}\n${stderr}${startupError}`);
+    }
+    return false;
+  });
+
+  const result = run("node", [SCRIPT, "task", "do not duplicate this turn"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_COMPANION_APP_SERVER_ENDPOINT: endpoint
+    }
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /connection closed/i);
+  const methods = fs.readFileSync(methodsLog, "utf8").split("\n").filter(Boolean);
+  assert.deepEqual(methods, ["initialize", "initialized", "thread/start", "thread/name/set", "turn/start"]);
+  if (fs.existsSync(fakeStatePath)) {
+    const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+    assert.equal(fakeState.appServerStarts ?? 0, 0);
+  }
+});
+
 test("task logs reasoning summaries and assistant messages to the job log", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
