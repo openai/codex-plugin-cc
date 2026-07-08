@@ -30,3 +30,22 @@ export function initGitRepo(cwd) {
   run("git", ["config", "commit.gpgsign", "false"], { cwd });
   run("git", ["config", "tag.gpgsign", "false"], { cwd });
 }
+
+export function initJjRepo(cwd) {
+  run("jj", ["git", "init", "--quiet"], { cwd });
+}
+
+export function commitJjChange(cwd, message) {
+  run("jj", ["commit", "-m", message], { cwd });
+}
+
+export function initJjRepoWithCommit(cwd) {
+  initJjRepo(cwd);
+  fs.writeFileSync(path.join(cwd, ".keep"), "");
+  run("jj", ["commit", "-m", "initial commit"], { cwd });
+}
+
+export function makeMockJjDir(parentDir) {
+  fs.mkdirSync(path.join(parentDir, ".jj"), { recursive: true });
+  return parentDir;
+}
