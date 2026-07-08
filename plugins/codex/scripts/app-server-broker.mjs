@@ -70,8 +70,26 @@ async function main() {
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
   const sockets = new Set();
+  // Requests on one socket can overlap (a client may stop waiting for a slow request
+  // and issue the next one), so request ownership must be refcounted: releasing the
+  // slot on the FIRST completion would drop notifications for the still-running
+  // request and let another socket bypass serialization mid-flight.
+  const inflightRequests = new Map();
+
+  function releaseRequestSlot(socket) {
+    const remaining = (inflightRequests.get(socket) ?? 1) - 1;
+    if (remaining > 0) {
+      inflightRequests.set(socket, remaining);
+      return;
+    }
+    inflightRequests.delete(socket);
+    if (activeRequestSocket === socket) {
+      activeRequestSocket = null;
+    }
+  }
 
   function clearSocketOwnership(socket) {
+    inflightRequests.delete(socket);
     if (activeRequestSocket === socket) {
       activeRequestSocket = null;
     }
@@ -196,6 +214,7 @@ async function main() {
 
         const isStreaming = STREAMING_METHODS.has(message.method);
         activeRequestSocket = socket;
+        inflightRequests.set(socket, (inflightRequests.get(socket) ?? 0) + 1);
 
         try {
           const result = await appClient.request(message.method, message.params ?? {});
@@ -204,17 +223,13 @@ async function main() {
             activeStreamSocket = socket;
             activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
           }
-          if (activeRequestSocket === socket) {
-            activeRequestSocket = null;
-          }
+          releaseRequestSlot(socket);
         } catch (error) {
           send(socket, {
             id: message.id,
             error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
           });
-          if (activeRequestSocket === socket) {
-            activeRequestSocket = null;
-          }
+          releaseRequestSlot(socket);
           // Deliberately keep activeStreamSocket: a failed NON-streaming request must not
           // strip stream ownership from an in-flight turn on the same socket, or its
           // turn/completed notifications are dropped and the client hangs forever.

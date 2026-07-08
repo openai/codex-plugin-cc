@@ -32,7 +32,7 @@ Command selection:
 - If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
 - `--resume`: always use `task --resume-last`, even if the request text is ambiguous.
 - `--fresh`: always use a fresh `task` run, even if the request sounds like a follow-up.
-- `--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`. Supported tiers vary by model (for example `max`/`ultra` are 5.6-family tiers); a pair the live model catalog rejects fails before dispatch with that model's supported list.
+- `--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`. Supported tiers vary by model (for example `max`/`ultra` are 5.6-family tiers); a pair the live model catalog rejects fails before dispatch with that model's supported list. `none` and `minimal` are legacy values that current catalogs do not list for any model — combined with an explicit `--model` they will be rejected the same way.
 - `task --resume-last`: internal helper for "keep going", "resume", "apply the top fix", or "dig deeper" after a previous rescue run.
 
 Safety rules:

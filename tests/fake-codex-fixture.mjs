@@ -341,6 +341,12 @@ rl.on("line", (line) => {
       }
 
       case "thread/resume": {
+        if (BEHAVIOR === "resume-reports-different-model") {
+          const resumed = ensureThread(state, message.params.threadId);
+          const reported = message.params.model === "gpt-5.4-mini" ? "gpt-5.6-sol" : "gpt-5.4-mini";
+          send({ id: message.id, result: { thread: buildThread(resumed), model: reported, modelProvider: "openai", serviceTier: null, cwd: resumed.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+          break;
+        }
         if (requiresExperimental("persistExtendedHistory", message, state) || requiresExperimental("persistFullHistory", message, state)) {
           throw new Error("thread/resume.persistFullHistory requires experimentalApi capability");
         }
@@ -356,7 +362,7 @@ rl.on("line", (line) => {
           send({ id: message.id, error: { code: -32601, message: "Unsupported method: model/list" } });
           break;
         }
-        if (BEHAVIOR === "model-list-slow-error") {
+        if (BEHAVIOR === "model-list-slow-error" || BEHAVIOR === "model-list-slow-error-during-request") {
           setTimeout(() => {
             send({ id: message.id, error: { code: -32000, message: "model catalog backend timed out" } });
           }, 3500);
@@ -476,6 +482,22 @@ rl.on("line", (line) => {
 	          prompt
 	        };
 	        saveState(state);
+	        if (BEHAVIOR === "model-list-slow-error-during-request") {
+	          // Keep turn/start pending long enough for the delayed model/list error to land
+	          // mid-flight, then flush the response and every turn event as ONE stdout write
+	          // (one chunk), so the notifications are processed before the microtask that
+	          // resumes the broker's awaited turn/start request.
+	          setTimeout(() => {
+	            const burst = [
+	              { id: message.id, result: { turn: buildTurn(turnId) } },
+	              { method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } },
+	              { method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "msg_" + turnId, text: taskPayload(prompt, false), phase: "final_answer" } } },
+	              { method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } }
+	            ];
+	            process.stdout.write(burst.map((entry) => JSON.stringify(entry)).join("\\n") + "\\n");
+	          }, 800);
+	          break;
+	        }
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
 
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
