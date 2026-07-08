@@ -1,13 +1,13 @@
 # Prompt Blocks
 
-Use these blocks selectively when composing Codex or GPT-5.4 prompts.
+Opt-in blocks for Codex / GPT-5 prompts. On GPT-5.5, apply these selectively — pull in a block only when it changes behavior for the run, and never stack them by default. Start from the outcome-first skeleton in SKILL.md; most runs need zero or one block.
 Wrap each block in the XML tag shown in its heading.
 
 ## Core Wrapper
 
 ### `task`
 
-Use in nearly every prompt.
+Use when the prompt feeds a downstream parser or you need a stable wrapper. On GPT-5.5 the plain `# Goal` / `# Success criteria` headers from the skeleton usually suffice.
 
 ```xml
 <task>
@@ -31,7 +31,7 @@ Put the highest-value findings or decisions first.
 
 ### `compact_output_contract`
 
-Use when you want concise prose instead of a schema.
+Use when you want concise prose instead of a schema. On GPT-5.5, consider `text.verbosity: low` instead.
 
 ```xml
 <compact_output_contract>
@@ -55,7 +55,7 @@ Only stop to ask questions when a missing detail changes correctness, safety, or
 
 ### `completeness_contract`
 
-Use for debugging, implementation, or any multi-step task that should not stop early.
+Use for debugging, implementation, or any multi-step task with a real risk of stopping early.
 
 ```xml
 <completeness_contract>
@@ -80,7 +80,7 @@ If a check fails, revise the answer instead of reporting the first draft.
 
 ### `missing_context_gating`
 
-Use when Codex might otherwise guess.
+Use only when a missing fact would change correctness or trigger an irreversible action.
 
 ```xml
 <missing_context_gating>
@@ -128,7 +128,7 @@ Call out any risky or irreversible action before taking it.
 
 ### `tool_persistence_rules`
 
-Use for long-running tool-heavy tasks.
+Use for long-running tool-heavy tasks. Pair with an explicit retrieval budget or stop rule so persistence does not turn into over-searching.
 
 ```xml
 <tool_persistence_rules>
@@ -162,7 +162,7 @@ After you find the first plausible issue, check for second-order failures, empty
 
 ### `progress_updates`
 
-Use when the run may take a while.
+Use when the run may take a while. On GPT-5.5 also consider a tool preamble: a 1–2 sentence user-visible acknowledgement before the first tool call.
 
 ```xml
 <progress_updates>
