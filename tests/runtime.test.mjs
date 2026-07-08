@@ -969,6 +969,77 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
 });
 
+test("foreground task survives its observer being killed mid-run and stays retrievable (#370)", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  // The turn stays open for ~5s, giving a deterministic window to kill the
+  // observer while the detached worker is still running its turn.
+  installFakeCodex(binDir, "interruptible-slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = buildEnv(binDir);
+
+  // Launch a FOREGROUND task as its own process-group leader so the test can
+  // kill the observer (and its group) the way Claude Code's 10-minute Bash
+  // ceiling SIGTERMs the foreground process tree. The Codex turn runs in a
+  // detached worker that setsid's into its own session, so it is not in this
+  // group and must survive.
+  const observer = spawn(process.execPath, [SCRIPT, "task", "--json", "investigate the slow worker timeout"], {
+    cwd: repo,
+    env,
+    detached: true,
+    stdio: "ignore"
+  });
+  observer.unref();
+  t.after(() => {
+    try {
+      process.kill(-observer.pid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  });
+
+  // Wait until the worker has the turn underway (running with a thread + turn id).
+  const jobId = await waitFor(() => {
+    const status = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env });
+    if (status.status !== 0) {
+      return null;
+    }
+    const running = JSON.parse(status.stdout).running ?? [];
+    const job = running.find((candidate) => candidate.jobClass === "task" && candidate.threadId && candidate.turnId);
+    return job ? job.id : null;
+  }, { timeoutMs: 15000 });
+
+  // Kill the observer's whole process group. The detached worker is in its own
+  // session, so this does not reach it.
+  process.kill(-observer.pid, "SIGKILL");
+
+  // The worker keeps running without the observer and drives the job to done.
+  const waited = run(
+    "node",
+    [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "15000", "--json"],
+    { cwd: repo, env }
+  );
+  assert.equal(waited.status, 0, waited.stderr);
+  assert.equal(JSON.parse(waited.stdout).job.status, "completed");
+
+  // The result is retrievable even though the observer died mid-run, instead of
+  // the job being stranded in "running" forever.
+  const resultPayload = await waitFor(() => {
+    const result = run("node", [SCRIPT, "result", jobId, "--json"], { cwd: repo, env });
+    if (result.status !== 0) {
+      return null;
+    }
+    return JSON.parse(result.stdout);
+  });
+  assert.equal(resultPayload.job.id, jobId);
+  assert.equal(resultPayload.job.status, "completed");
+  assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
+});
+
 test("review rejects focus text because it is native-review only", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

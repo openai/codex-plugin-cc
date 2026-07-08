@@ -37,6 +37,7 @@ import {
 import {
   buildSingleJobSnapshot,
   buildStatusSnapshot,
+  isStreamableProgressLine,
   readStoredJob,
   resolveCancelableJob,
   resolveResultJob,
@@ -66,8 +67,14 @@ import {
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
-const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
+const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 1800000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
+// A foreground `task` run observes a detached worker rather than running the
+// Codex turn inline (issue #370). The observer is killed by Claude Code's
+// 10-minute Bash ceiling on long turns, so this timeout is only a backstop for
+// direct CLI use; the worker survives the ceiling regardless.
+const FOREGROUND_OBSERVE_TIMEOUT_MS = 1800000;
+const FOREGROUND_OBSERVE_POLL_INTERVAL_MS = 250;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
@@ -681,21 +688,30 @@ function spawnDetachedTaskWorker(cwd, jobId) {
   return child;
 }
 
-function enqueueBackgroundTask(cwd, job, request) {
+function enqueueDetachedTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
-  appendLogLine(logFile, "Queued for background execution.");
+  appendLogLine(logFile, "Queued for execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
     request
   };
+  // Persist the full record (including the request payload) BEFORE spawning so
+  // the detached worker always finds it when it boots and reads the job file.
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
+
+  const child = spawnDetachedTaskWorker(cwd, job.id);
+  if (child.pid != null) {
+    // Record the worker pid so /codex:cancel can reach a job that has not
+    // transitioned to "running" yet. child.pid is the worker's own process.pid,
+    // so this only patches pid and never clobbers the worker's status writes.
+    upsertJob(job.workspaceRoot, { id: job.id, pid: child.pid });
+  }
 
   return {
     payload: {
@@ -707,6 +723,149 @@ function enqueueBackgroundTask(cwd, job, request) {
     },
     logFile
   };
+}
+
+function ensureTrailingNewline(text) {
+  const value = String(text ?? "");
+  return value.endsWith("\n") ? value : `${value}\n`;
+}
+
+function streamJobLogTail(logFile, fromOffset) {
+  if (!logFile || !fs.existsSync(logFile)) {
+    return fromOffset;
+  }
+  let stat;
+  try {
+    stat = fs.statSync(logFile);
+  } catch {
+    return fromOffset;
+  }
+  if (stat.size <= fromOffset) {
+    return fromOffset;
+  }
+  let fd = null;
+  try {
+    fd = fs.openSync(logFile, "r");
+    const length = stat.size - fromOffset;
+    const buffer = Buffer.alloc(length);
+    fs.readSync(fd, buffer, 0, length, fromOffset);
+    const chunk = buffer.toString("utf8");
+    // Only consume complete lines; leave any partial trailing line for the next
+    // poll so a line is never split or filtered on incomplete content.
+    const lastNewline = chunk.lastIndexOf("\n");
+    if (lastNewline === -1) {
+      return fromOffset;
+    }
+    const consumed = chunk.slice(0, lastNewline + 1);
+    // Echo only progress lines — never the persisted block bodies (assistant
+    // message, Final output, reasoning), which are rendered on stdout instead.
+    // Streaming them here would duplicate Codex's answer onto stderr (#372).
+    const progress = consumed
+      .split("\n")
+      .filter((line) => isStreamableProgressLine(line))
+      .map((line) => `${line}\n`)
+      .join("");
+    if (progress) {
+      process.stderr.write(progress);
+    }
+    return fromOffset + Buffer.byteLength(consumed, "utf8");
+  } catch {
+    return fromOffset;
+  } finally {
+    if (fd != null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Ignore close failures while tailing.
+      }
+    }
+  }
+}
+
+// Observe a task whose Codex turn runs in a detached worker (spawnDetachedTaskWorker).
+// The worker runs in its own session, so it survives Claude Code's 10-minute Bash
+// ceiling; this foreground observer streams the worker's log and waits for it to
+// finish, preserving live output and the synchronous stdout the rescue subagent and
+// stop hook expect. If the harness kills this observer at the ceiling, the worker
+// keeps running, records completion, and the result stays retrievable via
+// `/codex:result <jobId>` instead of dying silently (issue #370).
+async function observeDetachedTask(cwd, job, options = {}) {
+  const asJson = Boolean(options.json);
+  const jobId = job.id;
+  const workspaceRoot = job.workspaceRoot;
+  const logFile = job.logFile ?? null;
+
+  if (!asJson) {
+    process.stderr.write(
+      `[codex] ${job.title ?? "Codex task"} dispatched as ${jobId}. ` +
+        "Streaming progress below; if this run is interrupted before it finishes, " +
+        `retrieve the result later with \`/codex:result ${jobId}\`.\n`
+    );
+  }
+
+  const deadline = Date.now() + FOREGROUND_OBSERVE_TIMEOUT_MS;
+  let logOffset = asJson ? 0 : streamJobLogTail(logFile, 0);
+  let snapshot = buildSingleJobSnapshot(cwd, jobId);
+
+  while (isActiveJobStatus(snapshot.job.status) && Date.now() < deadline) {
+    await sleep(Math.min(FOREGROUND_OBSERVE_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())));
+    if (!asJson) {
+      logOffset = streamJobLogTail(logFile, logOffset);
+    }
+    snapshot = buildSingleJobSnapshot(cwd, jobId);
+  }
+  if (!asJson) {
+    streamJobLogTail(logFile, logOffset);
+  }
+
+  if (isActiveJobStatus(snapshot.job.status)) {
+    // The observer gave up waiting, but the detached worker is still running.
+    if (asJson) {
+      outputResult({ jobId, status: snapshot.job.status, waitTimedOut: true, job: snapshot.job }, true);
+    } else {
+      process.stdout.write(
+        `Codex job ${jobId} is still running. Retrieve the result later with \`/codex:result ${jobId}\`.\n`
+      );
+    }
+    return snapshot;
+  }
+
+  const status = snapshot.job.status;
+  const storedJob = readStoredJob(workspaceRoot, jobId);
+  const renderedText =
+    storedJob && typeof storedJob.rendered === "string" && storedJob.rendered.length > 0
+      ? storedJob.rendered
+      : null;
+
+  if (status === "completed") {
+    if (asJson) {
+      outputResult(storedJob?.result ?? { job: snapshot.job }, true);
+    } else {
+      process.stdout.write(ensureTrailingNewline(renderedText ?? renderStoredJobResult(snapshot.job, storedJob)));
+    }
+    return snapshot;
+  }
+
+  // Failed or cancelled.
+  if (renderedText) {
+    // Codex produced output but reported a non-zero status — surface it exactly
+    // as the old inline foreground path did.
+    if (asJson) {
+      outputResult(storedJob?.result ?? { job: snapshot.job }, true);
+    } else {
+      process.stdout.write(ensureTrailingNewline(renderedText));
+    }
+  } else {
+    // The turn failed before producing output — mirror the inline `main().catch`
+    // behaviour and report the error on stderr with a non-zero exit code.
+    const message =
+      storedJob?.errorMessage ?? snapshot.job.errorMessage ?? `Codex job ${jobId} ${status} before producing output.`;
+    process.stderr.write(`${message}\n`);
+  }
+
+  const exitStatus = Number(storedJob?.result?.status);
+  process.exitCode = Number.isFinite(exitStatus) && exitStatus !== 0 ? exitStatus : 1;
+  return snapshot;
 }
 
 async function handleReviewCommand(argv, config) {
@@ -799,27 +958,30 @@ async function handleTask(argv) {
       resumeLast,
       jobId: job.id
     });
-    const { payload } = enqueueBackgroundTask(cwd, job, request);
+    const { payload } = enqueueDetachedTask(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
   }
 
+  // Foreground (default): dispatch to the same detached worker the background
+  // path uses, then observe it. The worker survives Claude Code's 10-minute Bash
+  // ceiling, so a long turn no longer dies silently mid-run — it finishes in the
+  // worker and stays retrievable via /codex:result (issue #370).
+  ensureCodexAvailable(cwd);
+  requireTaskRequest(prompt, resumeLast);
+
   const job = buildTaskJob(workspaceRoot, taskMetadata, write);
-  await runForegroundCommand(
-    job,
-    (progress) =>
-      executeTaskRun({
-        cwd,
-        model,
-        effort,
-        prompt,
-        write,
-        resumeLast,
-        jobId: job.id,
-        onProgress: progress
-      }),
-    { json: options.json }
-  );
+  const request = buildTaskRequest({
+    cwd,
+    model,
+    effort,
+    prompt,
+    write,
+    resumeLast,
+    jobId: job.id
+  });
+  const { logFile } = enqueueDetachedTask(cwd, job, request);
+  await observeDetachedTask(cwd, { ...job, logFile }, { json: options.json });
 }
 
 async function handleTransfer(argv) {

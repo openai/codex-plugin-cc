@@ -58,6 +58,26 @@ function isProgressBlockTitle(line) {
   );
 }
 
+// A progress entry is written by appendLogLine as `[<ISO-8601>] message`, where
+// the timestamp comes from nowIso() (`new Date().toISOString()`). Match that
+// exact prefix — not a bare `[` — so block bodies that merely *start* with a
+// bracket (a markdown reference like `[1] ...`, a `[P2] ...` line, or a JSON
+// array in Codex's answer) are not mistaken for progress and streamed (#372).
+const LOG_TIMESTAMP_PREFIX = /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\]\s/;
+
+// True for a raw log line that is a streamable progress message — i.e. a
+// timestamped entry that is not a block title. Block bodies (the assistant
+// message, the final output, reasoning, etc.) are written as continuation lines
+// without the timestamp prefix and return false, so callers tailing the log for
+// live progress do not echo the full result (which is rendered on stdout).
+export function isStreamableProgressLine(line) {
+  if (typeof line !== "string" || !LOG_TIMESTAMP_PREFIX.test(line)) {
+    return false;
+  }
+  const stripped = stripLogPrefix(line);
+  return Boolean(stripped) && !isProgressBlockTitle(stripped);
+}
+
 export function readJobProgressPreview(logFile, maxLines = DEFAULT_MAX_PROGRESS_LINES) {
   if (!logFile || !fs.existsSync(logFile)) {
     return [];
