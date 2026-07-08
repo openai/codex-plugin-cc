@@ -40,19 +40,98 @@ export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
   return false;
 }
 
-export async function sendBrokerShutdown(endpoint) {
-  await new Promise((resolve) => {
+// Keep in sync with BROKER_BUSY_RPC_CODE in lib/app-server.mjs (importing it
+// here would create a circular dependency: app-server.mjs imports this module).
+const BROKER_BUSY_RPC_CODE = -32001;
+
+/**
+ * Probe whether the broker is currently serving a request or streaming turn.
+ * Uses the `broker/status` RPC (answered before the busy gate). Brokers from
+ * older plugin versions don't implement it: when busy their gate rejects the
+ * probe with BROKER_BUSY_RPC_CODE (busy), and when idle they forward it to the
+ * app server which rejects the unknown method (idle) — both interpretable.
+ * Timeouts are treated as busy so an unresponsive broker is never killed
+ * mid-turn by account rotation.
+ */
+export async function isBrokerBusy(endpoint, timeoutMs = 1500) {
+  return await new Promise((resolve) => {
     const socket = connectToEndpoint(endpoint);
+    let buffer = "";
+    let settled = false;
+    const finish = (busy) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        socket.destroy();
+        resolve(busy);
+      }
+    };
+    const timer = setTimeout(() => finish(true), timeoutMs);
     socket.setEncoding("utf8");
     socket.on("connect", () => {
-      socket.write(`${JSON.stringify({ id: 1, method: "broker/shutdown", params: {} })}\n`);
+      socket.write(`${JSON.stringify({ id: 1, method: "broker/status", params: {} })}\n`);
     });
-    socket.on("data", () => {
-      socket.end();
-      resolve();
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      const newlineIndex = buffer.indexOf("\n");
+      if (newlineIndex === -1) {
+        return;
+      }
+      try {
+        const message = JSON.parse(buffer.slice(0, newlineIndex));
+        if (message.error) {
+          finish(message.error.code === BROKER_BUSY_RPC_CODE);
+          return;
+        }
+        finish(Boolean(message.result?.busy));
+      } catch {
+        finish(true);
+      }
     });
-    socket.on("error", resolve);
-    socket.on("close", resolve);
+    socket.on("error", () => finish(true));
+    socket.on("close", () => finish(true));
+  });
+}
+
+/**
+ * Ask the broker to shut down. With `ifIdle: true` the broker refuses when a
+ * request/stream is in flight (atomic with its busy state — see
+ * app-server-broker.mjs); the promise then resolves `false`. Resolves `true`
+ * when the broker shut down (or on legacy brokers that ignore the param and
+ * reply with an empty result).
+ */
+export async function sendBrokerShutdown(endpoint, { ifIdle = false } = {}) {
+  return await new Promise((resolve) => {
+    const socket = connectToEndpoint(endpoint);
+    let buffer = "";
+    let settled = false;
+    const finish = (didShutdown) => {
+      if (!settled) {
+        settled = true;
+        socket.end();
+        resolve(didShutdown);
+      }
+    };
+    socket.setEncoding("utf8");
+    socket.on("connect", () => {
+      const params = ifIdle ? { ifIdle: true } : {};
+      socket.write(`${JSON.stringify({ id: 1, method: "broker/shutdown", params })}\n`);
+    });
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      const newlineIndex = buffer.indexOf("\n");
+      if (newlineIndex === -1) {
+        return;
+      }
+      try {
+        const message = JSON.parse(buffer.slice(0, newlineIndex));
+        finish(message.result?.shutdown !== false);
+      } catch {
+        finish(true);
+      }
+    });
+    socket.on("error", () => finish(true));
+    socket.on("close", () => finish(true));
   });
 }
 
@@ -111,12 +190,36 @@ async function isBrokerEndpointReady(endpoint) {
 }
 
 export async function ensureBrokerSession(cwd, options = {}) {
+  // Account-aware reuse: the broker (and the `codex app-server` it manages)
+  // inherits CODEX_HOME once, at spawn time, so a live broker started under one
+  // account would otherwise silently serve every later call in this workspace —
+  // ignoring the caller's CODEX_HOME and breaking multi-account fallback.
+  // When the caller's CODEX_HOME differs from the one the session was created
+  // with, shut the old broker down gracefully and start a fresh one.
+  const desiredCodexHome = (options.env ?? process.env).CODEX_HOME ?? "";
   const existing = loadBrokerSession(cwd);
-  if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
+  const existingReady = existing ? await isBrokerEndpointReady(existing.endpoint) : false;
+  if (existing && existingReady && (existing.codexHome ?? "") === desiredCodexHome) {
     return existing;
   }
 
   if (existing) {
+    if (existingReady && (existing.codexHome ?? "") !== desiredCodexHome) {
+      // Never kill in-flight work on account rotation. The probe also covers
+      // legacy brokers (their busy gate rejects it with BROKER_BUSY_RPC_CODE);
+      // the `ifIdle` shutdown closes the probe→shutdown race on current
+      // brokers (a turn that starts in between makes the broker refuse).
+      // On either busy signal: return null so this call falls back to a
+      // directly spawned app server with the caller's env, and the rotation
+      // happens on the next call that finds the broker idle.
+      if (await isBrokerBusy(existing.endpoint)) {
+        return null;
+      }
+      const didShutdown = await sendBrokerShutdown(existing.endpoint, { ifIdle: true });
+      if (!didShutdown) {
+        return null;
+      }
+    }
     teardownBrokerSession({
       endpoint: existing.endpoint ?? null,
       pidFile: existing.pidFile ?? null,
@@ -164,7 +267,8 @@ export async function ensureBrokerSession(cwd, options = {}) {
     pidFile,
     logFile,
     sessionDir,
-    pid: child.pid ?? null
+    pid: child.pid ?? null,
+    codexHome: desiredCodexHome
   };
   saveBrokerSession(cwd, session);
   return session;

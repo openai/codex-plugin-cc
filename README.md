@@ -285,6 +285,74 @@ Your configuration will be picked up based on:
 
 Check out the Codex docs for more [configuration options](https://developers.openai.com/codex/config-reference).
 
+### Multiple Accounts (`CODEX_HOME`)
+
+The Codex CLI keeps everything account-specific — `auth.json`, `config.toml`,
+session history — inside `CODEX_HOME` (default `~/.codex`). Pointing it at a
+different directory gives you a fully independent account profile, which is
+useful when one account hits its 5h/weekly usage window and another has idle
+capacity (for example, a Business workspace where some seats belong to
+teammates who don't use Codex day-to-day).
+
+#### Setup
+
+Add one alias per account to your shell profile:
+
+```bash
+# ~/.zshrc / ~/.bashrc
+alias codex-main='CODEX_HOME=$HOME/.codex codex'
+alias codex-alice='CODEX_HOME=$HOME/.codex-alice codex'
+alias codex-bob='CODEX_HOME=$HOME/.codex-bob codex'
+```
+
+Then:
+
+```bash
+source ~/.zshrc
+```
+
+Log each account in once, into its own home:
+
+```bash
+codex-main login    # default account -> ~/.codex
+codex-alice login   # second account  -> ~/.codex-alice
+codex-bob login     # third account   -> ~/.codex-bob
+```
+
+From then on, each alias is a fully independent Codex:
+
+```bash
+codex-main
+codex-alice
+codex-bob
+```
+
+> **Note:** the aliases are pure convenience for you in interactive shells —
+> switching accounts by typing `codex-alice` instead of
+> `CODEX_HOME=$HOME/.codex-alice codex`. The only **mandatory** step is logging
+> each account in once, into its own home (`codex-alice login`). The plugin
+> never uses your aliases: it reads the `CODEX_HOME` environment variable
+> directly, as described below.
+
+#### How the plugin handles it
+
+The plugin honors the same variable: invoking the companion with a different
+`CODEX_HOME` runs that turn on that account. The per-workspace broker is
+account-aware — it restarts when the account changes **and the broker is idle**;
+if it is mid-task for the previous account, the new call runs on a directly
+spawned app server instead (in-flight work is never interrupted) and the
+rotation happens on the next idle call. Same-account calls keep reusing the
+warm broker.
+
+Two gotchas worth knowing:
+
+- **Non-interactive shells** (agents, CI, hooks) don't load your shell aliases —
+  always use the explicit `CODEX_HOME=... codex ...` form there.
+- **Placement in compound commands**: an env assignment only applies to the
+  command it directly prefixes. `CODEX_HOME=... cd dir && codex ...` sets the
+  variable for `cd` and silently runs Codex on the default account. Correct:
+  `cd dir && CODEX_HOME=... codex ...`.
+
 ### Moving The Work Over To Codex
 
 Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/codex:result` or `/codex:status` or by selecting it from the list.
