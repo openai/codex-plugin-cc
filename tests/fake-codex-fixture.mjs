@@ -306,6 +306,10 @@ rl.on("line", (line) => {
         break;
 
       case "thread/start": {
+        if (BEHAVIOR === "hang-rpc-thread-start") {
+          // Intentionally drop the request: never respond, never error.
+          break;
+        }
         if (BEHAVIOR === "auth-run-fails") {
           throw new Error("authentication expired; run codex login");
         }
@@ -437,6 +441,22 @@ rl.on("line", (line) => {
       }
 
 	      case "turn/start": {
+	        if (BEHAVIOR === "hang-after-turn-start") {
+	          const thread = ensureThread(state, message.params.threadId);
+	          const hangTurnId = nextTurnId(state);
+	          thread.updatedAt = now();
+	          state.lastTurnStart = {
+	            threadId: message.params.threadId,
+	            turnId: hangTurnId,
+	            model: message.params.model ?? null,
+	            effort: message.params.effort ?? null,
+	            prompt: ""
+	          };
+	          saveState(state);
+	          send({ id: message.id, result: { turn: buildTurn(hangTurnId) } });
+	          // Never emit turn/completed or any further notifications for this turn.
+	          break;
+	        }
 	        const thread = ensureThread(state, message.params.threadId);
 	        const prompt = (message.params.input || [])
           .filter((item) => item.type === "text")
