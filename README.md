@@ -236,6 +236,27 @@ When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted
 > [!WARNING]
 > The review gate can create a long-running Claude/Codex loop and may drain usage limits quickly. Only enable it when you plan to actively monitor the session.
 
+#### Throttling the review gate
+
+To prevent runaway usage, you can limit how often the review gate fires:
+
+```bash
+# Allow at most 5 stop-gate reviews per session
+/codex:setup --review-gate-max 5
+
+# Require at least 10 minutes between stop-gate reviews
+/codex:setup --review-gate-cooldown 10
+
+# Combine both limits
+/codex:setup --enable-review-gate --review-gate-max 5 --review-gate-cooldown 10
+
+# Remove a limit
+/codex:setup --review-gate-max off
+/codex:setup --review-gate-cooldown off
+```
+
+When a limit is reached, the stop-gate review is skipped (the session is allowed to end) and a note is logged. You can still run `/codex:review` manually at any time.
+
 ## Typical Flows
 
 ### Review Before Shipping

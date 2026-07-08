@@ -174,6 +174,17 @@ function appendReasoningSection(lines, reasoningSummary) {
   }
 }
 
+function formatReviewGateLimits(report) {
+  const parts = [];
+  if (report.reviewGateMaxPerSession != null) {
+    parts.push(`max ${report.reviewGateMaxPerSession}/session`);
+  }
+  if (report.reviewGateCooldownMinutes != null) {
+    parts.push(`${report.reviewGateCooldownMinutes}m cooldown`);
+  }
+  return parts.length > 0 ? ` (${parts.join(", ")})` : "";
+}
+
 export function renderSetupReport(report) {
   const lines = [
     "# Codex Setup",
@@ -186,7 +197,7 @@ export function renderSetupReport(report) {
     `- codex: ${report.codex.detail}`,
     `- auth: ${report.auth.detail}`,
     `- session runtime: ${report.sessionRuntime.label}`,
-    `- review gate: ${report.reviewGateEnabled ? "enabled" : "disabled"}`,
+    `- review gate: ${report.reviewGateEnabled ? "enabled" : "disabled"}${report.reviewGateEnabled ? formatReviewGateLimits(report) : ""}`,
     ""
   ];
 
