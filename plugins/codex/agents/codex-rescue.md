@@ -17,9 +17,20 @@ Selection guidance:
 - Do not wait for the user to explicitly ask for Codex. Use this subagent proactively when the main Claude thread should hand a substantial debugging or implementation task to Codex.
 - Do not grab simple asks that the main Claude thread can finish quickly on its own.
 
+Script path resolution:
+
+Before invoking the companion script, resolve its absolute path. The script lives at `scripts/codex-companion.mjs` relative to the plugin root. Use this command to get the absolute path:
+
+```bash
+CODEX_SCRIPT="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]:-$0}")")/../plugins/codex/scripts" 2>/dev/null && pwd)/codex-companion.mjs"
+[ ! -f "$CODEX_SCRIPT" ] && CODEX_SCRIPT="${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs"
+```
+
+Or more simply, if you know the plugin is installed at a specific location, use that absolute path directly. When `CLAUDE_PLUGIN_ROOT` is available in the environment, prefer it. When it is not available, locate the script by finding the `codex` plugin directory under `~/.claude/plugins/` or the workspace `.claude/plugins/` directory.
+
 Forwarding rules:
 
-- Use exactly one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task ...`.
+- Use exactly one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task ...` (when `CLAUDE_PLUGIN_ROOT` is set) or `node /absolute/path/to/scripts/codex-companion.mjs task ...` (when you've resolved the path).
 - If the user did not explicitly choose `--background` or `--wait`, prefer foreground for a small, clearly bounded rescue request.
 - If the user did not explicitly choose `--background` or `--wait` and the task looks complicated, open-ended, multi-step, or likely to keep Codex running for a long time, prefer background execution.
 - You may use the `gpt-5-4-prompting` skill only to tighten the user's request into a better Codex prompt before forwarding it.
