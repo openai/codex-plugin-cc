@@ -1121,11 +1121,6 @@ async function fetchModelCatalog(client) {
   }
 }
 
-function catalogDefaultModel(entries) {
-  const entry = Array.isArray(entries) ? entries.find((item) => item && item.isDefault) : null;
-  return entry ? entry.id ?? entry.model ?? null : null;
-}
-
 function assertCatalogSupportsEffort(entries, resolvedModel, effort, onProgress) {
   if (!entries) {
     emitEffortValidationSkip(onProgress, effort, "model catalog unavailable or malformed");
@@ -1164,7 +1159,12 @@ export async function runAppServerTurn(cwd, options = {}) {
 
   return withAppServer(cwd, async (client) => {
     let threadId;
-    const catalogEntries = options.effort ? await fetchModelCatalog(client) : null;
+    // Validate only an explicit --model/--effort pair. Without --model the target is
+    // whatever the server resolves (the config.toml default on fresh dispatches, the
+    // thread's own model on resume) — the catalog's global isDefault entry is NOT that
+    // model, so guessing here falsely rejects documented flows.
+    const shouldValidateEffort = Boolean(options.effort) && Boolean(options.model);
+    const catalogEntries = shouldValidateEffort ? await fetchModelCatalog(client) : null;
 
     if (options.resumeThreadId) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
@@ -1174,13 +1174,12 @@ export async function runAppServerTurn(cwd, options = {}) {
         ephemeral: false
       });
       threadId = response.thread.id;
-      if (options.effort) {
-        assertCatalogSupportsEffort(catalogEntries, response.model ?? null, options.effort, options.onProgress);
+      if (shouldValidateEffort) {
+        assertCatalogSupportsEffort(catalogEntries, response.model ?? options.model, options.effort, options.onProgress);
       }
     } else {
-      if (options.effort) {
-        const targetModel = options.model ?? catalogDefaultModel(catalogEntries);
-        assertCatalogSupportsEffort(catalogEntries, targetModel, options.effort, options.onProgress);
+      if (shouldValidateEffort) {
+        assertCatalogSupportsEffort(catalogEntries, options.model, options.effort, options.onProgress);
       }
       emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
       const response = await startThread(client, cwd, {

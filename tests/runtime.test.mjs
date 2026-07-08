@@ -848,7 +848,7 @@ test("task rejects an effort the resolved model does not support before starting
   }
 });
 
-test("task validates an effort-only dispatch against the resolved default model", () => {
+test("task forwards an effort-only dispatch without validating against a guessed default model", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   const statePath = path.join(binDir, "fake-codex-state.json");
@@ -858,18 +858,15 @@ test("task validates an effort-only dispatch against the resolved default model"
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const result = run("node", [SCRIPT, "task", "--effort", "ultra", "diagnose the failing test"], {
+  const result = run("node", [SCRIPT, "task", "--fresh", "--effort", "ultra", "diagnose the failing test"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
 
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /Model "gpt-5\.4" does not support reasoning effort "ultra"/);
-  if (fs.existsSync(statePath)) {
-    const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
-    assert.equal(fakeState.lastTurnStart ?? null, null);
-    assert.equal((fakeState.threads ?? []).length, 0, "no thread may be created for a rejected pair");
-  }
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.effort, "ultra");
+  assert.equal(fakeState.lastTurnStart.model, null, "no guessed model may be injected into turn/start");
 });
 
 test("task fails open with a warning when the model catalog is unavailable", () => {
@@ -909,6 +906,54 @@ test("task fails open with a warning when the model catalog is malformed", () =>
   });
 
   assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout + result.stderr, /skipping reasoning-effort validation/);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.effort, "ultra");
+});
+
+test("task --resume-last keeps an explicit effort without validating against the config default", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const firstRun = run("node", [SCRIPT, "task", "--fresh", "--model", "gpt-5.6-sol", "--effort", "ultra", "start the migration"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+
+  const resume = run("node", [SCRIPT, "task", "--resume-last", "--effort", "ultra", "keep going"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(resume.status, 0, resume.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.effort, "ultra");
+});
+
+test("a slow-failing model/list does not kill the turn's event stream on the broker transport", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "model-list-slow-error");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "--fresh", "--model", "gpt-5.6-sol", "--effort", "ultra", "diagnose the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    timeout: 30000
+  });
+
+  assert.equal(result.status, 0, `companion did not complete (stream ownership lost?): ${result.stderr}`);
   assert.match(result.stdout + result.stderr, /skipping reasoning-effort validation/);
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(fakeState.lastTurnStart.effort, "ultra");

@@ -215,9 +215,9 @@ async function main() {
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
           }
-          if (activeStreamSocket === socket && !isStreaming) {
-            activeStreamSocket = null;
-          }
+          // Deliberately keep activeStreamSocket: a failed NON-streaming request must not
+          // strip stream ownership from an in-flight turn on the same socket, or its
+          // turn/completed notifications are dropped and the client hangs forever.
         }
       }
     });

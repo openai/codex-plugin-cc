@@ -356,6 +356,12 @@ rl.on("line", (line) => {
           send({ id: message.id, error: { code: -32601, message: "Unsupported method: model/list" } });
           break;
         }
+        if (BEHAVIOR === "model-list-slow-error") {
+          setTimeout(() => {
+            send({ id: message.id, error: { code: -32000, message: "model catalog backend timed out" } });
+          }, 3500);
+          break;
+        }
         if (BEHAVIOR === "model-list-malformed") {
           send({ id: message.id, result: { data: "not-a-catalog" } });
           break;
@@ -620,6 +626,9 @@ rl.on("line", (line) => {
 	          interruptibleTurns.set(turnId, { threadId: thread.id, timer });
 	        } else if (BEHAVIOR === "slow-task") {
 	          emitTurnCompletedLater(thread.id, turnId, items, 400);
+	        } else if (BEHAVIOR === "model-list-slow-error") {
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          emitTurnCompletedLater(thread.id, turnId, items, 1800);
 	        } else {
 	          emitTurnCompleted(thread.id, turnId, items);
 	        }
