@@ -6,7 +6,13 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-lifecycle-hook.mjs\" SessionStart",
+            "command": "node",
+            "args": [
+              "-e",
+              "const cp=require('node:child_process'),fs=require('node:fs'),p=require('node:path');let r=process.env.CLAUDE_PLUGIN_ROOT;if(!r){console.error('Codex plugin hook skipped: CLAUDE_PLUGIN_ROOT is not set.');process.exit(0);}if(process.platform==='win32'&&/^\\/[A-Za-z]\\//.test(r))r=r[1]+':/'+r.slice(3);const script=p.join(r,'scripts',process.argv[1]);if(!fs.existsSync(script)){console.error(`Codex plugin hook skipped: ${script} was not found.`);process.exit(0);}const x=cp.spawnSync(process.execPath,[script,...process.argv.slice(2)],{stdio:'inherit',env:process.env,windowsHide:true});if(x.error)throw x.error;process.exit(x.status??1);",
+              "session-lifecycle-hook.mjs",
+              "SessionStart"
+            ],
             "timeout": 5
           }
         ]
@@ -17,7 +23,13 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-lifecycle-hook.mjs\" SessionEnd",
+            "command": "node",
+            "args": [
+              "-e",
+              "const cp=require('node:child_process'),fs=require('node:fs'),p=require('node:path');let r=process.env.CLAUDE_PLUGIN_ROOT;if(!r){console.error('Codex plugin hook skipped: CLAUDE_PLUGIN_ROOT is not set.');process.exit(0);}if(process.platform==='win32'&&/^\\/[A-Za-z]\\//.test(r))r=r[1]+':/'+r.slice(3);const script=p.join(r,'scripts',process.argv[1]);if(!fs.existsSync(script)){console.error(`Codex plugin hook skipped: ${script} was not found.`);process.exit(0);}const x=cp.spawnSync(process.execPath,[script,...process.argv.slice(2)],{stdio:'inherit',env:process.env,windowsHide:true});if(x.error)throw x.error;process.exit(x.status??1);",
+              "session-lifecycle-hook.mjs",
+              "SessionEnd"
+            ],
             "timeout": 5
           }
         ]
@@ -28,7 +40,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/stop-review-gate-hook.mjs\"",
+            "command": "node",
+            "args": [
+              "-e",
+              "const cp=require('node:child_process'),fs=require('node:fs'),p=require('node:path');let r=process.env.CLAUDE_PLUGIN_ROOT;if(!r){console.error('Codex plugin hook skipped: CLAUDE_PLUGIN_ROOT is not set.');process.exit(0);}if(process.platform==='win32'&&/^\\/[A-Za-z]\\//.test(r))r=r[1]+':/'+r.slice(3);const script=p.join(r,'scripts',process.argv[1]);if(!fs.existsSync(script)){console.error(`Codex plugin hook skipped: ${script} was not found.`);process.exit(0);}const x=cp.spawnSync(process.execPath,[script,...process.argv.slice(2)],{stdio:'inherit',env:process.env,windowsHide:true});if(x.error)throw x.error;process.exit(x.status??1);",
+              "stop-review-gate-hook.mjs"
+            ],
             "timeout": 900
           }
         ]
