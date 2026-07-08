@@ -1,12 +1,113 @@
 import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
+import { getConfig, listJobs, readJobFile, resolveJobFile, upsertJob, writeJobFile } from "./state.mjs";
+import { isProcessAlive } from "./process.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
 export const DEFAULT_MAX_PROGRESS_LINES = 4;
+
+function isActiveJobStatus(status) {
+  return status === "queued" || status === "running";
+}
+
+/**
+ * Marks a job as failed when its tracked process has died unexpectedly.
+ * Re-reads the latest persisted state from disk before writing to guard
+ * against races where the job completes legitimately at the same moment.
+ *
+ * @param {string} workspaceRoot
+ * @param {string} jobId
+ * @param {number} pid - The PID we observed as dead
+ * @returns {boolean} true if the job was reconciled, false if skipped
+ */
+export function markDeadPidJobFailed(workspaceRoot, jobId, pid) {
+  const jobFile = resolveJobFile(workspaceRoot, jobId);
+
+  let latestJob;
+  try {
+    latestJob = readJobFile(jobFile);
+  } catch {
+    return false;
+  }
+
+  // Only overwrite active states; never downgrade completed/failed/cancelled.
+  if (!isActiveJobStatus(latestJob.status)) {
+    return false;
+  }
+
+  // Only overwrite if the PID still matches what we observed as dead. This
+  // guards against a job that legitimately restarted with a new PID between
+  // our liveness probe and the write.
+  if (latestJob.pid !== pid) {
+    return false;
+  }
+
+  const completedAt = new Date().toISOString();
+  const errorMessage = `Tracked process PID ${pid} exited unexpectedly without writing a terminal status.`;
+
+  // writeJobFile is a raw write; bump updatedAt explicitly so that a re-sort
+  // after reconciliation moves the freshly-failed job to the front of the
+  // newest-first list (otherwise it stays in its pre-reconciliation slot and
+  // can be dropped by the maxJobs slice in buildStatusSnapshot).
+  const failedPatch = {
+    status: "failed",
+    phase: "failed",
+    pid: null,
+    errorMessage,
+    completedAt,
+    updatedAt: completedAt
+  };
+
+  writeJobFile(workspaceRoot, jobId, {
+    ...latestJob,
+    ...failedPatch
+  });
+
+  upsertJob(workspaceRoot, {
+    id: jobId,
+    ...failedPatch
+  });
+
+  return true;
+}
+
+/**
+ * If a job is still marked active but its tracked PID is dead, reconcile it
+ * to failed and return the updated record. Otherwise return the original.
+ *
+ * Called from every status read path so a single status query is enough to
+ * surface dead workers - no need to wait for a polling watcher.
+ *
+ * @param {string} workspaceRoot
+ * @param {object} job
+ * @returns {object}
+ */
+function reconcileIfDead(workspaceRoot, job) {
+  if (!job || !isActiveJobStatus(job.status)) {
+    return job;
+  }
+  const pid = Number.isFinite(job.pid) ? job.pid : null;
+  if (pid === null) {
+    return job;
+  }
+  if (isProcessAlive(pid)) {
+    return job;
+  }
+
+  try {
+    markDeadPidJobFailed(workspaceRoot, job.id, pid);
+  } catch {
+    // Never let reconciliation errors crash a status read.
+    return job;
+  }
+
+  // Re-read so the caller sees the reconciled fields.
+  const refreshed = readStoredJob(workspaceRoot, job.id);
+  return refreshed ? { ...job, ...refreshed } : job;
+}
 
 export function sortJobsNewestFirst(jobs) {
   return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
@@ -213,19 +314,25 @@ function matchJobReference(jobs, reference, predicate = () => true) {
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
-  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), options));
+  const rawJobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), options));
+  // Reconcile any active jobs whose tracked PID is dead before partitioning,
+  // so a single status read surfaces stuck workers immediately. Re-sort after
+  // reconciliation because markDeadPidJobFailed bumps updatedAt to now, which
+  // means a stale `running` job that lived near the end of the pre-sort list
+  // must move to the front to survive the maxJobs slice below.
+  const jobs = sortJobsNewestFirst(rawJobs.map((job) => reconcileIfDead(workspaceRoot, job)));
   const maxJobs = options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS;
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
 
   const running = jobs
-    .filter((job) => job.status === "queued" || job.status === "running")
+    .filter((job) => isActiveJobStatus(job.status))
     .map((job) => enrichJob(job, { maxProgressLines }));
 
-  const latestFinishedRaw = jobs.find((job) => job.status !== "queued" && job.status !== "running") ?? null;
+  const latestFinishedRaw = jobs.find((job) => !isActiveJobStatus(job.status)) ?? null;
   const latestFinished = latestFinishedRaw ? enrichJob(latestFinishedRaw, { maxProgressLines }) : null;
 
   const recent = (options.all ? jobs : jobs.slice(0, maxJobs))
-    .filter((job) => job.status !== "queued" && job.status !== "running" && job.id !== latestFinished?.id)
+    .filter((job) => !isActiveJobStatus(job.status) && job.id !== latestFinished?.id)
     .map((job) => enrichJob(job, { maxProgressLines }));
 
   return {
@@ -247,9 +354,11 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
     throw new Error(`No job found for "${reference}". Run /codex:status to inspect known jobs.`);
   }
 
+  const reconciled = reconcileIfDead(workspaceRoot, selected);
+
   return {
     workspaceRoot,
-    job: enrichJob(selected, { maxProgressLines: options.maxProgressLines })
+    job: enrichJob(reconciled, { maxProgressLines: options.maxProgressLines })
   };
 }
 

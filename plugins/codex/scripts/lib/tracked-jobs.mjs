@@ -5,6 +5,22 @@ import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
+// Hard ceiling for any single tracked job. Default 30 minutes is generous
+// enough for long Codex turns but bounded so a hung captureTurn cannot keep
+// the companion process alive forever. Override via CODEX_COMPANION_JOB_TIMEOUT_MS.
+const DEFAULT_JOB_TIMEOUT_MS = 30 * 60 * 1000;
+
+function resolveJobTimeoutMs(options = {}) {
+  if (Number.isFinite(options.timeoutMs) && options.timeoutMs > 0) {
+    return options.timeoutMs;
+  }
+  const fromEnv = Number(process.env.CODEX_COMPANION_JOB_TIMEOUT_MS);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) {
+    return fromEnv;
+  }
+  return DEFAULT_JOB_TIMEOUT_MS;
+}
+
 export function nowIso() {
   return new Date().toISOString();
 }
@@ -151,8 +167,30 @@ export async function runTrackedJob(job, runner, options = {}) {
   writeJobFile(job.workspaceRoot, job.id, runningRecord);
   upsertJob(job.workspaceRoot, runningRecord);
 
+  // Race the runner against a hard timeout. If captureTurn or any other
+  // long-poll inside the runner hangs (e.g. underlying app-server died and
+  // never produced a terminal event), this guarantees the companion exits
+  // and the job transitions to a terminal status. See: openai/codex-plugin-cc#183.
+  const timeoutMs = resolveJobTimeoutMs(options);
+  let timeoutHandle = null;
+  const timeoutPromise = new Promise((_resolve, reject) => {
+    timeoutHandle = setTimeout(() => {
+      reject(
+        new Error(
+          `Tracked job ${job.id} exceeded the ${Math.round(timeoutMs / 1000)}s hard timeout. ` +
+            "The runner did not produce a terminal status. Set CODEX_COMPANION_JOB_TIMEOUT_MS to adjust."
+        )
+      );
+    }, timeoutMs);
+    timeoutHandle.unref?.();
+  });
+
   try {
-    const execution = await runner();
+    const execution = await Promise.race([runner(), timeoutPromise]);
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+      timeoutHandle = null;
+    }
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
     writeJobFile(job.workspaceRoot, job.id, {
@@ -179,6 +217,10 @@ export async function runTrackedJob(job, runner, options = {}) {
     appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
     return execution;
   } catch (error) {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+      timeoutHandle = null;
+    }
     const errorMessage = error instanceof Error ? error.message : String(error);
     const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
     const completedAt = nowIso();

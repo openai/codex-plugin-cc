@@ -70,6 +70,7 @@ async function main() {
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
   const sockets = new Set();
+  let shuttingDown = false;
 
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
@@ -100,7 +101,25 @@ async function main() {
   }
 
   async function shutdown(server) {
+    if (shuttingDown) {
+      return;
+    }
+    shuttingDown = true;
+    // Notify any client whose request is still in flight that the broker is
+    // going down. Without this they would hang on a half-open socket waiting
+    // for a response that will never arrive.
+    const fanoutMessage = {
+      method: "notifications/broker/shuttingDown",
+      params: {
+        reason: appClient.exitError ? String(appClient.exitError.message ?? appClient.exitError) : "broker shutdown"
+      }
+    };
     for (const socket of sockets) {
+      try {
+        send(socket, fanoutMessage);
+      } catch {
+        // Best-effort fanout. Continue tearing down.
+      }
       socket.end();
     }
     await appClient.close().catch(() => {});
@@ -114,6 +133,21 @@ async function main() {
   }
 
   appClient.setNotificationHandler(routeNotification);
+
+  // If the underlying codex CLI app-server dies (crashes, OOM, exits), tear
+  // down the broker rather than zombify with a dead client. The next companion
+  // process will detect a dead endpoint via ensureBrokerSession and respawn.
+  // See: openai/codex-plugin-cc#183.
+  appClient.exitPromise.then(() => {
+    if (shuttingDown) {
+      return;
+    }
+    const detail = appClient.exitError instanceof Error ? appClient.exitError.message : String(appClient.exitError ?? "unknown");
+    process.stderr.write(`[broker] underlying codex app-server exited: ${detail}\n`);
+    shutdown(server)
+      .catch(() => {})
+      .finally(() => process.exit(1));
+  });
 
   const server = net.createServer((socket) => {
     sockets.add(socket);
