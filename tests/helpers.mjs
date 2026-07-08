@@ -3,9 +3,69 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
+import { after } from "node:test";
+
+import {
+  clearBrokerSession,
+  loadBrokerSession,
+  sendBrokerShutdown,
+  teardownBrokerSession
+} from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+
+const TEST_TEMP_PREFIX = "codex-plugin-test-";
+const tempDirs = new Set();
+
+function isTestTempDir(dir) {
+  return path.basename(dir).startsWith(TEST_TEMP_PREFIX);
+}
+
+async function teardownTempBroker(cwd) {
+  const brokerSession = loadBrokerSession(cwd);
+  if (!brokerSession) {
+    return;
+  }
+
+  const endpoint = brokerSession.endpoint ?? null;
+  if (endpoint) {
+    // A wedged endpoint (accepts, never responds) must not hang the global
+    // cleanup hook and strand every later-registered broker.
+    await Promise.race([
+      sendBrokerShutdown(endpoint).catch(() => {}),
+      new Promise((resolve) => {
+        const timer = setTimeout(resolve, 5000);
+        timer.unref?.();
+      })
+    ]);
+  }
+
+  teardownBrokerSession({
+    endpoint,
+    pidFile: brokerSession.pidFile ?? null,
+    logFile: brokerSession.logFile ?? null,
+    sessionDir: brokerSession.sessionDir ?? null,
+    pid: brokerSession.pid ?? null,
+    killProcess: terminateProcessTree
+  });
+  clearBrokerSession(cwd);
+}
+
+export async function cleanupRegisteredTempBrokers() {
+  for (const dir of tempDirs) {
+    await teardownTempBroker(dir);
+  }
+}
+
+after(async () => {
+  await cleanupRegisteredTempBrokers();
+});
 
 export function makeTempDir(prefix = "codex-plugin-test-") {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  if (isTestTempDir(dir)) {
+    tempDirs.add(dir);
+  }
+  return dir;
 }
 
 export function writeExecutable(filePath, source) {

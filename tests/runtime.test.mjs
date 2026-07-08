@@ -7,7 +7,8 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
-import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { createBrokerSessionDir, loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { createBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -28,12 +29,40 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   throw new Error("Timed out waiting for condition.");
 }
 
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
+}
+
+function withEnvVar(name, value, callback) {
+  const previous = process.env[name];
+  if (value == null) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
+  }
+  try {
+    return callback();
+  } finally {
+    if (previous == null) {
+      delete process.env[name];
+    } else {
+      process.env[name] = previous;
+    }
+  }
+}
+
 test("setup reports ready when fake codex is installed and authenticated", () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
 
+  const workspace = makeTempDir();
   const result = run("node", [SCRIPT, "setup", "--json"], {
-    cwd: ROOT,
+    cwd: workspace,
     env: buildEnv(binDir)
   });
 
@@ -45,12 +74,13 @@ test("setup reports ready when fake codex is installed and authenticated", () =>
 });
 
 test("setup is ready without npm when Codex is already installed and authenticated", () => {
+  const workspace = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
   fs.symlinkSync(process.execPath, path.join(binDir, "node"));
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
-    cwd: ROOT,
+    cwd: workspace,
     env: {
       ...process.env,
       PATH: binDir
@@ -66,11 +96,12 @@ test("setup is ready without npm when Codex is already installed and authenticat
 });
 
 test("setup trusts app-server API key auth even when login status alone would fail", () => {
+  const workspace = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir, "api-key-account-only");
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
-    cwd: ROOT,
+    cwd: workspace,
     env: buildEnv(binDir)
   });
 
@@ -84,11 +115,12 @@ test("setup trusts app-server API key auth even when login status alone would fa
 });
 
 test("setup is ready when the active provider does not require OpenAI login", () => {
+  const workspace = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir, "provider-no-auth");
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
-    cwd: ROOT,
+    cwd: workspace,
     env: buildEnv(binDir)
   });
 
@@ -102,11 +134,12 @@ test("setup is ready when the active provider does not require OpenAI login", ()
 });
 
 test("setup treats custom providers with app-server-ready config as ready", () => {
+  const workspace = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir, "env-key-provider");
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
-    cwd: ROOT,
+    cwd: workspace,
     env: buildEnv(binDir)
   });
 
@@ -120,11 +153,12 @@ test("setup treats custom providers with app-server-ready config as ready", () =
 });
 
 test("setup reports not ready when app-server config read fails", () => {
+  const workspace = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir, "config-read-fails");
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
-    cwd: ROOT,
+    cwd: workspace,
     env: buildEnv(binDir)
   });
 
@@ -134,6 +168,33 @@ test("setup reports not ready when app-server config read fails", () => {
   assert.equal(payload.auth.loggedIn, false);
   assert.equal(payload.auth.source, "app-server");
   assert.match(payload.auth.detail, /config\/read failed for cwd/);
+});
+
+test("setup tests ignore a live broker for the repo cwd when run in a temp workspace", () => {
+  const workspace = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+
+  withEnvVar("CLAUDE_PLUGIN_DATA", pluginDataDir, () => {
+    saveBrokerSession(ROOT, {
+      endpoint: "unix:/tmp/codex-plugin-test-live-root-broker.sock"
+    });
+  });
+
+  const result = run("node", [SCRIPT, "setup", "--json"], {
+    cwd: workspace,
+    env: {
+      ...buildEnv(binDir),
+      CLAUDE_PLUGIN_DATA: pluginDataDir
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ready, true);
+  assert.equal(payload.sessionRuntime.mode, "direct");
+  assert.equal(payload.auth.loggedIn, true);
 });
 
 test("review renders a no-findings result from app-server review/start", () => {
@@ -782,6 +843,116 @@ test("task forwards model selection and reasoning effort to app-server turn/star
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(fakeState.lastTurnStart.model, "gpt-5.3-codex-spark");
   assert.equal(fakeState.lastTurnStart.effort, "low");
+});
+
+test("task does not retry direct after broker connection closes during an in-flight turn", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const brokerDir = fs.realpathSync(createBrokerSessionDir("cxc-test-"));
+  const endpoint = createBrokerEndpoint(brokerDir);
+  const socketPath = endpoint.startsWith("unix:") ? endpoint.slice(5) : endpoint;
+  const methodsLog = path.join(brokerDir, "received-methods.log");
+  const stubLog = path.join(brokerDir, "stub.log");
+  const stubScript = `
+    const net = require("node:net");
+    const fs = require("node:fs");
+    const [sock, log] = process.argv.slice(1);
+    const server = net.createServer((socket) => {
+      socket.setEncoding("utf8");
+      let buffered = "";
+      socket.on("data", (chunk) => {
+        buffered += chunk;
+        let idx;
+        while ((idx = buffered.indexOf("\\n")) !== -1) {
+          const line = buffered.slice(0, idx);
+          buffered = buffered.slice(idx + 1);
+          if (!line.trim()) continue;
+          let message;
+          try { message = JSON.parse(line); } catch { continue; }
+          if (message.method) fs.appendFileSync(log, message.method + "\\n");
+          if (message.method === "initialize") {
+            socket.write(JSON.stringify({ id: message.id, result: { userAgent: "test-broker" } }) + "\\n");
+            continue;
+          }
+          if (message.method === "initialized") {
+            continue;
+          }
+          if (message.method === "thread/start") {
+            socket.write(JSON.stringify({ id: message.id, result: { thread: { id: "thr-broker" } } }) + "\\n");
+            continue;
+          }
+          if (message.method === "thread/name/set") {
+            socket.write(JSON.stringify({ id: message.id, result: {} }) + "\\n");
+            continue;
+          }
+          if (message.method === "turn/start") {
+            socket.destroy();
+            server.close(() => process.exit(0));
+          }
+        }
+      });
+    });
+    server.on("error", (error) => {
+      fs.appendFileSync(log + ".error", error.stack || String(error));
+      process.exit(1);
+    });
+    server.listen(sock);
+  `;
+  const stubFd = fs.openSync(stubLog, "a");
+  const brokerProcess = spawn(process.execPath, ["-e", stubScript, socketPath, methodsLog], {
+    cwd: repo,
+    detached: true,
+    stdio: ["ignore", stubFd, stubFd]
+  });
+  fs.closeSync(stubFd);
+  let brokerExit = null;
+  brokerProcess.on("exit", (code, signal) => {
+    brokerExit = { code, signal };
+  });
+  brokerProcess.unref();
+  t.after(() => {
+    try {
+      process.kill(brokerProcess.pid, "SIGKILL");
+    } catch {
+      // Ignore missing process.
+    }
+    fs.rmSync(brokerDir, { recursive: true, force: true });
+  });
+  await waitFor(() => {
+    if (fs.existsSync(socketPath)) {
+      return true;
+    }
+    if (brokerExit) {
+      const stderr = fs.existsSync(stubLog) ? fs.readFileSync(stubLog, "utf8") : "";
+      const startupError = fs.existsSync(`${methodsLog}.error`) ? fs.readFileSync(`${methodsLog}.error`, "utf8") : "";
+      throw new Error(`Stub broker exited before listening: ${JSON.stringify(brokerExit)}\n${stderr}${startupError}`);
+    }
+    return false;
+  });
+
+  const result = run("node", [SCRIPT, "task", "do not duplicate this turn"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_COMPANION_APP_SERVER_ENDPOINT: endpoint
+    }
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /connection closed/i);
+  const methods = fs.readFileSync(methodsLog, "utf8").split("\n").filter(Boolean);
+  assert.deepEqual(methods, ["initialize", "initialized", "thread/start", "thread/name/set", "turn/start"]);
+  if (fs.existsSync(fakeStatePath)) {
+    const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+    assert.equal(fakeState.appServerStarts ?? 0, 0);
+  }
 });
 
 test("task logs reasoning summaries and assistant messages to the job log", () => {
@@ -1921,6 +2092,199 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   assert.deepEqual(state.jobs.map((job) => job.id), ["review-other"]);
   const otherJob = state.jobs[0];
   assert.equal(otherJob.logFile, otherSessionLog);
+});
+
+test("session end preserves shared broker while another session has active jobs", async (t) => {
+  const repo = makeTempDir();
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const currentLog = path.join(jobsDir, "task-current.log");
+  const completedLog = path.join(jobsDir, "task-current-completed.log");
+  const otherLog = path.join(jobsDir, "task-other.log");
+  const currentJobFile = path.join(jobsDir, "task-current.json");
+  const completedJobFile = path.join(jobsDir, "task-current-completed.json");
+  const otherJobFile = path.join(jobsDir, "task-other.json");
+  for (const filePath of [currentLog, completedLog, otherLog]) {
+    fs.writeFileSync(filePath, "log\n", "utf8");
+  }
+  for (const filePath of [currentJobFile, completedJobFile, otherJobFile]) {
+    fs.writeFileSync(filePath, JSON.stringify({ id: path.basename(filePath, ".json") }, null, 2), "utf8");
+  }
+
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "task-current",
+            status: "queued",
+            sessionId: "sess-current",
+            logFile: currentLog,
+            createdAt: "2026-03-18T15:30:00.000Z",
+            updatedAt: "2026-03-18T15:31:00.000Z"
+          },
+          {
+            id: "task-current-completed",
+            status: "completed",
+            sessionId: "sess-current",
+            logFile: completedLog,
+            createdAt: "2026-03-18T15:32:00.000Z",
+            updatedAt: "2026-03-18T15:33:00.000Z"
+          },
+          {
+            id: "task-other",
+            status: "running",
+            sessionId: "sess-other",
+            logFile: otherLog,
+            createdAt: "2026-03-18T15:34:00.000Z",
+            updatedAt: "2026-03-18T15:35:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const brokerDir = createBrokerSessionDir("cxc-test-");
+  const endpoint = createBrokerEndpoint(brokerDir);
+  const socketPath = endpoint.startsWith("unix:") ? endpoint.slice(5) : endpoint;
+  const pidFile = path.join(brokerDir, "broker.pid");
+  const logFile = path.join(brokerDir, "broker.log");
+  const methodsLog = path.join(brokerDir, "received-methods.log");
+
+  // A REAL listening broker in a separate process — the test driver calls the
+  // SessionEnd hook via spawnSync (blocking), so an in-process socket server
+  // would deadlock: it could never accept the subprocess's connection. The
+  // stub records every JSON-RPC method it receives to a file and exits on
+  // broker/shutdown, so a hook that sends shutdown while another session has
+  // active jobs is caught, not silently tolerated by an unmanned socket.
+  const stubScript = `
+    const net = require("node:net");
+    const fs = require("node:fs");
+    const [sock, log] = process.argv.slice(1);
+    const server = net.createServer((socket) => {
+      socket.setEncoding("utf8");
+      let buffered = "";
+      socket.on("data", (chunk) => {
+        buffered += chunk;
+        let idx;
+        while ((idx = buffered.indexOf("\\n")) !== -1) {
+          const line = buffered.slice(0, idx);
+          buffered = buffered.slice(idx + 1);
+          if (!line.trim()) continue;
+          let message;
+          try { message = JSON.parse(line); } catch { continue; }
+          if (message.method) fs.appendFileSync(log, message.method + "\\n");
+          if (message.id !== undefined) socket.write(JSON.stringify({ id: message.id, result: {} }) + "\\n");
+          if (message.method === "broker/shutdown") { server.close(); process.exit(0); }
+        }
+      });
+    });
+    server.listen(sock);
+  `;
+  const brokerProcess = spawn(process.execPath, ["-e", stubScript, socketPath, methodsLog], {
+    cwd: repo,
+    detached: true,
+    stdio: "ignore"
+  });
+  brokerProcess.unref();
+  await waitFor(() => fs.existsSync(socketPath));
+  fs.writeFileSync(pidFile, `${brokerProcess.pid}\n`, "utf8");
+  fs.writeFileSync(logFile, "broker\n", "utf8");
+  saveBrokerSession(repo, {
+    endpoint,
+    pidFile,
+    logFile,
+    sessionDir: brokerDir,
+    pid: brokerProcess.pid
+  });
+
+  const receivedMethods = () =>
+    fs.existsSync(methodsLog)
+      ? fs.readFileSync(methodsLog, "utf8").split("\n").filter(Boolean)
+      : [];
+
+  t.after(() => {
+    try {
+      process.kill(brokerProcess.pid, "SIGKILL");
+    } catch {
+      // Ignore missing process.
+    }
+    fs.rmSync(brokerDir, { recursive: true, force: true });
+  });
+
+  const firstEnd = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      CODEX_COMPANION_SESSION_ID: "sess-current"
+    },
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      session_id: "sess-current",
+      cwd: repo
+    })
+  });
+  assert.equal(firstEnd.status, 0, firstEnd.stderr);
+  assert.ok(loadBrokerSession(repo));
+  assert.equal(isProcessAlive(brokerProcess.pid), true);
+  assert.equal(
+    receivedMethods().includes("broker/shutdown"),
+    false,
+    "broker/shutdown must not be sent while another session has active jobs"
+  );
+  assert.equal(fs.existsSync(currentLog), false);
+  assert.equal(fs.existsSync(completedLog), false);
+  assert.equal(fs.existsSync(currentJobFile), false);
+  assert.equal(fs.existsSync(completedJobFile), false);
+  assert.equal(fs.existsSync(otherLog), true);
+  assert.equal(fs.existsSync(otherJobFile), true);
+
+  let state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.deepEqual(state.jobs.map((job) => job.id), ["task-other"]);
+  assert.equal(state.jobs[0].status, "running");
+
+  state.jobs[0] = {
+    ...state.jobs[0],
+    status: "completed",
+    updatedAt: "2026-03-18T15:36:00.000Z"
+  };
+  fs.writeFileSync(path.join(stateDir, "state.json"), `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+  const lastEnd = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      CODEX_COMPANION_SESSION_ID: "sess-other"
+    },
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      session_id: "sess-other",
+      cwd: repo
+    })
+  });
+  assert.equal(lastEnd.status, 0, lastEnd.stderr);
+  assert.equal(loadBrokerSession(repo), null);
+  assert.ok(
+    receivedMethods().includes("broker/shutdown"),
+    "the last session out must actually request broker shutdown"
+  );
+  assert.equal(fs.existsSync(otherLog), false);
+  assert.equal(fs.existsSync(otherJobFile), false);
+  assert.equal(fs.existsSync(pidFile), false);
+  assert.equal(fs.existsSync(logFile), false);
+
+  await waitFor(() => !isProcessAlive(brokerProcess.pid));
+
+  state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.deepEqual(state.jobs, []);
 });
 
 test("stop hook runs a stop-time review task and blocks on findings when the review gate is enabled", () => {

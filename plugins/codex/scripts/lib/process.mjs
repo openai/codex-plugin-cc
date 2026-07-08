@@ -55,7 +55,10 @@ function looksLikeMissingProcessMessage(text) {
 }
 
 export function terminateProcessTree(pid, options = {}) {
-  if (!Number.isFinite(pid)) {
+  // pid 0 signals the caller's own process group and pid <= -1 signals
+  // arbitrary groups — either can take down the invoking process tree
+  // (e.g. a test runner). Only ever target a concrete child pid.
+  if (!Number.isInteger(pid) || pid <= 1) {
     return { attempted: false, delivered: false, method: null };
   }
 
