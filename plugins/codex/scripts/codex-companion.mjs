@@ -68,6 +68,7 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
+const DEFAULT_TASK_AUTO_POLL_TIMEOUT_MS = 300000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
@@ -761,8 +762,8 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "auto-poll-timeout-ms"],
+    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "auto-poll"],
     aliasMap: {
       m: "model"
     }
@@ -801,6 +802,53 @@ async function handleTask(argv) {
     });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
+    return;
+  }
+
+  if (options["auto-poll"]) {
+    ensureCodexReady(cwd);
+    requireTaskRequest(prompt, resumeLast);
+
+    const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+    const request = buildTaskRequest({
+      cwd,
+      model,
+      effort,
+      prompt,
+      write,
+      resumeLast,
+      jobId: job.id
+    });
+    const { payload: queuedPayload } = enqueueBackgroundTask(cwd, job, request);
+
+    const timeoutMs = Math.max(
+      0,
+      Number(options["auto-poll-timeout-ms"]) || DEFAULT_TASK_AUTO_POLL_TIMEOUT_MS
+    );
+    const startedAt = Date.now();
+    const snapshot = await waitForSingleJobSnapshot(cwd, job.id, { timeoutMs });
+    const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
+
+    if (snapshot.waitTimedOut) {
+      const stillRunning = `${queuedPayload.title} still running after ${elapsedSec}s — job ${job.id}. Check /codex:status ${job.id} or /codex:result ${job.id} once it finishes.\n`;
+      outputCommandResult(
+        { ...queuedPayload, waitTimedOut: true, elapsedSec, timeoutMs },
+        renderQueuedTaskLaunch(queuedPayload) + stillRunning,
+        options.json
+      );
+      return;
+    }
+
+    const { workspaceRoot: resolvedWorkspaceRoot, job: resolvedJob } = resolveResultJob(cwd, job.id);
+    const storedJob = readStoredJob(resolvedWorkspaceRoot, resolvedJob.id);
+    outputCommandResult(
+      { job: resolvedJob, storedJob },
+      renderStoredJobResult(resolvedJob, storedJob),
+      options.json
+    );
+    if (resolvedJob.status === "failed" || resolvedJob.exitStatus === 1) {
+      process.exitCode = 1;
+    }
     return;
   }
 
