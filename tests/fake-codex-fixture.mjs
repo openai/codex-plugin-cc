@@ -437,6 +437,17 @@ rl.on("line", (line) => {
       }
 
 	      case "turn/start": {
+	        if (BEHAVIOR === "start-hangs") {
+	          // Never reply to turn/start: exercises the client's pre-ACK watchdog
+	          // (a start RPC that hangs before any ACK or notification arrives).
+	          break;
+	        }
+	        if (BEHAVIOR === "start-rejects") {
+	          // Reject turn/start before any ACK: exercises the pre-ACK reject path
+	          // (the real error must surface, with no unhandled rejection).
+	          send({ id: message.id, error: { code: -32000, message: "fake start rejection (pre-ACK)" } });
+	          break;
+	        }
 	        const thread = ensureThread(state, message.params.threadId);
 	        const prompt = (message.params.input || [])
           .filter((item) => item.type === "text")
@@ -453,6 +464,13 @@ rl.on("line", (line) => {
 	        };
 	        saveState(state);
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
+
+        if (BEHAVIOR === "never-completes") {
+          // Emit nothing further: no items, no turn/completed, no final_answer.
+          // The turn ACK was already sent, so the client must rely on its own
+          // stall guard rather than hang forever.
+          break;
+        }
 
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)

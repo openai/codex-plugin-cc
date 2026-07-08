@@ -2257,3 +2257,201 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
   assert.equal(payload.sessionRuntime.mode, "shared");
   assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
 });
+
+test("task fails fast instead of hanging when the turn never completes", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "never-completes");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const start = Date.now();
+  const result = run("node", [SCRIPT, "task", "do something"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      // Short stall window so the test is fast; the broker it spawns also
+      // self-cleans quickly rather than lingering past the test.
+      CODEX_COMPANION_TURN_STALL_MS: "500",
+      CODEX_COMPANION_BROKER_IDLE_MS: "1000"
+    }
+  });
+  const elapsedMs = Date.now() - start;
+
+  // Without the watchdog this hangs forever on `await state.completion`.
+  assert.notEqual(result.status, 0);
+  assert.match(`${result.stdout}\n${result.stderr}`, /no activity|stall/i);
+  assert.ok(elapsedMs < 30000, `expected a fast stall failure, took ${elapsedMs}ms`);
+});
+
+test("broker self-shuts-down after the idle window with no clients", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const broker = path.join(PLUGIN_ROOT, "scripts", "app-server-broker.mjs");
+  const sessionDir = makeTempDir();
+  const endpoint = `unix:${path.join(sessionDir, "broker.sock")}`;
+  const child = spawn(
+    "node",
+    [broker, "serve", "--endpoint", endpoint, "--cwd", repo, "--pid-file", path.join(sessionDir, "broker.pid")],
+    {
+      env: { ...buildEnv(binDir), CODEX_COMPANION_BROKER_IDLE_MS: "400" },
+      stdio: "ignore"
+    }
+  );
+
+  const exitCode = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("broker did not self-shut-down within the idle window"));
+    }, 10000);
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      resolve(code);
+    });
+  });
+
+  assert.equal(exitCode, 0);
+});
+
+test("task fails fast when the start RPC itself never replies (pre-ACK watchdog)", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "start-hangs");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const start = Date.now();
+  const result = run("node", [SCRIPT, "task", "do something"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_COMPANION_TURN_STALL_MS: "500",
+      CODEX_COMPANION_BROKER_IDLE_MS: "1000",
+      // Surface any unhandled rejection as a crash so a regression in guard
+      // observation is caught rather than silently warned.
+      NODE_OPTIONS: "--unhandled-rejections=throw"
+    }
+  });
+  const elapsedMs = Date.now() - start;
+
+  // The watchdog must cover the start RPC, not just the post-ACK wait, and must
+  // not leak an unhandled rejection from the unobserved guards.
+  assert.notEqual(result.status, 0);
+  const out = `${result.stdout}\n${result.stderr}`;
+  assert.match(out, /no activity|stall/i);
+  assert.doesNotMatch(out, /UnhandledPromiseRejection|Unhandled rejection/i);
+  assert.ok(elapsedMs < 30000, `expected a fast pre-ACK stall failure, took ${elapsedMs}ms`);
+});
+
+test("task surfaces a start RPC rejection without an unhandled rejection (pre-ACK)", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "start-rejects");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "do something"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_COMPANION_BROKER_IDLE_MS: "1000",
+      // A regression would manifest as the exit guard rejecting unobserved.
+      NODE_OPTIONS: "--unhandled-rejections=throw"
+    }
+  });
+
+  // The real start-RPC error must surface, and the unobserved-guard regression
+  // must not reappear as an unhandled rejection.
+  assert.notEqual(result.status, 0);
+  const out = `${result.stdout}\n${result.stderr}`;
+  assert.match(out, /fake start rejection|pre-ACK/i);
+  assert.doesNotMatch(out, /UnhandledPromiseRejection|Unhandled rejection/i);
+});
+
+test("a stalled brokered turn is interrupted upstream so it cannot overlap a retry", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "never-completes");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "do something"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_COMPANION_TURN_STALL_MS: "500",
+      // High idle so a broker exit can only be abandonment teardown, not idle.
+      CODEX_COMPANION_BROKER_IDLE_MS: "60000"
+    }
+  });
+  assert.notEqual(result.status, 0);
+
+  // The abandoned turn must be interrupted upstream (through the broker), not
+  // left running where it could collide with the next task.
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.ok(fakeState.lastInterrupt, "expected the stalled turn to be interrupted upstream");
+  assert.ok(fakeState.lastInterrupt.turnId, "the interrupt should carry the turn id");
+
+  // The turn ACKed but never reached turn/completed, so its stream is still
+  // active when the companion disconnects: the broker must self-terminate
+  // (closing the upstream app-server) rather than stay reusable with an
+  // orphaned turn still running.
+  const session = loadBrokerSession(repo);
+  assert.ok(session?.pid, "expected a broker session with a pid");
+  await waitFor(() => {
+    try {
+      process.kill(session.pid, 0);
+      return false;
+    } catch {
+      return true;
+    }
+  }, { timeoutMs: 8000, intervalMs: 100 });
+});
+
+test("broker self-terminates when a client abandons an in-flight start (pre-ACK)", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "start-hangs");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "do something"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_COMPANION_TURN_STALL_MS: "500",
+      // A high idle window so a broker exit can only be the abandonment teardown,
+      // never the idle timer. There is no turn id to interrupt on a pre-ACK hang,
+      // so the broker (not the companion) must tear itself down — which is what
+      // also covers env-shared brokers.
+      CODEX_COMPANION_BROKER_IDLE_MS: "60000"
+    }
+  });
+  assert.notEqual(result.status, 0);
+
+  const session = loadBrokerSession(repo);
+  assert.ok(session?.pid, "expected a broker session with a pid");
+  // Throws if the broker is still alive after the window (idle is 60s, so a live
+  // broker would mean abandonment teardown did not fire).
+  await waitFor(() => {
+    try {
+      process.kill(session.pid, 0);
+      return false;
+    } catch {
+      return true;
+    }
+  }, { timeoutMs: 8000, intervalMs: 100 });
+});

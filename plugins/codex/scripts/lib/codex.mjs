@@ -556,11 +556,49 @@ function applyTurnNotification(state, message) {
   }
 }
 
+// Best-effort interrupt of a turn being abandoned by a watchdog, bounded so the
+// teardown cannot itself hang. On the broker transport this is forwarded to the
+// upstream app-server, which stops the turn so it cannot overlap a retry.
+async function interruptTurnBestEffort(client, threadId, turnId) {
+  if (!threadId || !turnId) {
+    return;
+  }
+  try {
+    await Promise.race([
+      client.request("turn/interrupt", { threadId, turnId }),
+      new Promise((_resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("turn/interrupt timed out")), 5_000);
+        timer.unref?.();
+      })
+    ]);
+  } catch {
+    // Best-effort: the turn is being abandoned regardless of the interrupt outcome.
+  }
+}
+
 async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
 
+  // The completion promise resolves only on a terminal `turn/completed`
+  // notification (or the inferred-completion heuristic) and is otherwise
+  // uncoupled from time and from the app-server process. A wedged turn (e.g. a
+  // hung MCP server that never emits another notification) or an app-server that
+  // dies mid-turn would leave `await state.completion` hanging forever, which
+  // surfaces as a "stuck" Codex run. Bound the wait three ways so it always
+  // fails toward "didn't finish" instead of hanging:
+  //   - STALL_MS:   no inbound traffic at all for this long => treat as stalled.
+  //   - CEILING_MS: absolute backstop on a single turn.
+  //   - exit:       app-server process death rejects immediately.
+  // Both timeouts are env-overridable for genuinely long turns.
+  const CEILING_MS = Number(process.env.CODEX_COMPANION_TURN_TIMEOUT_MS) || 1_800_000;
+  const STALL_MS = Number(process.env.CODEX_COMPANION_TURN_STALL_MS) || 600_000;
+  let lastActivity = Date.now();
+  let ceilingTimer = null;
+  let stallTimer = null;
+
   client.setNotificationHandler((message) => {
+    lastActivity = Date.now();
     if (!state.turnId) {
       state.bufferedNotifications.push(message);
       return;
@@ -581,7 +619,54 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     applyTurnNotification(state, message);
   });
 
-  try {
+  // `turnAbandoned` marks a failure where the turn may still be running upstream
+  // (a watchdog fired, or the app-server vanished) — as opposed to a turn that
+  // errored and is therefore already over. The catch below uses it to decide
+  // whether the upstream work needs to be actively stopped.
+  const ceiling = new Promise((_resolve, reject) => {
+    ceilingTimer = setTimeout(() => {
+      reject(
+        Object.assign(
+          new Error(
+            `Codex turn exceeded the ${Math.round(CEILING_MS / 1000)}s ceiling without completing (raise CODEX_COMPANION_TURN_TIMEOUT_MS for long turns). Treating as stalled.`
+          ),
+          { turnAbandoned: true }
+        )
+      );
+    }, CEILING_MS);
+    ceilingTimer.unref?.();
+  });
+
+  const stall = new Promise((_resolve, reject) => {
+    stallTimer = setInterval(() => {
+      if (Date.now() - lastActivity >= STALL_MS) {
+        reject(
+          Object.assign(
+            new Error(
+              `Codex turn produced no activity for ${Math.round(STALL_MS / 1000)}s (raise CODEX_COMPANION_TURN_STALL_MS for long silent turns) — likely a hung MCP server or wedged turn. Treating as stalled.`
+            ),
+            { turnAbandoned: true }
+          )
+        );
+      }
+    }, Math.min(STALL_MS, 30_000));
+    stallTimer.unref?.();
+  });
+
+  const exit = client.exitPromise.then(() => {
+    if (state.completed) {
+      return state;
+    }
+    throw Object.assign(
+      new Error(client.exitError?.message ?? "codex app-server exited before the turn completed."),
+      { turnAbandoned: true }
+    );
+  });
+
+  // Wrap the start RPC and response processing so the guards also cover a start
+  // request that hangs or rejects before the turn is ever established, and so
+  // every guard is observed by Promise.race from the outset.
+  const work = (async () => {
     const response = await startRequest();
     options.onResponse?.(response, state);
     state.turnId = response.turn?.id ?? null;
@@ -604,8 +689,37 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     }
 
     return await state.completion;
+  })();
+
+  try {
+    // `work` wins under normal operation; the guards only fire on a wedge, an
+    // over-long turn, or app-server death — including a start RPC that hangs or
+    // rejects before the turn is established. Promise.race attaches a handler to
+    // every racer up front, so a guard that rejects (even before the start RPC
+    // returns, or after the race has settled) is always handled and never
+    // surfaces as an unhandledRejection.
+    return await Promise.race([work, ceiling, stall, exit]);
+  } catch (error) {
+    // Stopping the wait is not enough: on a shared broker, abandoning the turn
+    // here leaves it running upstream, where it can keep mutating the workspace
+    // and collide with the next task. (On the direct transport the app-server is
+    // killed by close(), so only the broker path needs this.) When the turn id is
+    // known, interrupt it so the broker stays alive and reusable. When the start
+    // RPC hung before a turn id existed there is nothing to interrupt — the broker
+    // detects the abandoned in-flight request when this client disconnects and
+    // tears itself down, which covers owned and env-shared brokers alike.
+    if (error?.turnAbandoned && !state.completed && client.transport === "broker" && state.turnId) {
+      await interruptTurnBestEffort(client, state.threadId, state.turnId);
+    }
+    throw error;
   } finally {
     clearCompletionTimer(state);
+    if (ceilingTimer) {
+      clearTimeout(ceilingTimer);
+    }
+    if (stallTimer) {
+      clearInterval(stallTimer);
+    }
     client.setNotificationHandler(previousHandler ?? null);
   }
 }
