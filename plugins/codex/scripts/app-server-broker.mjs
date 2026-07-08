@@ -99,7 +99,12 @@ async function main() {
     }
   }
 
+  let terminating = false;
   async function shutdown(server) {
+    if (terminating) {
+      return;
+    }
+    terminating = true;
     for (const socket of sockets) {
       socket.end();
     }
@@ -241,6 +246,20 @@ async function main() {
   process.on("SIGINT", async () => {
     await shutdown(server);
     process.exit(0);
+  });
+
+  // The broker proxies every request to the single app-server child spawned
+  // above. If that child exits, appClient can no longer serve: request() writes
+  // to a closed stdin and its promise never resolves, so a caller hangs forever
+  // (a submitted turn/task sits at "starting" and is never answered). The broker
+  // stays up as a zombie because its listening socket still accepts connections,
+  // so ensureBrokerSession() keeps reusing it. Terminate when the child exits so
+  // the stale socket/pid-file are removed and the next connect spawns a fresh,
+  // working broker.
+  appClient.exitPromise.then(() => {
+    if (!terminating) {
+      shutdown(server).finally(() => process.exit(1));
+    }
   });
 
   server.listen(listenTarget.path);
