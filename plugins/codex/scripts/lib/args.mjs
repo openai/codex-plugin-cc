@@ -2,6 +2,7 @@ export function parseArgs(argv, config = {}) {
   const valueOptions = new Set(config.valueOptions ?? []);
   const booleanOptions = new Set(config.booleanOptions ?? []);
   const aliasMap = config.aliasMap ?? {};
+  const stopParsingOptionsAfterFirstPositional = Boolean(config.stopParsingOptionsAfterFirstPositional);
   const options = {};
   const positionals = [];
   let passthrough = false;
@@ -21,6 +22,10 @@ export function parseArgs(argv, config = {}) {
 
     if (!token.startsWith("-") || token === "-") {
       positionals.push(token);
+      if (stopParsingOptionsAfterFirstPositional) {
+        positionals.push(...argv.slice(index + 1));
+        break;
+      }
       continue;
     }
 
@@ -46,6 +51,10 @@ export function parseArgs(argv, config = {}) {
       }
 
       positionals.push(token);
+      if (stopParsingOptionsAfterFirstPositional) {
+        positionals.push(...argv.slice(index + 1));
+        break;
+      }
       continue;
     }
 
@@ -68,6 +77,10 @@ export function parseArgs(argv, config = {}) {
     }
 
     positionals.push(token);
+    if (stopParsingOptionsAfterFirstPositional) {
+      positionals.push(...argv.slice(index + 1));
+      break;
+    }
   }
 
   return { options, positionals };

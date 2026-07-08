@@ -713,6 +713,7 @@ async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["base", "scope", "model", "cwd"],
     booleanOptions: ["json", "background", "wait"],
+    stopParsingOptionsAfterFirstPositional: true,
     aliasMap: {
       m: "model"
     }
