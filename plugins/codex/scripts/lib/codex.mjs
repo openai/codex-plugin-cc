@@ -1093,6 +1093,7 @@ export async function importExternalAgentSession(cwd, options = {}) {
 }
 
 const MODEL_LIST_TIMEOUT_MS = 3000;
+const MODEL_LIST_MAX_PAGES = 5;
 
 function emitEffortValidationSkip(onProgress, effort, reason) {
   emitProgress(
@@ -1103,22 +1104,44 @@ function emitEffortValidationSkip(onProgress, effort, reason) {
 }
 
 async function fetchModelCatalog(client) {
-  const requestPromise = client.request("model/list", {});
-  requestPromise.catch(() => {});
-  let timer;
-  try {
-    const response = await Promise.race([
-      requestPromise,
-      new Promise((resolve) => {
-        timer = setTimeout(() => resolve(null), MODEL_LIST_TIMEOUT_MS);
-      })
-    ]);
-    return Array.isArray(response?.data) ? response.data : null;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
+  // includeHidden: the default model/list only returns picker-visible models, so a
+  // hidden model passed via --model would otherwise dodge validation. The catalog is
+  // paginated; follow nextCursor under ONE shared deadline. A partial catalog can only
+  // cause a fail-open skip for models on unfetched pages — never a false rejection.
+  const deadline = Date.now() + MODEL_LIST_TIMEOUT_MS;
+  const entries = [];
+  let cursor = null;
+  for (let page = 0; page < MODEL_LIST_MAX_PAGES; page += 1) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      break;
+    }
+    const requestPromise = client.request("model/list", cursor ? { includeHidden: true, cursor } : { includeHidden: true });
+    requestPromise.catch(() => {});
+    let timer;
+    let response = null;
+    try {
+      response = await Promise.race([
+        requestPromise,
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(null), remaining);
+        })
+      ]);
+    } catch {
+      response = null;
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!response || !Array.isArray(response.data)) {
+      break;
+    }
+    entries.push(...response.data);
+    cursor = response.nextCursor ?? null;
+    if (!cursor) {
+      break;
+    }
   }
+  return entries.length > 0 ? entries : null;
 }
 
 function assertCatalogSupportsEffort(entries, resolvedModel, effort, onProgress) {

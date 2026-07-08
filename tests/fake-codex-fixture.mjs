@@ -372,6 +372,19 @@ rl.on("line", (line) => {
           send({ id: message.id, result: { data: "not-a-catalog" } });
           break;
         }
+        if (BEHAVIOR === "model-list-paginated") {
+          const pageEffort = (reasoningEffort) => ({ reasoningEffort, description: reasoningEffort });
+          if (message.params && message.params.cursor === "page-2") {
+            send({ id: message.id, result: { data: [
+              { id: "gpt-5.4-mini", model: "gpt-5.4-mini", hidden: true, isDefault: false, defaultReasoningEffort: "medium", supportedReasoningEfforts: ["low", "medium", "high", "xhigh"].map(pageEffort) }
+            ], nextCursor: null } });
+            break;
+          }
+          send({ id: message.id, result: { data: [
+            { id: "gpt-5.6-sol", model: "gpt-5.6-sol", isDefault: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"].map(pageEffort) }
+          ], nextCursor: "page-2" } });
+          break;
+        }
         const catalogEffort = (reasoningEffort) => ({ reasoningEffort, description: reasoningEffort });
         send({ id: message.id, result: { data: [
           { id: "gpt-5.6-sol", model: "gpt-5.6-sol", isDefault: false, defaultReasoningEffort: "medium", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"].map(catalogEffort) },

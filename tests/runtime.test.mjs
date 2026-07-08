@@ -976,6 +976,32 @@ test("resume validates the requested model, not the model reported by thread/res
   assert.equal(fakeState.lastTurnStart.effort, "ultra");
 });
 
+test("effort validation finds models on later catalog pages before dispatching", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "model-list-paginated");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  // gpt-5.4-mini only appears on the second catalog page; skipping pagination would
+  // fail open and dispatch the unsupported pair instead of rejecting it.
+  const result = run("node", [SCRIPT, "task", "--model", "gpt-5.4-mini", "--effort", "ultra", "diagnose the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Model "gpt-5\.4-mini" does not support reasoning effort "ultra"/);
+  if (fs.existsSync(statePath)) {
+    const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.equal(fakeState.lastTurnStart ?? null, null);
+    assert.equal((fakeState.threads ?? []).length, 0, "no thread may be created for a rejected pair");
+  }
+});
+
 test("a model/list settling during an in-flight request does not drop turn events or broker serialization", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
