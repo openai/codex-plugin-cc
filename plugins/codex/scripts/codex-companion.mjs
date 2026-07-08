@@ -83,9 +83,106 @@ function printUsage() {
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
-      "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
+      "  node scripts/codex-companion.mjs cancel [job-id] [--json]",
+      "  node scripts/codex-companion.mjs latest-images --since <epoch-ms> [--copy-to <abs-path>] [--json]"
     ].join("\n")
   );
+}
+
+function handleLatestImages(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["since", "copy-to"],
+    booleanOptions: ["json"]
+  });
+  const sinceRaw = options["since"];
+  const copyTo = options["copy-to"];
+  const asJson = Boolean(options["json"]);
+
+  if (!sinceRaw) {
+    throw new Error("latest-images requires --since <epoch-ms>");
+  }
+  const sinceMs = Number(sinceRaw);
+  if (!Number.isFinite(sinceMs)) {
+    throw new Error(`latest-images --since must be a millisecond epoch, got: ${sinceRaw}`);
+  }
+
+  const root = path.join(process.env.HOME || process.env.USERPROFILE || ".", ".codex", "generated_images");
+  const matches = [];
+  if (fs.existsSync(root)) {
+    const stack = [root];
+    while (stack.length > 0) {
+      const dir = stack.pop();
+      let entries;
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          stack.push(full);
+        } else if (entry.isFile() && /\.png$/i.test(entry.name)) {
+          let stat;
+          try {
+            stat = fs.statSync(full);
+          } catch {
+            continue;
+          }
+          if (stat.mtimeMs >= sinceMs) {
+            matches.push({ path: full, mtimeMs: stat.mtimeMs });
+          }
+        }
+      }
+    }
+  }
+
+  matches.sort((a, b) => a.mtimeMs - b.mtimeMs);
+
+  const copied = [];
+  if (copyTo && matches.length > 0) {
+    const looksLikeFile = /\.png$/i.test(copyTo);
+    if (looksLikeFile && matches.length === 1) {
+      fs.mkdirSync(path.dirname(copyTo), { recursive: true });
+      fs.copyFileSync(matches[0].path, copyTo);
+      copied.push(path.resolve(copyTo));
+    } else {
+      const targetDir = looksLikeFile ? path.dirname(copyTo) : copyTo;
+      fs.mkdirSync(targetDir, { recursive: true });
+      const basenameRoot = looksLikeFile
+        ? path.basename(copyTo, path.extname(copyTo))
+        : "codex-image";
+      matches.forEach((match, index) => {
+        const suffix = matches.length === 1 ? "" : `-${index + 1}`;
+        const target = path.join(targetDir, `${basenameRoot}${suffix}.png`);
+        fs.copyFileSync(match.path, target);
+        copied.push(path.resolve(target));
+      });
+    }
+  }
+
+  const sourcePaths = matches.map((m) => m.path);
+  if (asJson) {
+    console.log(JSON.stringify({ sources: sourcePaths, copied }, null, 2));
+    return;
+  }
+  if (sourcePaths.length === 0) {
+    process.stdout.write("==Generated PNG(s)==\n(none — no images written by the image_generation tool during this window)\n==/Generated PNG(s)==\n");
+    return;
+  }
+  const lines = ["==Generated PNG(s)=="];
+  if (copied.length > 0) {
+    for (const target of copied) {
+      lines.push(target);
+    }
+    lines.push(`(originals in ~/.codex/generated_images/, copied to the path${copied.length > 1 ? "s" : ""} above)`);
+  } else {
+    for (const source of sourcePaths) {
+      lines.push(source);
+    }
+  }
+  lines.push("==/Generated PNG(s)==");
+  process.stdout.write(lines.join("\n") + "\n");
 }
 
 function outputResult(value, asJson) {
@@ -1060,6 +1157,9 @@ async function main() {
       break;
     case "cancel":
       await handleCancel(argv);
+      break;
+    case "latest-images":
+      handleLatestImages(argv);
       break;
     default:
       throw new Error(`Unknown subcommand: ${subcommand}`);

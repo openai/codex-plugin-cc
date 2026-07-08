@@ -28,6 +28,71 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   throw new Error("Timed out waiting for condition.");
 }
 
+test("latest-images reports newly written PNGs from the codex generated_images dir", () => {
+  const home = makeTempDir("codex-image-home-");
+  const threadDir = path.join(home, ".codex", "generated_images", "test-thread-1");
+  fs.mkdirSync(threadDir, { recursive: true });
+
+  const sinceMs = Date.now();
+  // Sleep briefly so the fixture file's mtime is strictly >= sinceMs even at
+  // millisecond resolution on filesystems that round mtime down.
+  const wait = Date.now() + 5;
+  while (Date.now() < wait) {
+    // spin
+  }
+  const pngFixture = Buffer.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41,
+    0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+    0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+    0x42, 0x60, 0x82
+  ]);
+  const fixturePath = path.join(threadDir, "ig_test.png");
+  fs.writeFileSync(fixturePath, pngFixture);
+
+  const env = { ...process.env, HOME: home, USERPROFILE: home };
+
+  const noCopy = run("node", [SCRIPT, "latest-images", "--since", String(sinceMs)], {
+    cwd: ROOT,
+    env
+  });
+  assert.equal(noCopy.status, 0, noCopy.stderr);
+  assert.match(noCopy.stdout, /==Generated PNG\(s\)==/);
+  assert.match(noCopy.stdout, new RegExp(fixturePath.replace(/\\/g, "\\\\")));
+  assert.match(noCopy.stdout, /==\/Generated PNG\(s\)==/);
+
+  const jsonResult = run("node", [SCRIPT, "latest-images", "--since", String(sinceMs), "--json"], {
+    cwd: ROOT,
+    env
+  });
+  assert.equal(jsonResult.status, 0, jsonResult.stderr);
+  const parsed = JSON.parse(jsonResult.stdout);
+  assert.deepEqual(parsed.copied, []);
+  assert.equal(parsed.sources.length, 1);
+  assert.equal(parsed.sources[0], fixturePath);
+
+  const copyTo = path.join(makeTempDir("codex-image-out-"), "shipped.png");
+  const copied = run("node", [SCRIPT, "latest-images", "--since", String(sinceMs), "--copy-to", copyTo], {
+    cwd: ROOT,
+    env
+  });
+  assert.equal(copied.status, 0, copied.stderr);
+  assert.match(copied.stdout, new RegExp(copyTo.replace(/\\/g, "\\\\")));
+  assert.ok(fs.existsSync(copyTo), "expected --copy-to file to exist");
+  assert.deepEqual(fs.readFileSync(copyTo), pngFixture);
+
+  const empty = run("node", [SCRIPT, "latest-images", "--since", String(Date.now() + 60_000)], {
+    cwd: ROOT,
+    env
+  });
+  assert.equal(empty.status, 0, empty.stderr);
+  assert.match(empty.stdout, /\(none — no images written/);
+});
+
 test("setup reports ready when fake codex is installed and authenticated", () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);

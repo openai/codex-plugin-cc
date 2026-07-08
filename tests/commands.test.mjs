@@ -75,6 +75,7 @@ test("continue is not exposed as a user-facing command", () => {
   assert.deepEqual(commandFiles, [
     "adversarial-review.md",
     "cancel.md",
+    "image.md",
     "rescue.md",
     "result.md",
     "review.md",
@@ -82,6 +83,63 @@ test("continue is not exposed as a user-facing command", () => {
     "status.md",
     "transfer.md"
   ]);
+});
+
+test("image command forwards to codex-image subagent and pins inline Agent transport", () => {
+  const image = read("commands/image.md");
+  const agent = read("agents/codex-image.md");
+  const skill = read("skills/image/SKILL.md");
+
+  assert.match(image, /The final user-visible response must be Codex's output verbatim/i);
+  assert.match(image, /allowed-tools:\s*Bash\(node:\*\),\s*AskUserQuestion,\s*Agent/);
+  assert.match(image, /subagent_type: "codex:codex-image"/);
+  assert.match(image, /do not call `Skill\(codex:codex-image\)`/i);
+  assert.match(image, /do not call .* `Skill\(codex:image\)`/i);
+  assert.doesNotMatch(image, /^context:\s*fork\b/m);
+  assert.match(image, /--background\|--wait/);
+  assert.match(image, /--model <model\|spark>/);
+  assert.match(image, /--out <path>/);
+  assert.match(image, /default to foreground/i);
+  assert.match(image, /Do not forward them to `task`/i);
+  assert.match(image, /Always pass `--write`/i);
+  assert.match(image, /If they ask for `spark`, map it to `gpt-5\.3-codex-spark`/i);
+  assert.match(image, /thin forwarder only/i);
+  assert.match(image, /Return the Codex companion stdout verbatim to the user/i);
+  assert.match(image, /If the helper reports that Codex is missing or unauthenticated, stop and tell the user to run `\/codex:setup`/i);
+
+  assert.match(agent, /name:\s*codex-image/);
+  assert.match(agent, /tools:\s*Bash/);
+  assert.match(agent, /codex-cli-runtime/);
+  assert.match(agent, /gpt-5-4-prompting/);
+  assert.match(agent, /^\s*-\s*image\s*$/m);
+  assert.match(agent, /thin forwarding wrapper/i);
+  assert.match(agent, /Use exactly one `Bash` call/i);
+  assert.match(agent, /Always pass `--write`/i);
+  assert.match(agent, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
+  assert.match(agent, /Do not call `review`, `adversarial-review`, `status`, `result`, or `cancel`/i);
+  assert.match(agent, /native image generation tool/i);
+  assert.match(agent, /<image_prompt>/);
+  assert.match(agent, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
+  // Post-process contract: chain task + latest-images so we always report the
+  // real PNG path even when Codex's text response hallucinates a different one.
+  assert.match(agent, /SINCE_MS=\$\(node -e 'console\.log\(Date\.now\(\)\)'\)/);
+  assert.match(agent, /codex-companion\.mjs" task --write/);
+  assert.match(agent, /codex-companion\.mjs" latest-images --since "\$SINCE_MS"/);
+  assert.match(agent, /add `--copy-to "<path>"` to the `latest-images` call/);
+  assert.match(agent, /==Generated PNG\(s\)==/);
+  assert.match(agent, /Codex's text response can mention a different path, but that text is not authoritative/i);
+
+  assert.match(skill, /name:\s*image/);
+  assert.match(skill, /user-invocable:\s*false/);
+  assert.match(skill, /Use this skill only inside the `codex:codex-image` subagent/);
+  assert.match(skill, /Lead with style and intended use/i);
+  assert.match(skill, /Quote every literal string/i);
+  assert.match(skill, /Aspect ratio = explicit pixel dimensions/i);
+  assert.match(skill, /Constraints block is mandatory/i);
+  assert.match(skill, /Generate fresh, do not edit/i);
+  assert.match(skill, /Output in exactly \[W\]px x \[H\]px/);
+  assert.match(skill, /native image generation tool/i);
+  assert.match(skill, /<image_prompt>/);
 });
 
 test("rescue command absorbs continue semantics", () => {
