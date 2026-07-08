@@ -147,7 +147,34 @@ export function upsertJob(cwd, jobPatch) {
 }
 
 export function listJobs(cwd) {
-  return loadState(cwd).jobs;
+  const state = loadState(cwd);
+  const now = Date.now();
+  const terminalStatuses = ["completed", "failed", "cancelled", "stopped"];
+  const nextJobs = state.jobs.filter((job) => {
+    if (terminalStatuses.includes(job.status) && job.updatedAt) {
+      const updatedTime = Date.parse(job.updatedAt);
+      if (Number.isFinite(updatedTime) && now - updatedTime > 30 * 60 * 1000) {
+        return false;
+      }
+    }
+    return true;
+  });
+  if (nextJobs.length !== state.jobs.length) {
+    state.jobs = nextJobs;
+    saveState(cwd, state);
+  }
+  return nextJobs;
+}
+
+export function clearTerminalJobs(cwd) {
+  const state = loadState(cwd);
+  const terminalStatuses = ["completed", "failed", "cancelled", "stopped"];
+  const nextJobs = state.jobs.filter((job) => !terminalStatuses.includes(job.status));
+  if (nextJobs.length !== state.jobs.length) {
+    state.jobs = nextJobs;
+    saveState(cwd, state);
+  }
+  return nextJobs;
 }
 
 export function setConfig(cwd, key, value) {
