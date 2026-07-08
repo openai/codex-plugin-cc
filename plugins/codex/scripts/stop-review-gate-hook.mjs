@@ -18,6 +18,15 @@ const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
+// Stop-review outcomes. Only a genuine BLOCK verdict should block the Stop
+// event. Infrastructure failures (timeout, crash, rate limit, auth blip, empty
+// or garbled output) must fail OPEN, otherwise the Stop hook re-triggers, the
+// review re-runs, hits the same failure, and loops indefinitely — burning
+// tokens with no useful review (#248, #306).
+const REVIEW_ALLOW = "allow";
+const REVIEW_BLOCK = "block";
+const REVIEW_INFRA_ERROR = "infra_error";
+
 function readHookInput() {
   const raw = fs.readFileSync(0, "utf8").trim();
   if (!raw) {
@@ -70,29 +79,36 @@ function parseStopReviewOutput(rawOutput) {
   const text = String(rawOutput ?? "").trim();
   if (!text) {
     return {
-      ok: false,
-      reason:
-        "The stop-time Codex review task returned no final output. Run /codex:review --wait manually or bypass the gate."
+      outcome: REVIEW_INFRA_ERROR,
+      reason: "the review task returned no final output"
     };
   }
 
   const firstLine = text.split(/\r?\n/, 1)[0].trim();
   if (firstLine.startsWith("ALLOW:")) {
-    return { ok: true, reason: null };
+    return { outcome: REVIEW_ALLOW, reason: null };
   }
   if (firstLine.startsWith("BLOCK:")) {
     const reason = firstLine.slice("BLOCK:".length).trim() || text;
     return {
-      ok: false,
+      outcome: REVIEW_BLOCK,
       reason: `Codex stop-time review found issues that still need fixes before ending the session: ${reason}`
     };
   }
 
   return {
-    ok: false,
-    reason:
-      "The stop-time Codex review task returned an unexpected answer. Run /codex:review --wait manually or bypass the gate."
+    outcome: REVIEW_INFRA_ERROR,
+    reason: "the review task returned an unexpected answer (no ALLOW:/BLOCK: verdict)"
   };
+}
+
+function tryParseVerdict(stdout) {
+  try {
+    const payload = JSON.parse(String(stdout ?? ""));
+    return parseStopReviewOutput(payload?.rawOutput);
+  } catch {
+    return null;
+  }
 }
 
 function runStopReview(cwd, input = {}) {
@@ -111,19 +127,24 @@ function runStopReview(cwd, input = {}) {
 
   if (result.error?.code === "ETIMEDOUT") {
     return {
-      ok: false,
-      reason:
-        "The stop-time Codex review task timed out after 15 minutes. Run /codex:review --wait manually or bypass the gate."
+      outcome: REVIEW_INFRA_ERROR,
+      reason: "the review task timed out after 15 minutes"
     };
   }
 
   if (result.status !== 0) {
+    // The companion prints its JSON payload before setting a non-zero exit
+    // code, so a turn that failed AFTER streaming a final verdict still
+    // carries it in rawOutput. Never discard a BLOCK we actually received;
+    // fail open only when no verdict is present.
+    const salvaged = tryParseVerdict(result.stdout);
+    if (salvaged?.outcome === REVIEW_BLOCK) {
+      return salvaged;
+    }
     const detail = String(result.stderr || result.stdout || "").trim();
     return {
-      ok: false,
-      reason: detail
-        ? `The stop-time Codex review task failed: ${detail}`
-        : "The stop-time Codex review task failed. Run /codex:review --wait manually or bypass the gate."
+      outcome: REVIEW_INFRA_ERROR,
+      reason: detail ? `the review task failed: ${detail}` : "the review task failed"
     };
   }
 
@@ -132,9 +153,8 @@ function runStopReview(cwd, input = {}) {
     return parseStopReviewOutput(payload?.rawOutput);
   } catch {
     return {
-      ok: false,
-      reason:
-        "The stop-time Codex review task returned invalid JSON. Run /codex:review --wait manually or bypass the gate."
+      outcome: REVIEW_INFRA_ERROR,
+      reason: "the review task returned invalid JSON"
     };
   }
 }
@@ -164,11 +184,27 @@ function main() {
   }
 
   const review = runStopReview(cwd, input);
-  if (!review.ok) {
+
+  if (review.outcome === REVIEW_BLOCK) {
     emitDecision({
       decision: "block",
       reason: runningTaskNote ? `${runningTaskNote} ${review.reason}` : review.reason
     });
+    return;
+  }
+
+  if (review.outcome === REVIEW_INFRA_ERROR) {
+    // Fail open on infrastructure failures so a transient Codex problem cannot
+    // turn into an unbounded Stop-hook rewake loop (#248, #306). We warn on
+    // stderr but do NOT block, letting the session end normally.
+    // Embedded error details often end with a period; strip it so splicing
+    // into the sentence below does not produce "..".
+    const reason = String(review.reason ?? "").trim().replace(/\.$/, "");
+    logNote(
+      `Codex stop-time review could not complete — ${reason}. Allowing the stop instead of blocking; ` +
+        "run /codex:review --wait manually or bypass the gate."
+    );
+    logNote(runningTaskNote);
     return;
   }
 
