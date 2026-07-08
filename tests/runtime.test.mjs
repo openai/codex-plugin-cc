@@ -937,6 +937,67 @@ test("task --resume-last keeps an explicit effort without validating against the
   assert.equal(fakeState.lastTurnStart.effort, "ultra");
 });
 
+test("resume validates the requested model, not the model reported by thread/resume", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "resume-reports-different-model");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const firstRun = run("node", [SCRIPT, "task", "--fresh", "--model", "gpt-5.6-sol", "--effort", "ultra", "start the migration"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+
+  // thread/resume reports gpt-5.6-sol here; the requested gpt-5.4-mini is what
+  // turn/start would receive, so the pair must be rejected before any resume.
+  const reject = run("node", [SCRIPT, "task", "--resume-last", "--model", "gpt-5.4-mini", "--effort", "ultra", "keep going"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.notEqual(reject.status, 0);
+  assert.match(reject.stderr, /Model "gpt-5\.4-mini" does not support reasoning effort "ultra"/);
+  let fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.match(fakeState.lastTurnStart.prompt, /start the migration/, "rejected resume must not start a turn");
+
+  // thread/resume reports gpt-5.4-mini here; the requested gpt-5.6-sol supports
+  // ultra, so the resume must proceed instead of being falsely rejected.
+  const approve = run("node", [SCRIPT, "task", "--resume-last", "--model", "gpt-5.6-sol", "--effort", "ultra", "keep going"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(approve.status, 0, approve.stderr);
+  fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.model, "gpt-5.6-sol");
+  assert.equal(fakeState.lastTurnStart.effort, "ultra");
+});
+
+test("a model/list settling during an in-flight request does not drop turn events or broker serialization", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "model-list-slow-error-during-request");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "--fresh", "--model", "gpt-5.6-sol", "--effort", "ultra", "diagnose the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    timeout: 30000
+  });
+
+  assert.equal(result.status, 0, `companion did not complete (request slot lost?): ${result.stderr}`);
+  assert.match(result.stdout + result.stderr, /skipping reasoning-effort validation/);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.effort, "ultra");
+});
+
 test("a slow-failing model/list does not kill the turn's event stream on the broker transport", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

@@ -1167,6 +1167,13 @@ export async function runAppServerTurn(cwd, options = {}) {
     const catalogEntries = shouldValidateEffort ? await fetchModelCatalog(client) : null;
 
     if (options.resumeThreadId) {
+      // Validate the model that turn/start will actually receive, before thread/resume
+      // has any side effect. The resume response's model is NOT that model (it reports
+      // the config default / prior thread state), so checking it can both falsely reject
+      // a valid requested pair and approve an unsupported one.
+      if (shouldValidateEffort) {
+        assertCatalogSupportsEffort(catalogEntries, options.model, options.effort, options.onProgress);
+      }
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
       const response = await resumeThread(client, options.resumeThreadId, cwd, {
         model: options.model,
@@ -1174,9 +1181,6 @@ export async function runAppServerTurn(cwd, options = {}) {
         ephemeral: false
       });
       threadId = response.thread.id;
-      if (shouldValidateEffort) {
-        assertCatalogSupportsEffort(catalogEntries, response.model ?? options.model, options.effort, options.onProgress);
-      }
     } else {
       if (shouldValidateEffort) {
         assertCatalogSupportsEffort(catalogEntries, options.model, options.effort, options.onProgress);
