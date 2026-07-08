@@ -11,6 +11,34 @@ import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 
+// Broker-side idle timeout. When no client has been connected for this long the
+// broker self-terminates. This is the correctness backstop for stale ownership
+// records in broker.json: a co-owning session that exits without running its
+// SessionEnd hook (SIGKILL, OOM, crash, host reboot) or whose teardown skips the
+// entry on lock contention leaves its sessionId behind forever, so no future hook
+// will ever tear the broker down. Self-termination on idle is platform-independent
+// and needs no PID/liveness signal, so it covers the abnormal-exit orphan, the
+// dead-co-owner orphan, and the lock-contention skip in one mechanism. See #108,
+// #380, and #450.
+const IDLE_TIMEOUT_ENV = "CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS";
+const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+
+// Resolve the idle timeout from the CLI flag, then the environment, then the
+// default. A value <= 0 (or a non-finite/negative override) disables the timeout
+// so the broker never self-terminates, which keeps the old behavior available for
+// callers that manage lifecycle themselves.
+function resolveIdleTimeoutMs(optionValue, env = process.env) {
+  const raw = optionValue ?? env[IDLE_TIMEOUT_ENV];
+  if (raw === undefined || raw === null || raw === "") {
+    return DEFAULT_IDLE_TIMEOUT_MS;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return DEFAULT_IDLE_TIMEOUT_MS;
+  }
+  return parsed;
+}
+
 function buildStreamThreadIds(method, params, result) {
   const threadIds = new Set();
   if (params?.threadId) {
@@ -48,11 +76,11 @@ function writePidFile(pidFile) {
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (subcommand !== "serve") {
-    throw new Error("Usage: node scripts/app-server-broker.mjs serve --endpoint <value> [--cwd <path>] [--pid-file <path>]");
+    throw new Error("Usage: node scripts/app-server-broker.mjs serve --endpoint <value> [--cwd <path>] [--pid-file <path>] [--idle-timeout <ms>]");
   }
 
   const { options } = parseArgs(argv, {
-    valueOptions: ["cwd", "pid-file", "endpoint"]
+    valueOptions: ["cwd", "pid-file", "endpoint", "idle-timeout"]
   });
 
   if (!options.endpoint) {
@@ -63,6 +91,7 @@ async function main() {
   const endpoint = String(options.endpoint);
   const listenTarget = parseBrokerEndpoint(endpoint);
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
+  const idleTimeoutMs = resolveIdleTimeoutMs(options["idle-timeout"]);
   writePidFile(pidFile);
 
   const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
@@ -70,6 +99,31 @@ async function main() {
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
   const sockets = new Set();
+  let idleTimer = null;
+
+  function disarmIdleTimer() {
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  }
+
+  // Arm the idle timer whenever the broker has no connected clients. A live
+  // client connection means the broker is still in use, so we only count down
+  // while idle and cancel the moment a client connects. When the timer fires we
+  // shut the broker down gracefully and exit.
+  function armIdleTimer() {
+    disarmIdleTimer();
+    if (idleTimeoutMs <= 0 || sockets.size > 0) {
+      return;
+    }
+    idleTimer = setTimeout(() => {
+      idleTimer = null;
+      shutdown(server)
+        .catch(() => {})
+        .finally(() => process.exit(0));
+    }, idleTimeoutMs);
+  }
 
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
@@ -100,6 +154,7 @@ async function main() {
   }
 
   async function shutdown(server) {
+    disarmIdleTimer();
     for (const socket of sockets) {
       socket.end();
     }
@@ -117,6 +172,7 @@ async function main() {
 
   const server = net.createServer((socket) => {
     sockets.add(socket);
+    disarmIdleTimer();
     socket.setEncoding("utf8");
     let buffer = "";
 
@@ -225,11 +281,13 @@ async function main() {
     socket.on("close", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      armIdleTimer();
     });
 
     socket.on("error", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      armIdleTimer();
     });
   });
 
@@ -243,7 +301,12 @@ async function main() {
     process.exit(0);
   });
 
-  server.listen(listenTarget.path);
+  server.listen(listenTarget.path, () => {
+    // Start counting down immediately: a broker that is spawned but never
+    // receives a client (or whose only client connects briefly during the
+    // readiness probe) must still self-terminate instead of lingering.
+    armIdleTimer();
+  });
 }
 
 main().catch((error) => {
