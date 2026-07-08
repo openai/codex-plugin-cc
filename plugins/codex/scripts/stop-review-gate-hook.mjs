@@ -102,7 +102,7 @@ function runStopReview(cwd, input = {}) {
     ...process.env,
     ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {})
   };
-  const result = spawnSync(process.execPath, [scriptPath, "task", "--json", prompt], {
+  const result = spawnSync(process.execPath, [scriptPath, "task", "--stop-gate", "--json", prompt], {
     cwd,
     env: childEnv,
     encoding: "utf8",

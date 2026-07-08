@@ -1968,6 +1968,15 @@ test("stop hook runs a stop-time review task and blocks on findings when the rev
   assert.match(fakeState.lastTurnStart.prompt, /Only review the work from the previous Claude turn/i);
   assert.match(fakeState.lastTurnStart.prompt, /I completed the refactor and updated the retry logic\./);
 
+  // The stop-gate review is a one-shot consumed inline by the hook: it must run on an
+  // ephemeral thread (no on-disk rollout) and leave no record in the job catalog.
+  const stopGateThread = fakeState.threads.find((thread) => thread.id === fakeState.lastTurnStart.threadId);
+  assert.ok(stopGateThread, "stop-gate review thread should exist");
+  assert.equal(stopGateThread.ephemeral, true);
+
+  const catalog = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "state.json"), "utf8"));
+  assert.ok(!catalog.jobs.some((job) => job.title === "Codex Stop Gate Review"));
+
   const status = run("node", [SCRIPT, "status"], {
     cwd: repo,
     env: {
@@ -1976,7 +1985,30 @@ test("stop hook runs a stop-time review task and blocks on findings when the rev
     }
   });
   assert.equal(status.status, 0, status.stderr);
-  assert.match(status.stdout, /Codex Stop Gate Review/);
+  assert.doesNotMatch(status.stdout, /Codex Stop Gate Review/);
+});
+
+test("a normal task whose prompt contains the stop-gate marker is still tracked (routing is flag-gated, not prompt-sniffed)", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "Run a stop-gate review of the previous Claude turn."], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "state.json"), "utf8"));
+  assert.equal(state.jobs.length, 1);
+
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  const thread = fakeState.threads.find((entry) => entry.id === fakeState.lastTurnStart.threadId);
+  assert.equal(thread.ephemeral, false);
 });
 
 test("stop hook logs running tasks to stderr without blocking when the review gate is disabled", () => {
