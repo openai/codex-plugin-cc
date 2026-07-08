@@ -158,6 +158,8 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(readme, /--model gpt-5\.4-mini --effort medium/i);
   assert.match(readme, /`spark`, the plugin maps that to `gpt-5\.3-codex-spark`/i);
   assert.match(readme, /continue a previous Codex task/i);
+  assert.match(readme, /\[review gate\]\(#enabling-review-gate\)/i);
+  assert.doesNotMatch(readme, /#what-does-the-review-gate-do/i);
   assert.match(readme, /### `\/codex:setup`/);
   assert.match(readme, /### `\/codex:review`/);
   assert.match(readme, /### `\/codex:adversarial-review`/);
