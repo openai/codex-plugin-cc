@@ -661,7 +661,13 @@ async function runForegroundCommand(job, runner, options = {}) {
     stderr: !options.json
   });
   const execution = await runTrackedJob(job, () => runner(progress), { logFile });
-  outputResult(options.json ? execution.payload : execution.rendered, options.json);
+  // Include the human-readable message in JSON output so callers (e.g. the
+  // stop-review gate hook) can surface the real error instead of stderr noise.
+  const jsonPayload =
+    execution.payload && typeof execution.payload === "object" && !Array.isArray(execution.payload)
+      ? { ...execution.payload, rendered: execution.rendered }
+      : execution.payload;
+  outputResult(options.json ? jsonPayload : execution.rendered, options.json);
   if (execution.exitStatus !== 0) {
     process.exitCode = execution.exitStatus;
   }
