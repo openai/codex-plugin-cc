@@ -35,3 +35,41 @@ Output rules:
 - Present the final setup output to the user.
 - If installation was skipped, present the original setup output.
 - If Codex is installed but not authenticated, preserve the guidance to run `!codex login`.
+
+After setup completes successfully (Codex installed and authenticated):
+- Use `AskUserQuestion` to ask whether the user wants to configure agent models now.
+- Use these two options:
+  - `Configure agent models`
+  - `Skip for now`
+- If the user chooses to configure, run the agent config flow:
+
+**Agent config flow:**
+
+1. Get available models:
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/patch-agents.mjs" available-models --json
+```
+
+2. List current agents:
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/patch-agents.mjs" list --json
+```
+
+3. If there are many agents (>10), use `AskUserQuestion` first:
+  - `Configure all agents one by one`
+  - `Select specific agents to configure`
+  - `Skip`
+- If user picks "Select specific", list agent names and let them pick.
+
+4. For each agent to configure, use `AskUserQuestion` with format:
+```
+<agent-name> (current: <current-model>)
+```
+Options: all available models (mark current with `(current)`), plus `Skip` at the end.
+
+5. For each selection that differs from current, run:
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/patch-agents.mjs" patch <agent-name> <model> --json
+```
+
+6. Summarize all changes made.
