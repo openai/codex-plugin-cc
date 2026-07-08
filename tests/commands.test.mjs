@@ -127,8 +127,10 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /--resume/);
   assert.match(agent, /--fresh/);
   assert.match(agent, /thin forwarding wrapper/i);
-  assert.match(agent, /prefer foreground for a small, clearly bounded rescue request/i);
-  assert.match(agent, /If the user did not explicitly choose `--background` or `--wait` and the task looks complicated, open-ended, multi-step, or likely to keep Codex running for a long time, prefer background execution/i);
+  assert.match(agent, /Always wait for that single `Bash` call to finish/i);
+  assert.match(agent, /Do not set `run_in_background: true` on the inner `task` invocation/i);
+  assert.match(agent, /If the user chose `--background`, that applies to Claude Code's handling of the outer `codex:codex-rescue` subagent/i);
+  assert.match(agent, /If neither flag is present, default to foreground behavior and still wait on the inner `task` Bash call/i);
   assert.match(agent, /Use exactly one `Bash` call/i);
   assert.match(agent, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
   assert.match(agent, /Do not call `review`, `adversarial-review`, `status`, `result`, or `cancel`/i);
@@ -150,6 +152,8 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /Map `spark` to `--model gpt-5\.3-codex-spark`/i);
   assert.match(runtimeSkill, /If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only/i);
   assert.match(runtimeSkill, /Strip it before calling `task`/i);
+  assert.match(runtimeSkill, /Never set `run_in_background: true` on the `Bash` call that invokes `task`/i);
+  assert.match(runtimeSkill, /let Claude Code background the outer `codex:codex-rescue` subagent itself/i);
   assert.match(runtimeSkill, /`--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`/i);
   assert.match(runtimeSkill, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
   assert.match(runtimeSkill, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
