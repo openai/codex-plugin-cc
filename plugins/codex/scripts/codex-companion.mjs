@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -53,6 +53,18 @@ import {
   SESSION_ID_ENV
 } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
+import {
+  compactShiftHistory,
+  formatCompactForPrompt,
+  getActiveShiftSessionId,
+  initShiftSession,
+  listShiftSessions,
+  mergeAllShiftSessions,
+  readShiftHistory,
+  readShiftCompact,
+  setShiftSessionClaudeId,
+  setShiftSessionCodexJobId
+} from "./lib/shift-history.mjs";
 import {
   renderNativeReviewResult,
   renderReviewResult,
@@ -468,7 +480,10 @@ async function executeTaskRun(request) {
   });
 
   let resumeThreadId = null;
-  if (request.resumeLast) {
+  if (request.resumeThreadId) {
+    // Explicit thread supplied (e.g. monitor resume reusing same Codex thread)
+    resumeThreadId = request.resumeThreadId;
+  } else if (request.resumeLast) {
     const latestThread = await resolveLatestTrackedTaskThread(workspaceRoot, {
       excludeJobId: request.jobId
     });
@@ -601,7 +616,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId, resumeThreadId = null }) {
   return {
     cwd,
     model,
@@ -609,7 +624,8 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId
     prompt,
     write,
     resumeLast,
-    jobId
+    jobId,
+    resumeThreadId
   };
 }
 
@@ -1021,6 +1037,450 @@ async function handleCancel(argv) {
   outputCommandResult(payload, renderCancelReport(nextJob), options.json);
 }
 
+async function handleMonitor(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["model", "effort", "cwd", "resume-session"],
+    booleanOptions: ["json", "resume", "list-sessions"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveCommandWorkspace(options);
+
+  // --list-sessions: just print existing sessions and exit, don't start anything
+  if (options["list-sessions"]) {
+    const sessions = listShiftSessions(workspaceRoot);
+    if (sessions.length === 0) {
+      const rendered = "No shift sessions found for this project.\n";
+      outputCommandResult({ sessions: [] }, rendered, options.json);
+      return;
+    }
+    const lines = sessions.map((s) =>
+      `${s.active ? "[active] " : "         "}${s.id}  ${s.startedAt.slice(0, 10)}  ${s.turnCount} turn${s.turnCount !== 1 ? "s" : ""}${s.resumed ? "  (resumed)" : ""}`
+    );
+    const rendered = [
+      "Shift sessions for this project:",
+      ...lines,
+      "",
+      `To resume a session:  /codex:monitor --resume-session <id>`,
+      `To resume the active: /codex:monitor --resume`,
+      `To start fresh:       /codex:monitor`,
+      ""
+    ].join("\n");
+    outputCommandResult({ sessions }, rendered, options.json);
+    return;
+  }
+
+  const model = normalizeRequestedModel(options.model);
+  const effort = normalizeReasoningEffort(options.effort);
+
+  ensureCodexAvailable(cwd);
+
+  // Resolve which session to use before initializing
+  let resolvedResumeSessionId = null;
+
+  if (options.resume || options["resume-session"]) {
+    const existing = listShiftSessions(workspaceRoot);
+    const rawPick = options["resume-session"] ?? null;
+
+    if (rawPick !== null) {
+      const asNumber = Number(rawPick);
+      if (Number.isInteger(asNumber) && asNumber >= 1 && asNumber <= existing.length) {
+        // User passed a list number like --resume-session 2
+        resolvedResumeSessionId = existing[asNumber - 1].id;
+      } else {
+        // User passed a full session ID
+        resolvedResumeSessionId = rawPick;
+      }
+    } else if (existing.length === 1) {
+      // --resume with exactly one session → auto-pick it
+      resolvedResumeSessionId = existing[0].id;
+    } else if (existing.length > 1) {
+      // --resume with multiple sessions → print numbered list with summaries, stop
+      const lines = existing.flatMap((s, i) => {
+        const badge = s.active ? " [active]" : "";
+        const meta = `${s.startedAt.slice(0, 10)}  ${s.turnCount} turn${s.turnCount !== 1 ? "s" : ""}`;
+        const header = `  ${i + 1}.${badge} ${meta}`;
+        const summary = s.lastSummary ? `       └─ ${s.lastSummary}` : null;
+        return summary ? [header, summary] : [header];
+      });
+      const rendered = [
+        "Multiple shift sessions found. Pick one:",
+        ...lines,
+        "",
+        "Re-run with:  /codex:monitor --resume-session <number>",
+        ""
+      ].join("\n");
+      outputCommandResult({ sessions: existing, needsPick: true }, rendered, options.json);
+      return;
+    }
+    // existing.length === 0 with --resume → fall through to fresh start
+  }
+
+  const isResumed = Boolean(resolvedResumeSessionId);
+  const shiftSessionId = initShiftSession(workspaceRoot, {
+    resume: isResumed,
+    sessionId: resolvedResumeSessionId
+  });
+
+  // When resuming, reuse the same Codex thread so `codex resume` doesn't
+  // accumulate a new entry every time the user runs /codex:monitor.
+  let prevCodexThreadId = null;
+  if (isResumed) {
+    const sessions = listShiftSessions(workspaceRoot);
+    const chosenMeta = sessions.find((s) => s.id === shiftSessionId);
+    if (chosenMeta?.codexJobId) {
+      const prevStoredJob = readStoredJob(workspaceRoot, chosenMeta.codexJobId);
+      prevCodexThreadId = prevStoredJob?.threadId ?? null;
+    }
+  }
+
+  const prompt =
+    "You are now monitoring a Claude Code session for this project. " +
+    "Explore the project structure, read key source files, review recent git commits, " +
+    "and understand what is currently being built. " +
+    "Build a complete mental model of the codebase. " +
+    "Do not make any changes. " +
+    "When /codex:shift is called you will receive a compacted summary of the Claude session " +
+    "and further instructions.";
+
+  const taskMetadata = { title: "Codex Monitor", summary: "Session monitor — building project context" };
+  const job = buildTaskJob(workspaceRoot, taskMetadata, false);
+  const request = buildTaskRequest({
+    cwd, model, effort, prompt, write: false, resumeLast: false, jobId: job.id,
+    resumeThreadId: prevCodexThreadId  // null for fresh, existing thread when resuming
+  });
+  const { payload } = enqueueBackgroundTask(cwd, job, request);
+
+  // Track the new job and the current Claude session against this shift session.
+  // The Stop hook uses the Claude session ID to avoid recording turns from
+  // unrelated sessions that happen to share the same workspace.
+  // Pass prevCodexThreadId so the session record retains access to the previous
+  // thread while the new job is still queued and has not yet reported its threadId.
+  setShiftSessionCodexJobId(workspaceRoot, shiftSessionId, job.id, prevCodexThreadId);
+  setShiftSessionClaudeId(workspaceRoot, shiftSessionId, getCurrentClaudeSessionId());
+
+  const modeLabel = isResumed
+    ? prevCodexThreadId
+      ? "Resuming previous shift session (continuing Codex thread)"
+      : "Resuming previous shift session (new Codex thread)"
+    : "Starting fresh shift session";
+  const rendered =
+    `Codex monitor started in the background as ${payload.jobId}.\n` +
+    `${modeLabel} (${shiftSessionId}).\n` +
+    `Codex is now building context for this project.\n` +
+    `Run /codex:shift when you are ready to hand off to Codex.\n`;
+
+  outputCommandResult({ ...payload, shiftSessionId, resumed: isResumed }, rendered, options.json);
+}
+
+function tryLaunchCodexTerminal(cwd, threadId, contextPrompt) {
+  // Try to copy context to clipboard (used when pre-send is unavailable)
+  let clipboardCopied = false;
+  if (contextPrompt) {
+    for (const { cmd, args } of [
+      { cmd: "xclip", args: ["-selection", "clipboard"] },
+      { cmd: "xsel", args: ["--clipboard", "--input"] },
+      { cmd: "pbcopy", args: [] }
+    ]) {
+      const which = spawnSync("which", [cmd], { encoding: "utf8" });
+      if (which.status !== 0) continue;
+      const proc = spawnSync(cmd, args, { input: contextPrompt, encoding: "utf8" });
+      if (proc.status === 0) { clipboardCopied = true; break; }
+    }
+  }
+
+  const codexCommand = `codex resume ${threadId}`;
+
+  // 1. tmux — new window inside the current tmux session.
+  //    When the IDE terminal runs inside tmux (common VS Code setup), this opens
+  //    a new tab inside the IDE rather than a separate system window.
+  if (process.env.TMUX) {
+    const res = spawnSync("tmux", ["new-window", "-n", "codex", codexCommand], { encoding: "utf8" });
+    if (res.status === 0) return { launched: true, terminal: "tmux", method: "new-window", clipboardCopied };
+  }
+
+  // 2. WezTerm — new tab via the WezTerm IPC CLI.
+  if (process.env.WEZTERM_UNIX_SOCKET || process.env.WEZTERM_PANE) {
+    const check = spawnSync("which", ["wezterm"], { encoding: "utf8" });
+    if (check.status === 0) {
+      const res = spawnSync("wezterm", ["cli", "spawn", "--", "bash", "-c", codexCommand], { encoding: "utf8" });
+      if (res.status === 0) return { launched: true, terminal: "wezterm", method: "cli spawn", clipboardCopied };
+    }
+  }
+
+  // 3. Zellij — new pane running the command.
+  if (process.env.ZELLIJ) {
+    const check = spawnSync("which", ["zellij"], { encoding: "utf8" });
+    if (check.status === 0) {
+      const res = spawnSync("zellij", ["run", "--name", "codex", "--", "bash", "-c", codexCommand], { encoding: "utf8" });
+      if (res.status === 0) return { launched: true, terminal: "zellij", method: "run", clipboardCopied };
+    }
+  }
+
+  // 4. System terminal emulators (fallback — opens outside the IDE).
+  for (const { name, args } of [
+    { name: "gnome-terminal", args: (c) => ["--", "bash", "-c", c] },
+    { name: "xterm", args: (c) => ["-e", c] },
+    { name: "konsole", args: (c) => ["-e", c] },
+    { name: "xfce4-terminal", args: (c) => ["-e", c] },
+    { name: "lxterminal", args: (c) => ["-e", c] },
+    { name: "alacritty", args: (c) => ["-e", "bash", "-c", c] },
+    { name: "kitty", args: (c) => ["bash", "-c", c] },
+    { name: "x-terminal-emulator", args: (c) => ["-e", c] }
+  ]) {
+    const which = spawnSync("which", [name], { encoding: "utf8" });
+    if (which.status !== 0) continue;
+    try {
+      const child = spawn(name, args(codexCommand), { cwd, detached: true, stdio: "ignore" });
+      child.unref();
+      return { launched: true, terminal: name, method: "system", clipboardCopied };
+    } catch {
+      // try next
+    }
+  }
+
+  return { launched: false, terminal: null, method: null, clipboardCopied };
+}
+
+async function handleShift(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "session"],
+    booleanOptions: ["json", "list-sessions", "launch"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveCommandWorkspace(options);
+
+  // --list-sessions: informational only
+  if (options["list-sessions"]) {
+    const sessions = listShiftSessions(workspaceRoot);
+    const rendered = sessions.length === 0
+      ? "No shift sessions found. Run /codex:monitor to start one.\n"
+      : sessions.map((s) =>
+          `${s.active ? "* " : "  "}${s.id}  (${s.turnCount} turns, started ${s.startedAt.slice(0, 10)}${s.resumed ? ", resumed" : ""})`
+        ).join("\n") + "\n";
+    outputCommandResult({ sessions }, rendered, options.json);
+    return;
+  }
+
+  // Resolve which session(s) to use
+  const allSessions = listShiftSessions(workspaceRoot);
+  let compact = null;
+  let chosenSession = null;
+
+  if (options.session) {
+    const rawPick = String(options.session);
+    const asNumber = Number(rawPick);
+    let sessionId;
+    if (Number.isInteger(asNumber) && asNumber >= 1 && asNumber <= allSessions.length) {
+      sessionId = allSessions[asNumber - 1].id;
+    } else {
+      sessionId = rawPick;
+    }
+    chosenSession = allSessions.find((s) => s.id === sessionId) ?? null;
+    if (!chosenSession) {
+      throw new Error(`Session not found: ${sessionId}`);
+    }
+    compact = compactShiftHistory(workspaceRoot, sessionId);
+  } else {
+    // No specific session — merge all
+    compact = allSessions.length > 0 ? mergeAllShiftSessions(workspaceRoot) : null;
+  }
+
+  const contextBlock = formatCompactForPrompt(compact);
+
+  // Resolve Codex threadId.
+  // When a specific session is selected, only use that session's tracked job —
+  // never fall back to another session's thread, which would send the wrong context.
+  // Cross-session fallback is only allowed in "merge all" mode (no --session flag).
+  let threadId = null;
+  if (chosenSession) {
+    if (chosenSession.codexJobId) {
+      const trackedJob = readStoredJob(workspaceRoot, chosenSession.codexJobId);
+      threadId = trackedJob?.threadId ?? null;
+    }
+    // The new job may still be queued and have no threadId yet. Fall back to the
+    // previous thread that was preserved when the resume job was enqueued, so
+    // /codex:shift remains usable immediately after /codex:monitor --resume.
+    if (!threadId && chosenSession.prevCodexThreadId) {
+      threadId = chosenSession.prevCodexThreadId;
+    }
+  } else {
+    // Merge-all mode: search all sessions newest-first, then fall back to current session
+    for (const s of allSessions) {
+      if (!s.codexJobId) continue;
+      const storedJob = readStoredJob(workspaceRoot, s.codexJobId);
+      if (storedJob?.threadId) { threadId = storedJob.threadId; break; }
+    }
+    if (!threadId) {
+      const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
+      threadId = jobs.find((job) => job.threadId)?.threadId ?? null;
+    }
+  }
+
+  // Create git-diff markdown file in project root
+  const now = new Date().toISOString().slice(0, 10);
+  const SHIFT_EXCLUDE = [":(exclude).codex-shift-*.md"];
+  const diffStat = spawnSync("git", ["diff", "--stat", "HEAD", "--", ".", ...SHIFT_EXCLUDE], { cwd, encoding: "utf8" });
+  const diffFull = spawnSync("git", ["diff", "HEAD", "--", ".", ...SHIFT_EXCLUDE], { cwd, encoding: "utf8" });
+  const logRecent = spawnSync("git", ["log", "--oneline", "-10"], { cwd, encoding: "utf8" });
+  const untrackedResult = spawnSync(
+    "git",
+    ["ls-files", "--others", "--exclude-standard", "--exclude=.codex-shift-*.md"],
+    { cwd, encoding: "utf8" }
+  );
+  const untrackedFiles = (untrackedResult.stdout ?? "").trim().split("\n")
+    .filter(Boolean)
+    .filter((f) => !/^\.codex-shift-.*\.md$/.test(f));
+
+  // Build untracked diff by running git diff --no-index /dev/null <file> for each.
+  // All files are included; no silent truncation.
+  const untrackedDiffParts = [];
+  for (const file of untrackedFiles) {
+    const fileDiff = spawnSync("git", ["diff", "--no-index", "/dev/null", file], { cwd, encoding: "utf8" });
+    if (fileDiff.stdout) untrackedDiffParts.push(fileDiff.stdout.trim());
+  }
+
+  const statBlock = [
+    (diffStat.stdout ?? "").trim() || "",
+    untrackedFiles.length > 0
+      ? `\nUntracked files:\n${untrackedFiles.map((f) => `  ${f}`).join("\n")}`
+      : ""
+  ].join("").trim() || "(no changes)";
+
+  const fullDiffBlock = [
+    (diffFull.stdout ?? "").trim(),
+    ...untrackedDiffParts
+  ].filter(Boolean).join("\n") || "(no diff)";
+
+  const mdLines = [
+    `# Codex Shift — ${now}`,
+    "",
+    "## Recent Commits",
+    "```",
+    (logRecent.stdout ?? "").trim() || "(none)",
+    "```",
+    "",
+    "## Changed Files",
+    "```",
+    statBlock,
+    "```",
+    "",
+    "## Full Diff",
+    "```diff",
+    fullDiffBlock,
+    "```"
+  ];
+
+  if (contextBlock) {
+    const sessionLabel = chosenSession
+      ? "## Claude Session Context"
+      : `## Claude Session Context (merged from ${allSessions.length} sessions)`;
+    mdLines.push("", sessionLabel, "", contextBlock);
+  }
+
+  const mdContent = mdLines.join("\n") + "\n";
+  const mdPath = path.join(cwd, `.codex-shift-${now}.md`);
+  fs.writeFileSync(mdPath, mdContent, "utf8");
+
+  // Build the initial Codex prompt
+  const contextSection = contextBlock
+    ? `\n\n${contextBlock}`
+    : "\n\n(No session history recorded yet — run /codex:monitor at the start of your next session.)";
+
+  const codexPrompt =
+    `Don't do anything with this query, just take context and follow my further instructions.\n` +
+    contextSection;
+
+  // When --launch is requested, pre-send the context to the Codex thread so it
+  // is already processed when the user opens the terminal. This avoids needing
+  // to paste anything manually.
+  let preSendOk = false;
+  let targetThreadId = threadId;
+  if (options.launch && threadId) {
+    process.stderr.write("Sending context to Codex...\n");
+    try {
+      ensureCodexAvailable(cwd);
+      const result = await runAppServerTurn(workspaceRoot, {
+        resumeThreadId: threadId,
+        prompt: codexPrompt,
+        sandbox: "read-only",
+        persistThread: true
+      });
+      targetThreadId = result.threadId ?? threadId;
+      preSendOk = true;
+      process.stderr.write("Context delivered. Opening terminal...\n");
+    } catch (err) {
+      process.stderr.write(`Note: could not pre-send context (${err.message}). Paste it manually.\n`);
+    }
+  }
+
+  // Launch terminal — pass contextPrompt only when pre-send failed (clipboard fallback)
+  let launchResult = null;
+  if (options.launch && targetThreadId) {
+    launchResult = tryLaunchCodexTerminal(cwd, targetThreadId, preSendOk ? null : codexPrompt);
+  }
+
+  const resumeLine = targetThreadId
+    ? `codex resume ${targetThreadId}`
+    : "(no Codex thread found — run /codex:monitor first or start a /codex:rescue)";
+
+  const sessionInfo = chosenSession
+    ? `${chosenSession.id} (${chosenSession.turnCount} turn${chosenSession.turnCount !== 1 ? "s" : ""})`
+    : `${allSessions.length} merged sessions`;
+
+  let rendered;
+  if (launchResult?.launched) {
+    const inIde = launchResult.terminal === "tmux" || launchResult.terminal === "wezterm" || launchResult.terminal === "zellij";
+    const where = inIde ? "IDE terminal" : "system terminal";
+    const statusLine = preSendOk
+      ? "Context already loaded — Codex is ready for your instructions."
+      : launchResult.clipboardCopied
+        ? "Context copied to clipboard — paste it as your first Codex message."
+        : `Paste as your first Codex message:\n---\n${codexPrompt}\n---`;
+    rendered = [
+      "=== Codex Shift Ready ===",
+      "",
+      `Changes saved to: ${mdPath}`,
+      `Context: ${sessionInfo}`,
+      "",
+      `Codex terminal opened in ${where} (${launchResult.terminal}).`,
+      statusLine,
+      ""
+    ].join("\n");
+  } else {
+    const pasteBlock = preSendOk
+      ? "(context already pre-loaded — just resume and start giving instructions)"
+      : `Then send this as your first message to Codex:\n---\n${codexPrompt}\n---`;
+    rendered = [
+      "=== Codex Shift Ready ===",
+      "",
+      `Changes saved to: ${mdPath}`,
+      `Context: ${sessionInfo}`,
+      "",
+      "Run this in a new terminal:",
+      `  ${resumeLine}`,
+      "",
+      pasteBlock,
+      ""
+    ].join("\n");
+  }
+
+  const payload = {
+    threadId: targetThreadId,
+    mdPath,
+    sessionCount: allSessions.length,
+    chosenSessionId: chosenSession?.id ?? null,
+    compact,
+    resumeCommand: resumeLine,
+    codexPrompt,
+    preSendOk,
+    launch: launchResult
+  };
+
+  outputCommandResult(payload, rendered, options.json);
+}
+
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (!subcommand || subcommand === "help" || subcommand === "--help") {
@@ -1060,6 +1520,12 @@ async function main() {
       break;
     case "cancel":
       await handleCancel(argv);
+      break;
+    case "monitor":
+      await handleMonitor(argv);
+      break;
+    case "shift":
+      await handleShift(argv);
       break;
     default:
       throw new Error(`Unknown subcommand: ${subcommand}`);
