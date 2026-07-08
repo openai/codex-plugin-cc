@@ -1,10 +1,32 @@
 import { spawnSync } from "node:child_process";
 import process from "node:process";
 
+export const ROUTING_INTENT_ENV = "RUST_VERIFICATION_PRESERVE_ROUTING_ENV";
+// Keep exact-match entries uppercase because keys are normalized before lookup.
+const SCRUBBED_ENV_EXACT_KEYS = new Set([
+  "RUST_VERIFICATION_ROOT_BASE",
+  "RUST_VERIFICATION_REAL_CARGO",
+  ROUTING_INTENT_ENV,
+  "BOLT_RUST_VERIFICATION_ROOT"
+]);
+const SCRUBBED_ENV_PATTERN = /^CARGO_.*TARGET_DIR$/;
+
+export function sanitizeChildEnv(env = process.env) {
+  const sourceEnv = env ?? process.env;
+  const childEnv = { ...sourceEnv };
+  for (const key of Object.keys(childEnv)) {
+    const normalizedKey = key.toUpperCase();
+    if (SCRUBBED_ENV_PATTERN.test(normalizedKey) || SCRUBBED_ENV_EXACT_KEYS.has(normalizedKey)) {
+      delete childEnv[key];
+    }
+  }
+  return childEnv;
+}
+
 export function runCommand(command, args = [], options = {}) {
   const result = spawnSync(command, args, {
     cwd: options.cwd,
-    env: options.env,
+    env: sanitizeChildEnv(options.env ?? process.env),
     encoding: "utf8",
     input: options.input,
     maxBuffer: options.maxBuffer,
