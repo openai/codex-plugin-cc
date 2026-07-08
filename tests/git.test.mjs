@@ -132,13 +132,21 @@ test("collectReviewContext skips untracked directories in working tree review", 
   assert.match(context.content, /### \.claude\/worktrees\/agent-test\/\n\(skipped: directory\)/);
 });
 
-test("collectReviewContext skips broken untracked symlinks instead of crashing", () => {
+test("collectReviewContext skips broken untracked symlinks instead of crashing", (t) => {
   const cwd = makeTempDir();
   initGitRepo(cwd);
   fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v1');\n");
   run("git", ["add", "app.js"], { cwd });
   run("git", ["commit", "-m", "init"], { cwd });
-  fs.symlinkSync("missing-target", path.join(cwd, "broken-link"));
+  try {
+    fs.symlinkSync("missing-target", path.join(cwd, "broken-link"));
+  } catch (err) {
+    if (process.platform === "win32" && err.code === "EPERM") {
+      t.skip("Skipping symlink test: Windows requires Developer Mode or Administrator privileges to create symlinks.");
+      return;
+    }
+    throw err;
+  }
 
   const target = resolveReviewTarget(cwd, {});
   const context = collectReviewContext(cwd, target);
