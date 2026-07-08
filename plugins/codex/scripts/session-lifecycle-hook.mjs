@@ -21,11 +21,16 @@ export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 
 function readHookInput() {
-  const raw = fs.readFileSync(0, "utf8").trim();
-  if (!raw) {
-    return {};
+  try {
+    const raw = fs.readFileSync(0, "utf8").trim();
+    if (!raw) {
+      return {};
+    }
+    return JSON.parse(raw);
+  } catch (e) {
+    if (e.code === 'EAGAIN') return {};
+    throw e;
   }
-  return JSON.parse(raw);
 }
 
 function shellEscape(value) {
