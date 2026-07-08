@@ -44,7 +44,9 @@ export type {
   UserInput
 };
 
-export type ThreadStartParams = Omit<RawThreadStartParams, "persistExtendedHistory">;
+export type ThreadStartParams = Omit<RawThreadStartParams, "persistExtendedHistory"> & {
+  experimentalRawEvents?: boolean;
+};
 export type ThreadResumeParams = Omit<RawThreadResumeParams, "persistExtendedHistory">;
 
 export interface CodexAppServerClientOptions {

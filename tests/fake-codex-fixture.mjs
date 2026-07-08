@@ -16,6 +16,7 @@ const readline = require("node:readline");
 	const STATE_PATH = ${JSON.stringify(statePath)};
 	const BEHAVIOR = ${JSON.stringify(behavior)};
 	const interruptibleTurns = new Map();
+	let SERVER_ACCOUNT_EMAIL = null;
 
 	function loadState() {
 	  if (!fs.existsSync(STATE_PATH)) {
@@ -75,6 +76,11 @@ function buildAccountReadResult() {
       return { account: null, requiresOpenaiAuth: false };
     case "api-key-account-only":
       return { account: { type: "apiKey" }, requiresOpenaiAuth: true };
+    case "switchable-account":
+      return {
+        account: { type: "chatgpt", email: SERVER_ACCOUNT_EMAIL || "old@example.com", planType: "plus" },
+        requiresOpenaiAuth: true
+      };
     default:
       return {
         account: { type: "chatgpt", email: "test@example.com", planType: "plus" },
@@ -271,6 +277,10 @@ if (args[0] !== "app-server") {
   process.exit(1);
 }
 const bootState = loadState();
+if (BEHAVIOR === "switchable-account") {
+  SERVER_ACCOUNT_EMAIL = bootState.currentAccountEmail || "old@example.com";
+  bootState.currentAccountEmail = SERVER_ACCOUNT_EMAIL;
+}
 bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
 saveState(bootState);
 
