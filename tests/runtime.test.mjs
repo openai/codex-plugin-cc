@@ -795,13 +795,14 @@ test("task accepts max and ultra reasoning efforts and forwards them to turn/sta
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
   for (const effort of ["max", "ultra"]) {
-    const result = run("node", [SCRIPT, "task", "--fresh", "--effort", effort, "diagnose the failing test"], {
+    const result = run("node", [SCRIPT, "task", "--fresh", "--model", "gpt-5.6-sol", "--effort", effort, "diagnose the failing test"], {
       cwd: repo,
       env: buildEnv(binDir)
     });
 
     assert.equal(result.status, 0, result.stderr);
     const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.equal(fakeState.lastTurnStart.model, "gpt-5.6-sol");
     assert.equal(fakeState.lastTurnStart.effort, effort);
   }
 });
@@ -820,6 +821,117 @@ test("task rejects an unknown reasoning effort before starting a job", () => {
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /Unsupported reasoning effort "hyperdrive"/);
   assert.match(result.stderr, /max, ultra/);
+});
+
+test("task rejects an effort the resolved model does not support before starting a turn", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "--model", "gpt-5.4-mini", "--effort", "ultra", "diagnose the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Model "gpt-5\.4-mini" does not support reasoning effort "ultra"/);
+  assert.match(result.stderr, /low, medium, high, xhigh/);
+  if (fs.existsSync(statePath)) {
+    const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.equal(fakeState.lastTurnStart ?? null, null);
+  }
+});
+
+test("task validates an effort-only dispatch against the resolved default model", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "--effort", "ultra", "diagnose the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Model "gpt-5\.4" does not support reasoning effort "ultra"/);
+  if (fs.existsSync(statePath)) {
+    const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.equal(fakeState.lastTurnStart ?? null, null);
+  }
+});
+
+test("task fails open with a warning when the model catalog is unavailable", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "model-list-unsupported");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "--model", "gpt-5.4-mini", "--effort", "ultra", "diagnose the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout + result.stderr, /skipping reasoning-effort validation/);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.effort, "ultra");
+});
+
+test("task fails open with a warning when the model catalog is malformed", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "model-list-malformed");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "--model", "gpt-5.4-mini", "--effort", "ultra", "diagnose the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout + result.stderr, /skipping reasoning-effort validation/);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.effort, "ultra");
+});
+
+test("task warns and proceeds when the resolved model is not in the catalog", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "--model", "spark", "--effort", "ultra", "diagnose the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout + result.stderr, /is not in the model catalog/);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.model, "gpt-5.3-codex-spark");
+  assert.equal(fakeState.lastTurnStart.effort, "ultra");
 });
 
 test("task logs reasoning summaries and assistant messages to the job log", () => {

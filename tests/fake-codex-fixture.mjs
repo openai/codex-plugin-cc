@@ -351,6 +351,24 @@ rl.on("line", (line) => {
         break;
       }
 
+      case "model/list": {
+        if (BEHAVIOR === "model-list-unsupported") {
+          send({ id: message.id, error: { code: -32601, message: "Unsupported method: model/list" } });
+          break;
+        }
+        if (BEHAVIOR === "model-list-malformed") {
+          send({ id: message.id, result: { data: "not-a-catalog" } });
+          break;
+        }
+        const catalogEffort = (reasoningEffort) => ({ reasoningEffort, description: reasoningEffort });
+        send({ id: message.id, result: { data: [
+          { id: "gpt-5.6-sol", model: "gpt-5.6-sol", isDefault: false, defaultReasoningEffort: "medium", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"].map(catalogEffort) },
+          { id: "gpt-5.4", model: "gpt-5.4", isDefault: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: ["low", "medium", "high", "xhigh"].map(catalogEffort) },
+          { id: "gpt-5.4-mini", model: "gpt-5.4-mini", isDefault: false, defaultReasoningEffort: "medium", supportedReasoningEfforts: ["low", "medium", "high", "xhigh"].map(catalogEffort) }
+        ] } });
+        break;
+      }
+
       case "externalAgentConfig/import": {
         if (BEHAVIOR === "external-import-unsupported") {
           send({ id: message.id, error: { code: -32601, message: "Unsupported method: externalAgentConfig/import" } });
