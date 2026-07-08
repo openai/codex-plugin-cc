@@ -137,7 +137,6 @@ export function resolveReviewTarget(cwd, options = {}) {
 
   const requestedScope = options.scope ?? "auto";
   const baseRef = options.base ?? null;
-  const state = getWorkingTreeState(cwd);
   const supportedScopes = new Set(["auto", "working-tree", "branch"]);
 
   if (baseRef) {
@@ -172,6 +171,8 @@ export function resolveReviewTarget(cwd, options = {}) {
       explicit: true
     };
   }
+
+  const state = getWorkingTreeState(cwd);
 
   if (state.isDirty) {
     return {
