@@ -19,7 +19,15 @@ const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
 function readHookInput() {
-  const raw = fs.readFileSync(0, "utf8").trim();
+  let raw;
+  try {
+    raw = fs.readFileSync(0, "utf8").trim();
+  } catch (e) {
+    if (e.code === "EAGAIN") {
+      return {};
+    }
+    throw e;
+  }
   if (!raw) {
     return {};
   }

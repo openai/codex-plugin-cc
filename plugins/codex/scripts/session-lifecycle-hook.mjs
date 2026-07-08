@@ -21,7 +21,15 @@ export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 
 function readHookInput() {
-  const raw = fs.readFileSync(0, "utf8").trim();
+  let raw;
+  try {
+    raw = fs.readFileSync(0, "utf8").trim();
+  } catch (e) {
+    if (e.code === "EAGAIN") {
+      return {};
+    }
+    throw e;
+  }
   if (!raw) {
     return {};
   }
