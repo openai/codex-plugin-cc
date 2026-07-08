@@ -1094,44 +1094,50 @@ export async function importExternalAgentSession(cwd, options = {}) {
 
 const MODEL_LIST_TIMEOUT_MS = 3000;
 
-async function validateReasoningEffortForModel(client, resolvedModel, effort, onProgress) {
-  const skip = (reason) => {
-    emitProgress(
-      onProgress,
-      `Warning: skipping reasoning-effort validation (${reason}); dispatching effort "${effort}" as requested.`,
-      "starting"
-    );
-  };
+function emitEffortValidationSkip(onProgress, effort, reason) {
+  emitProgress(
+    onProgress,
+    `Warning: skipping reasoning-effort validation (${reason}); dispatching effort "${effort}" as requested.`,
+    "starting"
+  );
+}
 
+async function fetchModelCatalog(client) {
   const requestPromise = client.request("model/list", {});
   requestPromise.catch(() => {});
   let timer;
-  let response = null;
   try {
-    response = await Promise.race([
+    const response = await Promise.race([
       requestPromise,
       new Promise((resolve) => {
         timer = setTimeout(() => resolve(null), MODEL_LIST_TIMEOUT_MS);
       })
     ]);
+    return Array.isArray(response?.data) ? response.data : null;
   } catch {
-    response = null;
+    return null;
   } finally {
     clearTimeout(timer);
   }
+}
 
-  const entries = Array.isArray(response?.data) ? response.data : null;
+function catalogDefaultModel(entries) {
+  const entry = Array.isArray(entries) ? entries.find((item) => item && item.isDefault) : null;
+  return entry ? entry.id ?? entry.model ?? null : null;
+}
+
+function assertCatalogSupportsEffort(entries, resolvedModel, effort, onProgress) {
   if (!entries) {
-    skip("model catalog unavailable or malformed");
+    emitEffortValidationSkip(onProgress, effort, "model catalog unavailable or malformed");
     return;
   }
   if (!resolvedModel) {
-    skip("app-server did not report a resolved model");
+    emitEffortValidationSkip(onProgress, effort, "could not resolve the target model");
     return;
   }
   const entry = entries.find((item) => item && (item.id === resolvedModel || item.model === resolvedModel));
   if (!entry) {
-    skip(`model "${resolvedModel}" is not in the model catalog`);
+    emitEffortValidationSkip(onProgress, effort, `model "${resolvedModel}" is not in the model catalog`);
     return;
   }
   const supported = Array.isArray(entry.supportedReasoningEfforts)
@@ -1140,7 +1146,7 @@ async function validateReasoningEffortForModel(client, resolvedModel, effort, on
         .filter((value) => typeof value === "string" && value)
     : [];
   if (supported.length === 0) {
-    skip(`model "${resolvedModel}" reports no reasoning-effort catalog`);
+    emitEffortValidationSkip(onProgress, effort, `model "${resolvedModel}" reports no reasoning-effort catalog`);
     return;
   }
   if (!supported.includes(effort)) {
@@ -1158,7 +1164,7 @@ export async function runAppServerTurn(cwd, options = {}) {
 
   return withAppServer(cwd, async (client) => {
     let threadId;
-    let resolvedModel = null;
+    const catalogEntries = options.effort ? await fetchModelCatalog(client) : null;
 
     if (options.resumeThreadId) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
@@ -1168,8 +1174,14 @@ export async function runAppServerTurn(cwd, options = {}) {
         ephemeral: false
       });
       threadId = response.thread.id;
-      resolvedModel = response.model ?? null;
+      if (options.effort) {
+        assertCatalogSupportsEffort(catalogEntries, response.model ?? null, options.effort, options.onProgress);
+      }
     } else {
+      if (options.effort) {
+        const targetModel = options.model ?? catalogDefaultModel(catalogEntries);
+        assertCatalogSupportsEffort(catalogEntries, targetModel, options.effort, options.onProgress);
+      }
       emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
       const response = await startThread(client, cwd, {
         model: options.model,
@@ -1178,7 +1190,6 @@ export async function runAppServerTurn(cwd, options = {}) {
         threadName: options.persistThread ? options.threadName : options.threadName ?? null
       });
       threadId = response.thread.id;
-      resolvedModel = response.model ?? null;
     }
 
     emitProgress(options.onProgress, `Thread ready (${threadId}).`, "starting", {
@@ -1188,10 +1199,6 @@ export async function runAppServerTurn(cwd, options = {}) {
     const prompt = options.prompt?.trim() || options.defaultPrompt || "";
     if (!prompt) {
       throw new Error("A prompt is required for this Codex run.");
-    }
-
-    if (options.effort) {
-      await validateReasoningEffortForModel(client, resolvedModel, options.effort, options.onProgress);
     }
 
     const turnState = await captureTurn(

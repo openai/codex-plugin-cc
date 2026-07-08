@@ -844,6 +844,7 @@ test("task rejects an effort the resolved model does not support before starting
   if (fs.existsSync(statePath)) {
     const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
     assert.equal(fakeState.lastTurnStart ?? null, null);
+    assert.equal((fakeState.threads ?? []).length, 0, "no thread may be created for a rejected pair");
   }
 });
 
@@ -867,6 +868,7 @@ test("task validates an effort-only dispatch against the resolved default model"
   if (fs.existsSync(statePath)) {
     const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
     assert.equal(fakeState.lastTurnStart ?? null, null);
+    assert.equal((fakeState.threads ?? []).length, 0, "no thread may be created for a rejected pair");
   }
 });
 
