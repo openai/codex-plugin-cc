@@ -1105,6 +1105,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
       const response = await resumeThread(client, options.resumeThreadId, cwd, {
         model: options.model,
+        approvalPolicy: options.approvalPolicy,
         sandbox: options.sandbox,
         ephemeral: false
       });
@@ -1113,6 +1114,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
       const response = await startThread(client, cwd, {
         model: options.model,
+        approvalPolicy: options.approvalPolicy,
         sandbox: options.sandbox,
         ephemeral: options.persistThread ? false : true,
         threadName: options.persistThread ? options.threadName : options.threadName ?? null
