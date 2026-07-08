@@ -2030,7 +2030,7 @@ test("stop hook logs running tasks to stderr without blocking when the review ga
   });
 
   assert.equal(blocked.status, 0, blocked.stderr);
-  assert.equal(blocked.stdout.trim(), "");
+  assert.equal(blocked.stdout.trim(), "{}");
   assert.match(blocked.stderr, /Codex task task-live is still running/i);
   assert.match(blocked.stderr, /\/codex:status/i);
   assert.match(blocked.stderr, /\/codex:cancel task-live/i);
@@ -2058,7 +2058,7 @@ test("stop hook allows the stop when the review gate is enabled and the stop-tim
   });
 
   assert.equal(allowed.status, 0, allowed.stderr);
-  assert.equal(allowed.stdout.trim(), "");
+  assert.equal(allowed.stdout.trim(), "{}");
 });
 
 test("stop hook does not block when Codex is unavailable even if the review gate is enabled", () => {
@@ -2083,7 +2083,7 @@ test("stop hook does not block when Codex is unavailable even if the review gate
   });
 
   assert.equal(allowed.status, 0, allowed.stderr);
-  assert.equal(allowed.stdout.trim(), "");
+  assert.equal(allowed.stdout.trim(), "{}");
   assert.match(allowed.stderr, /Codex is not set up for the review gate/i);
   assert.match(allowed.stderr, /Run \/codex:setup/i);
 });
