@@ -62,7 +62,7 @@ If Codex is installed but not logged in yet, run:
 After install, you should see:
 
 - the slash commands listed below
-- the `codex:codex-rescue` subagent in `/agents`
+- the `codex:codex-rescue` and `codex:codex-reviewer` subagents in `/agents`
 
 One simple first run is:
 
@@ -122,6 +122,14 @@ Examples:
 ```
 
 This command is read-only. It does not fix code.
+
+### `codex:codex-reviewer` subagent
+
+Dispatches a read-only Codex review programmatically through the `Agent` tool - the review-mode counterpart to the `codex:codex-rescue` subagent.
+
+Slash commands do not compose, so other plugins and pipelines cannot invoke `/codex:review` or `/codex:adversarial-review` directly. The `codex:codex-reviewer` subagent fills that gap: one `Agent` call (`subagent_type: "codex:codex-reviewer"`) forwards the request to the plugin's `review` or `adversarial-review` runtime and returns Codex's output verbatim.
+
+It is hard-coded to be review-only: it never adds `--write`, never forwards to `task`, and has no `--resume` semantics. Requests with focus text or an adversarial framing route to `adversarial-review`; plain requests route to the built-in reviewer.
 
 ### `/codex:rescue`
 

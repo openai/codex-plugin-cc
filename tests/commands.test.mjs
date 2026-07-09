@@ -170,6 +170,46 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(readme, /### `\/codex:cancel`/);
 });
 
+test("codex-reviewer agent is a review-only thin forwarder", () => {
+  const agent = read("agents/codex-reviewer.md");
+  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+
+  assert.match(agent, /^name: codex-reviewer$/m);
+  assert.match(agent, /^tools: Bash$/m);
+  assert.match(agent, /review-mode counterpart to codex-rescue/i);
+  assert.match(agent, /thin forwarding wrapper/i);
+  assert.match(agent, /Use exactly one `Bash` call/i);
+  assert.match(agent, /codex-companion\.mjs" review \.\.\./);
+  assert.match(agent, /codex-companion\.mjs" adversarial-review \.\.\./);
+  assert.match(agent, /Choose `adversarial-review` when the request asks for an adversarial or challenge review, or includes extra focus text/i);
+  assert.match(agent, /does not support focus text/i);
+  assert.match(agent, /review-only\. Never add `--write`, and never forward to `task`/i);
+  assert.match(agent, /Do not call `task`, `setup`, `transfer`, `status`, `result`, or `cancel`/i);
+  assert.match(agent, /no `--resume`, `--fresh`, or `--resume-last` semantics/i);
+  assert.match(agent, /Every review is a fresh run/i);
+  assert.match(agent, /Do not fix issues, apply patches/i);
+  assert.match(agent, /Leave model unset by default/i);
+  assert.match(agent, /If the user asks for `spark`, map that to `--model gpt-5\.3-codex-spark`/i);
+  assert.match(agent, /Do not weaken the adversarial framing or rewrite the user's focus text/i);
+  assert.match(agent, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
+  // The companion parses --background but still runs reviews in the
+  // foreground; only Claude Code's Bash background mode actually detaches.
+  assert.match(agent, /The companion script parses `--wait` and `--background`, but Claude Code's `Bash\(..., run_in_background: true\)` is what actually detaches the run/i);
+  assert.match(agent, /launch the single `Bash` call with `run_in_background: true`/i);
+  assert.match(agent, /Do not call `BashOutput`/);
+  assert.match(agent, /Codex review started in the background\. Check `\/codex:status` for progress\./);
+  // --background --json callers still get machine-readable output: a fixed
+  // structured launch object, since the review payload does not exist yet.
+  assert.match(agent, /If the request includes both `--background` and `--json`/i);
+  assert.match(agent, /\{"status":"started","message":"Codex review started in the background\. Check \/codex:status for progress\."\}/);
+  assert.match(agent, /callers fetch it afterwards with `\/codex:result` or `result --json`/i);
+  assert.match(agent, /For foreground runs, return the stdout of the `codex-companion` command exactly as-is/i);
+  assert.match(agent, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
+  assert.match(readme, /`codex:codex-rescue` and `codex:codex-reviewer` subagents/i);
+  assert.match(readme, /### `codex:codex-reviewer` subagent/);
+  assert.match(readme, /subagent_type: "codex:codex-reviewer"/);
+});
+
 test("transfer, result, and cancel commands are exposed as deterministic runtime entrypoints", () => {
   const transfer = read("commands/transfer.md");
   const result = read("commands/result.md");
