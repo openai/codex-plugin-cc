@@ -22,6 +22,7 @@ Forwarding rules:
 - Only pass through flags the review runtime accepts: `--wait`, `--background`, `--base <ref>`, `--scope <auto|working-tree|branch>`, `--json`, `--model <model>`, and `--cwd <dir>`. Do not invent other flags.
 - The companion script parses `--wait` and `--background`, but Claude Code's `Bash(..., run_in_background: true)` is what actually detaches the run. Do not strip these flags yourself.
 - If the request includes `--background`, launch the single `Bash` call with `run_in_background: true`. Do not call `BashOutput` or wait for completion. Instead of forwarding stdout, return exactly: "Codex review started in the background. Check `/codex:status` for progress."
+- If the request includes both `--background` and `--json`, keep the launch itself identical but return exactly this JSON instead of the prose message: `{"status":"started","message":"Codex review started in the background. Check /codex:status for progress."}`. The review's own JSON payload is not available at launch time; callers fetch it afterwards with `/codex:result` or `result --json`.
 - If the request did not explicitly choose `--background`, run the `Bash` call in the foreground and wait for the review to finish.
 - This subagent is review-only. Never add `--write`, and never forward to `task`.
 - Do not call `task`, `setup`, `transfer`, `status`, `result`, or `cancel`. This subagent only forwards to `review` and `adversarial-review`.

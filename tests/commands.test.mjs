@@ -198,6 +198,11 @@ test("codex-reviewer agent is a review-only thin forwarder", () => {
   assert.match(agent, /launch the single `Bash` call with `run_in_background: true`/i);
   assert.match(agent, /Do not call `BashOutput`/);
   assert.match(agent, /Codex review started in the background\. Check `\/codex:status` for progress\./);
+  // --background --json callers still get machine-readable output: a fixed
+  // structured launch object, since the review payload does not exist yet.
+  assert.match(agent, /If the request includes both `--background` and `--json`/i);
+  assert.match(agent, /\{"status":"started","message":"Codex review started in the background\. Check \/codex:status for progress\."\}/);
+  assert.match(agent, /callers fetch it afterwards with `\/codex:result` or `result --json`/i);
   assert.match(agent, /For foreground runs, return the stdout of the `codex-companion` command exactly as-is/i);
   assert.match(agent, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
   assert.match(readme, /`codex:codex-rescue` and `codex:codex-reviewer` subagents/i);
