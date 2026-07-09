@@ -192,7 +192,13 @@ test("codex-reviewer agent is a review-only thin forwarder", () => {
   assert.match(agent, /If the user asks for `spark`, map that to `--model gpt-5\.3-codex-spark`/i);
   assert.match(agent, /Do not weaken the adversarial framing or rewrite the user's focus text/i);
   assert.match(agent, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
-  assert.match(agent, /Return the stdout of the `codex-companion` command exactly as-is/i);
+  // The companion parses --background but still runs reviews in the
+  // foreground; only Claude Code's Bash background mode actually detaches.
+  assert.match(agent, /The companion script parses `--wait` and `--background`, but Claude Code's `Bash\(..., run_in_background: true\)` is what actually detaches the run/i);
+  assert.match(agent, /launch the single `Bash` call with `run_in_background: true`/i);
+  assert.match(agent, /Do not call `BashOutput`/);
+  assert.match(agent, /Codex review started in the background\. Check `\/codex:status` for progress\./);
+  assert.match(agent, /For foreground runs, return the stdout of the `codex-companion` command exactly as-is/i);
   assert.match(agent, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
   assert.match(readme, /`codex:codex-rescue` and `codex:codex-reviewer` subagents/i);
   assert.match(readme, /### `codex:codex-reviewer` subagent/);
