@@ -210,3 +210,41 @@ test("collectReviewContext keeps untracked file content in lightweight working t
   assert.match(context.content, /## Untracked Files/);
   assert.match(context.content, /UNTRACKED_RISK_MARKER/);
 });
+
+test("collectReviewContext caps aggregate untracked content instead of growing unbounded", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v1');\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  for (let index = 0; index < 5; index += 1) {
+    fs.writeFileSync(path.join(cwd, `untracked-${index}.txt`), `UNTRACKED_MARKER_${index} ${"x".repeat(400)}\n`);
+  }
+
+  const target = resolveReviewTarget(cwd, { scope: "working-tree" });
+  const context = collectReviewContext(cwd, target, { maxUntrackedTotalBytes: 1024 });
+
+  assert.match(context.content, /UNTRACKED_MARKER_0/);
+  assert.doesNotMatch(context.content, /UNTRACKED_MARKER_4/);
+  assert.match(context.content, /\(\d+ untracked file\(s\) omitted: aggregate untracked content exceeds the 1024 byte limit\./);
+  // The Git Status section still names every untracked file, so nothing is silently invisible.
+  assert.match(context.content, /\?\? untracked-4\.txt/);
+});
+
+test("collectReviewContext keeps all untracked content when under the aggregate cap", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v1');\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  for (let index = 0; index < 5; index += 1) {
+    fs.writeFileSync(path.join(cwd, `untracked-${index}.txt`), `UNTRACKED_MARKER_${index}\n`);
+  }
+
+  const target = resolveReviewTarget(cwd, { scope: "working-tree" });
+  const context = collectReviewContext(cwd, target);
+
+  assert.match(context.content, /UNTRACKED_MARKER_0/);
+  assert.match(context.content, /UNTRACKED_MARKER_4/);
+  assert.doesNotMatch(context.content, /untracked file\(s\) omitted/);
+});
