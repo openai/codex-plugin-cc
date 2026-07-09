@@ -13,7 +13,7 @@ import {
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
+import { loadState, resolveStateFile, updateState } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -68,9 +68,11 @@ function cleanupSessionJobs(cwd, sessionId) {
     }
   }
 
-  saveState(workspaceRoot, {
-    ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
+  // Use updateState so the read-modify-write is atomic under the state lock.
+  // This prevents a concurrent upsertJob from being silently dropped (and its
+  // artifacts deleted) when the stale snapshot loaded above is saved back.
+  updateState(workspaceRoot, (currentState) => {
+    currentState.jobs = currentState.jobs.filter((job) => job.sessionId !== sessionId);
   });
 }
 
