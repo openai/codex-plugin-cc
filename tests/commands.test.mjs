@@ -124,6 +124,11 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /Do not paraphrase, summarize, rewrite, or add commentary before or after it/i);
   assert.match(rescue, /return that command's stdout as-is/i);
   assert.match(rescue, /Leave `--resume` and `--fresh` in the forwarded request/i);
+  assert.match(rescue, /codex:codex-prompting/);
+  assert.match(rescue, /main Claude context/i);
+  assert.match(rescue, /<task>/);
+  assert.match(rescue, /preserve.*exact/i);
+  assert.doesNotMatch(rescue, /gpt-5-4-prompting/);
   assert.match(agent, /--resume/);
   assert.match(agent, /--fresh/);
   assert.match(agent, /thin forwarding wrapper/i);
@@ -138,13 +143,12 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /If the user asks for a concrete model name such as `gpt-5\.4-mini`, pass it through with `--model`/i);
   assert.match(agent, /Return the stdout of the `codex-companion` command exactly as-is/i);
   assert.match(agent, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
-  assert.match(agent, /gpt-5-4-prompting/);
-  assert.match(agent, /only to tighten the user's request into a better Codex prompt/i);
-  assert.match(agent, /Do not use that skill to inspect the repository, reason through the problem yourself, draft a solution, or do any independent work/i);
+  assert.match(agent, /Do not rewrite or reshape/i);
+  assert.doesNotMatch(agent, /gpt-5-4-prompting/);
   assert.match(runtimeSkill, /only job is to invoke `task` once and return that stdout unchanged/i);
   assert.match(runtimeSkill, /Do not call `setup`, `review`, `adversarial-review`, `status`, `result`, or `cancel`/i);
-  assert.match(runtimeSkill, /use the `gpt-5-4-prompting` skill to rewrite the user's request into a tighter Codex prompt/i);
-  assert.match(runtimeSkill, /That prompt drafting is the only Claude-side work allowed/i);
+  assert.match(runtimeSkill, /transports? the prompt received from the main context unchanged/i);
+  assert.doesNotMatch(runtimeSkill, /gpt-5-4-prompting/);
   assert.match(runtimeSkill, /Leave `--effort` unset unless the user explicitly requests a specific effort/i);
   assert.match(runtimeSkill, /Leave model unset by default/i);
   assert.match(runtimeSkill, /Map `spark` to `--model gpt-5\.3-codex-spark`/i);
@@ -189,17 +193,26 @@ test("transfer, result, and cancel commands are exposed as deterministic runtime
 
 test("internal docs use task terminology for rescue runs", () => {
   const runtimeSkill = read("skills/codex-cli-runtime/SKILL.md");
-  const promptingSkill = read("skills/gpt-5-4-prompting/SKILL.md");
-  const promptRecipes = read("skills/gpt-5-4-prompting/references/codex-prompt-recipes.md");
 
   assert.match(runtimeSkill, /codex-companion\.mjs" task "<raw arguments>"/);
   assert.match(runtimeSkill, /Use `task` for every rescue request/i);
   assert.match(runtimeSkill, /task --resume-last/i);
-  assert.match(promptingSkill, /Use `task` when the task is diagnosis/i);
-  assert.match(promptRecipes, /Codex task prompts/i);
-  assert.match(promptRecipes, /Use these as starting templates for Codex task prompts/i);
-  assert.match(promptRecipes, /## Diagnosis/);
-  assert.match(promptRecipes, /## Narrow Fix/);
+});
+
+test("internal Codex prompting skill is model-neutral and preserves native task contracts", () => {
+  const promptingSkill = read("skills/codex-prompting/SKILL.md");
+
+  assert.match(promptingSkill, /^user-invocable:\s*false$/m);
+  assert.match(promptingSkill, /For a fresh implementation task, preserve the user's original task text exactly/i);
+  assert.match(promptingSkill, /<task>[\s\S]*the user's exact task text[\s\S]*<\/task>/i);
+  assert.match(promptingSkill, /Add these blocks only when they contain concrete information already known/i);
+  assert.match(promptingSkill, /<scope_and_success>[\s\S]*<\/scope_and_success>/i);
+  assert.match(promptingSkill, /<evidence_and_final_response>[\s\S]*<\/evidence_and_final_response>/i);
+  assert.match(promptingSkill, /For a resume, send only the user's new delta or correction/i);
+  assert.match(promptingSkill, /Do not repeat the original task or previously supplied context/i);
+  assert.match(promptingSkill, /For review and adversarial-review work, retain the review command's native finding-first contract/i);
+  assert.match(promptingSkill, /Do not add generic instructions such as “be concise” or “think harder,”/i);
+  assert.match(promptingSkill, /do not request hidden chain-of-thought/i);
 });
 
 test("hooks manifest contains only supported top-level fields", () => {

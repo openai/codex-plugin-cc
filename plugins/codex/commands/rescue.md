@@ -1,10 +1,10 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up rescue work to the Codex rescue subagent
 argument-hint: "[--background|--wait] [--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [what Codex should investigate, solve, or continue]"
-allowed-tools: Bash(node:*), AskUserQuestion, Agent
+allowed-tools: Bash(node:*), AskUserQuestion, Agent, Skill
 ---
 
-Invoke the `codex:codex-rescue` subagent via the `Agent` tool (`subagent_type: "codex:codex-rescue"`), forwarding the raw user request as the prompt.
+Invoke the `codex:codex-rescue` subagent via the `Agent` tool (`subagent_type: "codex:codex-rescue"`), forwarding the prompt prepared in the main Claude context.
 `codex:codex-rescue` is a subagent, not a skill — do not call `Skill(codex:codex-rescue)` (no such skill) or `Skill(codex:rescue)` (that re-enters this command and hangs the session). The command runs inline so the `Agent` tool stays in scope; forked general-purpose subagents do not expose it.
 The final user-visible response must be Codex's output verbatim.
 
@@ -35,6 +35,14 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task-resume-candidate -
 - If the user chooses continue, add `--resume` before routing to the subagent.
 - If the user chooses a new thread, add `--fresh` before routing to the subagent.
 - If the helper reports `available: false`, do not ask. Route normally.
+
+Prompt shaping:
+
+- For a fresh implementation task, load `codex:codex-prompting` in the main Claude context before invoking `codex:codex-rescue`.
+- Shape the implementation prompt in the main Claude context according to that skill.
+- Preserve the user's original request exactly inside `<task>`; do not ask the rescue subagent to rewrite or reshape it.
+- Add optional scope, success, evidence, or final-response blocks only when the main context already has concrete supporting information.
+- For a resume operation, pass only the user's new delta or correction. Do not repeat the original task or previously supplied context.
 
 Operating rules:
 
