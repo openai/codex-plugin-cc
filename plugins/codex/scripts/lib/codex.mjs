@@ -1186,6 +1186,17 @@ export function buildPersistentTaskThreadName(prompt) {
 }
 
 export function parseStructuredOutput(rawOutput, fallback = {}) {
+  if (typeof fallback.status === "number" && fallback.status !== 0) {
+    return {
+      parsed: null,
+      parseError:
+        fallback.failureMessage ??
+        `Codex run failed with status ${fallback.status} before returning a final structured message.`,
+      rawOutput: rawOutput ?? "",
+      ...fallback
+    };
+  }
+
   if (!rawOutput) {
     return {
       parsed: null,
