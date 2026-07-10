@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { DEFAULT_CONTINUE_PROMPT } from "../plugins/codex/scripts/lib/codex.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -545,6 +546,25 @@ test("task --resume-id resumes the exact requested thread", () => {
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(fakeState.lastTurnStart.threadId, "thr_exact");
   assert.equal(fakeState.lastTurnStart.prompt, "apply only the requested fix");
+});
+
+test("task --resume-id without a prompt resumes the exact thread with the default continue prompt", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  seedFakeCodexThread(statePath, repo);
+
+  const result = run("node", [SCRIPT, "task", "--resume-id", "thr_exact"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.threadId, "thr_exact");
+  assert.equal(fakeState.lastTurnStart.prompt, DEFAULT_CONTINUE_PROMPT);
 });
 
 test("task --resume-id preserves explicit model and effort overrides", () => {
@@ -1158,6 +1178,40 @@ test("task --resume-id background round-trip preserves the exact thread", () => 
   const jobPath = path.join(resolveStateDir(repo), "jobs", `${launchPayload.jobId}.json`);
   const finishedJob = JSON.parse(fs.readFileSync(jobPath, "utf8"));
   assert.equal(finishedJob.request.resumeId, "thr_exact");
+});
+
+test("task --resume-id background without a prompt uses the default continue prompt", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  seedFakeCodexThread(statePath, repo);
+
+  const launched = run(
+    "node",
+    [SCRIPT, "task", "--background", "--json", "--resume-id", "thr_exact"],
+    { cwd: repo, env: buildEnv(binDir) }
+  );
+
+  assert.equal(launched.status, 0, launched.stderr);
+  const launchPayload = JSON.parse(launched.stdout);
+  const waitedStatus = run(
+    "node",
+    [SCRIPT, "status", launchPayload.jobId, "--wait", "--timeout-ms", "15000", "--json"],
+    { cwd: repo, env: buildEnv(binDir) }
+  );
+
+  assert.equal(waitedStatus.status, 0, waitedStatus.stderr);
+  assert.equal(JSON.parse(waitedStatus.stdout).job.status, "completed");
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.threadId, "thr_exact");
+  assert.equal(fakeState.lastTurnStart.prompt, DEFAULT_CONTINUE_PROMPT);
+
+  const jobPath = path.join(resolveStateDir(repo), "jobs", `${launchPayload.jobId}.json`);
+  const finishedJob = JSON.parse(fs.readFileSync(jobPath, "utf8"));
+  assert.equal(finishedJob.request.resumeId, "thr_exact");
+  assert.equal(finishedJob.request.prompt, "");
 });
 
 test("review rejects focus text because it is native-review only", () => {

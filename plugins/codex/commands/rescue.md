@@ -57,16 +57,16 @@ Handle the resume flow before the fresh flow. A request is resumed when it inclu
 A request is fresh when it includes `--fresh`, the user chooses `Start a new Codex thread`, or no resumable thread is available.
 
 1. Parse the explicit model and effort without changing them (apart from the documented `spark` alias).
-2. Load `codex:gpt-5-6-routing` with the `Skill` tool only for fresh work.
-3. Classify the task in the main Claude/Fable context. When the fresh task is ambiguous or falls between tiers, select the higher tier.
-4. Fill only missing routing values:
-   - Explicit model and effort: preserve both.
+2. When both model and effort are explicit, forward both unchanged; do not load or apply `codex:gpt-5-6-routing`; do not classify the task. Continue at step 6.
+3. Otherwise, load `codex:gpt-5-6-routing` with the `Skill` tool and apply it only to missing routing values.
+4. Classify the task in the main Claude/Fable context. When the fresh task is ambiguous or falls between tiers, select the higher tier.
+5. Fill only missing routing values:
    - Explicit model only: preserve the model and select only the effort.
    - Explicit effort only: preserve the effort and select only the model.
    - Neither explicit: select both.
    - If Fable cannot decide a missing value, leave that value unset so the upstream runtime default applies.
-5. Load `codex:codex-prompting` in the main Claude context and shape the implementation prompt according to that skill.
-6. Invoke `codex:codex-rescue` with the resolved prompt and resolved optional model and effort overrides.
+6. Load `codex:codex-prompting` in the main Claude context and shape the implementation prompt according to that skill.
+7. Invoke `codex:codex-rescue` with the resolved prompt and resolved optional model and effort overrides.
 
 Preserve the user's original request exactly inside `<task>`; do not ask the rescue subagent to rewrite or reshape it. Add optional scope, success, evidence, or final-response blocks only when the main context already has concrete supporting information.
 

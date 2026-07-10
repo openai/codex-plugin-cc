@@ -11,6 +11,12 @@ function read(relativePath) {
   return fs.readFileSync(path.join(PLUGIN_ROOT, relativePath), "utf8");
 }
 
+function readFrontmatterList(source, field) {
+  const match = source.match(new RegExp(`^${field}:\\s*(.+)$`, "m"));
+  assert.ok(match, `Missing ${field} frontmatter`);
+  return match[1].split(",").map((value) => value.trim());
+}
+
 test("review command uses AskUserQuestion and background Bash while staying review-only", () => {
   const source = read("commands/review.md");
   assert.match(source, /AskUserQuestion/);
@@ -117,6 +123,21 @@ test("internal GPT-5.6 routing policy defines fresh rescue tiers and safe fallba
   assert.match(routing, /do not substitute fallback model names/i);
 });
 
+test("fresh rescue bypasses routing when model and effort are both explicit", () => {
+  const rescue = read("commands/rescue.md");
+  const freshFlow = rescue.slice(rescue.indexOf("## Fresh flow"));
+  const explicitBothBranch = freshFlow.indexOf("When both model and effort are explicit");
+  const routingLoad = freshFlow.search(/Otherwise, load `codex:gpt-5-6-routing`/i);
+
+  assert.notEqual(explicitBothBranch, -1, "Missing explicit-both branch");
+  assert.notEqual(routingLoad, -1, "Missing conditional routing load");
+  assert.ok(explicitBothBranch < routingLoad, "Explicit-both branch must precede routing load");
+  assert.match(
+    freshFlow,
+    /When both model and effort are explicit[^.]*forward both unchanged[^.]*do not load or apply `codex:gpt-5-6-routing`[^.]*do not classify the task/i
+  );
+});
+
 test("rescue command absorbs continue semantics", () => {
   const rescue = read("commands/rescue.md");
   const agent = read("agents/codex-rescue.md");
@@ -124,7 +145,12 @@ test("rescue command absorbs continue semantics", () => {
   const runtimeSkill = read("skills/codex-cli-runtime/SKILL.md");
 
   assert.match(rescue, /The final user-visible response must be Codex's output verbatim/i);
-  assert.match(rescue, /allowed-tools:\s*Bash\(node:\*\),\s*AskUserQuestion,\s*Agent/);
+  assert.deepEqual(readFrontmatterList(rescue, "allowed-tools"), [
+    "Bash(node:*)",
+    "AskUserQuestion",
+    "Agent",
+    "Skill"
+  ]);
   // Regression for #234: `Skill(codex:rescue)` from the main agent recursed
   // because rescue.md named the routing with ambiguous prose ("Route this
   // request to the `codex:codex-rescue` subagent") while running under
@@ -169,7 +195,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /resume-id.*new delta/is);
   assert.match(rescue, /resume[\s\S]*preserve the thread's original model and effort defaults[\s\S]*only explicit user overrides/i);
   assert.match(rescue, /fresh[\s\S]*load `codex:gpt-5-6-routing`/i);
-  assert.match(rescue, /Explicit model and effort[\s\S]*preserve both/i);
+  assert.match(rescue, /both model and effort are explicit[\s\S]*forward both unchanged/i);
   assert.match(rescue, /Explicit model only[\s\S]*select only the effort/i);
   assert.match(rescue, /Explicit effort only[\s\S]*select only the model/i);
   assert.match(rescue, /Neither explicit[\s\S]*select both/i);
