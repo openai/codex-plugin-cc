@@ -658,16 +658,36 @@ function sourceContentSha256(sourcePath) {
   return crypto.createHash("sha256").update(fs.readFileSync(sourcePath)).digest("hex");
 }
 
-function importedThreadIdForSource(sourcePath) {
-  const ledgerPath = path.join(resolveCodexHome(), "external_agent_session_imports.json");
+function importLedgerPath() {
+  return path.join(resolveCodexHome(), "external_agent_session_imports.json");
+}
+
+function readImportLedgerRecords() {
+  const ledgerPath = importLedgerPath();
   if (!fs.existsSync(ledgerPath)) {
-    return null;
+    return [];
   }
   const ledger = readJsonFile(ledgerPath);
+  return Array.isArray(ledger?.records) ? ledger.records : [];
+}
+
+// Codex canonicalizes the recorded source path itself; on Windows Rust's
+// canonicalization yields verbatim paths (\\?\C:\...) that never compare
+// equal to Node's realpathSync output.
+function normalizeLedgerSourcePath(value) {
+  if (typeof value !== "string" || value === "") {
+    return null;
+  }
+  let normalized = value.startsWith("\\\\?\\") ? value.slice(4) : value;
+  normalized = normalized.replaceAll("\\", "/");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function importedThreadIdForSource(sourcePath, previousRecords = null) {
+  const records = readImportLedgerRecords();
   const canonicalSource = fs.realpathSync(sourcePath);
   const contentSha256 = sourceContentSha256(canonicalSource);
-  const records = Array.isArray(ledger?.records) ? ledger.records : [];
-  const match = records
+  const strictMatch = records
     .filter(
       (record) =>
         record?.source_path === canonicalSource &&
@@ -675,7 +695,32 @@ function importedThreadIdForSource(sourcePath) {
         typeof record?.imported_thread_id === "string"
     )
     .at(-1);
-  return match?.imported_thread_id ?? null;
+  if (strictMatch) {
+    return strictMatch.imported_thread_id;
+  }
+
+  // Fall back to records Codex appended during this import. The strict match
+  // misses real imports in two known ways: a live Claude transcript keeps
+  // growing while the transfer runs, so the hash computed here trails the
+  // content Codex imported, and Codex may canonicalize the recorded source
+  // path differently than realpathSync does.
+  if (!previousRecords) {
+    return null;
+  }
+  const appended = records
+    .slice(previousRecords.length)
+    .filter((record) => typeof record?.imported_thread_id === "string");
+  const normalizedSource = normalizeLedgerSourcePath(canonicalSource);
+  const pathMatch = appended
+    .filter((record) => normalizeLedgerSourcePath(record?.source_path) === normalizedSource)
+    .at(-1);
+  if (pathMatch) {
+    return pathMatch.imported_thread_id;
+  }
+  if (appended.length === 1) {
+    return appended[0].imported_thread_id;
+  }
+  return null;
 }
 
 function externalAgentSessionMigration(sourcePath, cwd) {
@@ -1066,6 +1111,7 @@ export async function importExternalAgentSession(cwd, options = {}) {
 
   return withDirectAppServer(cwd, async (client) => {
     emitProgress(options.onProgress, "Importing Claude session into Codex.", "transferring");
+    const previousRecords = readImportLedgerRecords();
     try {
       await requestExternalAgentSessionImport(client, externalAgentSessionMigration(options.sourcePath, cwd));
     } catch (error) {
@@ -1077,11 +1123,11 @@ export async function importExternalAgentSession(cwd, options = {}) {
       }
       throw error;
     }
-    const threadId = importedThreadIdForSource(options.sourcePath);
+    const threadId = importedThreadIdForSource(options.sourcePath, previousRecords);
     if (!threadId) {
       const stderr = cleanCodexStderr(client.stderr);
       throw new Error(
-        `Codex reported that the Claude import completed, but did not record an imported thread.${stderr ? `\n${stderr}` : " Check the Codex app-server logs for the underlying import error."}`
+        `Codex reported that the Claude import completed, but did not record an imported thread in ${importLedgerPath()}.${stderr ? `\n${stderr}` : " Check the Codex app-server logs for the underlying import error."}`
       );
     }
     emitProgress(options.onProgress, `Claude session imported (${threadId}).`, "completed", { threadId });

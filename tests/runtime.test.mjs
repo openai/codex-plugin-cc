@@ -303,6 +303,42 @@ test("transfer fails visibly when native import completes without a ledger recor
   assert.match(result.stderr, /did not record an imported thread/);
 });
 
+// Regression for #417: real Codex canonicalizes the recorded source_path
+// itself (verbatim \\?\C:\... paths on Windows) and hashes the transcript as
+// it was at import time, while a live Claude session keeps appending to it.
+// The strict path+hash ledger match therefore failed even though the import
+// succeeded. The lookup must fall back to records appended during the import.
+test("transfer resolves the imported thread when the ledger record diverges in path and hash", () => {
+  const home = makeTempDir();
+  const repo = path.join(home, "repo");
+  const binDir = makeTempDir();
+  const projectDir = path.join(home, ".claude", "projects", "-repo");
+  const sourcePath = path.join(projectDir, "session.jsonl");
+  fs.mkdirSync(repo, { recursive: true });
+  fs.mkdirSync(projectDir, { recursive: true });
+  installFakeCodex(binDir, "external-import-divergent-ledger");
+  initGitRepo(repo);
+  fs.writeFileSync(
+    sourcePath,
+    `${JSON.stringify({ type: "user", cwd: repo, message: { role: "user", content: "Continue this work." } })}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "transfer", "--source", sourcePath, "--json"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      HOME: home,
+      CODEX_HOME: path.join(home, ".codex")
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.threadId, "thr_1");
+  assert.equal(payload.resumeCommand, "codex resume thr_1");
+});
+
 test("transfer rejects sources outside the Claude projects directory", () => {
   const home = makeTempDir();
   const repo = path.join(home, "repo");

@@ -395,6 +395,10 @@ rl.on("line", (line) => {
             imported_at: now(),
             source_modified_at: null
           };
+          if (BEHAVIOR === "external-import-divergent-ledger") {
+            record.source_path = "\\\\\\\\?\\\\" + sourcePath.split("/").join("\\\\");
+            record.content_sha256 = crypto.createHash("sha256").update(contents + "appended-after-import\\n").digest("hex");
+          }
           ledger.records.push(record);
           saveState(state);
           saveImportLedger(ledger);
