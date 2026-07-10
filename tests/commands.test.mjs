@@ -84,6 +84,21 @@ test("continue is not exposed as a user-facing command", () => {
   ]);
 });
 
+test("internal GPT-5.6 routing policy defines fresh rescue tiers and safe fallbacks", () => {
+  const routing = read("skills/gpt-5-6-routing/SKILL.md");
+
+  assert.match(routing, /user-invocable:\s*false/);
+  assert.match(routing, /gpt-5\.6-luna.*low/s);
+  assert.match(routing, /gpt-5\.6-terra.*medium/s);
+  assert.match(routing, /gpt-5\.6-sol.*high/s);
+  assert.match(routing, /gpt-5\.6-sol.*xhigh/s);
+  assert.match(routing, /ambiguous.*higher tier/i);
+  assert.match(routing, /cannot decide.*leave.*unset/is);
+  assert.match(routing, /max.*explicit-only/is);
+  assert.match(routing, /Do not query a model catalog/i);
+  assert.match(routing, /do not substitute fallback model names/i);
+});
+
 test("rescue command absorbs continue semantics", () => {
   const rescue = read("commands/rescue.md");
   const agent = read("agents/codex-rescue.md");
@@ -113,7 +128,6 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /default to foreground/i);
   assert.match(rescue, /Do not forward them to `task`/i);
   assert.match(rescue, /`--model` and `--effort` are runtime-selection flags/i);
-  assert.match(rescue, /Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort/i);
   assert.match(rescue, /accepted effort values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`/i);
   assert.match(rescue, /`max` is explicit-only and `ultra` is not a valid effort value/i);
   assert.match(rescue, /If they ask for `spark`, map it to `gpt-5\.3-codex-spark`/i);
@@ -127,6 +141,17 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /return that command's stdout as-is/i);
   assert.match(rescue, /Leave `--resume` and `--fresh` in the forwarded request/i);
   assert.match(rescue, /codex:codex-prompting/);
+  assert.match(rescue, /Resume flow[\s\S]*Fresh flow/i);
+  assert.match(rescue, /resume[\s\S]*do not load or apply `codex:gpt-5-6-routing`/i);
+  assert.match(rescue, /resume[\s\S]*preserve the thread's original model and effort defaults[\s\S]*only explicit user overrides/i);
+  assert.match(rescue, /fresh[\s\S]*load `codex:gpt-5-6-routing`/i);
+  assert.match(rescue, /Explicit model and effort[\s\S]*preserve both/i);
+  assert.match(rescue, /Explicit model only[\s\S]*select only the effort/i);
+  assert.match(rescue, /Explicit effort only[\s\S]*select only the model/i);
+  assert.match(rescue, /Neither explicit[\s\S]*select both/i);
+  assert.match(rescue, /ambiguous[\s\S]*higher tier/i);
+  assert.match(rescue, /cannot decide[\s\S]*leave[\s\S]*unset/i);
+  assert.match(rescue, /main Claude\/Fable context/i);
   assert.match(rescue, /main Claude context/i);
   assert.match(rescue, /<task>/);
   assert.match(rescue, /preserve.*exact/i);
@@ -134,17 +159,16 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /--resume/);
   assert.match(agent, /--fresh/);
   assert.match(agent, /thin forwarding wrapper/i);
-  assert.match(agent, /prefer foreground for a small, clearly bounded rescue request/i);
-  assert.match(agent, /If the user did not explicitly choose `--background` or `--wait` and the task looks complicated, open-ended, multi-step, or likely to keep Codex running for a long time, prefer background execution/i);
+  assert.match(agent, /model and effort[\s\S]*already resolved optional values/i);
+  assert.match(agent, /If neither `--background` nor `--wait` is present, use foreground/i);
   assert.match(agent, /Use exactly one `Bash` call/i);
   assert.match(agent, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
   assert.match(agent, /Do not call `review`, `adversarial-review`, `status`, `result`, or `cancel`/i);
-  assert.match(agent, /Leave `--effort` unset unless the user explicitly requests a specific reasoning effort/i);
-  assert.match(agent, /Leave model unset by default/i);
-  assert.match(agent, /If the user asks for `spark`, map that to `--model gpt-5\.3-codex-spark`/i);
-  assert.match(agent, /If the user asks for a concrete model name such as `gpt-5\.4-mini`, pass it through with `--model`/i);
+  assert.match(agent, /Omit `--model` or `--effort` when its resolved value is unset/i);
+  assert.match(agent, /Do not evaluate task complexity/i);
+  assert.match(agent, /Do not choose or change the model or effort/i);
   assert.match(agent, /Return the stdout of the `codex-companion` command exactly as-is/i);
-  assert.match(agent, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
+  assert.match(agent, /Keep invocation errors visible/i);
   assert.match(agent, /Do not rewrite or reshape/i);
   assert.doesNotMatch(agent, /gpt-5-4-prompting/);
   assert.match(runtimeSkill, /only job is to invoke `task` once and return that stdout unchanged/i);

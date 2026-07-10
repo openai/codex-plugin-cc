@@ -36,13 +36,36 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task-resume-candidate -
 - If the user chooses a new thread, add `--fresh` before routing to the subagent.
 - If the helper reports `available: false`, do not ask. Route normally.
 
-Prompt shaping:
+Routing and prompt flow:
 
-- For a fresh implementation task, load `codex:codex-prompting` in the main Claude context before invoking `codex:codex-rescue`.
-- Shape the implementation prompt in the main Claude context according to that skill.
-- Preserve the user's original request exactly inside `<task>`; do not ask the rescue subagent to rewrite or reshape it.
-- Add optional scope, success, evidence, or final-response blocks only when the main context already has concrete supporting information.
-- For a resume operation, pass only the user's new delta or correction. Do not repeat the original task or previously supplied context.
+Parse any user-supplied model and effort as explicit runtime overrides without changing them. If they ask for `spark`, map it to `gpt-5.3-codex-spark`; this documented alias is the sole normalization. Accepted effort values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; `max` is explicit-only and `ultra` is not a valid effort value.
+
+## Resume flow
+
+Handle the resume flow before the fresh flow. A request is resumed when it includes `--resume` or the user chooses `Continue current Codex thread`.
+
+- For resume work, do not load or apply `codex:gpt-5-6-routing`.
+- Preserve the thread's original model and effort defaults by passing only explicit user overrides. Never fill a missing model or effort for a resume.
+- Pass only the user's new delta or correction. Do not repeat the original task or previously supplied context.
+- Invoke `codex:codex-rescue` with the resume routing flag, delta prompt, and any explicit model or effort values.
+
+## Fresh flow
+
+A request is fresh when it includes `--fresh`, the user chooses `Start a new Codex thread`, or no resumable thread is available.
+
+1. Parse the explicit model and effort without changing them (apart from the documented `spark` alias).
+2. Load `codex:gpt-5-6-routing` with the `Skill` tool only for fresh work.
+3. Classify the task in the main Claude/Fable context. When the fresh task is ambiguous or falls between tiers, select the higher tier.
+4. Fill only missing routing values:
+   - Explicit model and effort: preserve both.
+   - Explicit model only: preserve the model and select only the effort.
+   - Explicit effort only: preserve the effort and select only the model.
+   - Neither explicit: select both.
+   - If Fable cannot decide a missing value, leave that value unset so the upstream runtime default applies.
+5. Load `codex:codex-prompting` in the main Claude context and shape the implementation prompt according to that skill.
+6. Invoke `codex:codex-rescue` with the resolved prompt and resolved optional model and effort overrides.
+
+Preserve the user's original request exactly inside `<task>`; do not ask the rescue subagent to rewrite or reshape it. Add optional scope, success, evidence, or final-response blocks only when the main context already has concrete supporting information.
 
 Operating rules:
 
@@ -50,9 +73,6 @@ Operating rules:
 - Return the Codex companion stdout verbatim to the user.
 - Do not paraphrase, summarize, rewrite, or add commentary before or after it.
 - Do not ask the subagent to inspect files, monitor progress, poll `/codex:status`, fetch `/codex:result`, call `/codex:cancel`, summarize output, or do follow-up work of its own.
-- Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort.
-- Accepted effort values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. `max` is explicit-only and `ultra` is not a valid effort value.
-- Leave the model unset unless the user explicitly asks for one. If they ask for `spark`, map it to `gpt-5.3-codex-spark`.
 - Leave `--resume` and `--fresh` in the forwarded request. The subagent handles that routing when it builds the `task` command.
 - If the helper reports that Codex is missing or unauthenticated, stop and tell the user to run `/codex:setup`.
 - If the user did not supply a request, ask what Codex should investigate or fix.
