@@ -570,6 +570,48 @@ test("task-resume-candidate returns the latest rescue thread from the current se
   assert.equal(payload.candidate.threadId, "thr_current");
 });
 
+test("task-resume-candidate reaps a crashed running task so it becomes resumable", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  // A pid that has already exited: process.kill(pid, 0) will throw ESRCH.
+  const deadPid = run(process.execPath, ["-e", ""]).pid;
+  const crashedJob = {
+    id: "task-crashed",
+    status: "running",
+    phase: "delegating",
+    title: "Codex Task",
+    jobClass: "task",
+    sessionId: "sess-current",
+    threadId: "thr_crashed",
+    summary: "Investigate the crash",
+    pid: deadPid,
+    updatedAt: "2026-03-24T20:00:00.000Z"
+  };
+  fs.writeFileSync(path.join(jobsDir, "task-crashed.json"), `${JSON.stringify(crashedJob, null, 2)}\n`, "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [crashedJob] }, null, 2)}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "task-resume-candidate", "--json"], {
+    cwd: workspace,
+    env: { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-current" }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  // Without the reaper the job would still read as "running" and be skipped,
+  // leaving the resume probe with no candidate.
+  assert.equal(payload.available, true);
+  assert.equal(payload.candidate.id, "task-crashed");
+  assert.equal(payload.candidate.status, "failed");
+  assert.equal(payload.candidate.threadId, "thr_crashed");
+});
+
 test("task --resume-last does not resume a task from another Claude session", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
