@@ -19,5 +19,6 @@ https://github.com/openai/codex-plugin-cc.
 6. Run `npm test`, `npm run check-version`, and `npm run build`.
 7. Update this file with the new upstream tag, exact commit, relay mapping, and date.
 
-The relay keeps the upstream Apache-2.0 license, plugin name, `/codex:*` namespace,
-and Git history. `UPSTREAM.md` is authoritative for the exact upstream base.
+The relay keeps the upstream Apache-2.0 license, runtime compatibility, and Git
+history while deliberately using its own `codex-relay` plugin identity and
+`/codex-relay:*` namespace. `UPSTREAM.md` is authoritative for the exact upstream base.

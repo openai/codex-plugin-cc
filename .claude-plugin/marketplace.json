@@ -1,19 +1,19 @@
 {
-  "name": "openai-codex",
+  "name": "codex-cc-relay",
   "owner": {
-    "name": "OpenAI"
+    "name": "hotaru-ritsuki"
   },
   "metadata": {
-    "description": "Codex plugins to use in Claude Code for delegation and code review.",
+    "description": "GPT-5.6-aware Codex relay for Claude Code delegation and review.",
     "version": "1.1.6"
   },
   "plugins": [
     {
-      "name": "codex",
-      "description": "Use Codex from Claude Code to review code or delegate tasks.",
+      "name": "codex-relay",
+      "description": "Relay Claude Code tasks and reviews to Codex with GPT-5.6 routing.",
       "version": "1.1.6",
       "author": {
-        "name": "OpenAI"
+        "name": "hotaru-ritsuki"
       },
       "source": "./plugins/codex"
     }

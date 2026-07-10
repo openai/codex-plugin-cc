@@ -17,7 +17,7 @@
 ### Compatibility
 
 - Based on upstream `openai/codex-plugin-cc` v1.0.6 at `db52e28`.
-- Preserves the `codex` plugin name, `/codex:*` commands, state format, and Apache-2.0 license.
+- Preserves upstream runtime and state-format compatibility while deliberately using the `codex-relay` plugin identity and `/codex-relay:*` commands; retains the Apache-2.0 license.
 
 ## 1.0.0
 

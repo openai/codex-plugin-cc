@@ -3,7 +3,7 @@ Run a stop-gate review of the previous Claude turn.
 Only review the work from the previous Claude turn.
 Only review it if Claude actually did code changes in that turn.
 Pure status, setup, or reporting output does not count as reviewable work.
-For example, the output of /codex:setup or /codex:status does not count.
+For example, the output of /codex-relay:setup or /codex-relay:status does not count.
 Only direct edits made in that specific turn count.
 If the previous Claude turn was only a status update, a summary, a setup/login check, a review result, or output from a command that did not itself make direct edits in that turn, return ALLOW immediately and do no further work.
 Challenge whether that specific work and its design choices should ship.

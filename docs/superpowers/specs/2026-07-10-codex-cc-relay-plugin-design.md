@@ -12,13 +12,14 @@
 
 `codex-cc-relay-plugin` is a compatibility-first fork of
 [`openai/codex-plugin-cc`](https://github.com/openai/codex-plugin-cc). It keeps the
-upstream command namespace, runtime, history, and Apache-2.0 license while adding a
-small relay layer for Claude Fable 5 to delegate appropriate tasks to GPT-5.6.
+upstream runtime, history, and Apache-2.0 license while deliberately using its own
+`codex-relay` installed identity and adding a small relay layer for Claude Fable 5
+to delegate appropriate tasks to GPT-5.6.
 
 The first release adds five capabilities only:
 
 1. Fable-selected GPT-5.6 model and reasoning-effort routing for fresh
-   `/codex:rescue` tasks.
+   `/codex-relay:rescue` tasks.
 2. A compact, model-neutral prompting skill based on OpenAI's GPT-5.6 guidance.
 3. A model-invocable, read-only `codex-reviewer` agent.
 4. Explicit `task --resume-id <threadId>` support.
@@ -66,8 +67,8 @@ user-owned remote will be named `origin`.
 The fork keeps:
 
 - Apache-2.0 licensing and upstream notices.
-- The `codex` plugin name and `/codex:*` command namespace.
-- Existing commands and their default behavior.
+- Runtime compatibility with existing commands and their default behavior.
+- A distinct `codex-relay` plugin identity and `/codex-relay:*` command namespace.
 - Upstream directory structure unless a relay feature requires an additive file.
 
 An `UPSTREAM.md` file will record the upstream repository, tag, exact commit, last
@@ -90,7 +91,7 @@ exact base version and commit.
 
 ```mermaid
 flowchart LR
-    U["User or Fable workflow"] --> C["/codex:rescue command"]
+    U["User or Fable workflow"] --> C["/codex-relay:rescue command"]
     C --> R["gpt-5-6-routing skill"]
     C --> P["codex-prompting skill"]
     R --> A["codex-rescue thin agent"]
@@ -201,7 +202,7 @@ Prompting rules:
 ### 3. Rescue Command and Agent
 
 `commands/rescue.md` remains the entry point. For fresh work it invokes routing and
-prompting in the main Fable context, then delegates once to `codex:codex-rescue`.
+prompting in the main Fable context, then delegates once to `codex-relay:codex-rescue`.
 Existing explicit execution, resume, model, effort, write, and task-text semantics
 remain intact.
 
@@ -329,7 +330,7 @@ All upstream tests must continue to pass. New tests cover only the approved chan
 The design is successfully implemented when:
 
 - the relay is versioned `1.1.6` everywhere;
-- upstream commands work unchanged without relay-specific input;
+- upstream command behavior works under the `/codex-relay:*` namespace without relay-specific input;
 - Fable routes fresh rescue tasks according to the approved static GPT-5.6 policy;
 - explicit flags and resumed-thread behavior take precedence over routing;
 - fresh task text is preserved exactly inside the compact prompt contract;

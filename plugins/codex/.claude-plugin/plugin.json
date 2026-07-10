@@ -1,8 +1,8 @@
 {
-  "name": "codex",
+  "name": "codex-relay",
   "version": "1.1.6",
-  "description": "Use Codex from Claude Code to review code or delegate tasks.",
+  "description": "Relay Claude Code tasks and reviews to Codex with GPT-5.6 routing.",
   "author": {
-    "name": "OpenAI"
+    "name": "hotaru-ritsuki"
   }
 }

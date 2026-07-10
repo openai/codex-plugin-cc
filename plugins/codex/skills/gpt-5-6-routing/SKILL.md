@@ -6,7 +6,7 @@ user-invocable: false
 
 # GPT-5.6 Routing
 
-Apply this policy only to fresh /codex:rescue work. Never automatically route a resumed thread.
+Apply this policy only to fresh /codex-relay:rescue work. Never automatically route a resumed thread.
 
 Respect user overrides:
 

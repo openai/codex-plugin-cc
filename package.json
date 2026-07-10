@@ -1,5 +1,5 @@
 {
-  "name": "@openai/codex-plugin-cc",
+  "name": "@hotaru-ritsuki/codex-cc-relay-plugin",
   "version": "1.1.6",
   "private": true,
   "type": "module",

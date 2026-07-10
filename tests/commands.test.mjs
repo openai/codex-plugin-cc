@@ -17,6 +17,29 @@ function readFrontmatterList(source, field) {
   return match[1].split(",").map((value) => value.trim());
 }
 
+test("relay manifests and docs use the codex-relay identity", () => {
+  const marketplace = JSON.parse(
+    fs.readFileSync(path.join(ROOT, ".claude-plugin", "marketplace.json"), "utf8"),
+  );
+  const plugin = JSON.parse(read(".claude-plugin/plugin.json"));
+  const packageJson = JSON.parse(
+    fs.readFileSync(path.join(ROOT, "package.json"), "utf8"),
+  );
+  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+
+  assert.equal(marketplace.name, "codex-cc-relay");
+  assert.equal(marketplace.owner.name, "hotaru-ritsuki");
+  assert.equal(marketplace.plugins[0].name, "codex-relay");
+  assert.equal(marketplace.plugins[0].author.name, "hotaru-ritsuki");
+  assert.equal(plugin.name, "codex-relay");
+  assert.equal(plugin.author.name, "hotaru-ritsuki");
+  assert.equal(packageJson.name, "@hotaru-ritsuki/codex-cc-relay-plugin");
+  assert.match(readme, /\/codex-relay:setup/);
+  assert.match(readme, /codex-relay:codex-rescue/);
+  assert.doesNotMatch(readme, new RegExp("/" + "codex:"));
+  assert.doesNotMatch(readme, new RegExp("codex:" + "codex-"));
+});
+
 test("review command uses AskUserQuestion and background Bash while staying review-only", () => {
   const source = read("commands/review.md");
   assert.match(source, /AskUserQuestion/);
@@ -70,7 +93,7 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /Claude Code's `Bash\(..., run_in_background: true\)` is what actually detaches the run/i);
   assert.match(source, /When in doubt, run the review/i);
   assert.match(source, /\(Recommended\)/);
-  assert.match(source, /uses the same review target selection as `\/codex:review`/i);
+  assert.match(source, /uses the same review target selection as `\/codex-relay:review`/i);
   assert.match(source, /supports working-tree review, branch review, and `--base <ref>`/i);
   assert.match(source, /does not support `--scope staged` or `--scope unstaged`/i);
   assert.match(source, /can still take extra focus text after the flags/i);
@@ -91,7 +114,7 @@ test("codex-reviewer is a read-only native review forwarder", () => {
   assert.match(agent, /never add --resume, --resume-last, or --resume-id/i);
   assert.doesNotMatch(agent, /codex-companion\.mjs" task/);
   assert.doesNotMatch(agent, /^skills:/m);
-  assert.match(readme, /the `codex:codex-rescue` and `codex:codex-reviewer` subagents in `\/agents`/i);
+  assert.match(readme, /the `codex-relay:codex-rescue` and `codex-relay:codex-reviewer` subagents in `\/agents`/i);
 });
 
 test("continue is not exposed as a user-facing command", () => {
@@ -127,14 +150,14 @@ test("fresh rescue bypasses routing when model and effort are both explicit", ()
   const rescue = read("commands/rescue.md");
   const freshFlow = rescue.slice(rescue.indexOf("## Fresh flow"));
   const explicitBothBranch = freshFlow.indexOf("When both model and effort are explicit");
-  const routingLoad = freshFlow.search(/Otherwise, load `codex:gpt-5-6-routing`/i);
+  const routingLoad = freshFlow.search(/Otherwise, load `codex-relay:gpt-5-6-routing`/i);
 
   assert.notEqual(explicitBothBranch, -1, "Missing explicit-both branch");
   assert.notEqual(routingLoad, -1, "Missing conditional routing load");
   assert.ok(explicitBothBranch < routingLoad, "Explicit-both branch must precede routing load");
   assert.match(
     freshFlow,
-    /When both model and effort are explicit[^.]*forward both unchanged[^.]*do not load or apply `codex:gpt-5-6-routing`[^.]*do not classify the task/i
+    /When both model and effort are explicit[^.]*forward both unchanged[^.]*do not load or apply `codex-relay:gpt-5-6-routing`[^.]*do not classify the task/i
   );
 });
 
@@ -151,14 +174,14 @@ test("rescue command absorbs continue semantics", () => {
     "Agent",
     "Skill"
   ]);
-  // Regression for #234: `Skill(codex:rescue)` from the main agent recursed
+  // Regression for #234: `Skill(codex-relay:rescue)` from the main agent recursed
   // because rescue.md named the routing with ambiguous prose ("Route this
-  // request to the `codex:codex-rescue` subagent") while running under
+  // request to the `codex-relay:codex-rescue` subagent") while running under
   // `context: fork` — forked general-purpose subagents do not expose the
   // `Agent` tool, so the fork fell back to `Skill` and re-entered this
   // command. Pin the explicit transport and the inline (no-fork) execution.
-  assert.match(rescue, /subagent_type: "codex:codex-rescue"/);
-  assert.match(rescue, /do not call `Skill\(codex:codex-rescue\)`/i);
+  assert.match(rescue, /subagent_type: "codex-relay:codex-rescue"/);
+  assert.match(rescue, /do not call `Skill\(codex-relay:codex-rescue\)`/i);
   assert.doesNotMatch(rescue, /^context:\s*fork\b/m);
   assert.match(rescue, /--background\|--wait/);
   assert.match(rescue, /--resume\|--resume-id <thread-id>\|--fresh/);
@@ -168,7 +191,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /AskUserQuestion/);
   assert.match(rescue, /Continue current Codex thread/);
   assert.match(rescue, /Start a new Codex thread/);
-  assert.match(rescue, /run the `codex:codex-rescue` subagent in the background/i);
+  assert.match(rescue, /run the `codex-relay:codex-rescue` subagent in the background/i);
   assert.match(rescue, /default to foreground/i);
   assert.match(rescue, /Do not forward them to `task`/i);
   assert.match(rescue, /`--model` and `--effort` are runtime-selection flags/i);
@@ -183,18 +206,18 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /Do not paraphrase, summarize, rewrite, or add commentary before or after it/i);
   assert.match(rescue, /return that command's stdout as-is/i);
   assert.match(rescue, /Leave `--resume`, `--resume-id <thread-id>`, and `--fresh` in the forwarded request/i);
-  assert.match(rescue, /codex:codex-prompting/);
+  assert.match(rescue, /codex-relay:codex-prompting/);
   assert.match(rescue, /Resume flow[\s\S]*Fresh flow/i);
-  assert.match(rescue, /resume[\s\S]*do not load or apply `codex:gpt-5-6-routing`/i);
+  assert.match(rescue, /resume[\s\S]*do not load or apply `codex-relay:gpt-5-6-routing`/i);
   assert.match(rescue, /`--resume`, `--resume-last`, or `--resume-id/);
-  assert.match(rescue, /`--resume-last`[\s\S]*do not load or apply `codex:gpt-5-6-routing`/i);
-  assert.match(rescue, /`--resume-id`[\s\S]*do not load or apply `codex:gpt-5-6-routing`/i);
+  assert.match(rescue, /`--resume-last`[\s\S]*do not load or apply `codex-relay:gpt-5-6-routing`/i);
+  assert.match(rescue, /`--resume-id`[\s\S]*do not load or apply `codex-relay:gpt-5-6-routing`/i);
   assert.match(rescue, /--resume-id <thread-id>/);
   assert.match(rescue, /skip.*task-resume-candidate.*--resume-id/is);
   assert.match(rescue, /skip.*GPT-5\.6 routing.*--resume-id/is);
   assert.match(rescue, /resume-id.*new delta/is);
   assert.match(rescue, /resume[\s\S]*preserve the thread's original model and effort defaults[\s\S]*only explicit user overrides/i);
-  assert.match(rescue, /fresh[\s\S]*load `codex:gpt-5-6-routing`/i);
+  assert.match(rescue, /fresh[\s\S]*load `codex-relay:gpt-5-6-routing`/i);
   assert.match(rescue, /both model and effort are explicit[\s\S]*forward both unchanged/i);
   assert.match(rescue, /Explicit model only[\s\S]*select only the effort/i);
   assert.match(rescue, /Explicit effort only[\s\S]*select only the model/i);
@@ -233,7 +256,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /`max` is explicit-only and `ultra` is not a valid effort value/i);
   assert.match(runtimeSkill, /--resume-id <thread-id>/);
   assert.match(runtimeSkill, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
-  assert.match(readme, /`codex:codex-rescue` subagent/i);
+  assert.match(readme, /`codex-relay:codex-rescue` subagent/i);
   assert.match(readme, /if you do not pass `--model` or `--effort`, Codex chooses its own defaults/i);
   assert.match(readme, /--model gpt-5\.4-mini --effort medium/i);
   assert.match(readme, /`spark`, the plugin maps that to `gpt-5\.3-codex-spark`/i);
@@ -241,16 +264,16 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(readme, /--resume-id thr_[a-z0-9_-]+/i);
   assert.match(readme, /--background --resume-id thr_[a-z0-9_-]+/i);
   assert.match(readme, /resume-id.*mutually exclusive.*resume.*fresh/is);
-  assert.match(readme, /### `\/codex:setup`/);
-  assert.match(readme, /### `\/codex:review`/);
-  assert.match(readme, /### `\/codex:adversarial-review`/);
-  assert.match(readme, /uses the same review target selection as `\/codex:review`/i);
+  assert.match(readme, /### `\/codex-relay:setup`/);
+  assert.match(readme, /### `\/codex-relay:review`/);
+  assert.match(readme, /### `\/codex-relay:adversarial-review`/);
+  assert.match(readme, /uses the same review target selection as `\/codex-relay:review`/i);
   assert.match(readme, /--base main challenge whether this was the right caching and retry design/);
-  assert.match(readme, /### `\/codex:rescue`/);
-  assert.match(readme, /### `\/codex:transfer`/);
-  assert.match(readme, /### `\/codex:status`/);
-  assert.match(readme, /### `\/codex:result`/);
-  assert.match(readme, /### `\/codex:cancel`/);
+  assert.match(readme, /### `\/codex-relay:rescue`/);
+  assert.match(readme, /### `\/codex-relay:transfer`/);
+  assert.match(readme, /### `\/codex-relay:status`/);
+  assert.match(readme, /### `\/codex-relay:result`/);
+  assert.match(readme, /### `\/codex-relay:cancel`/);
 });
 
 test("transfer, result, and cancel commands are exposed as deterministic runtime entrypoints", () => {
@@ -320,6 +343,6 @@ test("setup command can offer Codex install and still points users to codex logi
   assert.match(setup, /codex-companion\.mjs" setup --json \$ARGUMENTS/);
   assert.match(readme, /!codex login/);
   assert.match(readme, /offer to install Codex for you/i);
-  assert.match(readme, /\/codex:setup --enable-review-gate/);
-  assert.match(readme, /\/codex:setup --disable-review-gate/);
+  assert.match(readme, /\/codex-relay:setup --enable-review-gate/);
+  assert.match(readme, /\/codex-relay:setup --disable-review-gate/);
 });
