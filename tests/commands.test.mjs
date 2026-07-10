@@ -70,6 +70,24 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /can still take extra focus text after the flags/i);
 });
 
+test("codex-reviewer is a read-only native review forwarder", () => {
+  const agent = read("agents/codex-reviewer.md");
+  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+  assert.match(agent, /^name:\s*codex-reviewer$/m);
+  assert.match(agent, /^tools:\s*Bash$/m);
+  assert.match(agent, /Use exactly one `Bash` call/i);
+  assert.match(agent, /normal request[\s\S]*codex-companion\.mjs" review/);
+  assert.match(agent, /focus text[\s\S]*codex-companion\.mjs" adversarial-review/);
+  assert.match(agent, /foreground by default/i);
+  assert.match(agent, /only.*background.*explicit/i);
+  assert.match(agent, /stdout.*exactly as-is/i);
+  assert.match(agent, /Never invoke task, never add --write/i);
+  assert.match(agent, /never add --resume, --resume-last, or --resume-id/i);
+  assert.doesNotMatch(agent, /codex-companion\.mjs" task/);
+  assert.doesNotMatch(agent, /^skills:/m);
+  assert.match(readme, /the `codex:codex-rescue` and `codex:codex-reviewer` subagents in `\/agents`/i);
+});
+
 test("continue is not exposed as a user-facing command", () => {
   const commandFiles = fs.readdirSync(path.join(PLUGIN_ROOT, "commands")).sort();
   assert.deepEqual(commandFiles, [

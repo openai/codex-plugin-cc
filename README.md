@@ -62,7 +62,9 @@ If Codex is installed but not logged in yet, run:
 After install, you should see:
 
 - the slash commands listed below
-- the `codex:codex-rescue` subagent in `/agents`
+- the `codex:codex-rescue` and `codex:codex-reviewer` subagents in `/agents`
+
+Claude can proactively delegate an independent review to `codex:codex-reviewer`. The reviewer selects the existing native `review` path for a normal request or `adversarial-review` when the request includes focus text, custom instructions, or adversarial framing. It is read-only, foreground by default, and non-resumable.
 
 One simple first run is:
 
