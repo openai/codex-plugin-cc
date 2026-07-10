@@ -202,12 +202,10 @@ test("internal docs use task terminology for rescue runs", () => {
   assert.match(promptRecipes, /## Narrow Fix/);
 });
 
-test("hooks keep session-end cleanup and stop gating enabled", () => {
-  const source = read("hooks/hooks.json");
-  assert.match(source, /SessionStart/);
-  assert.match(source, /SessionEnd/);
-  assert.match(source, /stop-review-gate-hook\.mjs/);
-  assert.match(source, /session-lifecycle-hook\.mjs/);
+test("hooks manifest contains only supported top-level fields", () => {
+  const hooks = JSON.parse(read("hooks/hooks.json"));
+  assert.deepEqual(Object.keys(hooks), ["hooks"]);
+  assert.ok(Array.isArray(hooks.hooks.SessionEnd));
 });
 
 test("setup command can offer Codex install and still points users to codex login", () => {

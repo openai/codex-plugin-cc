@@ -1,5 +1,4 @@
 {
-  "description": "Optional stop-time review gate for Codex Companion.",
   "hooks": {
     "SessionStart": [
       {
