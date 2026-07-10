@@ -1,9 +1,14 @@
-# Codex plugin for Claude Code
+# Codex CC Relay Plugin
 
 Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex.
 
-This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
-they already have.
+This compatibility-first relay is built on
+[openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc). See
+[`UPSTREAM.md`](./UPSTREAM.md) for the exact upstream base and synchronization procedure.
+It preserves the `codex` plugin name and the `/codex:*` command namespace.
+
+The separate `fable-codex-workflow` project owns orchestration and workflow setup. This
+repository provides the compatible Codex relay plugin and its runtime policy.
 
 <video src="./docs/plugin-demo.webm" controls muted playsinline autoplay></video>
 
@@ -21,19 +26,8 @@ they already have.
 
 ## Install
 
-Add the marketplace in Claude Code:
-
-```bash
-/plugin marketplace add openai/codex-plugin-cc
-```
-
-Install the plugin:
-
-```bash
-/plugin install codex@openai-codex
-```
-
-Reload plugins:
+Relay publication and installation coordinates have not been selected yet. Once the relay is
+installed from the chosen source, reload plugins:
 
 ```bash
 /reload-plugins
@@ -75,6 +69,31 @@ One simple first run is:
 ```
 
 ## Usage
+
+### Relay routing and prompting policy
+
+Automatic GPT-5.6 routing applies only to fresh `/codex:rescue` tasks:
+
+| Task class | Model | Effort |
+| --- | --- | --- |
+| Small, bounded, mechanical | `gpt-5.6-luna` | `low` |
+| Normal, bounded diagnosis or implementation | `gpt-5.6-terra` | `medium` |
+| Broad, ambiguous, cross-component, or high-value | `gpt-5.6-sol` | `high` |
+| Architectural, high-risk, or unusually difficult | `gpt-5.6-sol` | `xhigh` |
+
+Explicit choices take precedence. An explicit model and effort are both preserved; an explicit
+model fills only the missing effort; and an explicit effort fills only the missing model. The
+relay never selects `max` automatically: `max` is explicit-only.
+
+Resumed work, including `--resume-id <thread-id>`, skips automatic routing. It preserves the
+thread's model and effort defaults, forwards only explicit overrides, and keeps an explicitly
+supplied thread ID exact.
+
+For fresh implementation work, the relay uses a model-neutral prompt envelope. The user's task
+text is preserved exactly inside `<task>`. Optional scope, success, evidence, and response blocks
+are added only from concrete information already available; the relay does not rewrite the task,
+invent requirements, or add model-specific prompting. Resumes send only the new delta, while
+review commands keep their native review contracts.
 
 ### `/codex:review`
 
@@ -162,7 +181,8 @@ Ask Codex to redesign the database connection to be more resilient.
 
 **Notes:**
 
-- if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
+- fresh requests fill missing model and effort values using the relay policy above
+- for resumed requests, if you do not pass `--model` or `--effort`, Codex chooses its own defaults
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
 - `--resume-id <thread-id>` sends only the new prompt delta to exactly that Codex thread without consulting relay-tracked state; explicit model and effort overrides are preserved
