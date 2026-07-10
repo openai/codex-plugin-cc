@@ -131,7 +131,6 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /accepted effort values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`/i);
   assert.match(rescue, /`max` is explicit-only and `ultra` is not a valid effort value/i);
   assert.match(rescue, /If they ask for `spark`, map it to `gpt-5\.3-codex-spark`/i);
-  assert.match(rescue, /If the request includes `--resume`, do not ask whether to continue/i);
   assert.match(rescue, /If the request includes `--fresh`, do not ask whether to continue/i);
   assert.match(rescue, /If the user chooses continue, add `--resume`/i);
   assert.match(rescue, /If the user chooses a new thread, add `--fresh`/i);
@@ -143,6 +142,9 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /codex:codex-prompting/);
   assert.match(rescue, /Resume flow[\s\S]*Fresh flow/i);
   assert.match(rescue, /resume[\s\S]*do not load or apply `codex:gpt-5-6-routing`/i);
+  assert.match(rescue, /`--resume`, `--resume-last`, or `--resume-id/);
+  assert.match(rescue, /`--resume-last`[\s\S]*do not load or apply `codex:gpt-5-6-routing`/i);
+  assert.match(rescue, /`--resume-id`[\s\S]*do not load or apply `codex:gpt-5-6-routing`/i);
   assert.match(rescue, /resume[\s\S]*preserve the thread's original model and effort defaults[\s\S]*only explicit user overrides/i);
   assert.match(rescue, /fresh[\s\S]*load `codex:gpt-5-6-routing`/i);
   assert.match(rescue, /Explicit model and effort[\s\S]*preserve both/i);
@@ -175,15 +177,11 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /Do not call `setup`, `review`, `adversarial-review`, `status`, `result`, or `cancel`/i);
   assert.match(runtimeSkill, /transports? the prompt received from the main context unchanged/i);
   assert.doesNotMatch(runtimeSkill, /gpt-5-4-prompting/);
-  assert.match(runtimeSkill, /Leave `--effort` unset unless the user explicitly requests a specific effort/i);
-  assert.match(runtimeSkill, /Leave model unset by default/i);
-  assert.match(runtimeSkill, /Map `spark` to `--model gpt-5\.3-codex-spark`/i);
   assert.match(runtimeSkill, /If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only/i);
   assert.match(runtimeSkill, /Strip it before calling `task`/i);
   assert.match(runtimeSkill, /`--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`/i);
   assert.match(runtimeSkill, /`max` is explicit-only and `ultra` is not a valid effort value/i);
   assert.match(runtimeSkill, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
-  assert.match(runtimeSkill, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
   assert.match(readme, /`codex:codex-rescue` subagent/i);
   assert.match(readme, /if you do not pass `--model` or `--effort`, Codex chooses its own defaults/i);
   assert.match(readme, /--model gpt-5\.4-mini --effort medium/i);
@@ -224,6 +222,16 @@ test("internal docs use task terminology for rescue runs", () => {
   assert.match(runtimeSkill, /codex-companion\.mjs" task "<raw arguments>"/);
   assert.match(runtimeSkill, /Use `task` for every rescue request/i);
   assert.match(runtimeSkill, /task --resume-last/i);
+});
+
+test("preloaded rescue runtime forwards resolved routing and visible errors", () => {
+  const runtimeSkill = read("skills/codex-cli-runtime/SKILL.md");
+
+  assert.match(runtimeSkill, /model and effort[\s\S]*already resolved optional values/i);
+  assert.match(runtimeSkill, /pass resolved `--model` and `--effort` values through unchanged/i);
+  assert.match(runtimeSkill, /omit either flag when its resolved value is unset/i);
+  assert.match(runtimeSkill, /keep Bash and runtime invocation errors visible/i);
+  assert.doesNotMatch(runtimeSkill, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
 });
 
 test("internal Codex prompting skill is model-neutral and preserves native task contracts", () => {

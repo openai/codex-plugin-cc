@@ -19,15 +19,15 @@ Execution rules:
 - The rescue agent transports the prompt received from the main context unchanged apart from stripping routing and runtime-control flags needed to build the `task` invocation.
 - Do not rewrite or reshape the prompt, and do not add, remove, or reorder prompt blocks.
 - Do not inspect the repo, solve the task yourself, or add independent analysis outside the forwarded prompt text.
-- Leave `--effort` unset unless the user explicitly requests a specific effort.
-- Leave model unset by default. Add `--model` only when the user explicitly asks for one.
-- Map `spark` to `--model gpt-5.3-codex-spark`.
+- The model and effort received from the main context are already resolved optional values.
+- Pass resolved `--model` and `--effort` values through unchanged.
+- Omit either flag when its resolved value is unset.
 - Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
 
 Command selection:
 - Use exactly one `task` invocation per rescue handoff.
 - If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Strip it before calling `task`, and do not treat it as part of the natural-language task text.
-- If the forwarded request includes `--model`, normalize `spark` to `gpt-5.3-codex-spark` and pass it through to `task`.
+- If the forwarded request includes `--model`, pass it through to `task` unchanged.
 - If the forwarded request includes `--effort`, pass it through to `task`.
 - If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
 - If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
@@ -41,4 +41,4 @@ Safety rules:
 - Preserve the supplied prompt as-is apart from stripping routing flags.
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own.
 - Return the stdout of the `task` command exactly as-is.
-- If the Bash call fails or Codex cannot be invoked, return nothing.
+- Keep Bash and runtime invocation errors visible. If the command fails or Codex cannot be invoked, do not hide or replace the error.
