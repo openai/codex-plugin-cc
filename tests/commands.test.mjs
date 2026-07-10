@@ -148,11 +148,16 @@ test("internal GPT-5.6 routing skill loads its complete policy bundle", () => {
   assert.match(routing, /references\/model-effort-policy\.md/);
   assert.match(routing, /references\/routing-examples\.md/);
   assert.match(rubric, /breadth.*ambiguity.*risk.*verification/is);
+  assert.match(rubric, /exploration/i);
+  assert.match(rubric, /(?:diagnosis.*implementation|implementation.*diagnosis)/is);
+  assert.match(rubric, /reversibility/i);
+  assert.match(rubric, /autonomy.*long autonomous run/is);
   assert.doesNotMatch(rubric, /gpt-5\.6-(?:luna|terra|sol)/i);
   assert.match(policy, /gpt-5\.6-luna.*low/s);
   assert.match(policy, /gpt-5\.6-terra.*medium/s);
   assert.match(policy, /gpt-5\.6-sol.*high/s);
   assert.match(policy, /gpt-5\.6-sol.*xhigh/s);
+  assert.match(policy, /adjacent.*higher tier/is);
   assert.match(policy, /max.*explicit-only/is);
   assert.match(policy, /cannot decide.*leave.*unset/is);
   assert.match(examples, /partial override/i);

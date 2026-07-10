@@ -8,6 +8,8 @@ user did not provide.
 Evaluate the task's breadth and affected surface, ambiguity and required
 exploration, reversibility and risk, and the depth of verification needed.
 Consider implementation or diagnosis depth as supporting evidence.
+Evaluate required autonomy by distinguishing tightly bounded work from work
+that needs a long autonomous run.
 
 ## Classes
 

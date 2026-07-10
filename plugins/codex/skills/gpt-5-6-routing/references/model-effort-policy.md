@@ -24,6 +24,9 @@ forward only explicit user overrides.
 | Broad, ambiguous, or high-value | gpt-5.6-sol | high |
 | Architectural, high-risk, or unusually difficult | gpt-5.6-sol | xhigh |
 
+When the available facts place a task on a boundary between two adjacent
+classifications, select the higher tier.
+
 `max` is explicit-only and must never be selected automatically. `ultra` is
 not a valid effort value.
 
