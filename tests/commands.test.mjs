@@ -131,19 +131,33 @@ test("continue is not exposed as a user-facing command", () => {
   ]);
 });
 
-test("internal GPT-5.6 routing policy defines fresh rescue tiers and safe fallbacks", () => {
+test("internal GPT-5.6 routing skill loads its complete policy bundle", () => {
   const routing = read("skills/gpt-5-6-routing/SKILL.md");
+  const rubric = read(
+    "skills/gpt-5-6-routing/references/complexity-rubric.md",
+  );
+  const policy = read(
+    "skills/gpt-5-6-routing/references/model-effort-policy.md",
+  );
+  const examples = read(
+    "skills/gpt-5-6-routing/references/routing-examples.md",
+  );
 
   assert.match(routing, /user-invocable:\s*false/);
-  assert.match(routing, /gpt-5\.6-luna.*low/s);
-  assert.match(routing, /gpt-5\.6-terra.*medium/s);
-  assert.match(routing, /gpt-5\.6-sol.*high/s);
-  assert.match(routing, /gpt-5\.6-sol.*xhigh/s);
-  assert.match(routing, /ambiguous.*higher tier/i);
-  assert.match(routing, /cannot decide.*leave.*unset/is);
-  assert.match(routing, /max.*explicit-only/is);
-  assert.match(routing, /Do not query a model catalog/i);
-  assert.match(routing, /do not substitute fallback model names/i);
+  assert.match(routing, /references\/complexity-rubric\.md/);
+  assert.match(routing, /references\/model-effort-policy\.md/);
+  assert.match(routing, /references\/routing-examples\.md/);
+  assert.match(rubric, /breadth.*ambiguity.*risk.*verification/is);
+  assert.doesNotMatch(rubric, /gpt-5\.6-(?:luna|terra|sol)/i);
+  assert.match(policy, /gpt-5\.6-luna.*low/s);
+  assert.match(policy, /gpt-5\.6-terra.*medium/s);
+  assert.match(policy, /gpt-5\.6-sol.*high/s);
+  assert.match(policy, /gpt-5\.6-sol.*xhigh/s);
+  assert.match(policy, /max.*explicit-only/is);
+  assert.match(policy, /cannot decide.*leave.*unset/is);
+  assert.match(examples, /partial override/i);
+  assert.match(examples, /resume/i);
+  assert.match(examples, /insufficient context/i);
 });
 
 test("fresh rescue bypasses routing when model and effort are both explicit", () => {
