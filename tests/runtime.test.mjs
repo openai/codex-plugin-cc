@@ -784,6 +784,35 @@ test("task forwards model selection and reasoning effort to app-server turn/star
   assert.equal(fakeState.lastTurnStart.effort, "low");
 });
 
+test("task forwards explicit max effort", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const result = run(
+    "node",
+    [SCRIPT, "task", "--effort", "max", "inspect this"],
+    { cwd: repo, env: buildEnv(binDir) },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.effort, "max");
+});
+
+test("task rejects ultra effort", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const result = run("node", [SCRIPT, "task", "--effort", "ultra", "inspect this"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /none, minimal, low, medium, high, xhigh, max/);
+});
+
 test("task logs reasoning summaries and assistant messages to the job log", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
