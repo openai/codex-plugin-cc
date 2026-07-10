@@ -28,6 +28,30 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   throw new Error("Timed out waiting for condition.");
 }
 
+function seedFakeCodexThread(statePath, cwd, threadId = "thr_exact") {
+  fs.writeFileSync(
+    statePath,
+    JSON.stringify({
+      nextThreadId: 1,
+      nextTurnId: 1,
+      appServerStarts: 0,
+      threads: [
+        {
+          id: threadId,
+          cwd,
+          name: "Existing exact thread",
+          preview: "",
+          ephemeral: false,
+          createdAt: Math.floor(Date.now() / 1000),
+          updatedAt: Math.floor(Date.now() / 1000)
+        }
+      ],
+      capabilities: null,
+      lastInterrupt: null
+    })
+  );
+}
+
 test("setup reports ready when fake codex is installed and authenticated", () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
@@ -501,6 +525,111 @@ test("task --resume-last resumes the latest persisted task thread", () => {
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
+});
+
+test("task --resume-id resumes the exact requested thread", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  seedFakeCodexThread(statePath, repo);
+
+  const result = run(
+    "node",
+    [SCRIPT, "task", "--resume-id", "thr_exact", "apply only the requested fix"],
+    { cwd: repo, env: buildEnv(binDir) }
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.threadId, "thr_exact");
+  assert.equal(fakeState.lastTurnStart.prompt, "apply only the requested fix");
+});
+
+test("task --resume-id preserves explicit model and effort overrides", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  seedFakeCodexThread(statePath, repo);
+
+  const result = run(
+    "node",
+    [
+      SCRIPT,
+      "task",
+      "--resume-id",
+      "thr_exact",
+      "--model",
+      "gpt-5.6-sol",
+      "--effort",
+      "high",
+      "continue exact work"
+    ],
+    { cwd: repo, env: buildEnv(binDir) }
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.threadId, "thr_exact");
+  assert.equal(fakeState.lastTurnStart.model, "gpt-5.6-sol");
+  assert.equal(fakeState.lastTurnStart.effort, "high");
+  assert.equal(fakeState.lastTurnStart.prompt, "continue exact work");
+});
+
+for (const conflictingArgs of [
+  ["--resume-id", "thr_exact", "--resume"],
+  ["--resume-id", "thr_exact", "--resume-last"],
+  ["--resume-id", "thr_exact", "--fresh"]
+]) {
+  test(`task rejects conflicting resume mode: ${conflictingArgs.join(" ")}`, () => {
+    const repo = makeTempDir();
+    const binDir = makeTempDir();
+    installFakeCodex(binDir);
+    initGitRepo(repo);
+    const result = run("node", [SCRIPT, "task", ...conflictingArgs, "continue"], {
+      cwd: repo,
+      env: buildEnv(binDir)
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Choose exactly one.*resume-id.*resume-last.*fresh/i);
+  });
+}
+
+test("task rejects --resume-id without a value before invoking Codex", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--resume-id"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /resume-id.*(?:requires|missing).*thread ID|Missing value for --resume-id/i);
+  assert.equal(fs.existsSync(statePath), false);
+});
+
+test("task rejects a --resume-id value beginning with a dash before invoking Codex", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--resume-id", "--not-a-thread", "continue"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--resume-id requires a non-empty thread ID/i);
+  assert.equal(fs.existsSync(statePath), false);
 });
 
 test("task-resume-candidate returns the latest rescue thread from the current session", () => {
@@ -996,6 +1125,39 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.equal(resultPayload.job.id, launchPayload.jobId);
   assert.equal(resultPayload.job.status, "completed");
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
+});
+
+test("task --resume-id background round-trip preserves the exact thread", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  seedFakeCodexThread(statePath, repo);
+
+  const launched = run(
+    "node",
+    [SCRIPT, "task", "--background", "--json", "--resume-id", "thr_exact", "continue exact thread"],
+    { cwd: repo, env: buildEnv(binDir) }
+  );
+
+  assert.equal(launched.status, 0, launched.stderr);
+  const launchPayload = JSON.parse(launched.stdout);
+  const waitedStatus = run(
+    "node",
+    [SCRIPT, "status", launchPayload.jobId, "--wait", "--timeout-ms", "15000", "--json"],
+    { cwd: repo, env: buildEnv(binDir) }
+  );
+
+  assert.equal(waitedStatus.status, 0, waitedStatus.stderr);
+  assert.equal(JSON.parse(waitedStatus.stdout).job.status, "completed");
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.threadId, "thr_exact");
+  assert.equal(fakeState.lastTurnStart.prompt, "continue exact thread");
+
+  const jobPath = path.join(resolveStateDir(repo), "jobs", `${launchPayload.jobId}.json`);
+  const finishedJob = JSON.parse(fs.readFileSync(jobPath, "utf8"));
+  assert.equal(finishedJob.request.resumeId, "thr_exact");
 });
 
 test("review rejects focus text because it is native-review only", () => {

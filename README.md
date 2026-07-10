@@ -139,7 +139,7 @@ Use it when you want Codex to:
 > [!NOTE]
 > Depending on the task and the model you choose these tasks might take a long time and it's generally recommended to force the task to be in the background or move the agent to the background.
 
-It supports `--background`, `--wait`, `--resume`, and `--fresh`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo.
+It supports `--background`, `--wait`, `--resume`, `--resume-id <thread-id>`, and `--fresh`. If you omit all resume and fresh routing flags, the plugin can offer to continue the latest rescue thread for this repo. `--resume-id` is mutually exclusive with `--resume`/latest-resume and `--fresh`.
 
 Examples:
 
@@ -147,9 +147,11 @@ Examples:
 /codex:rescue investigate why the tests started failing
 /codex:rescue fix the failing test with the smallest safe patch
 /codex:rescue --resume apply the top fix from the last run
+/codex:rescue --resume-id thr_exact continue this specific thread
 /codex:rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
 /codex:rescue --model spark fix the issue quickly
 /codex:rescue --background investigate the regression
+/codex:rescue --background --resume-id thr_exact continue this specific thread
 ```
 
 You can also just ask for a task to be delegated to Codex:
@@ -163,6 +165,7 @@ Ask Codex to redesign the database connection to be more resilient.
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
+- `--resume-id <thread-id>` sends only the new prompt delta to exactly that Codex thread without consulting relay-tracked state; explicit model and effort overrides are preserved
 
 ### `/codex:transfer`
 

@@ -1,6 +1,6 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up rescue work to the Codex rescue subagent
-argument-hint: "[--background|--wait] [--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh|max>] [what Codex should investigate, solve, or continue]"
+argument-hint: "[--background|--wait] [--resume|--resume-id <thread-id>|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh|max>] [what Codex should investigate, solve, or continue]"
 allowed-tools: Bash(node:*), AskUserQuestion, Agent, Skill
 ---
 
@@ -19,6 +19,7 @@ Execution mode:
 - `--background` and `--wait` are execution flags for Claude Code. Do not forward them to `task`, and do not treat them as part of the natural-language task text.
 - `--model` and `--effort` are runtime-selection flags. Preserve them for the forwarded `task` call, but do not treat them as part of the natural-language task text.
 - If the request includes `--resume`, `--resume-last`, or `--resume-id`, do not ask whether to continue. The user already chose a resumed routing mode.
+- Skip the `task-resume-candidate` check entirely when the request includes `--resume-id <thread-id>`.
 - If the request includes `--fresh`, do not ask whether to continue. The user already chose.
 - Otherwise, before starting Codex, check for a resumable rescue thread from this Claude session by running:
 
@@ -45,8 +46,10 @@ Parse any user-supplied model and effort as explicit runtime overrides without c
 Handle the resume flow before the fresh flow. A request is resumed when it includes `--resume`, `--resume-last`, or `--resume-id <thread-id>`, or when the user chooses `Continue current Codex thread`.
 
 - For resume work, do not load or apply `codex:gpt-5-6-routing`.
+- Skip automatic GPT-5.6 routing when `--resume-id <thread-id>` is present.
 - Preserve the thread's original model and effort defaults by passing only explicit user overrides. Never fill a missing model or effort for a resume.
 - Pass only the user's new delta or correction. Do not repeat the original task or previously supplied context.
+- For `--resume-id`, send only the new delta to the exact supplied thread ID.
 - Invoke `codex:codex-rescue` with the resume routing flag, delta prompt, and any explicit model or effort values.
 
 ## Fresh flow
@@ -73,6 +76,6 @@ Operating rules:
 - Return the Codex companion stdout verbatim to the user.
 - Do not paraphrase, summarize, rewrite, or add commentary before or after it.
 - Do not ask the subagent to inspect files, monitor progress, poll `/codex:status`, fetch `/codex:result`, call `/codex:cancel`, summarize output, or do follow-up work of its own.
-- Leave `--resume` and `--fresh` in the forwarded request. The subagent handles that routing when it builds the `task` command.
+- Leave `--resume`, `--resume-id <thread-id>`, and `--fresh` in the forwarded request. The subagent handles that routing when it builds the `task` command.
 - If the helper reports that Codex is missing or unauthenticated, stop and tell the user to run `/codex:setup`.
 - If the user did not supply a request, ask what Codex should investigate or fix.

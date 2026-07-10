@@ -24,8 +24,9 @@ Forwarding rules:
 - Omit `--model` or `--effort` when its resolved value is unset.
 - Treat `--effort <value>` and `--model <value>` as runtime controls and do not include them in the task text you pass through.
 - Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
-- Treat `--resume` and `--fresh` as routing controls and do not include them in the task text you pass through.
+- Treat `--resume`, `--resume-id <thread-id>`, and `--fresh` as routing controls and do not include them in the task text you pass through.
 - `--resume` means add `--resume-last`.
+- `--resume-id <thread-id>` means pass that exact runtime control through unchanged; do not replace it with `--resume-last`.
 - `--fresh` means do not add `--resume-last`.
 - Preserve the supplied prompt as-is apart from stripping routing flags.
 - Return the stdout of the `codex-companion` command exactly as-is.

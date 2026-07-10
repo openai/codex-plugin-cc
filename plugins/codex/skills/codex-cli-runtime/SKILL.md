@@ -30,8 +30,10 @@ Command selection:
 - If the forwarded request includes `--model`, pass it through to `task` unchanged.
 - If the forwarded request includes `--effort`, pass it through to `task`.
 - If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
+- If the forwarded request includes `--resume-id <thread-id>`, keep it out of the task text and pass it directly to `task`; do not replace it with `--resume-last`.
 - If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
 - `--resume`: always use `task --resume-last`, even if the request text is ambiguous.
+- `--resume-id <thread-id>`: resume exactly that thread and pass only explicit model or effort overrides.
 - `--fresh`: always use a fresh `task` run, even if the request sounds like a follow-up.
 - `--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. `max` is explicit-only and `ultra` is not a valid effort value.
 - `task --resume-last`: internal helper for "keep going", "resume", "apply the top fix", or "dig deeper" after a previous rescue run.
