@@ -276,7 +276,11 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /--resume-id <thread-id>/);
   assert.match(runtimeSkill, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
   assert.match(readme, /`codex-relay:codex-rescue` subagent/i);
-  assert.match(readme, /if you do not pass `--model` or `--effort`, Codex chooses its own defaults/i);
+  assert.match(
+    readme,
+    /For resumed requests, omitted model or effort values preserve the existing thread's defaults; only explicit overrides are forwarded\./
+  );
+  assert.doesNotMatch(readme, /Codex chooses its own defaults/i);
   assert.match(readme, /--model gpt-5\.4-mini --effort medium/i);
   assert.match(readme, /`spark`, the plugin maps that to `gpt-5\.3-codex-spark`/i);
   assert.match(readme, /continue a previous Codex task/i);

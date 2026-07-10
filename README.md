@@ -184,7 +184,7 @@ Ask Codex to redesign the database connection to be more resilient.
 **Notes:**
 
 - fresh requests fill missing model and effort values using the relay policy above
-- for resumed requests, if you do not pass `--model` or `--effort`, Codex chooses its own defaults
+- For resumed requests, omitted model or effort values preserve the existing thread's defaults; only explicit overrides are forwarded.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
 - `--resume-id <thread-id>` sends only the new prompt delta to exactly that Codex thread without consulting relay-tracked state; explicit model and effort overrides are preserved
