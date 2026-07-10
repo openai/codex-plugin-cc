@@ -19,6 +19,10 @@ they already have.
   - Usage will contribute to your Codex usage limits. [Learn more](https://developers.openai.com/codex/pricing).
 - **Node.js 18.18 or later**
 
+## Contributing
+
+For local development setup, repository layout, test commands, and release metadata notes, see [CONTRIBUTING.md](./CONTRIBUTING.md).
+
 ## Install
 
 Add the marketplace in Claude Code:
