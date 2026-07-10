@@ -210,16 +210,24 @@ export function renderSetupReport(report) {
 
 export function renderReviewResult(parsedResult, meta) {
   if (!parsedResult.parsed) {
+    const runFailed = typeof parsedResult.status === "number" && parsedResult.status !== 0;
     const lines = [
       `# Codex ${meta.reviewLabel}`,
       "",
-      "Codex did not return valid structured JSON.",
+      ...(meta.targetLabel ? [`Target: ${meta.targetLabel}`, ""] : []),
+      runFailed
+        ? "Codex review failed before returning a final verdict."
+        : "Codex did not return valid structured JSON.",
       "",
-      `- Parse error: ${parsedResult.parseError}`
+      `- ${runFailed ? "Runtime error" : "Parse error"}: ${parsedResult.parseError}`
     ];
 
     if (parsedResult.rawOutput) {
-      lines.push("", "Raw final message:", "", "```text", parsedResult.rawOutput, "```");
+      if (runFailed) {
+        lines.push("", "An interim assistant message was discarded because the review turn failed.");
+      } else {
+        lines.push("", "Raw final message:", "", "```text", parsedResult.rawOutput, "```");
+      }
     }
 
     appendReasoningSection(lines, meta.reasoningSummary ?? parsedResult.reasoningSummary);
