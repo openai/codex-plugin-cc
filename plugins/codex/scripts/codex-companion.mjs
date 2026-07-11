@@ -79,7 +79,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--resume-thread <id>|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -464,11 +464,11 @@ async function executeTaskRun(request) {
 
   const taskMetadata = buildTaskRunMetadata({
     prompt: request.prompt,
-    resumeLast: request.resumeLast
+    resumeLast: Boolean(request.resumeLast || request.resumeThreadId)
   });
 
-  let resumeThreadId = null;
-  if (request.resumeLast) {
+  let resumeThreadId = request.resumeThreadId ?? null;
+  if (!resumeThreadId && request.resumeLast) {
     const latestThread = await resolveLatestTrackedTaskThread(workspaceRoot, {
       excludeJobId: request.jobId
     });
@@ -601,7 +601,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, resumeThreadId, jobId }) {
   return {
     cwd,
     model,
@@ -609,6 +609,7 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId
     prompt,
     write,
     resumeLast,
+    resumeThreadId: resumeThreadId ?? null,
     jobId
   };
 }
@@ -649,9 +650,9 @@ function readTaskPrompt(cwd, options, positionals) {
   return positionalPrompt || readStdinIfPiped();
 }
 
-function requireTaskRequest(prompt, resumeLast) {
-  if (!prompt && !resumeLast) {
-    throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
+function requireTaskRequest(prompt, resume) {
+  if (!prompt && !resume) {
+    throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last/--resume-thread.");
   }
 }
 
@@ -761,7 +762,7 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "resume-thread"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
     aliasMap: {
       m: "model"
@@ -775,19 +776,23 @@ async function handleTask(argv) {
   const prompt = readTaskPrompt(cwd, options, positionals);
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
+  const resumeThreadId = options["resume-thread"] || null;
   const fresh = Boolean(options.fresh);
   if (resumeLast && fresh) {
     throw new Error("Choose either --resume/--resume-last or --fresh.");
   }
+  if (resumeThreadId && (resumeLast || fresh)) {
+    throw new Error("Choose either --resume-thread or --resume/--resume-last/--fresh.");
+  }
   const write = Boolean(options.write);
   const taskMetadata = buildTaskRunMetadata({
     prompt,
-    resumeLast
+    resumeLast: resumeLast || Boolean(resumeThreadId)
   });
 
   if (options.background) {
     ensureCodexAvailable(cwd);
-    requireTaskRequest(prompt, resumeLast);
+    requireTaskRequest(prompt, resumeLast || Boolean(resumeThreadId));
 
     const job = buildTaskJob(workspaceRoot, taskMetadata, write);
     const request = buildTaskRequest({
@@ -797,6 +802,7 @@ async function handleTask(argv) {
       prompt,
       write,
       resumeLast,
+      resumeThreadId,
       jobId: job.id
     });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
@@ -815,6 +821,7 @@ async function handleTask(argv) {
         prompt,
         write,
         resumeLast,
+        resumeThreadId,
         jobId: job.id,
         onProgress: progress
       }),

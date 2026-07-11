@@ -503,6 +503,58 @@ test("task --resume-last resumes the latest persisted task thread", () => {
   assert.equal(result.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
 });
 
+test("task --resume-thread resumes the specified thread", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const firstRun = run("node", [SCRIPT, "task", "--json", "initial task"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+  const firstPayload = JSON.parse(firstRun.stdout);
+  assert.ok(firstPayload.threadId, "first run should report a threadId");
+
+  const result = run(
+    "node",
+    [SCRIPT, "task", "--resume-thread", firstPayload.threadId, "--json", "follow up"],
+    {
+      cwd: repo,
+      env: buildEnv(binDir)
+    }
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.threadId, firstPayload.threadId);
+  assert.equal(payload.rawOutput, "Resumed the prior run.\nFollow-up prompt accepted.");
+});
+
+test("task --resume-thread rejects --resume-last and --fresh", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  for (const conflicting of ["--resume-last", "--fresh"]) {
+    const result = run(
+      "node",
+      [SCRIPT, "task", "--resume-thread", "thr_explicit", conflicting, "follow up"],
+      {
+        cwd: repo,
+        env: buildEnv(binDir)
+      }
+    );
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Choose either --resume-thread/);
+  }
+});
+
 test("task-resume-candidate returns the latest rescue thread from the current session", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
