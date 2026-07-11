@@ -86,7 +86,7 @@ Use it when you want:
 - a review of your current uncommitted changes
 - a review of your branch compared to a base branch like `main`
 
-Use `--base <ref>` for branch review. It also supports `--wait` and `--background`. It is not steerable and does not take custom focus text. Use [`/codex:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
+Use `--base <ref>` for branch review. It also supports `--wait`, `--background`, `--model`, and `--effort`. It is not steerable and does not take custom focus text. Use [`/codex:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
 
 Examples:
 
@@ -94,6 +94,7 @@ Examples:
 /codex:review
 /codex:review --base main
 /codex:review --background
+/codex:review --model gpt-5.6-sol --effort max
 ```
 
 This command is read-only and will not perform any changes. When run in the background you can use [`/codex:status`](#codexstatus) to check on the progress and [`/codex:cancel`](#codexcancel) to cancel the ongoing task.
@@ -105,7 +106,7 @@ Runs a **steerable** review that questions the chosen implementation and design.
 It can be used to pressure-test assumptions, tradeoffs, failure modes, and whether a different approach would have been safer or simpler.
 
 It uses the same review target selection as `/codex:review`, including `--base <ref>` for branch review.
-It also supports `--wait` and `--background`. Unlike `/codex:review`, it can take extra focus text after the flags.
+It also supports `--wait`, `--background`, `--model`, and `--effort`. Unlike `/codex:review`, it can take extra focus text after the flags.
 
 Use it when you want:
 
@@ -119,6 +120,7 @@ Examples:
 /codex:adversarial-review
 /codex:adversarial-review --base main challenge whether this was the right caching and retry design
 /codex:adversarial-review --background look for race conditions and question the chosen approach
+/codex:adversarial-review --model gpt-5.6-terra --effort xhigh challenge the retry design
 ```
 
 This command is read-only. It does not fix code.
@@ -160,6 +162,8 @@ Ask Codex to redesign the database connection to be more resilient.
 
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
+- reasoning efforts are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`; the current Codex model catalog is used to reject unsupported combinations such as `gpt-5.6-luna` with `ultra`
+- model names are otherwise passed through, so custom providers and newly released models are not blocked by a plugin allowlist
 - follow-up rescue requests can continue the latest Codex task in the repo
 
 ### `/codex:transfer`

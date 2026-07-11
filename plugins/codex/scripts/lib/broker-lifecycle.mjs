@@ -6,11 +6,31 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
+import { withBrokerLock } from "./broker-lock.mjs";
+import { probeBroker } from "./broker-probe.mjs";
+import { binaryAvailable, terminateProcessTree } from "./process.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
 const BROKER_STATE_FILE = "broker.json";
+const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
+const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
+
+export function resolveBrokerRuntimeIdentity(cwd, env = process.env) {
+  const codex = binaryAvailable("codex", ["--version"], { cwd, env });
+  return {
+    pluginVersion: PLUGIN_MANIFEST.version ?? "0.0.0",
+    codexVersion: codex.available ? codex.detail : null
+  };
+}
+
+export function isBrokerRuntimeCurrent(session, runtime) {
+  return (
+    session?.runtime?.pluginVersion === runtime.pluginVersion &&
+    session?.runtime?.codexVersion === runtime.codexVersion
+  );
+}
 
 export function createBrokerSessionDir(prefix = "cxc-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -41,18 +61,29 @@ export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
 }
 
 export async function sendBrokerShutdown(endpoint) {
-  await new Promise((resolve) => {
+  return new Promise((resolve) => {
     const socket = connectToEndpoint(endpoint);
+    let buffer = "";
     socket.setEncoding("utf8");
     socket.on("connect", () => {
       socket.write(`${JSON.stringify({ id: 1, method: "broker/shutdown", params: {} })}\n`);
     });
-    socket.on("data", () => {
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      const newlineIndex = buffer.indexOf("\n");
+      if (newlineIndex === -1) {
+        return;
+      }
+      const line = buffer.slice(0, newlineIndex);
       socket.end();
-      resolve();
+      try {
+        resolve(!JSON.parse(line.trim()).error);
+      } catch {
+        resolve(false);
+      }
     });
-    socket.on("error", resolve);
-    socket.on("close", resolve);
+    socket.on("error", () => resolve(false));
+    socket.on("close", () => resolve(false));
   });
 }
 
@@ -110,64 +141,105 @@ async function isBrokerEndpointReady(endpoint) {
   }
 }
 
-export async function ensureBrokerSession(cwd, options = {}) {
+function teardownExistingBroker(cwd, existing, killProcess) {
+  teardownBrokerSession({
+    endpoint: existing.endpoint ?? null,
+    pidFile: existing.pidFile ?? null,
+    logFile: existing.logFile ?? null,
+    sessionDir: existing.sessionDir ?? null,
+    pid: existing.pid ?? null,
+    killProcess
+  });
+  clearBrokerSession(cwd);
+}
+
+async function loadReusableBrokerSessionUnlocked(cwd, options = {}) {
   const existing = loadBrokerSession(cwd);
-  if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
+  const runtime = resolveBrokerRuntimeIdentity(cwd, options.env);
+  if (
+    existing &&
+    isBrokerRuntimeCurrent(existing, runtime) &&
+    (await isBrokerEndpointReady(existing.endpoint))
+  ) {
     return existing;
   }
 
   if (existing) {
-    teardownBrokerSession({
-      endpoint: existing.endpoint ?? null,
-      pidFile: existing.pidFile ?? null,
-      logFile: existing.logFile ?? null,
-      sessionDir: existing.sessionDir ?? null,
-      pid: existing.pid ?? null,
-      killProcess: options.killProcess ?? null
-    });
-    clearBrokerSession(cwd);
+    if (await isBrokerEndpointReady(existing.endpoint)) {
+      const brokerStatus = await probeBroker(existing.endpoint, cwd);
+      if (brokerStatus === "busy" && options.allowBusyStaleBroker) {
+        return existing;
+      }
+      if (brokerStatus !== "idle") {
+        options.deferBrokerReplacement = true;
+        return null;
+      }
+      if (!(await sendBrokerShutdown(existing.endpoint))) {
+        options.deferBrokerReplacement = true;
+        return null;
+      }
+    }
+    teardownExistingBroker(cwd, existing, options.killProcess ?? terminateProcessTree);
   }
 
-  const sessionDir = createBrokerSessionDir();
-  const endpointFactory = options.createBrokerEndpoint ?? createBrokerEndpoint;
-  const endpoint = endpointFactory(sessionDir, options.platform);
-  const pidFile = path.join(sessionDir, "broker.pid");
-  const logFile = path.join(sessionDir, "broker.log");
-  const scriptPath =
-    options.scriptPath ??
-    fileURLToPath(new URL("../app-server-broker.mjs", import.meta.url));
+  return null;
+}
 
-  const child = spawnBrokerProcess({
-    scriptPath,
-    cwd,
-    endpoint,
-    pidFile,
-    logFile,
-    env: options.env ?? process.env
-  });
+export async function loadReusableBrokerSession(cwd, options = {}) {
+  return withBrokerLock(cwd, options, () => loadReusableBrokerSessionUnlocked(cwd, options));
+}
 
-  const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
-  if (!ready) {
-    teardownBrokerSession({
+export async function ensureBrokerSession(cwd, options = {}) {
+  return withBrokerLock(cwd, options, async () => {
+    const existing = await loadReusableBrokerSessionUnlocked(cwd, options);
+    if (existing || options.deferBrokerReplacement) {
+      return existing;
+    }
+
+    const runtime = resolveBrokerRuntimeIdentity(cwd, options.env);
+
+    const sessionDir = createBrokerSessionDir();
+    const endpointFactory = options.createBrokerEndpoint ?? createBrokerEndpoint;
+    const endpoint = endpointFactory(sessionDir, options.platform);
+    const pidFile = path.join(sessionDir, "broker.pid");
+    const logFile = path.join(sessionDir, "broker.log");
+    const scriptPath =
+      options.scriptPath ??
+      fileURLToPath(new URL("../app-server-broker.mjs", import.meta.url));
+
+    const child = spawnBrokerProcess({
+      scriptPath,
+      cwd,
+      endpoint,
+      pidFile,
+      logFile,
+      env: options.env ?? process.env
+    });
+
+    const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
+    if (!ready) {
+      teardownBrokerSession({
+        endpoint,
+        pidFile,
+        logFile,
+        sessionDir,
+        pid: child.pid ?? null,
+        killProcess: options.killProcess ?? terminateProcessTree
+      });
+      return null;
+    }
+
+    const session = {
       endpoint,
       pidFile,
       logFile,
       sessionDir,
       pid: child.pid ?? null,
-      killProcess: options.killProcess ?? null
-    });
-    return null;
-  }
-
-  const session = {
-    endpoint,
-    pidFile,
-    logFile,
-    sessionDir,
-    pid: child.pid ?? null
-  };
-  saveBrokerSession(cwd, session);
-  return session;
+      runtime
+    };
+    saveBrokerSession(cwd, session);
+    return session;
+  });
 }
 
 export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null }) {

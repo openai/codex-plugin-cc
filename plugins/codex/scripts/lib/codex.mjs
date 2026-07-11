@@ -43,11 +43,10 @@ import { readJsonFile } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
+import { validateExplicitReasoningSelection, validateReasoningSelection } from "./model-catalog.mjs";
+import { TASK_THREAD_PREFIX } from "./task-thread.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
-const TASK_THREAD_PREFIX = "Codex Companion Task";
-const DEFAULT_CONTINUE_PROMPT =
-  "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
 const EXTERNAL_AGENT_IMPORT_TIMEOUT_MS = 2 * 60 * 1000;
 
@@ -66,6 +65,7 @@ function buildThreadParams(cwd, options = {}) {
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
     sandbox: options.sandbox ?? "read-only",
+    config: options.effort ? { model_reasoning_effort: options.effort } : null,
     serviceName: SERVICE_NAME,
     ephemeral: options.ephemeral ?? true
   };
@@ -102,11 +102,6 @@ function looksLikeVerificationCommand(command) {
   return /\b(test|tests|lint|build|typecheck|type-check|check|verify|validate|pytest|jest|vitest|cargo test|npm test|pnpm test|yarn test|go test|mvn test|gradle test|tsc|eslint|ruff)\b/i.test(
     command
   );
-}
-
-function buildTaskThreadName(prompt) {
-  const excerpt = shorten(prompt, 56);
-  return excerpt ? `${TASK_THREAD_PREFIX}: ${excerpt}` : TASK_THREAD_PREFIX;
 }
 
 function extractThreadId(message) {
@@ -979,7 +974,10 @@ export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
 
   let client = null;
   try {
-    client = await CodexAppServerClient.connect(cwd, { reuseExistingBroker: true });
+    client = await CodexAppServerClient.connect(cwd, {
+      reuseExistingBroker: true,
+      allowBusyStaleBroker: true
+    });
     await client.request("turn/interrupt", { threadId, turnId });
     return {
       attempted: true,
@@ -1006,14 +1004,21 @@ export async function runAppServerReview(cwd, options = {}) {
   }
 
   return withAppServer(cwd, async (client) => {
+    await validateExplicitReasoningSelection(client, cwd, options);
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
     const thread = await startThread(client, cwd, {
       model: options.model,
+      effort: options.effort,
       sandbox: "read-only",
       ephemeral: true,
       threadName: options.threadName
     });
     const sourceThreadId = thread.thread.id;
+    await validateReasoningSelection(client, {
+      model: options.model ?? thread.model,
+      effort: options.effort ?? thread.reasoningEffort,
+      modelProvider: thread.modelProvider
+    });
     emitProgress(options.onProgress, `Thread ready (${sourceThreadId}).`, "starting", {
       threadId: sourceThreadId
     });
@@ -1100,6 +1105,13 @@ export async function runAppServerTurn(cwd, options = {}) {
 
   return withAppServer(cwd, async (client) => {
     let threadId;
+    let threadSelection;
+
+    if (!options.resumeThreadId) {
+      await validateExplicitReasoningSelection(client, cwd, options, {
+        includeInherited: options.persistThread === true
+      });
+    }
 
     if (options.resumeThreadId) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
@@ -1109,6 +1121,7 @@ export async function runAppServerTurn(cwd, options = {}) {
         ephemeral: false
       });
       threadId = response.thread.id;
+      threadSelection = response;
     } else {
       emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
       const response = await startThread(client, cwd, {
@@ -1118,7 +1131,14 @@ export async function runAppServerTurn(cwd, options = {}) {
         threadName: options.persistThread ? options.threadName : options.threadName ?? null
       });
       threadId = response.thread.id;
+      threadSelection = response;
     }
+
+    await validateReasoningSelection(client, {
+      model: options.model ?? threadSelection.model,
+      effort: options.effort ?? threadSelection.reasoningEffort,
+      modelProvider: threadSelection.modelProvider
+    });
 
     emitProgress(options.onProgress, `Thread ready (${threadId}).`, "starting", {
       threadId
@@ -1180,40 +1200,3 @@ export async function findLatestTaskThread(cwd) {
     );
   });
 }
-
-export function buildPersistentTaskThreadName(prompt) {
-  return buildTaskThreadName(prompt);
-}
-
-export function parseStructuredOutput(rawOutput, fallback = {}) {
-  if (!rawOutput) {
-    return {
-      parsed: null,
-      parseError: fallback.failureMessage ?? "Codex did not return a final structured message.",
-      rawOutput: rawOutput ?? "",
-      ...fallback
-    };
-  }
-
-  try {
-    return {
-      parsed: JSON.parse(rawOutput),
-      parseError: null,
-      rawOutput,
-      ...fallback
-    };
-  } catch (error) {
-    return {
-      parsed: null,
-      parseError: error.message,
-      rawOutput,
-      ...fallback
-    };
-  }
-}
-
-export function readOutputSchema(schemaPath) {
-  return readJsonFile(schemaPath);
-}
-
-export { DEFAULT_CONTINUE_PROMPT, TASK_THREAD_PREFIX };

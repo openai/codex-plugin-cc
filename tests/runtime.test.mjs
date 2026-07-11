@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
-import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { loadBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -716,6 +716,46 @@ test("write task output focuses on the Codex result without generic follow-up hi
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
+test("task --write starts Codex with unrestricted sandbox access", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--write", "capture the page"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(state.lastThreadStart.sandbox, "danger-full-access");
+});
+
+test("resuming task --write upgrades the thread to unrestricted sandbox access", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const firstRun = run("node", [SCRIPT, "task", "initial task"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+
+  const result = run("node", [SCRIPT, "task", "--write", "--resume-last", "capture the page"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(state.lastThreadResume.sandbox, "danger-full-access");
+});
+
 test("task --resume acts like --resume-last without leaking the flag into the prompt", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -732,15 +772,73 @@ test("task --resume acts like --resume-last without leaking the flag into the pr
   });
   assert.equal(firstRun.status, 0, firstRun.stderr);
 
-  const result = run("node", [SCRIPT, "task", "--resume", "follow up"], {
-    cwd: repo,
-    env: buildEnv(binDir)
-  });
+  const result = run(
+    "node",
+    [SCRIPT, "task", "--resume", "--model", "gpt-5.6-terra", "--effort", "max", "follow up"],
+    {
+      cwd: repo,
+      env: buildEnv(binDir)
+    }
+  );
 
   assert.equal(result.status, 0, result.stderr);
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(fakeState.lastTurnStart.threadId, "thr_1");
+  assert.equal(fakeState.lastThreadResume.model, "gpt-5.6-terra");
+  assert.equal(fakeState.lastTurnStart.model, "gpt-5.6-terra");
+  assert.equal(fakeState.lastTurnStart.effort, "max");
   assert.equal(fakeState.lastTurnStart.prompt, "follow up");
+});
+
+test("resume validates the persisted thread provider even when current config uses a custom provider", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "custom-provider");
+  initGitRepo(repo);
+
+  const first = run("node", [SCRIPT, "task", "initial task"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(first.status, 0, first.stderr);
+  const initialTurnId = JSON.parse(fs.readFileSync(statePath, "utf8")).lastTurnStart.turnId;
+
+  const resumed = run(
+    "node",
+    [SCRIPT, "task", "--resume", "--model", "gpt-5.6-luna", "--effort", "ultra", "follow up"],
+    { cwd: repo, env: buildEnv(binDir) }
+  );
+
+  assert.notEqual(resumed.status, 0);
+  assert.match(resumed.stderr, /not supported by model "gpt-5\.6-luna"/i);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).lastTurnStart.turnId, initialTurnId);
+});
+
+test("resume validates effort against the persisted thread model instead of current config", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "config-luna");
+  initGitRepo(repo);
+
+  const first = run(
+    "node",
+    [SCRIPT, "task", "--model", "gpt-5.6-sol", "--effort", "high", "initial task"],
+    { cwd: repo, env: buildEnv(binDir) }
+  );
+  assert.equal(first.status, 0, first.stderr);
+
+  const resumed = run("node", [SCRIPT, "task", "--resume", "--effort", "ultra", "follow up"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(resumed.status, 0, resumed.stderr);
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(state.lastThreadResume.model, "gpt-5.6-sol");
+  assert.equal(state.lastTurnStart.model, null);
+  assert.equal(state.lastTurnStart.effort, "ultra");
 });
 
 test("task --fresh is treated as routing control and does not leak into the prompt", () => {
@@ -782,6 +880,183 @@ test("task forwards model selection and reasoning effort to app-server turn/star
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(fakeState.lastTurnStart.model, "gpt-5.3-codex-spark");
   assert.equal(fakeState.lastTurnStart.effort, "low");
+});
+
+test("task supports max and ultra while rejecting unsupported model combinations locally", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const max = run("node", [SCRIPT, "task", "--model", "gpt-5.6-luna", "--effort", "max", "check"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(max.status, 0, max.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).lastTurnStart.effort, "max");
+
+  const ultra = run("node", [SCRIPT, "task", "--model", "gpt-5.6-sol", "--effort", "ultra", "check"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(ultra.status, 0, ultra.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).lastTurnStart.effort, "ultra");
+
+  const invalid = run("node", [SCRIPT, "task", "--model", "gpt-5.6-luna", "--effort", "ultra", "check"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.notEqual(invalid.status, 0);
+  assert.match(invalid.stderr, /not supported by model "gpt-5\.6-luna"/i);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).lastThreadStart.model, "gpt-5.6-sol");
+});
+
+test("task validates model and effort inherited from Codex config", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "inherited-sol-max");
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "check inherited selection"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(state.lastThreadStart.model, "gpt-5.6-sol");
+  assert.equal(state.lastThreadStart.effort, "max");
+  assert.equal(state.lastTurnStart.model, null);
+  assert.equal(state.lastTurnStart.effort, null);
+});
+
+test("task rejects an unsupported model and effort inherited from Codex config", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "inherited-luna-ultra");
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "check inherited selection"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Reasoning effort "ultra" is not supported by model "gpt-5\.6-luna"/i);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).threads.length, 0);
+});
+
+test("task prevalidates a partial explicit selection against Codex config", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "inherited-luna-ultra");
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--effort", "ultra", "check selection"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /not supported by model "gpt-5\.6-luna"/i);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).threads.length, 0);
+});
+
+test("task prevalidates effort against the catalog default before creating a persistent thread", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "inherited-default-luna-ultra");
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--effort", "ultra", "check default selection"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /not supported by model "gpt-5\.6-luna"/i);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).threads.length, 0);
+});
+
+test("task falls back cleanly when an older Codex CLI does not expose model/list", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "model-list-unsupported");
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--model", "gpt-5.6-sol", "--effort", "max", "check"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test("task does not apply the OpenAI effort matrix to a custom provider", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "custom-provider");
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--model", "gpt-5.6-luna", "--effort", "ultra", "check"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test("review rejects an unsupported explicit selection before creating a thread", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+
+  const result = run("node", [SCRIPT, "review", "--model", "gpt-5.6-luna", "--effort", "ultra"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /not supported by model "gpt-5\.6-luna"/i);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).threads.length, 0);
+});
+
+test("review and adversarial-review consume model and effort flags instead of leaking them into focus text", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+
+  const review = run("node", [SCRIPT, "review", "--model", "gpt-5.6-sol", "--effort", "max"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(review.status, 0, review.stderr);
+  let state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(state.lastThreadStart.model, "gpt-5.6-sol");
+  assert.equal(state.lastThreadStart.effort, "max");
+
+  const adversarial = run(
+    "node",
+    [SCRIPT, "adversarial-review", "--model", "gpt-5.6-terra", "--effort", "xhigh", "challenge retries"],
+    { cwd: repo, env: buildEnv(binDir) }
+  );
+  assert.equal(adversarial.status, 0, adversarial.stderr);
+  state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(state.lastTurnStart.model, "gpt-5.6-terra");
+  assert.equal(state.lastTurnStart.effort, "xhigh");
+  assert.doesNotMatch(state.lastTurnStart.prompt, /--model|--effort/);
+  assert.match(state.lastTurnStart.prompt, /challenge retries/);
 });
 
 test("task logs reasoning summaries and assistant messages to the job log", () => {
@@ -929,10 +1204,21 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate the failing test"], {
-    cwd: repo,
-    env: buildEnv(binDir)
-  });
+  const launched = run(
+    "node",
+    [
+      SCRIPT,
+      "task",
+      "--background",
+      "--json",
+      "--model",
+      "gpt-5.6-luna",
+      "--effort",
+      "max",
+      "investigate the failing test"
+    ],
+    { cwd: repo, env: buildEnv(binDir) }
+  );
 
   assert.equal(launched.status, 0, launched.stderr);
   const launchPayload = JSON.parse(launched.stdout);
@@ -967,6 +1253,9 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.equal(resultPayload.job.id, launchPayload.jobId);
   assert.equal(resultPayload.job.status, "completed");
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.lastTurnStart.model, "gpt-5.6-luna");
+  assert.equal(fakeState.lastTurnStart.effort, "max");
 });
 
 test("review rejects focus text because it is native-review only", () => {
@@ -1768,6 +2057,8 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
     return null;
   }, { timeoutMs: 15000 });
 
+  installFakeCodex(binDir, "interruptible-slow-task", "codex-cli 0.144.0");
+
   const cancelResult = run("node", [SCRIPT, "cancel", jobId, "--json"], {
     cwd: repo,
     env
@@ -1789,6 +2080,7 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
     threadId: runningJob.threadId,
     turnId: runningJob.turnId
   });
+  assert.equal(fakeState.appServerStarts, 1);
 
   const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
     cwd: repo,
@@ -2161,6 +2453,59 @@ test("commands lazily start and reuse one shared app-server after first use", as
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
+test("shared broker invalidates stale CLI, plugin, and legacy runtime state", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "reject-gpt-5.6", "codex-cli 0.143.0");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  const env = buildEnv(binDir);
+
+  const first = run("node", [SCRIPT, "task", "first"], { cwd: repo, env });
+  assert.equal(first.status, 0, first.stderr);
+  assert.ok(loadBrokerSession(repo), "expected the first task to create a shared broker");
+
+  installFakeCodex(binDir, "review-ok", "codex-cli 0.144.0");
+  const second = run(
+    "node",
+    [SCRIPT, "task", "--model", "gpt-5.6-sol", "--effort", "high", "second"],
+    { cwd: repo, env }
+  );
+  assert.equal(second.status, 0, second.stderr);
+
+  let state = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.equal(state.appServerStarts, 2);
+  assert.equal(loadBrokerSession(repo).runtime.codexVersion, "codex-cli 0.144.0");
+
+  let broker = loadBrokerSession(repo);
+  fs.writeFileSync(
+    path.join(resolveStateDir(repo), "broker.json"),
+    `${JSON.stringify({ ...broker, runtime: { ...broker.runtime, pluginVersion: "1.0.6" } }, null, 2)}\n`
+  );
+  const pluginUpgrade = run("node", [SCRIPT, "task", "after plugin upgrade"], { cwd: repo, env });
+  assert.equal(pluginUpgrade.status, 0, pluginUpgrade.stderr);
+  state = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.equal(state.appServerStarts, 3);
+
+  broker = loadBrokerSession(repo);
+  const { runtime: _runtime, ...legacyBroker } = broker;
+  fs.writeFileSync(
+    path.join(resolveStateDir(repo), "broker.json"),
+    `${JSON.stringify(legacyBroker, null, 2)}\n`
+  );
+  const legacyUpgrade = run("node", [SCRIPT, "task", "after legacy upgrade"], { cwd: repo, env });
+  assert.equal(legacyUpgrade.status, 0, legacyUpgrade.stderr);
+  state = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.equal(state.appServerStarts, 4);
+
+  run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+});
+
 test("setup reuses an existing shared app-server without starting another one", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -2238,22 +2583,39 @@ test("status reports shared session runtime when a lazy broker is active", () =>
 test("setup and status honor --cwd when reading shared session runtime", () => {
   const targetWorkspace = makeTempDir();
   const invocationWorkspace = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(targetWorkspace);
 
-  saveBrokerSession(targetWorkspace, {
-    endpoint: "unix:/tmp/fake-broker.sock"
+  const task = run("node", [SCRIPT, "task", "start shared runtime"], {
+    cwd: targetWorkspace,
+    env: buildEnv(binDir)
   });
+  assert.equal(task.status, 0, task.stderr);
+  const broker = loadBrokerSession(targetWorkspace);
+  if (!broker) {
+    return;
+  }
 
   const status = run("node", [SCRIPT, "status", "--cwd", targetWorkspace], {
-    cwd: invocationWorkspace
+    cwd: invocationWorkspace,
+    env: buildEnv(binDir)
   });
   assert.equal(status.status, 0, status.stderr);
   assert.match(status.stdout, /Session runtime: shared session/);
 
   const setup = run("node", [SCRIPT, "setup", "--cwd", targetWorkspace, "--json"], {
-    cwd: invocationWorkspace
+    cwd: invocationWorkspace,
+    env: buildEnv(binDir)
   });
   assert.equal(setup.status, 0, setup.stderr);
   const payload = JSON.parse(setup.stdout);
   assert.equal(payload.sessionRuntime.mode, "shared");
-  assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
+  assert.equal(payload.sessionRuntime.endpoint, broker.endpoint);
+
+  run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: targetWorkspace,
+    env: buildEnv(binDir),
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: targetWorkspace })
+  });
 });

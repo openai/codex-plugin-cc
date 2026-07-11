@@ -4,7 +4,7 @@ import process from "node:process";
 
 import { writeExecutable } from "./helpers.mjs";
 
-export function installFakeCodex(binDir, behavior = "review-ok") {
+export function installFakeCodex(binDir, behavior = "review-ok", version = "codex-cli test") {
   const statePath = path.join(binDir, "fake-codex-state.json");
   const scriptPath = path.join(binDir, "codex");
   const source = `#!/usr/bin/env node
@@ -14,7 +14,8 @@ const path = require("node:path");
 const readline = require("node:readline");
 
 	const STATE_PATH = ${JSON.stringify(statePath)};
-	const BEHAVIOR = ${JSON.stringify(behavior)};
+		const BEHAVIOR = ${JSON.stringify(behavior)};
+		const VERSION = ${JSON.stringify(version)};
 	const interruptibleTurns = new Map();
 
 	function loadState() {
@@ -71,7 +72,7 @@ function buildAccountReadResult() {
     case "auth-run-fails":
       return { account: null, requiresOpenaiAuth: true };
     case "provider-no-auth":
-    case "env-key-provider":
+	    case "env-key-provider":
       return { account: null, requiresOpenaiAuth: false };
     case "api-key-account-only":
       return { account: { type: "apiKey" }, requiresOpenaiAuth: true };
@@ -88,8 +89,33 @@ function buildConfigReadResult() {
     case "provider-no-auth":
       return {
         config: { model_provider: "ollama" },
-        origins: {}
-      };
+	        origins: {}
+	      };
+	    case "custom-provider":
+	      return {
+	        config: { model_provider: "custom" },
+	        origins: {}
+	      };
+	    case "inherited-sol-max":
+	      return {
+	        config: { model_provider: "openai", model: "gpt-5.6-sol", model_reasoning_effort: "max" },
+	        origins: {}
+	      };
+	    case "inherited-luna-ultra":
+	      return {
+	        config: { model_provider: "openai", model: "gpt-5.6-luna", model_reasoning_effort: "ultra" },
+	        origins: {}
+	      };
+	    case "inherited-default-luna-ultra":
+	      return {
+	        config: { model_provider: "openai", model_reasoning_effort: "ultra" },
+	        origins: {}
+	      };
+	    case "config-luna":
+	      return {
+	        config: { model_provider: "openai", model: "gpt-5.6-luna", model_reasoning_effort: "high" },
+	        origins: {}
+	      };
     case "env-key-provider":
       return {
         config: {
@@ -249,7 +275,7 @@ function taskPayload(prompt, resume) {
 
 const args = process.argv.slice(2);
 if (args[0] === "--version") {
-  console.log("codex-cli test");
+	  console.log(VERSION);
   process.exit(0);
 }
 if (args[0] === "app-server" && args[1] === "--help") {
@@ -312,8 +338,27 @@ rl.on("line", (line) => {
         if (requiresExperimental("persistExtendedHistory", message, state) || requiresExperimental("persistFullHistory", message, state)) {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
-        const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+	        const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
+	        const inheritedSelection = BEHAVIOR === "inherited-sol-max"
+	          ? { model: "gpt-5.6-sol", effort: "max" }
+	          : BEHAVIOR === "inherited-luna-ultra"
+	            ? { model: "gpt-5.6-luna", effort: "ultra" }
+	            : BEHAVIOR === "inherited-default-luna-ultra"
+              ? { model: "gpt-5.6-luna", effort: "ultra" }
+	            : null;
+	        const selectedModel = message.params.model || inheritedSelection?.model || "gpt-5.4";
+	        const selectedEffort = message.params.config?.model_reasoning_effort || inheritedSelection?.effort || null;
+	        const modelProvider = BEHAVIOR === "custom-provider" ? "custom" : "openai";
+	        thread.model = selectedModel;
+	        thread.reasoningEffort = selectedEffort;
+	        state.lastThreadStart = {
+	          model: selectedModel,
+	          effort: selectedEffort,
+	          config: message.params.config ?? null,
+	          sandbox: message.params.sandbox ?? null
+	        };
+	        saveState(state);
+	        send({ id: message.id, result: { thread: buildThread(thread), model: selectedModel, modelProvider, serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: selectedEffort } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
         break;
       }
@@ -347,9 +392,43 @@ rl.on("line", (line) => {
         const thread = ensureThread(state, message.params.threadId);
         thread.updatedAt = now();
         saveState(state);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
-        break;
+	        const selectedModel = message.params.model || thread.model || "gpt-5.4";
+	        const selectedEffort = BEHAVIOR === "inherited-sol-max" ? "max" : thread.reasoningEffort || null;
+	        state.lastThreadResume = {
+	          model: selectedModel,
+	          effort: selectedEffort,
+	          sandbox: message.params.sandbox ?? null
+	        };
+	        saveState(state);
+	        send({ id: message.id, result: { thread: buildThread(thread), model: selectedModel, modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: selectedEffort } });
+	        break;
       }
+
+	      case "model/list": {
+	        if (BEHAVIOR === "model-list-unsupported") {
+	          send({ id: message.id, error: { code: -32601, message: "Unsupported method: model/list" } });
+	          break;
+	        }
+	        const model = (name, efforts) => ({
+	          id: name,
+	          model: name,
+	          isDefault: BEHAVIOR === "inherited-default-luna-ultra" && name === "gpt-5.6-luna",
+	          hidden: false,
+	          supportedReasoningEfforts: efforts.map((reasoningEffort) => ({ reasoningEffort, description: reasoningEffort }))
+	        });
+	        send({
+	          id: message.id,
+	          result: {
+	            data: [
+	              model("gpt-5.6-sol", ["low", "medium", "high", "xhigh", "max", "ultra"]),
+	              model("gpt-5.6-terra", ["low", "medium", "high", "xhigh", "max", "ultra"]),
+	              model("gpt-5.6-luna", ["low", "medium", "high", "xhigh", "max"])
+	            ],
+	            nextCursor: null
+	          }
+	        });
+	        break;
+	      }
 
       case "externalAgentConfig/import": {
         if (BEHAVIOR === "external-import-unsupported") {
@@ -437,13 +516,25 @@ rl.on("line", (line) => {
       }
 
 	      case "turn/start": {
+	        if (BEHAVIOR === "reject-gpt-5.6" && String(message.params.model || "").startsWith("gpt-5.6-")) {
+	          send({
+	            id: message.id,
+	            error: {
+	              code: -32000,
+	              message: "The '" + message.params.model + "' model requires a newer version of Codex."
+	            }
+	          });
+	          break;
+	        }
 	        const thread = ensureThread(state, message.params.threadId);
 	        const prompt = (message.params.input || [])
           .filter((item) => item.type === "text")
           .map((item) => item.text)
           .join("\\n");
-        const turnId = nextTurnId(state);
-        thread.updatedAt = now();
+	        const turnId = nextTurnId(state);
+	        thread.updatedAt = now();
+	        thread.model = message.params.model ?? thread.model ?? null;
+	        thread.reasoningEffort = message.params.effort ?? thread.reasoningEffort ?? null;
 	        state.lastTurnStart = {
 	          threadId: message.params.threadId,
 	          turnId,
