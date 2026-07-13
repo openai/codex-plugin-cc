@@ -25,7 +25,8 @@ Execution rules:
 
 Command selection:
 - Use exactly one `task` invocation per rescue handoff.
-- If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Strip it before calling `task`, and do not treat it as part of the natural-language task text.
+- If the forwarded request omits `--background` and `--wait`, run `task` in the foreground. Do not infer background execution from task complexity; the caller expects the final stdout unchanged.
+- If the forwarded request explicitly includes `--background`, strip it from the task text and add `--background` to `task`; if it includes `--wait`, strip it and keep `task` in the foreground.
 - If the forwarded request includes `--model`, normalize `spark` to `gpt-5.3-codex-spark` and pass it through to `task`.
 - If the forwarded request includes `--effort`, pass it through to `task`.
 - If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
