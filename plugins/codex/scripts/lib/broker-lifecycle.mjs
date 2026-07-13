@@ -10,7 +10,9 @@ import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
+export const BROKER_SHUTDOWN_ACCEPTED = "accepted";
 const BROKER_STATE_FILE = "broker.json";
+const BROKER_SHUTDOWN_TIMEOUT_MS = 1000;
 
 export function createBrokerSessionDir(prefix = "cxc-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -40,19 +42,68 @@ export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
   return false;
 }
 
-export async function sendBrokerShutdown(endpoint) {
-  await new Promise((resolve) => {
-    const socket = connectToEndpoint(endpoint);
+export async function sendBrokerShutdown(endpoint, timeoutMs = BROKER_SHUTDOWN_TIMEOUT_MS) {
+  return new Promise((resolve) => {
+    let socket;
+    let timer = null;
+    let settled = false;
+    let buffer = "";
+
+    const finish = (outcome) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timer) {
+        clearTimeout(timer);
+      }
+      if (socket && !socket.destroyed) {
+        socket.destroy();
+      }
+      resolve(outcome);
+    };
+
+    try {
+      socket = connectToEndpoint(endpoint);
+    } catch {
+      finish("rejected");
+      return;
+    }
+
+    const boundedTimeoutMs = Number.isFinite(timeoutMs) ? Math.max(1, timeoutMs) : BROKER_SHUTDOWN_TIMEOUT_MS;
+    timer = setTimeout(() => finish("timeout"), boundedTimeoutMs);
     socket.setEncoding("utf8");
     socket.on("connect", () => {
       socket.write(`${JSON.stringify({ id: 1, method: "broker/shutdown", params: {} })}\n`);
     });
-    socket.on("data", () => {
-      socket.end();
-      resolve();
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      let newlineIndex = buffer.indexOf("\n");
+      while (newlineIndex !== -1) {
+        const line = buffer.slice(0, newlineIndex);
+        buffer = buffer.slice(newlineIndex + 1);
+        newlineIndex = buffer.indexOf("\n");
+        if (!line.trim()) {
+          continue;
+        }
+
+        let response;
+        try {
+          response = JSON.parse(line);
+        } catch {
+          finish("rejected");
+          return;
+        }
+        if (response.id !== 1) {
+          continue;
+        }
+        const hasResult = Object.prototype.hasOwnProperty.call(response, "result");
+        finish(response.error || !hasResult ? "rejected" : BROKER_SHUTDOWN_ACCEPTED);
+        return;
+      }
     });
-    socket.on("error", resolve);
-    socket.on("close", resolve);
+    socket.on("error", () => finish("rejected"));
+    socket.on("close", () => finish("rejected"));
   });
 }
 
@@ -93,26 +144,53 @@ export function saveBrokerSession(cwd, session) {
 }
 
 export function clearBrokerSession(cwd) {
-  const stateFile = resolveBrokerStateFile(cwd);
-  if (fs.existsSync(stateFile)) {
-    fs.unlinkSync(stateFile);
-  }
+  fs.rmSync(resolveBrokerStateFile(cwd), { force: true });
 }
 
-async function isBrokerEndpointReady(endpoint) {
-  if (!endpoint) {
+export function isBrokerSessionActive(session) {
+  if (!session?.endpoint) {
     return false;
   }
+  if (!Number.isFinite(session.pid)) {
+    return true;
+  }
+
   try {
-    return await waitForBrokerEndpoint(endpoint, 150);
+    process.kill(session.pid, 0);
+  } catch {
+    return false;
+  }
+
+  if (session.pidFile && !fs.existsSync(session.pidFile)) {
+    return false;
+  }
+
+  try {
+    const target = parseBrokerEndpoint(session.endpoint);
+    return target.kind !== "unix" || fs.existsSync(target.path);
   } catch {
     return false;
   }
 }
 
+async function isBrokerEndpointReady(endpoint, timeoutMs = 150) {
+  if (!endpoint) {
+    return false;
+  }
+  try {
+    return await waitForBrokerEndpoint(endpoint, timeoutMs);
+  } catch {
+    return false;
+  }
+}
+
+export async function isBrokerSessionReady(session, timeoutMs = 150) {
+  return isBrokerSessionActive(session) && (await isBrokerEndpointReady(session.endpoint, timeoutMs));
+}
+
 export async function ensureBrokerSession(cwd, options = {}) {
   const existing = loadBrokerSession(cwd);
-  if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
+  if (existing && (await isBrokerSessionReady(existing))) {
     return existing;
   }
 
@@ -179,19 +257,18 @@ export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessi
     }
   }
 
-  if (pidFile && fs.existsSync(pidFile)) {
-    fs.unlinkSync(pidFile);
+  if (pidFile) {
+    fs.rmSync(pidFile, { force: true });
   }
-
-  if (logFile && fs.existsSync(logFile)) {
-    fs.unlinkSync(logFile);
+  if (logFile) {
+    fs.rmSync(logFile, { force: true });
   }
 
   if (endpoint) {
     try {
       const target = parseBrokerEndpoint(endpoint);
-      if (target.kind === "unix" && fs.existsSync(target.path)) {
-        fs.unlinkSync(target.path);
+      if (target.kind === "unix") {
+        fs.rmSync(target.path, { force: true });
       }
     } catch {
       // Ignore malformed or already-removed broker endpoints during teardown.

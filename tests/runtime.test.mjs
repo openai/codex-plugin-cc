@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -7,7 +8,15 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
-import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { BROKER_ENDPOINT_ENV, CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
+import {
+  isBrokerSessionActive,
+  loadBrokerSession,
+  saveBrokerSession,
+  sendBrokerShutdown
+} from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { createBrokerEndpoint, parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
+import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -1801,6 +1810,396 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
+test("ending another session preserves an active brokered task", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "interruptible-slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const ownerEnv = {
+    ...buildEnv(binDir),
+    CODEX_COMPANION_SESSION_ID: "sess-owner"
+  };
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate the flaky worker timeout"], {
+    cwd: repo,
+    env: ownerEnv
+  });
+
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+  const stateDir = resolveStateDir(repo);
+  const runningJob = await waitFor(() => {
+    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+    const job = state.jobs.find((candidate) => candidate.id === jobId);
+    return job?.status === "running" && job.threadId && job.turnId ? job : null;
+  }, { timeoutMs: 15000 });
+  const brokerBefore = loadBrokerSession(repo);
+  assert.ok(brokerBefore?.pid);
+
+  t.after(() => {
+    for (const pid of [runningJob.pid, brokerBefore.pid]) {
+      try {
+        terminateProcessTree(pid);
+      } catch {}
+    }
+  });
+
+  const otherSessionEnd = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_COMPANION_SESSION_ID: "sess-other"
+    },
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      session_id: "sess-other",
+      cwd: repo
+    })
+  });
+
+  assert.equal(otherSessionEnd.status, 0, otherSessionEnd.stderr);
+  const brokerAfter = loadBrokerSession(repo);
+  assert.equal(brokerAfter?.pid, brokerBefore.pid);
+
+  const stateAfter = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(stateAfter.jobs.find((job) => job.id === jobId)?.status, "running");
+});
+
+test("session end preserves a broker that rejects shutdown while another client is connected", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    CODEX_COMPANION_SESSION_ID: ""
+  };
+  const taskResult = run("node", [SCRIPT, "task", "exercise the shared broker"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(taskResult.status, 0, taskResult.stderr);
+
+  const brokerSession = loadBrokerSession(repo);
+  assert.ok(brokerSession?.pid);
+  const client = net.createConnection({ path: parseBrokerEndpoint(brokerSession.endpoint).path });
+  await new Promise((resolve, reject) => {
+    client.once("connect", resolve);
+    client.once("error", reject);
+  });
+
+  t.after(() => {
+    client.destroy();
+    try {
+      terminateProcessTree(brokerSession.pid);
+    } catch {}
+  });
+
+  const busySessionEnd = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      session_id: "sess-exiting",
+      cwd: repo
+    })
+  });
+
+  assert.equal(busySessionEnd.status, 0, busySessionEnd.stderr);
+  assert.equal(loadBrokerSession(repo)?.pid, brokerSession.pid);
+  process.kill(brokerSession.pid, 0);
+
+  const clientClosed = new Promise((resolve) => client.once("close", resolve));
+  client.end();
+  await clientClosed;
+
+  const idleSessionEnd = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      session_id: "sess-exiting",
+      cwd: repo
+    })
+  });
+
+  assert.equal(idleSessionEnd.status, 0, idleSessionEnd.stderr);
+  assert.equal(isBrokerSessionActive(brokerSession), false);
+});
+
+test("accepted shutdown stops accepting new broker clients immediately", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "interruptible-slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = buildEnv(binDir);
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "leave an orphaned slow turn"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+
+  const { jobId } = JSON.parse(launched.stdout);
+  const stateDir = resolveStateDir(repo);
+  const runningJob = await waitFor(() => {
+    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+    const job = state.jobs.find((candidate) => candidate.id === jobId);
+    return job?.status === "running" && job.threadId && job.turnId ? job : null;
+  }, { timeoutMs: 15000 });
+  const brokerSession = loadBrokerSession(repo);
+  assert.ok(brokerSession?.pid);
+
+  let lateClient = null;
+  t.after(() => {
+    lateClient?.destroy();
+    for (const pid of [runningJob.pid, brokerSession.pid]) {
+      try {
+        terminateProcessTree(pid);
+      } catch {}
+    }
+  });
+
+  terminateProcessTree(runningJob.pid);
+  await waitFor(() => {
+    try {
+      process.kill(runningJob.pid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  });
+
+  await waitFor(async () => {
+    const outcome = await sendBrokerShutdown(brokerSession.endpoint, 200);
+    return outcome === "accepted";
+  });
+
+  lateClient = net.createConnection({ path: parseBrokerEndpoint(brokerSession.endpoint).path });
+  const protocolAccepted = await new Promise((resolve) => {
+    let settled = false;
+    let buffer = "";
+    const finish = (accepted) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      resolve(accepted);
+    };
+    const timer = setTimeout(() => {
+      lateClient.destroy();
+      finish(false);
+    }, 1000);
+    lateClient.once("connect", () => {
+      lateClient.write(`${JSON.stringify({ id: 99, method: "initialize", params: {} })}\n`);
+    });
+    lateClient.on("data", (chunk) => {
+      buffer += chunk;
+      if (buffer.includes("\n")) {
+        const response = JSON.parse(buffer.slice(0, buffer.indexOf("\n")));
+        finish(response.id === 99 && Boolean(response.result));
+      }
+    });
+    lateClient.once("error", () => {
+      finish(false);
+    });
+    lateClient.once("close", () => {
+      finish(false);
+    });
+  });
+
+  assert.equal(protocolAccepted, false);
+});
+
+test("task falls back to direct when the broker exits between readiness and initialize", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const brokerDir = makeTempDir("codex-one-shot-broker-");
+  const endpoint = createBrokerEndpoint(brokerDir);
+  const endpointPath = parseBrokerEndpoint(endpoint).path;
+  const readyFile = path.join(brokerDir, "ready");
+  const pidFile = path.join(brokerDir, "broker.pid");
+  const logFile = path.join(brokerDir, "broker.log");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const oneShotBroker = spawn(
+    process.execPath,
+    [
+      "-e",
+      `
+        const fs = require("node:fs");
+        const net = require("node:net");
+        const [endpointPath, readyFile] = process.argv.slice(1);
+        const server = net.createServer((socket) => {
+          server.close(() => process.exit(0));
+          if (process.platform !== "win32") {
+            fs.rmSync(endpointPath, { force: true });
+          }
+          socket.end();
+        });
+        server.listen(endpointPath, () => fs.writeFileSync(readyFile, "ready\\n", "utf8"));
+      `,
+      endpointPath,
+      readyFile
+    ],
+    {
+      cwd: repo,
+      stdio: "ignore"
+    }
+  );
+
+  t.after(() => {
+    try {
+      terminateProcessTree(oneShotBroker.pid);
+    } catch {}
+  });
+
+  await waitFor(() => fs.existsSync(readyFile));
+  fs.writeFileSync(pidFile, `${oneShotBroker.pid}\n`, "utf8");
+  fs.writeFileSync(logFile, "", "utf8");
+  saveBrokerSession(repo, {
+    endpoint,
+    pidFile,
+    logFile,
+    sessionDir: brokerDir,
+    pid: oneShotBroker.pid
+  });
+
+  const result = run("node", [SCRIPT, "task", "exercise broker connection fallback"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Handled the requested task/);
+});
+
+test("broker exits after remaining fully idle for the configured timeout", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS: "100"
+  };
+  delete env[BROKER_ENDPOINT_ENV];
+  const taskResult = run("node", [SCRIPT, "task", "exercise broker idle cleanup"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(taskResult.status, 0, taskResult.stderr);
+
+  const brokerSession = loadBrokerSession(repo);
+  assert.ok(brokerSession?.pid);
+  t.after(() => {
+    try {
+      terminateProcessTree(brokerSession.pid);
+    } catch {}
+  });
+
+  await waitFor(() => {
+    try {
+      process.kill(brokerSession.pid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  });
+
+  assert.equal(fs.existsSync(brokerSession.pidFile), false);
+  const target = parseBrokerEndpoint(brokerSession.endpoint);
+  if (target.kind === "unix") {
+    assert.equal(fs.existsSync(target.path), false);
+  }
+
+  const statusResult = run("node", [SCRIPT, "status", "--json"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(statusResult.status, 0, statusResult.stderr);
+
+  const reusedClient = await CodexAppServerClient.connect(repo, {
+    env,
+    reuseExistingBroker: true
+  });
+  t.after(async () => {
+    await reusedClient.close().catch(() => {});
+  });
+
+  assert.equal(loadBrokerSession(repo)?.pid, brokerSession.pid);
+  assert.equal(JSON.parse(statusResult.stdout).sessionRuntime.mode, "direct");
+  assert.equal(reusedClient.transport, "direct");
+});
+
+test("broker disconnect marks a background task failed", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "interruptible-slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    CODEX_COMPANION_SESSION_ID: "sess-owner"
+  };
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate the flaky worker timeout"], {
+    cwd: repo,
+    env
+  });
+
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+  const stateDir = resolveStateDir(repo);
+  const runningJob = await waitFor(() => {
+    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+    const job = state.jobs.find((candidate) => candidate.id === jobId);
+    return job?.status === "running" && job.threadId && job.turnId ? job : null;
+  }, { timeoutMs: 15000 });
+  const brokerSession = loadBrokerSession(repo);
+  assert.ok(brokerSession?.pid);
+
+  t.after(() => {
+    for (const pid of [runningJob.pid, brokerSession.pid]) {
+      try {
+        terminateProcessTree(pid);
+      } catch {}
+    }
+  });
+
+  terminateProcessTree(brokerSession.pid);
+
+  const failedJob = await waitFor(() => {
+    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+    const job = state.jobs.find((candidate) => candidate.id === jobId);
+    return job?.status === "failed" ? job : null;
+  }, { timeoutMs: 5000 });
+
+  assert.match(failedJob.errorMessage, /connection closed/i);
+  assert.equal(failedJob.pid, null);
+});
+
 test("session end fully cleans up jobs for the ending session", async (t) => {
   const repo = makeTempDir();
   initGitRepo(repo);
@@ -2238,19 +2637,27 @@ test("status reports shared session runtime when a lazy broker is active", () =>
 test("setup and status honor --cwd when reading shared session runtime", () => {
   const targetWorkspace = makeTempDir();
   const invocationWorkspace = makeTempDir();
+  const binDir = makeTempDir();
+  fs.symlinkSync(process.execPath, path.join(binDir, "node"));
+  const env = {
+    ...process.env,
+    PATH: binDir
+  };
 
   saveBrokerSession(targetWorkspace, {
     endpoint: "unix:/tmp/fake-broker.sock"
   });
 
   const status = run("node", [SCRIPT, "status", "--cwd", targetWorkspace], {
-    cwd: invocationWorkspace
+    cwd: invocationWorkspace,
+    env
   });
   assert.equal(status.status, 0, status.stderr);
   assert.match(status.stdout, /Session runtime: shared session/);
 
   const setup = run("node", [SCRIPT, "setup", "--cwd", targetWorkspace, "--json"], {
-    cwd: invocationWorkspace
+    cwd: invocationWorkspace,
+    env
   });
   assert.equal(setup.status, 0, setup.stderr);
   const payload = JSON.parse(setup.stdout);

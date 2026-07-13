@@ -40,8 +40,13 @@ import os from "node:os";
 import path from "node:path";
 
 import { readJsonFile } from "./fs.mjs";
-import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
-import { loadBrokerSession } from "./broker-lifecycle.mjs";
+import {
+  BROKER_BUSY_RPC_CODE,
+  BROKER_ENDPOINT_ENV,
+  CodexAppServerClient,
+  isBrokerTransportError
+} from "./app-server.mjs";
+import { isBrokerSessionActive, loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
@@ -603,7 +608,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       completeTurn(state, response.turn);
     }
 
-    return await state.completion;
+    return await Promise.race([state.completion, client.waitForExit()]);
   } finally {
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
@@ -618,10 +623,16 @@ async function withAppServer(cwd, fn) {
     await client.close();
     return result;
   } catch (error) {
-    const brokerRequested = client?.transport === "broker" || Boolean(process.env[BROKER_ENDPOINT_ENV]);
+    const brokerTransportError = isBrokerTransportError(error);
+    const brokerConnectionFailed =
+      brokerTransportError &&
+      (error?.code === "ENOENT" ||
+        error?.code === "ECONNREFUSED" ||
+        error?.code === "ECONNRESET" ||
+        error?.code === "EPIPE");
     const shouldRetryDirect =
       (client?.transport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE) ||
-      (brokerRequested && (error?.code === "ENOENT" || error?.code === "ECONNREFUSED"));
+      brokerConnectionFailed;
 
     if (client) {
       await client.close().catch(() => {});
@@ -904,7 +915,10 @@ export function getCodexAvailability(cwd) {
 }
 
 export function getSessionRuntimeStatus(env = process.env, cwd = process.cwd()) {
-  const endpoint = env?.[BROKER_ENDPOINT_ENV] ?? loadBrokerSession(cwd)?.endpoint ?? null;
+  const brokerSession = loadBrokerSession(cwd);
+  const endpoint =
+    env?.[BROKER_ENDPOINT_ENV] ??
+    (isBrokerSessionActive(brokerSession) ? brokerSession.endpoint : null);
   if (endpoint) {
     return {
       mode: "shared",

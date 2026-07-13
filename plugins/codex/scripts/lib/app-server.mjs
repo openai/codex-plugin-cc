@@ -1,5 +1,5 @@
 /**
- * @typedef {Error & { data?: unknown, rpcCode?: number }} ProtocolError
+ * @typedef {Error & { code?: string, codexTransport?: "broker", data?: unknown, rpcCode?: number }} ProtocolError
  * @typedef {import("./app-server-protocol").AppServerMethod} AppServerMethod
  * @typedef {import("./app-server-protocol").AppServerNotification} AppServerNotification
  * @typedef {import("./app-server-protocol").AppServerNotificationHandler} AppServerNotificationHandler
@@ -13,7 +13,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
+import { ensureBrokerSession, isBrokerSessionReady, loadBrokerSession } from "./broker-lifecycle.mjs";
 import { terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
@@ -52,6 +52,22 @@ function createProtocolError(message, data) {
     error.rpcCode = data.code;
   }
   return error;
+}
+
+function createBrokerConnectionClosedError() {
+  const error = /** @type {ProtocolError} */ (new Error("codex app-server connection closed."));
+  error.code = "ECONNRESET";
+  return error;
+}
+
+function markBrokerTransportError(error) {
+  const marked = /** @type {ProtocolError} */ (error instanceof Error ? error : new Error(String(error)));
+  marked.codexTransport = "broker";
+  return marked;
+}
+
+export function isBrokerTransportError(error) {
+  return error instanceof Error && /** @type {ProtocolError} */ (error).codexTransport === "broker";
 }
 
 class AppServerClientBase {
@@ -173,6 +189,11 @@ class AppServerClientBase {
     }
     this.pending.clear();
     this.resolveExit(undefined);
+  }
+
+  async waitForExit() {
+    await this.exitPromise;
+    throw this.exitError ?? new Error("codex app-server connection closed.");
   }
 
   sendMessage(_message) {
@@ -298,7 +319,7 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
         this.handleExit(error);
       });
       this.socket.on("close", () => {
-        this.handleExit(this.exitError);
+        this.handleExit(this.exitError ?? createBrokerConnectionClosedError());
       });
     });
 
@@ -338,7 +359,8 @@ export class CodexAppServerClient {
     if (!options.disableBroker) {
       brokerEndpoint = options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
       if (!brokerEndpoint && options.reuseExistingBroker) {
-        brokerEndpoint = loadBrokerSession(cwd)?.endpoint ?? null;
+        const brokerSession = loadBrokerSession(cwd);
+        brokerEndpoint = (await isBrokerSessionReady(brokerSession)) ? brokerSession.endpoint : null;
       }
       if (!brokerEndpoint && !options.reuseExistingBroker) {
         const brokerSession = await ensureBrokerSession(cwd, { env: options.env });
@@ -348,7 +370,14 @@ export class CodexAppServerClient {
     const client = brokerEndpoint
       ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
       : new SpawnedCodexAppServerClient(cwd, options);
-    await client.initialize();
+    try {
+      await client.initialize();
+    } catch (error) {
+      if (client.transport === "broker") {
+        throw markBrokerTransportError(error);
+      }
+      throw error;
+    }
     return client;
   }
 }

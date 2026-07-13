@@ -10,6 +10,8 @@ import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
+const BROKER_IDLE_TIMEOUT_ENV = "CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS";
+const DEFAULT_BROKER_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 
 function buildStreamThreadIds(method, params, result) {
   const threadIds = new Set();
@@ -45,6 +47,14 @@ function writePidFile(pidFile) {
   fs.writeFileSync(pidFile, `${process.pid}\n`, "utf8");
 }
 
+function resolveIdleTimeoutMs(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DEFAULT_BROKER_IDLE_TIMEOUT_MS;
+  }
+  return Math.max(1, Math.floor(parsed));
+}
+
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (subcommand !== "serve") {
@@ -70,6 +80,28 @@ async function main() {
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
   const sockets = new Set();
+  const idleTimeoutMs = resolveIdleTimeoutMs(process.env[BROKER_IDLE_TIMEOUT_ENV]);
+  let idleTimer = null;
+  let shutdownPromise = null;
+
+  function cancelIdleShutdown() {
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  }
+
+  function isFullyIdle() {
+    return sockets.size === 0 && !activeRequestSocket && !activeStreamSocket;
+  }
+
+  function isBusyForShutdown(requestingSocket) {
+    return Boolean(
+      activeRequestSocket ||
+        activeStreamSocket ||
+        [...sockets].some((socket) => socket !== requestingSocket)
+    );
+  }
 
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
@@ -99,23 +131,57 @@ async function main() {
     }
   }
 
-  async function shutdown(server) {
-    for (const socket of sockets) {
-      socket.end();
+  function shutdown(server) {
+    if (!shutdownPromise) {
+      shutdownPromise = (async () => {
+        cancelIdleShutdown();
+        const serverClosed = new Promise((resolve) => server.close(resolve));
+        if (listenTarget.kind === "unix") {
+          fs.rmSync(listenTarget.path, { force: true });
+        }
+        for (const socket of sockets) {
+          socket.end();
+        }
+        await appClient.close().catch(() => {});
+        await serverClosed;
+        if (pidFile) {
+          fs.rmSync(pidFile, { force: true });
+        }
+      })();
     }
-    await appClient.close().catch(() => {});
-    await new Promise((resolve) => server.close(resolve));
-    if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
-      fs.unlinkSync(listenTarget.path);
+    return shutdownPromise;
+  }
+
+  function scheduleIdleShutdown(server) {
+    cancelIdleShutdown();
+    if (!isFullyIdle() || shutdownPromise) {
+      return;
     }
-    if (pidFile && fs.existsSync(pidFile)) {
-      fs.unlinkSync(pidFile);
-    }
+
+    idleTimer = setTimeout(() => {
+      idleTimer = null;
+      if (!isFullyIdle() || shutdownPromise) {
+        return;
+      }
+      shutdown(server).then(
+        () => process.exit(0),
+        (error) => {
+          process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+          process.exit(1);
+        }
+      );
+    }, idleTimeoutMs);
+    idleTimer.unref?.();
   }
 
   appClient.setNotificationHandler(routeNotification);
 
   const server = net.createServer((socket) => {
+    if (shutdownPromise) {
+      socket.destroy();
+      return;
+    }
+    cancelIdleShutdown();
     sockets.add(socket);
     socket.setEncoding("utf8");
     let buffer = "";
@@ -158,6 +224,13 @@ async function main() {
         }
 
         if (message.id !== undefined && message.method === "broker/shutdown") {
+          if (isBusyForShutdown(socket)) {
+            send(socket, {
+              id: message.id,
+              error: buildJsonRpcError(BROKER_BUSY_RPC_CODE, "Shared Codex broker is busy.")
+            });
+            continue;
+          }
           send(socket, { id: message.id, result: {} });
           await shutdown(server);
           process.exit(0);
@@ -222,15 +295,15 @@ async function main() {
       }
     });
 
-    socket.on("close", () => {
-      sockets.delete(socket);
+    const releaseSocket = () => {
+      const removed = sockets.delete(socket);
       clearSocketOwnership(socket);
-    });
-
-    socket.on("error", () => {
-      sockets.delete(socket);
-      clearSocketOwnership(socket);
-    });
+      if (removed) {
+        scheduleIdleShutdown(server);
+      }
+    };
+    socket.on("close", releaseSocket);
+    socket.on("error", releaseSocket);
   });
 
   process.on("SIGTERM", async () => {
@@ -243,6 +316,7 @@ async function main() {
     process.exit(0);
   });
 
+  server.on("listening", () => scheduleIdleShutdown(server));
   server.listen(listenTarget.path);
 }
 

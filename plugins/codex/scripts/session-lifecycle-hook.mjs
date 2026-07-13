@@ -6,7 +6,7 @@ import process from "node:process";
 import { terminateProcessTree } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
-  clearBrokerSession,
+  BROKER_SHUTDOWN_ACCEPTED,
   LOG_FILE_ENV,
   loadBrokerSession,
   PID_FILE_ENV,
@@ -74,6 +74,20 @@ function cleanupSessionJobs(cwd, sessionId) {
   });
 }
 
+function hasActiveJobFromAnotherSession(cwd, sessionId) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const stateFile = resolveStateFile(workspaceRoot);
+  if (!fs.existsSync(stateFile)) {
+    return false;
+  }
+
+  return loadState(workspaceRoot).jobs.some(
+    (job) =>
+      (job.status === "queued" || job.status === "running") &&
+      (!sessionId || !job.sessionId || job.sessionId !== sessionId)
+  );
+}
+
 function handleSessionStart(input) {
   appendEnvVar(SESSION_ID_ENV, input.session_id);
   appendEnvVar(TRANSCRIPT_PATH_ENV, input.transcript_path);
@@ -82,6 +96,7 @@ function handleSessionStart(input) {
 
 async function handleSessionEnd(input) {
   const cwd = input.cwd || process.cwd();
+  const sessionId = input.session_id || process.env[SESSION_ID_ENV] || null;
   const brokerSession =
     loadBrokerSession(cwd) ??
     (process.env[BROKER_ENDPOINT_ENV]
@@ -92,25 +107,24 @@ async function handleSessionEnd(input) {
         }
       : null);
   const brokerEndpoint = brokerSession?.endpoint ?? null;
-  const pidFile = brokerSession?.pidFile ?? null;
-  const logFile = brokerSession?.logFile ?? null;
-  const sessionDir = brokerSession?.sessionDir ?? null;
-  const pid = brokerSession?.pid ?? null;
 
-  if (brokerEndpoint) {
-    await sendBrokerShutdown(brokerEndpoint);
+  cleanupSessionJobs(cwd, sessionId);
+  if (!brokerEndpoint || hasActiveJobFromAnotherSession(cwd, sessionId)) {
+    return;
   }
 
-  cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
+  const shutdownOutcome = await sendBrokerShutdown(brokerEndpoint);
+  if (shutdownOutcome !== BROKER_SHUTDOWN_ACCEPTED) {
+    return;
+  }
+
+  // A new broker may replace broker.json after the old listener closes.
+  // Remove only resources captured from the broker that accepted shutdown.
   teardownBrokerSession({
+    ...brokerSession,
     endpoint: brokerEndpoint,
-    pidFile,
-    logFile,
-    sessionDir,
-    pid,
     killProcess: terminateProcessTree
   });
-  clearBrokerSession(cwd);
 }
 
 async function main() {
