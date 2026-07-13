@@ -653,6 +653,9 @@ export function buildEnv(binDir) {
   const sep = process.platform === "win32" ? ";" : ":";
   return {
     ...process.env,
-    PATH: `${binDir}${sep}${process.env.PATH}`
+    PATH: `${binDir}${sep}${process.env.PATH}`,
+    // Production keeps an idle broker warm for 15 minutes. Tests only need a
+    // brief reuse window and should not leave dozens of detached helpers.
+    CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS: "2000"
   };
 }
