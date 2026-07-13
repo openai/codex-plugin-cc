@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -26,18 +27,38 @@ function defaultState() {
   };
 }
 
+function resolveRepositoryIdentity(workspaceRoot) {
+  try {
+    const commonDir = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
+      cwd: workspaceRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    }).trim();
+    const mainWorktree = execFileSync("git", ["--git-dir", commonDir, "worktree", "list", "--porcelain"], {
+      cwd: workspaceRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    }).match(/^worktree (.+)$/m)?.[1];
+    return mainWorktree ?? commonDir;
+  } catch {
+    return null;
+  }
+}
+
 export function resolveStateDir(cwd) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  let canonicalWorkspaceRoot = workspaceRoot;
+  const repositoryIdentity = resolveRepositoryIdentity(workspaceRoot);
+  const stateIdentity = repositoryIdentity ?? workspaceRoot;
+  let canonicalStateIdentity = stateIdentity;
   try {
-    canonicalWorkspaceRoot = fs.realpathSync.native(workspaceRoot);
+    canonicalStateIdentity = fs.realpathSync.native(stateIdentity);
   } catch {
-    canonicalWorkspaceRoot = workspaceRoot;
+    canonicalStateIdentity = stateIdentity;
   }
 
-  const slugSource = path.basename(workspaceRoot) || "workspace";
+  const slugSource = path.basename(stateIdentity) || "workspace";
   const slug = slugSource.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
-  const hash = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex").slice(0, 16);
+  const hash = createHash("sha256").update(canonicalStateIdentity).digest("hex").slice(0, 16);
   const pluginDataDir = process.env[PLUGIN_DATA_ENV];
   const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
   return path.join(stateRoot, `${slug}-${hash}`);
