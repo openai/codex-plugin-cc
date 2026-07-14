@@ -54,7 +54,7 @@ function createProtocolError(message, data) {
   return error;
 }
 
-class AppServerClientBase {
+export class AppServerClientBase {
   constructor(cwd, options = {}) {
     this.cwd = cwd;
     this.options = options;
@@ -154,6 +154,20 @@ class AppServerClientBase {
   }
 
   handleServerRequest(message) {
+    // MCP servers (e.g. ChatGPT connectors surfaced as `codex_apps`) request the
+    // operator's consent via an elicitation, which app-server delivers as a
+    // server->client request. This client runs Codex non-interactively, so there
+    // is no human to answer it; blanket-rejecting every server request with
+    // -32601 makes those tool calls fail ("user rejected MCP tool call") on the
+    // background runner and hang on `codex exec` / `codex mcp-server`. Accept the
+    // elicitation so connectors the operator has already enabled can run.
+    if (message.method === "mcpServer/elicitation/request") {
+      this.sendMessage({
+        id: message.id,
+        result: { action: "accept", content: null, _meta: null }
+      });
+      return;
+    }
     this.sendMessage({
       id: message.id,
       error: buildJsonRpcError(-32601, `Unsupported server request: ${message.method}`)
