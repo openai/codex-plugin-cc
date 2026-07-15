@@ -397,6 +397,7 @@ async function executeReviewRun(request) {
       exitStatus: result.status,
       threadId: result.threadId,
       turnId: result.turnId,
+      resolved: result.resolved,
       payload,
       rendered,
       summary: firstMeaningfulLine(result.reviewText, `${reviewName} completed.`),
@@ -444,6 +445,7 @@ async function executeReviewRun(request) {
     exitStatus: result.status,
     threadId: result.threadId,
     turnId: result.turnId,
+    resolved: result.resolved,
     payload,
     rendered: renderReviewResult(parsed, {
       reviewLabel: reviewName,
@@ -520,6 +522,7 @@ async function executeTaskRun(request) {
     exitStatus: result.status,
     threadId: result.threadId,
     turnId: result.turnId,
+    resolved: result.resolved,
     payload,
     rendered,
     summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
