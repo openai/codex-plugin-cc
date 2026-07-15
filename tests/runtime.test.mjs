@@ -8,7 +8,12 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import {
+  resolveCancelableJob,
+  settleCancellationAfterTermination
+} from "../plugins/codex/scripts/lib/job-control.mjs";
+import { resolveStateDir, upsertJob, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
+import { runTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -191,6 +196,45 @@ test("task runs without auth preflight so Codex can refresh an expired session",
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Handled the requested task/);
+});
+
+test("task uses an explicit workspace cwd from an unrelated invocation directory", () => {
+  const repo = makeTempDir();
+  const invocationDir = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "-C", repo, "inspect the target workspace"], {
+    cwd: invocationDir,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.equal(path.resolve(fakeState.threads[0].cwd), path.resolve(repo));
+});
+
+test("task rejects a nonexistent explicit workspace cwd", () => {
+  const invocationDir = makeTempDir();
+  const missingDir = path.join(invocationDir, "missing-workspace");
+  const result = run("node", [SCRIPT, "task", "--cwd", missingDir, "inspect the target workspace"], {
+    cwd: invocationDir
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Task workspace directory does not exist/);
+});
+
+test("command help documents the task cwd option", () => {
+  const result = run("node", [SCRIPT, "--help"], { cwd: ROOT });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /task \[--background\].*\[--cwd <dir>\]/);
 });
 
 test("transfer delegates the current Claude session directly to native import", () => {
@@ -503,8 +547,9 @@ test("task --resume-last resumes the latest persisted task thread", () => {
   assert.equal(result.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
 });
 
-test("task-resume-candidate returns the latest rescue thread from the current session", () => {
+test("task-resume-candidate uses an explicit workspace cwd from an unrelated invocation directory", () => {
   const workspace = makeTempDir();
+  const invocationDir = makeTempDir();
   const stateDir = resolveStateDir(workspace);
   const jobsDir = path.join(stateDir, "jobs");
   fs.mkdirSync(jobsDir, { recursive: true });
@@ -554,8 +599,8 @@ test("task-resume-candidate returns the latest rescue thread from the current se
     "utf8"
   );
 
-  const result = run("node", [SCRIPT, "task-resume-candidate", "--json"], {
-    cwd: workspace,
+  const result = run("node", [SCRIPT, "task-resume-candidate", "-C", workspace, "--json"], {
+    cwd: invocationDir,
     env: {
       ...process.env,
       CODEX_COMPANION_SESSION_ID: "sess-current"
@@ -568,6 +613,17 @@ test("task-resume-candidate returns the latest rescue thread from the current se
   assert.equal(payload.sessionId, "sess-current");
   assert.equal(payload.candidate.id, "task-current");
   assert.equal(payload.candidate.threadId, "thr_current");
+});
+
+test("task-resume-candidate rejects a nonexistent explicit workspace cwd", () => {
+  const invocationDir = makeTempDir();
+  const missingDir = path.join(invocationDir, "missing-workspace");
+  const result = run("node", [SCRIPT, "task-resume-candidate", "--cwd", missingDir, "--json"], {
+    cwd: invocationDir
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Task workspace directory does not exist/);
 });
 
 test("task --resume-last does not resume a task from another Claude session", () => {
@@ -1352,6 +1408,67 @@ test("status --wait times out cleanly when a job is still active", () => {
   assert.equal(payload.waitTimedOut, true);
 });
 
+test("status and resume candidates mark a running job with a dead pid as failed", async () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const exitedWorker = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  const deadPid = exitedWorker.pid;
+  await new Promise((resolve, reject) => {
+    exitedWorker.once("error", reject);
+    exitedWorker.once("exit", resolve);
+  });
+
+  const jobId = "task-stale";
+  const logFile = path.join(jobsDir, `${jobId}.log`);
+  const jobFile = path.join(jobsDir, `${jobId}.json`);
+  const staleJob = {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    title: "Codex Task",
+    jobClass: "task",
+    sessionId: "sess-stale",
+    threadId: "thr_stale",
+    summary: "Investigate flaky test",
+    pid: deadPid,
+    logFile,
+    createdAt: "2026-03-18T15:30:00.000Z",
+    startedAt: "2026-03-18T15:30:01.000Z",
+    updatedAt: "2026-03-18T15:30:02.000Z"
+  };
+  fs.writeFileSync(logFile, "[2026-03-18T15:30:00.000Z] Starting Codex Task.\n", "utf8");
+  fs.writeFileSync(jobFile, `${JSON.stringify(staleJob, null, 2)}\n`, "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [staleJob] }, null, 2)}\n`,
+    "utf8"
+  );
+
+  const env = { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-stale" };
+  const candidateResult = run("node", [SCRIPT, "task-resume-candidate", "--json"], { cwd: workspace, env });
+  assert.equal(candidateResult.status, 0, candidateResult.stderr);
+  const candidate = JSON.parse(candidateResult.stdout);
+  assert.equal(candidate.available, true);
+  assert.equal(candidate.candidate.status, "failed");
+
+  const statusResult = run("node", [SCRIPT, "status", "--json"], { cwd: workspace, env });
+  assert.equal(statusResult.status, 0, statusResult.stderr);
+  const status = JSON.parse(statusResult.stdout);
+  assert.deepEqual(status.running, []);
+  assert.equal(status.latestFinished.status, "failed");
+  assert.equal(status.latestFinished.errorMessage, "Process exited without reporting.");
+
+  const persistedState = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(persistedState.jobs[0].status, "failed");
+  assert.equal(persistedState.jobs[0].pid, null);
+  const persistedJob = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  assert.equal(persistedJob.status, "failed");
+  assert.equal(persistedJob.errorMessage, "Process exited without reporting.");
+});
+
 test("result returns the stored output for the latest finished job by default", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
@@ -1632,6 +1749,229 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
   const stored = JSON.parse(fs.readFileSync(jobFile, "utf8"));
   assert.equal(stored.status, "cancelled");
   assert.match(fs.readFileSync(logFile, "utf8"), /Cancelled by user/);
+});
+
+test("failed cancellation restores a live job so cancellation can be retried", () => {
+  const workspace = makeTempDir();
+  const job = {
+    id: "task-cancel-failed-live",
+    status: "running",
+    phase: "investigating",
+    title: "Codex Task",
+    jobClass: "task",
+    pid: process.pid
+  };
+  const existing = {
+    ...job,
+    request: {
+      cwd: workspace,
+      prompt: "Investigate the flaky test"
+    }
+  };
+  const completedAt = "2026-03-18T15:31:00.000Z";
+
+  writeJobFile(workspace, job.id, {
+    ...existing,
+    status: "cancelled",
+    phase: "cancelled",
+    completedAt,
+    cancelledAt: completedAt,
+    errorMessage: "Cancelled by user."
+  });
+  upsertJob(workspace, {
+    ...job,
+    status: "cancelled",
+    phase: "cancelled",
+    completedAt,
+    errorMessage: "Cancelled by user."
+  });
+
+  const terminationError = new Error("Access is denied.");
+  const outcome = settleCancellationAfterTermination(
+    workspace,
+    job,
+    existing,
+    null,
+    terminationError,
+    { isProcessAliveImpl: () => true }
+  );
+
+  assert.equal(outcome.processStopped, false);
+  assert.equal(outcome.error, terminationError);
+  assert.equal(outcome.job.status, "running");
+  assert.equal(outcome.job.pid, process.pid);
+  assert.match(outcome.job.errorMessage, /retry \/codex:cancel/i);
+
+  const retryable = resolveCancelableJob(workspace, job.id);
+  assert.equal(retryable.job.status, "running");
+  assert.equal(retryable.job.pid, process.pid);
+
+  const stored = JSON.parse(
+    fs.readFileSync(path.join(resolveStateDir(workspace), "jobs", `${job.id}.json`), "utf8")
+  );
+  assert.equal(stored.status, "running");
+  assert.equal(stored.phase, "investigating");
+  assert.equal(stored.pid, process.pid);
+  assert.equal("completedAt" in stored, false);
+  assert.equal("cancelledAt" in stored, false);
+  assert.match(stored.errorMessage, /retry \/codex:cancel/i);
+});
+
+test("failed cancellation remains cancelled when the process is already dead", () => {
+  const workspace = makeTempDir();
+  const job = {
+    id: "task-cancel-failed-dead",
+    status: "running",
+    phase: "investigating",
+    title: "Codex Task",
+    jobClass: "task",
+    pid: 999999
+  };
+  const existing = { ...job };
+  const completedAt = "2026-03-18T15:31:00.000Z";
+  const cancelledJob = {
+    ...job,
+    status: "cancelled",
+    phase: "cancelled",
+    completedAt,
+    errorMessage: "Cancelled by user."
+  };
+
+  writeJobFile(workspace, job.id, {
+    ...cancelledJob,
+    cancelledAt: completedAt
+  });
+  upsertJob(workspace, cancelledJob);
+
+  const outcome = settleCancellationAfterTermination(
+    workspace,
+    job,
+    existing,
+    { attempted: true, delivered: false, method: "taskkill" },
+    null,
+    { isProcessAliveImpl: () => false }
+  );
+
+  assert.equal(outcome.processStopped, true);
+  assert.equal(outcome.error, null);
+
+  const state = JSON.parse(fs.readFileSync(path.join(resolveStateDir(workspace), "state.json"), "utf8"));
+  assert.equal(state.jobs[0].status, "cancelled");
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(resolveStateDir(workspace), "jobs", `${job.id}.json`), "utf8")).status,
+    "cancelled"
+  );
+});
+
+test("cancelled queued jobs remain stored and are skipped by a late worker", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const jobId = "task-queued";
+  const logFile = path.join(jobsDir, `${jobId}.log`);
+  const jobFile = path.join(jobsDir, `${jobId}.json`);
+  const queuedJob = {
+    id: jobId,
+    status: "queued",
+    phase: "queued",
+    title: "Codex Task",
+    jobClass: "task",
+    summary: "Investigate flaky test",
+    pid: null,
+    logFile,
+    request: {
+      cwd: workspace,
+      model: null,
+      effort: null,
+      prompt: "Investigate the flaky test",
+      write: false,
+      resumeLast: false,
+      jobId
+    },
+    createdAt: "2026-03-18T15:30:00.000Z",
+    updatedAt: "2026-03-18T15:30:00.000Z"
+  };
+  fs.writeFileSync(logFile, "[2026-03-18T15:30:00.000Z] Queued for background execution.\n", "utf8");
+  fs.writeFileSync(jobFile, `${JSON.stringify(queuedJob, null, 2)}\n`, "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [queuedJob] }, null, 2)}\n`,
+    "utf8"
+  );
+
+  const cancel = run("node", [SCRIPT, "cancel", jobId, "--json"], { cwd: workspace });
+  assert.equal(cancel.status, 0, cancel.stderr);
+  assert.equal(JSON.parse(cancel.stdout).status, "cancelled");
+  assert.equal(fs.existsSync(jobFile), true);
+
+  const worker = run("node", [SCRIPT, "task-worker", "--cwd", workspace, "--job-id", jobId], {
+    cwd: workspace
+  });
+  assert.equal(worker.status, 0, worker.stderr);
+
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(state.jobs[0].status, "cancelled");
+  assert.equal(JSON.parse(fs.readFileSync(jobFile, "utf8")).status, "cancelled");
+});
+
+test("tracked jobs preserve cancellation observed during execution", async () => {
+  const workspace = makeTempDir();
+  const jobId = "task-cancel-race";
+  const stateDir = resolveStateDir(workspace);
+  const logFile = path.join(stateDir, "jobs", `${jobId}.log`);
+  const job = {
+    id: jobId,
+    status: "queued",
+    title: "Codex Task",
+    workspaceRoot: workspace,
+    jobClass: "task",
+    summary: "Investigate flaky test",
+    logFile
+  };
+  fs.mkdirSync(path.dirname(logFile), { recursive: true });
+  fs.writeFileSync(logFile, "", "utf8");
+  writeJobFile(workspace, jobId, job);
+  upsertJob(workspace, job);
+
+  const execution = await runTrackedJob(
+    job,
+    async () => {
+      const cancelledAt = new Date().toISOString();
+      const runningJob = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${jobId}.json`), "utf8"));
+      writeJobFile(workspace, jobId, {
+        ...runningJob,
+        status: "cancelled",
+        phase: "cancelled",
+        pid: null,
+        completedAt: cancelledAt,
+        errorMessage: "Cancelled by user."
+      });
+      upsertJob(workspace, {
+        id: jobId,
+        status: "cancelled",
+        phase: "cancelled",
+        pid: null,
+        completedAt: cancelledAt,
+        errorMessage: "Cancelled by user."
+      });
+      return {
+        exitStatus: 0,
+        threadId: "thr_cancelled",
+        turnId: "turn_cancelled",
+        payload: { status: 0 },
+        rendered: "should not replace cancellation",
+        summary: "Should not replace cancellation"
+      };
+    },
+    { logFile }
+  );
+
+  assert.equal(execution.payload.status, "cancelled");
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(state.jobs[0].status, "cancelled");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${jobId}.json`), "utf8")).status, "cancelled");
 });
 
 test("cancel without a job id ignores active jobs from other Claude sessions", () => {

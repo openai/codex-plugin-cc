@@ -139,20 +139,55 @@ function readStoredJobOrNull(workspaceRoot, jobId) {
   return readJobFile(jobFile);
 }
 
+function stopTrackedJobIfCancelled(job, logFile) {
+  const storedJob = readStoredJobOrNull(job.workspaceRoot, job.id);
+  if (storedJob?.status !== "cancelled") {
+    return null;
+  }
+
+  upsertJob(job.workspaceRoot, {
+    id: job.id,
+    status: "cancelled",
+    phase: "cancelled",
+    pid: storedJob.pid ?? null,
+    errorMessage: storedJob.errorMessage ?? "Cancelled by user.",
+    completedAt: storedJob.completedAt ?? nowIso()
+  });
+  appendLogLine(logFile, "Stopped after cancellation.");
+  return {
+    exitStatus: 0,
+    threadId: storedJob.threadId ?? null,
+    turnId: storedJob.turnId ?? null,
+    payload: { status: "cancelled" },
+    rendered: "",
+    summary: storedJob.summary ?? "Cancelled by user."
+  };
+}
+
 export async function runTrackedJob(job, runner, options = {}) {
+  const logFile = options.logFile ?? job.logFile ?? null;
+  const cancelledBeforeStart = stopTrackedJobIfCancelled(job, logFile);
+  if (cancelledBeforeStart) {
+    return cancelledBeforeStart;
+  }
+
   const runningRecord = {
     ...job,
     status: "running",
     startedAt: nowIso(),
     phase: "starting",
     pid: process.pid,
-    logFile: options.logFile ?? job.logFile ?? null
+    logFile
   };
   writeJobFile(job.workspaceRoot, job.id, runningRecord);
   upsertJob(job.workspaceRoot, runningRecord);
 
   try {
     const execution = await runner();
+    const cancelledDuringRun = stopTrackedJobIfCancelled(job, logFile);
+    if (cancelledDuringRun) {
+      return cancelledDuringRun;
+    }
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
     writeJobFile(job.workspaceRoot, job.id, {
@@ -179,6 +214,10 @@ export async function runTrackedJob(job, runner, options = {}) {
     appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
     return execution;
   } catch (error) {
+    const cancelledDuringRun = stopTrackedJobIfCancelled(job, logFile);
+    if (cancelledDuringRun) {
+      return cancelledDuringRun;
+    }
     const errorMessage = error instanceof Error ? error.message : String(error);
     const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
     const completedAt = nowIso();

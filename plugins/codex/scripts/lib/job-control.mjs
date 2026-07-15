@@ -1,12 +1,15 @@
 import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
+import { isProcessAlive } from "./process.mjs";
+import { getConfig, listJobs, readJobFile, resolveJobFile, upsertJob, writeJobFile } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
 export const DEFAULT_MAX_PROGRESS_LINES = 4;
+export const CANCELLATION_TERMINATION_FAILED_MESSAGE =
+  "Cancellation requested but process termination failed; retry /codex:cancel.";
 
 export function sortJobsNewestFirst(jobs) {
   return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
@@ -186,6 +189,48 @@ export function readStoredJob(workspaceRoot, jobId) {
     return null;
   }
   return readJobFile(jobFile);
+}
+
+export function settleCancellationAfterTermination(
+  workspaceRoot,
+  job,
+  existing,
+  termination,
+  terminationError = null,
+  options = {}
+) {
+  const terminationFailed = Boolean(terminationError) || termination?.delivered !== true;
+  const pid = job.pid ?? null;
+  const isProcessAliveImpl = options.isProcessAliveImpl ?? isProcessAlive;
+
+  if (!terminationFailed || !Number.isInteger(pid) || pid <= 0 || !isProcessAliveImpl(pid)) {
+    return { processStopped: true, job: null, error: null };
+  }
+
+  const restoredJob = {
+    ...existing,
+    ...job,
+    status: job.status,
+    phase: job.phase ?? existing.phase ?? job.status,
+    pid,
+    errorMessage: CANCELLATION_TERMINATION_FAILED_MESSAGE
+  };
+  writeJobFile(workspaceRoot, job.id, restoredJob);
+  upsertJob(workspaceRoot, {
+    ...job,
+    status: job.status,
+    phase: restoredJob.phase,
+    pid,
+    completedAt: job.completedAt ?? null,
+    cancelledAt: job.cancelledAt ?? null,
+    errorMessage: CANCELLATION_TERMINATION_FAILED_MESSAGE
+  });
+
+  return {
+    processStopped: false,
+    job: restoredJob,
+    error: terminationError ?? new Error(CANCELLATION_TERMINATION_FAILED_MESSAGE)
+  };
 }
 
 function matchJobReference(jobs, reference, predicate = () => true) {

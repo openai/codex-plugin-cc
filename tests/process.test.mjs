@@ -7,8 +7,8 @@ test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;
   const outcome = terminateProcessTree(1234, {
     platform: "win32",
-    runCommandImpl(command, args) {
-      captured = { command, args };
+    runCommandImpl(command, args, options) {
+      captured = { command, args, options };
       return {
         command,
         args,
@@ -26,7 +26,12 @@ test("terminateProcessTree uses taskkill on Windows", () => {
 
   assert.deepEqual(captured, {
     command: "taskkill",
-    args: ["/PID", "1234", "/T", "/F"]
+    args: ["/PID", "1234", "/T", "/F"],
+    options: {
+      cwd: undefined,
+      env: undefined,
+      shell: false
+    }
   });
   assert.equal(outcome.delivered, true);
   assert.equal(outcome.method, "taskkill");
@@ -52,4 +57,30 @@ test("terminateProcessTree treats missing Windows processes as already stopped",
   assert.equal(outcome.method, "taskkill");
   assert.equal(outcome.result.status, 128);
   assert.match(outcome.result.stdout, /not found/i);
+});
+
+test("terminateProcessTree recognizes a missing Windows process with localized output", () => {
+  const outcome = terminateProcessTree(1234, {
+    platform: "win32",
+    runCommandImpl(command, args) {
+      return {
+        command,
+        args,
+        status: 128,
+        signal: null,
+        stdout: "Localized taskkill error.",
+        stderr: "",
+        error: null
+      };
+    },
+    killImpl() {
+      const error = new Error("No such process");
+      error.code = "ESRCH";
+      throw error;
+    }
+  });
+
+  assert.equal(outcome.attempted, true);
+  assert.equal(outcome.delivered, false);
+  assert.equal(outcome.method, "taskkill");
 });

@@ -40,6 +40,7 @@ import {
   readStoredJob,
   resolveCancelableJob,
   resolveResultJob,
+  settleCancellationAfterTermination,
   sortJobsNewestFirst
 } from "./lib/job-control.mjs";
 import {
@@ -68,6 +69,7 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
+const TASK_WORKER_RECORD_WAIT_TIMEOUT_MS = 1000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
@@ -79,7 +81,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--cwd <dir>] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -156,8 +158,39 @@ function resolveCommandWorkspace(options = {}) {
   return resolveWorkspaceRoot(resolveCommandCwd(options));
 }
 
+function resolveTaskCwd(options = {}) {
+  const cwd = resolveCommandCwd(options);
+  if (!options.cwd) {
+    return cwd;
+  }
+
+  let stats;
+  try {
+    stats = fs.statSync(cwd);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw new Error(`Task workspace directory does not exist: ${cwd}`);
+    }
+    throw error;
+  }
+  if (!stats.isDirectory()) {
+    throw new Error(`Task workspace path is not a directory: ${cwd}`);
+  }
+  return cwd;
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForStoredJob(workspaceRoot, jobId) {
+  const deadline = Date.now() + TASK_WORKER_RECORD_WAIT_TIMEOUT_MS;
+  let storedJob = readStoredJob(workspaceRoot, jobId);
+  while (!storedJob && Date.now() < deadline) {
+    await sleep(25);
+    storedJob = readStoredJob(workspaceRoot, jobId);
+  }
+  return storedJob;
 }
 
 function shorten(text, limit = 96) {
@@ -768,7 +801,7 @@ async function handleTask(argv) {
     }
   });
 
-  const cwd = resolveCommandCwd(options);
+  const cwd = resolveTaskCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const model = normalizeRequestedModel(options.model);
   const effort = normalizeReasoningEffort(options.effort);
@@ -846,9 +879,13 @@ async function handleTaskWorker(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
+  const storedJob = await waitForStoredJob(workspaceRoot, options["job-id"]);
   if (!storedJob) {
-    throw new Error(`No stored job found for ${options["job-id"]}.`);
+    return;
+  }
+  if (storedJob.status === "cancelled") {
+    appendLogLine(storedJob.logFile, "Skipped cancelled background job.");
+    return;
   }
 
   const request = storedJob.request;
@@ -931,8 +968,8 @@ function handleTaskResumeCandidate(argv) {
     booleanOptions: ["json"]
   });
 
-  const cwd = resolveCommandCwd(options);
-  const workspaceRoot = resolveCommandWorkspace(options);
+  const cwd = resolveTaskCwd(options);
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
   const sessionId = getCurrentClaudeSessionId();
   const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
   const candidate = findLatestResumableTaskJob(jobs);
@@ -972,6 +1009,34 @@ async function handleCancel(argv) {
   const existing = readStoredJob(workspaceRoot, job.id) ?? {};
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
+  const completedAt = nowIso();
+  const cancellingJob = {
+    ...job,
+    status: "cancelled",
+    phase: "cancelled",
+    completedAt,
+    errorMessage: "Cancelled by user."
+  };
+  const persistCancellation = (pid) => {
+    const cancelledJob = { ...cancellingJob, pid };
+    writeJobFile(workspaceRoot, job.id, {
+      ...existing,
+      ...cancelledJob,
+      cancelledAt: completedAt
+    });
+    upsertJob(workspaceRoot, {
+      id: job.id,
+      status: "cancelled",
+      phase: "cancelled",
+      pid,
+      errorMessage: "Cancelled by user.",
+      completedAt
+    });
+    return cancelledJob;
+  };
+
+  persistCancellation(job.pid ?? null);
+  appendLogLine(job.logFile, "Cancelled by user.");
 
   const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
   if (interrupt.attempted) {
@@ -983,32 +1048,27 @@ async function handleCancel(argv) {
     );
   }
 
-  terminateProcessTree(job.pid ?? Number.NaN);
-  appendLogLine(job.logFile, "Cancelled by user.");
+  let termination = null;
+  let terminationError = null;
+  try {
+    termination = terminateProcessTree(job.pid ?? Number.NaN);
+  } catch (error) {
+    terminationError = error;
+  }
 
-  const completedAt = nowIso();
-  const nextJob = {
-    ...job,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    completedAt,
-    errorMessage: "Cancelled by user."
-  };
+  const outcome = settleCancellationAfterTermination(
+    workspaceRoot,
+    job,
+    existing,
+    termination,
+    terminationError
+  );
+  if (!outcome.processStopped) {
+    appendLogLine(job.logFile, outcome.job.errorMessage);
+    throw outcome.error;
+  }
 
-  writeJobFile(workspaceRoot, job.id, {
-    ...existing,
-    ...nextJob,
-    cancelledAt: completedAt
-  });
-  upsertJob(workspaceRoot, {
-    id: job.id,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    errorMessage: "Cancelled by user.",
-    completedAt
-  });
+  const nextJob = persistCancellation(null);
 
   const payload = {
     jobId: job.id,

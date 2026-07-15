@@ -73,21 +73,29 @@ export function parseArgs(argv, config = {}) {
   return { options, positionals };
 }
 
-export function splitRawArgumentString(raw) {
+function parseRawArgumentString(raw, literalClosingQuoteBackslash) {
   const tokens = [];
   let current = "";
   let quote = null;
-  let escaping = false;
 
-  for (const character of raw) {
-    if (escaping) {
-      current += character;
-      escaping = false;
-      continue;
-    }
+  for (let index = 0; index < raw.length; index += 1) {
+    const character = raw[index];
 
     if (character === "\\") {
-      escaping = true;
+      const nextCharacter = raw[index + 1];
+      if (literalClosingQuoteBackslash && quote !== null && nextCharacter === quote) {
+        current += character;
+        continue;
+      }
+      if (
+        nextCharacter !== undefined &&
+        (nextCharacter === "'" || nextCharacter === "\"" || nextCharacter === "\\" || /\s/.test(nextCharacter))
+      ) {
+        current += nextCharacter;
+        index += 1;
+      } else {
+        current += character;
+      }
       continue;
     }
 
@@ -116,13 +124,18 @@ export function splitRawArgumentString(raw) {
     current += character;
   }
 
-  if (escaping) {
-    current += "\\";
-  }
-
   if (current) {
     tokens.push(current);
   }
 
-  return tokens;
+  return { tokens, openQuote: quote };
+}
+
+export function splitRawArgumentString(raw) {
+  const escapePreferred = parseRawArgumentString(raw, false);
+  if (escapePreferred.openQuote === null) {
+    return escapePreferred.tokens;
+  }
+
+  return parseRawArgumentString(raw, true).tokens;
 }

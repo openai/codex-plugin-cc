@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { isProcessAlive } from "./process.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
@@ -11,6 +12,7 @@ const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
+const UNREPORTED_PROCESS_EXIT_MESSAGE = "Process exited without reporting.";
 
 function nowIso() {
   return new Date().toISOString();
@@ -146,8 +148,56 @@ export function upsertJob(cwd, jobPatch) {
   });
 }
 
+function reconcileRunningJobs(cwd, state) {
+  const completedAt = nowIso();
+  const staleJobs = [];
+  const jobs = state.jobs.map((job) => {
+    if (job.status !== "running" || !Number.isInteger(job.pid) || job.pid <= 0 || isProcessAlive(job.pid)) {
+      return job;
+    }
+
+    const failedJob = {
+      ...job,
+      status: "failed",
+      phase: "failed",
+      pid: null,
+      completedAt,
+      updatedAt: completedAt,
+      errorMessage: UNREPORTED_PROCESS_EXIT_MESSAGE
+    };
+    staleJobs.push(failedJob);
+    return failedJob;
+  });
+
+  if (staleJobs.length === 0) {
+    return state.jobs;
+  }
+
+  const nextState = saveState(cwd, { ...state, jobs });
+  for (const job of staleJobs) {
+    const jobFile = resolveJobFile(cwd, job.id);
+    if (!fs.existsSync(jobFile)) {
+      continue;
+    }
+    try {
+      writeJobFile(cwd, job.id, {
+        ...readJobFile(jobFile),
+        status: job.status,
+        phase: job.phase,
+        pid: job.pid,
+        completedAt: job.completedAt,
+        errorMessage: job.errorMessage
+      });
+    } catch {
+      // The state record is still authoritative when a per-job file is unreadable.
+    }
+  }
+  return nextState.jobs;
+}
+
 export function listJobs(cwd) {
-  return loadState(cwd).jobs;
+  const state = loadState(cwd);
+  return reconcileRunningJobs(cwd, state);
 }
 
 export function setConfig(cwd, key, value) {
