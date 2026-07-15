@@ -1415,6 +1415,43 @@ test("result returns the stored output for the latest finished job by default", 
   );
 });
 
+test("result reports the status of an explicitly referenced active job", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(stateDir, { recursive: true });
+
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "task-live",
+            status: "running",
+            title: "Codex Task",
+            jobClass: "task",
+            createdAt: "2026-03-18T15:00:00.000Z",
+            updatedAt: "2026-03-18T15:01:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "result", "task-live"], {
+    cwd: workspace
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Job task-live is still running/i);
+  assert.doesNotMatch(result.stderr, /No job found/i);
+});
+
 test("result without a job id prefers the latest finished job from the current Claude session", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
