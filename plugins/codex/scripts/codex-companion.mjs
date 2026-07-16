@@ -67,7 +67,10 @@ import {
   renderTaskResult
 } from "./lib/render.mjs";
 import { buildTaskDispatchedStatusToken } from "./lib/task-status-token.mjs";
-import { commitSpawnedTaskWorker, runClaimedTaskWorker } from "./lib/task-launch-state.mjs";
+import {
+  commitSpawnedTaskWorker as commitSpawnedWorker,
+  runClaimedTaskWorker as runClaimedWorker
+} from "./lib/task-launch-state.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
@@ -634,16 +637,17 @@ function buildTaskRunMetadata({ prompt, resumeLast = false }) {
   };
 }
 
-function renderQueuedTaskLaunch(payload) {
+function renderQueuedJobLaunch(payload, options = {}) {
   // PR #346 review: a terminal enqueue payload means launch did not dispatch a
   // worker, so emitting the dispatched sentinel would make hooks and humans
   // believe there is live background work to poll.
   if (!isActiveJobStatus(payload.status)) {
+    const launchLabel = options.launchLabel ?? payload.title;
     if (payload.status === "cancelled") {
-      return `Codex task ${payload.jobId} was cancelled before a worker launched; no work started.\n`;
+      return `${launchLabel} ${payload.jobId} was cancelled before a worker launched; no work started.\n`;
     }
     const detail = payload.errorMessage ? `: ${payload.errorMessage}` : ".";
-    return `Codex task ${payload.jobId} failed before a worker launched${detail}\n`;
+    return `${launchLabel} ${payload.jobId} failed before a worker launched${detail}\n`;
   }
 
   const statusToken = buildTaskDispatchedStatusToken(payload.jobId);
@@ -775,7 +779,7 @@ function formatSpawnFailureMessage(error) {
   return detail ? `Failed to launch background worker: ${detail}` : "Failed to launch background worker.";
 }
 
-function persistQueuedTaskRecord(workspaceRoot, queuedRecord) {
+function persistQueuedJobRecord(workspaceRoot, queuedRecord) {
   // PR #346 review: the launch record is inserted through updateState so the
   // summary row and stored job file are created from the same read-modify-write
   // transition before any worker is allowed to observe the request.
@@ -797,7 +801,7 @@ function persistQueuedTaskRecord(workspaceRoot, queuedRecord) {
   });
 }
 
-function markTaskLaunchFailed(workspaceRoot, jobId, errorMessage, fallbackLogFile = null) {
+function markJobLaunchFailed(workspaceRoot, jobId, errorMessage, fallbackLogFile = null) {
   let failedJob = null;
   let preservedJob = null;
 
@@ -843,12 +847,12 @@ function markTaskLaunchFailed(workspaceRoot, jobId, errorMessage, fallbackLogFil
   return preservedJob;
 }
 
-function spawnDetachedTaskWorker(cwd, jobId, options = {}) {
+function spawnDetachedWorker(cwd, jobId, workerSubcommand = "task-worker", options = {}) {
   const scriptPath = path.join(ROOT_DIR, "scripts", "codex-companion.mjs");
   let child = null;
 
   try {
-    child = spawn(process.execPath, [scriptPath, "task-worker", "--cwd", cwd, "--job-id", jobId], {
+    child = spawn(process.execPath, [scriptPath, workerSubcommand, "--cwd", cwd, "--job-id", jobId], {
       cwd,
       env: process.env,
       detached: true,
@@ -876,7 +880,7 @@ function spawnDetachedTaskWorker(cwd, jobId, options = {}) {
   return { child, error: null };
 }
 
-function enqueueBackgroundTask(cwd, job, request) {
+function enqueueBackgroundJob(cwd, job, request, workerSubcommand = "task-worker") {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
@@ -890,7 +894,7 @@ function enqueueBackgroundTask(cwd, job, request) {
     logFile,
     request
   };
-  persistQueuedTaskRecord(job.workspaceRoot, queuedRecord);
+  persistQueuedJobRecord(job.workspaceRoot, queuedRecord);
 
   // PR #346 review: /codex:cancel can land after the durable queued record is
   // written but before worker launch; re-read the job and do not spawn a worker
@@ -911,8 +915,8 @@ function enqueueBackgroundTask(cwd, job, request) {
   }
 
   const recordLaunchFailure = (error) =>
-    markTaskLaunchFailed(job.workspaceRoot, job.id, formatSpawnFailureMessage(error), logFile);
-  const { child, error: spawnError } = spawnDetachedTaskWorker(cwd, job.id, {
+    markJobLaunchFailed(job.workspaceRoot, job.id, formatSpawnFailureMessage(error), logFile);
+  const { child, error: spawnError } = spawnDetachedWorker(cwd, job.id, workerSubcommand, {
     onError: recordLaunchFailure
   });
   if (spawnError || !child) {
@@ -930,7 +934,7 @@ function enqueueBackgroundTask(cwd, job, request) {
     };
   }
 
-  const { shouldKillWorker, launchStatus } = commitSpawnedTaskWorker(job.workspaceRoot, job.id, child.pid);
+  const { shouldKillWorker, launchStatus } = commitSpawnedWorker(job.workspaceRoot, job.id, child.pid);
   if (shouldKillWorker) {
     appendLogLine(logFile, `Terminating background worker because job is ${launchStatus}.`);
   }
@@ -945,6 +949,10 @@ function enqueueBackgroundTask(cwd, job, request) {
     },
     logFile
   };
+}
+
+function enqueueBackgroundTask(cwd, job, request) {
+  return enqueueBackgroundJob(cwd, job, request);
 }
 
 function buildWorkerExitedError(jobId) {
@@ -1089,6 +1097,9 @@ async function handleReviewCommand(argv, config) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
+  if (options.background && options.wait) {
+    throw new Error("Choose either --background or --wait, not both.");
+  }
   const focusText = positionals.join(" ").trim();
   const target = resolveReviewTarget(cwd, {
     base: options.base,
@@ -1105,16 +1116,30 @@ async function handleReviewCommand(argv, config) {
     jobClass: "review",
     summary: metadata.summary
   });
+  const request = {
+    cwd,
+    base: options.base,
+    scope: options.scope,
+    model: options.model,
+    focusText,
+    reviewName: config.reviewName
+  };
+
+  if (options.background) {
+    ensureCodexAvailable(cwd);
+    const { payload } = enqueueBackgroundJob(cwd, job, request, "review-worker");
+    outputCommandResult(payload, renderQueuedJobLaunch(payload), options.json);
+    if (!isActiveJobStatus(payload.status)) {
+      process.exitCode = 1;
+    }
+    return;
+  }
+
   await runForegroundCommand(
     job,
     (progress) =>
       executeReviewRun({
-        cwd,
-        base: options.base,
-        scope: options.scope,
-        model: options.model,
-        focusText,
-        reviewName: config.reviewName,
+        ...request,
         onProgress: progress
       }),
     { json: options.json }
@@ -1172,7 +1197,7 @@ async function handleTask(argv) {
       jobId: job.id
     });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
-    outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
+    outputCommandResult(payload, renderQueuedJobLaunch(payload, { launchLabel: "Codex task" }), options.json);
     // PR #346 review: exit non-zero unless a live background job was actually
     // dispatched (queued/running). A terminal launch — `failed`, or `cancelled`
     // when a concurrent cancel won before worker spawn — means there is no job to
@@ -1218,26 +1243,26 @@ async function handleTransfer(argv) {
   outputCommandResult(payload, rendered, options.json);
 }
 
-async function handleTaskWorker(argv) {
+async function handleClaimedWorker(argv, config) {
   const { options } = parseCommandInput(argv, {
     valueOptions: ["cwd", "job-id"]
   });
 
   if (!options["job-id"]) {
-    throw new Error("Missing required --job-id for task-worker.");
+    throw new Error(`Missing required --job-id for ${config.subcommand}.`);
   }
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const jobId = options["job-id"];
-  await runClaimedTaskWorker(
+  await runClaimedWorker(
     workspaceRoot,
     jobId,
     process.pid,
     async (storedJob) => {
       const request = storedJob.request;
       if (!request || typeof request !== "object") {
-        throw new Error(`Stored job ${jobId} is missing its task request payload.`);
+        throw new Error(`Stored job ${jobId} is missing its ${config.requestKind} request payload.`);
       }
 
       const { logFile, progress } = createTrackedProgress(
@@ -1256,7 +1281,7 @@ async function handleTaskWorker(argv) {
           logFile
         },
         () =>
-          executeTaskRun({
+          config.executeRun({
             ...request,
             onProgress: progress
           }),
@@ -1266,10 +1291,28 @@ async function handleTaskWorker(argv) {
     {
       onSkip(outcome) {
         const logFile = outcome.job?.logFile ?? resolveJobLogFile(workspaceRoot, jobId);
-        appendLogLine(logFile, `Skipped task worker execution because job is ${outcome.status}.`);
+        appendLogLine(logFile, `Skipped ${config.workerLabel} execution because job is ${outcome.status}.`);
       }
     }
   );
+}
+
+async function handleTaskWorker(argv) {
+  return handleClaimedWorker(argv, {
+    subcommand: "task-worker",
+    requestKind: "task",
+    workerLabel: "task worker",
+    executeRun: executeTaskRun
+  });
+}
+
+async function handleReviewWorker(argv) {
+  return handleClaimedWorker(argv, {
+    subcommand: "review-worker",
+    requestKind: "review",
+    workerLabel: "review worker",
+    executeRun: executeReviewRun
+  });
 }
 
 function reconcileExitedStatusWorker(snapshot) {
@@ -1462,6 +1505,9 @@ async function main() {
       break;
     case "task-worker":
       await handleTaskWorker(argv);
+      break;
+    case "review-worker":
+      await handleReviewWorker(argv);
       break;
     case "status":
       await handleStatus(argv);
