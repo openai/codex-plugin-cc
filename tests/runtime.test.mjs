@@ -1357,6 +1357,7 @@ test("task background persists its complete request in both stores before spawni
     prompt: "persist this exact request",
     write: false,
     resumeLast: false,
+    resumeThreadId: null,
     jobId: launchPayload.jobId
   };
   assert.equal(atSpawn.stateJob.status, "queued");
