@@ -1259,7 +1259,6 @@ async function handleClaimedWorker(argv, config) {
     throw new Error(`Missing required --job-id for ${config.subcommand}.`);
   }
 
-  const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const jobId = options["job-id"];
   await runClaimedWorker(
@@ -1395,7 +1394,6 @@ function handleTaskResumeCandidate(argv) {
     booleanOptions: ["json"]
   });
 
-  const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const sessionId = getCurrentClaudeSessionId();
   const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
