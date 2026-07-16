@@ -30,6 +30,7 @@ import {
   generateJobId,
   getConfig,
   listJobs,
+  resolveJobLogFile,
   setConfig,
   updateJobStores,
   updateState,
@@ -66,7 +67,7 @@ import {
   renderTaskResult
 } from "./lib/render.mjs";
 import { buildTaskDispatchedStatusToken } from "./lib/task-status-token.mjs";
-import { commitSpawnedTaskWorker } from "./lib/task-launch-state.mjs";
+import { commitSpawnedTaskWorker, runClaimedTaskWorker } from "./lib/task-launch-state.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
@@ -1228,37 +1229,46 @@ async function handleTaskWorker(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
-  if (!storedJob) {
-    throw new Error(`No stored job found for ${options["job-id"]}.`);
-  }
+  const jobId = options["job-id"];
+  await runClaimedTaskWorker(
+    workspaceRoot,
+    jobId,
+    process.pid,
+    async (storedJob) => {
+      const request = storedJob.request;
+      if (!request || typeof request !== "object") {
+        throw new Error(`Stored job ${jobId} is missing its task request payload.`);
+      }
 
-  const request = storedJob.request;
-  if (!request || typeof request !== "object") {
-    throw new Error(`Stored job ${options["job-id"]} is missing its task request payload.`);
-  }
-
-  const { logFile, progress } = createTrackedProgress(
-    {
-      ...storedJob,
-      workspaceRoot
+      const { logFile, progress } = createTrackedProgress(
+        {
+          ...storedJob,
+          workspaceRoot
+        },
+        {
+          logFile: storedJob.logFile ?? null
+        }
+      );
+      await runTrackedJob(
+        {
+          ...storedJob,
+          workspaceRoot,
+          logFile
+        },
+        () =>
+          executeTaskRun({
+            ...request,
+            onProgress: progress
+          }),
+        { logFile }
+      );
     },
     {
-      logFile: storedJob.logFile ?? null
+      onSkip(outcome) {
+        const logFile = outcome.job?.logFile ?? resolveJobLogFile(workspaceRoot, jobId);
+        appendLogLine(logFile, `Skipped task worker execution because job is ${outcome.status}.`);
+      }
     }
-  );
-  await runTrackedJob(
-    {
-      ...storedJob,
-      workspaceRoot,
-      logFile
-    },
-    () =>
-      executeTaskRun({
-        ...request,
-        onProgress: progress
-      }),
-    { logFile }
   );
 }
 

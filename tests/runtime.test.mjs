@@ -1243,6 +1243,69 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
 });
 
+test("task worker logs a cancelled no-op without entering the app-server runner", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  const jobId = "task-worker-cancelled-before-claim";
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n", "utf8");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  const logFile = path.join(jobsDir, `${jobId}.log`);
+  const cancelledJob = {
+    id: jobId,
+    kind: "task",
+    jobClass: "task",
+    title: "Codex Task",
+    status: "cancelled",
+    phase: "cancelled",
+    pid: null,
+    logFile,
+    request: {
+      cwd: repo,
+      model: null,
+      effort: null,
+      prompt: "This runner must never start.",
+      write: true,
+      resumeLast: false,
+      jobId
+    },
+    createdAt: "2026-07-16T12:00:00.000Z",
+    updatedAt: "2026-07-16T12:00:01.000Z",
+    completedAt: "2026-07-16T12:00:01.000Z",
+    cancelledAt: "2026-07-16T12:00:01.000Z",
+    errorMessage: "Cancelled by user."
+  };
+  fs.mkdirSync(jobsDir, { recursive: true });
+  fs.writeFileSync(logFile, "[2026-07-16T12:00:00.000Z] Queued for background execution.\n", "utf8");
+  fs.writeFileSync(path.join(jobsDir, `${jobId}.json`), `${JSON.stringify(cancelledJob, null, 2)}\n`, "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [cancelledJob] }, null, 2)}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "task-worker", "--cwd", repo, "--job-id", jobId], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(fakeStatePath), false, "task worker entered the app-server runner");
+  assert.match(fs.readFileSync(logFile, "utf8"), /Skipped task worker execution because job is cancelled\./);
+  const stateJob = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs[0];
+  const storedJob = JSON.parse(fs.readFileSync(path.join(jobsDir, `${jobId}.json`), "utf8"));
+  assert.equal(stateJob.status, "cancelled");
+  assert.equal(stateJob.errorMessage, "Cancelled by user.");
+  assert.equal(storedJob.status, "cancelled");
+  assert.equal(storedJob.errorMessage, "Cancelled by user.");
+});
+
 test("task --background skips spawning when the queued job was cancelled before worker launch", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
