@@ -1244,6 +1244,77 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
 });
 
+test("task background persists its complete request in both stores before spawning", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const spawnMarker = path.join(binDir, "persist-before-spawn.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const preloadPath = writePreloadScript(
+    binDir,
+    [
+      'const fs = require("node:fs");',
+      'const path = require("node:path");',
+      'const childProcess = require("node:child_process");',
+      'const { syncBuiltinESMExports } = require("node:module");',
+      'const originalSpawn = childProcess.spawn;',
+      'const originalWriteFileSync = fs.writeFileSync;',
+      'childProcess.spawn = function patchedSpawn(command, args, options) {',
+      '  if (Array.isArray(args) && args[1] === "task-worker") {',
+      '    const jobId = args[args.indexOf("--job-id") + 1];',
+      '    const stateDir = process.env.ORDERING_STATE_DIR;',
+      '    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));',
+      '    const stateJob = state.jobs.find((job) => job.id === jobId);',
+      '    const storedJob = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", jobId + ".json"), "utf8"));',
+      '    originalWriteFileSync(process.env.SPAWN_MARKER, JSON.stringify({ stateJob, storedJob }), "utf8");',
+      '    return {',
+      '      pid: 424248,',
+      '      unref() {},',
+      '      once() { return this; },',
+      '      on() { return this; }',
+      '    };',
+      '  }',
+      '  return originalSpawn.apply(this, arguments);',
+      '};',
+      'syncBuiltinESMExports();'
+    ].join("\n")
+  );
+
+  const stateDir = resolveStateDir(repo);
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "persist this exact request"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      NODE_OPTIONS: extendNodeOptions(preloadPath),
+      ORDERING_STATE_DIR: stateDir,
+      SPAWN_MARKER: spawnMarker
+    }
+  });
+
+  assert.equal(launched.status, 0, launched.stderr);
+  const launchPayload = JSON.parse(launched.stdout);
+  const atSpawn = JSON.parse(fs.readFileSync(spawnMarker, "utf8"));
+  const expectedRequest = {
+    cwd: fs.realpathSync(repo),
+    model: null,
+    effort: null,
+    prompt: "persist this exact request",
+    write: false,
+    resumeLast: false,
+    jobId: launchPayload.jobId
+  };
+  assert.equal(atSpawn.stateJob.status, "queued");
+  assert.equal(atSpawn.stateJob.pid, null);
+  assert.deepEqual(atSpawn.stateJob.request, expectedRequest);
+  assert.equal(atSpawn.storedJob.status, "queued");
+  assert.equal(atSpawn.storedJob.pid, null);
+  assert.deepEqual(atSpawn.storedJob.request, expectedRequest);
+});
+
 test("task worker logs a cancelled no-op without entering the app-server runner", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
