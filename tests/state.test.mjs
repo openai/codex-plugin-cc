@@ -1,11 +1,42 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { makeTempDir } from "./helpers.mjs";
-import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import {
+  acquireStateLock,
+  loadState,
+  resolveJobFile,
+  resolveJobLogFile,
+  resolveStateDir,
+  resolveStateFile,
+  saveState
+} from "../plugins/codex/scripts/lib/state.mjs";
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const STATE_MODULE_URL = pathToFileURL(path.join(ROOT, "plugins", "codex", "scripts", "lib", "state.mjs")).href;
+
+function runLockChild(workspace, body) {
+  return spawnSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "--eval",
+      `import { acquireStateLock } from ${JSON.stringify(STATE_MODULE_URL)};\n${body}`
+    ],
+    {
+      encoding: "utf8",
+      env: process.env,
+      shell: false,
+      timeout: 3000,
+      windowsHide: true
+    }
+  );
+}
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -102,4 +133,46 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
       .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
       .sort()
   );
+});
+
+test("loadState reports corrupt state instead of silently resetting it", () => {
+  const workspace = makeTempDir();
+  const stateFile = resolveStateFile(workspace);
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+  fs.writeFileSync(stateFile, "{not-json", "utf8");
+
+  assert.throws(() => loadState(workspace), /Could not parse Codex companion state/);
+});
+
+test("state lock excludes another process until its owner releases it", () => {
+  const workspace = makeTempDir();
+  const release = acquireStateLock(workspace);
+
+  try {
+    const blocked = runLockChild(
+      workspace,
+      `acquireStateLock(${JSON.stringify(workspace)}, { timeoutMs: 0 });`
+    );
+
+    assert.notEqual(blocked.status, 0);
+    assert.match(blocked.stderr, /Timed out acquiring Codex companion state lock/);
+  } finally {
+    release();
+  }
+
+  const releaseAfter = acquireStateLock(workspace, { timeoutMs: 0 });
+  releaseAfter();
+});
+
+test("state lock recovers after a holder exits without releasing", () => {
+  const workspace = makeTempDir();
+  const crashed = runLockChild(
+    workspace,
+    `acquireStateLock(${JSON.stringify(workspace)});`
+  );
+
+  assert.equal(crashed.status, 0, crashed.stderr);
+
+  const release = acquireStateLock(workspace, { timeoutMs: 0 });
+  release();
 });

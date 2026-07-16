@@ -1269,7 +1269,7 @@ fs.writeFileSync = function patchedWriteFileSync(file, data, options) {
   }
 
   const filePath = String(file);
-  if (!filePath.endsWith(".json")) {
+  if (!filePath.includes(".json")) {
     return;
   }
 
@@ -1285,7 +1285,7 @@ fs.writeFileSync = function patchedWriteFileSync(file, data, options) {
     return;
   }
 
-  if (filePath.endsWith(path.sep + "state.json") && Array.isArray(parsed.jobs)) {
+  if (filePath.includes(path.sep + "state.json") && Array.isArray(parsed.jobs)) {
     let changed = false;
     const jobs = parsed.jobs.map((job) => {
       if (job?.jobClass !== "task" || job.status !== "queued") {
@@ -1640,7 +1640,7 @@ fs.writeFileSync = function patchedWriteFileSync(file, data, options) {
   }
 
   const filePath = String(file);
-  if (!filePath.endsWith(".json")) {
+  if (!filePath.includes(".json")) {
     return;
   }
 
@@ -1656,7 +1656,7 @@ fs.writeFileSync = function patchedWriteFileSync(file, data, options) {
     return;
   }
 
-  if (filePath.endsWith(path.sep + "state.json") && Array.isArray(parsed.jobs)) {
+  if (filePath.includes(path.sep + "state.json") && Array.isArray(parsed.jobs)) {
     let changed = false;
     const jobs = parsed.jobs.map((job) => {
       if (job?.jobClass !== "task" || job.status !== "queued") {

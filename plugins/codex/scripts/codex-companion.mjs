@@ -31,6 +31,7 @@ import {
   getConfig,
   listJobs,
   setConfig,
+  updateJobStores,
   updateState,
   upsertJob,
   writeJobFile
@@ -65,6 +66,7 @@ import {
   renderTaskResult
 } from "./lib/render.mjs";
 import { buildTaskDispatchedStatusToken } from "./lib/task-status-token.mjs";
+import { commitSpawnedTaskWorker } from "./lib/task-launch-state.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
@@ -332,15 +334,6 @@ function isTerminalJobRecord(stateJob, storedJob = null) {
   // or the per-job file first, so both records must agree the job is active
   // before a launcher writes worker-owned fields such as pid.
   return !isActiveJobStatus(stateJob?.status) || Boolean(storedJob && !isActiveJobStatus(storedJob.status));
-}
-
-function resolveLaunchStatus(stateJob, storedJob = null, fallback = "queued") {
-  for (const status of [stateJob?.status, storedJob?.status]) {
-    if (status && !isActiveJobStatus(status)) {
-      return status;
-    }
-  }
-  return stateJob?.status ?? storedJob?.status ?? fallback;
 }
 
 function getCurrentClaudeSessionId() {
@@ -849,50 +842,6 @@ function markTaskLaunchFailed(workspaceRoot, jobId, errorMessage, fallbackLogFil
   return preservedJob;
 }
 
-function persistSpawnedTaskWorkerPid(workspaceRoot, jobId, childPid) {
-  let shouldKillWorker = false;
-  let launchStatus = "queued";
-  let updatedJob = null;
-
-  // PR #346 review: pid persistence must re-check cancellation inside the same
-  // state read-modify-write that writes the pid. A cancel that already made the
-  // job terminal wins, and the just-spawned worker is killed after the state
-  // update instead of being resurrected by stale launch data.
-  updateState(workspaceRoot, (state) => {
-    const jobIndex = state.jobs.findIndex((candidate) => candidate.id === jobId);
-    if (jobIndex === -1) {
-      shouldKillWorker = true;
-      launchStatus = "cancelled";
-      return;
-    }
-
-    const stateJob = state.jobs[jobIndex];
-    const storedJob = readStoredJob(workspaceRoot, jobId);
-    if (isTerminalJobRecord(stateJob, storedJob)) {
-      shouldKillWorker = true;
-      launchStatus = resolveLaunchStatus(stateJob, storedJob, "cancelled");
-      updatedJob = {
-        ...stateJob,
-        ...(storedJob ?? {})
-      };
-      return;
-    }
-
-    const updatedAt = nowIso();
-    updatedJob = {
-      ...(storedJob ?? {}),
-      ...stateJob,
-      pid: childPid,
-      updatedAt
-    };
-    state.jobs[jobIndex] = updatedJob;
-    writeJobFile(workspaceRoot, jobId, updatedJob);
-    launchStatus = updatedJob.status;
-  });
-
-  return { shouldKillWorker, launchStatus, job: updatedJob };
-}
-
 function spawnDetachedTaskWorker(cwd, jobId, options = {}) {
   const scriptPath = path.join(ROOT_DIR, "scripts", "codex-companion.mjs");
   let child = null;
@@ -903,6 +852,7 @@ function spawnDetachedTaskWorker(cwd, jobId, options = {}) {
       env: process.env,
       detached: true,
       stdio: "ignore",
+      shell: false,
       windowsHide: true
     });
   } catch (error) {
@@ -979,10 +929,9 @@ function enqueueBackgroundTask(cwd, job, request) {
     };
   }
 
-  const { shouldKillWorker, launchStatus } = persistSpawnedTaskWorkerPid(job.workspaceRoot, job.id, child.pid);
+  const { shouldKillWorker, launchStatus } = commitSpawnedTaskWorker(job.workspaceRoot, job.id, child.pid);
   if (shouldKillWorker) {
     appendLogLine(logFile, `Terminating background worker because job is ${launchStatus}.`);
-    terminateProcessTree(child.pid);
   }
 
   return {
@@ -1438,21 +1387,13 @@ async function handleCancel(argv) {
     );
   }
 
-  terminateProcessTree(job.pid ?? Number.NaN);
-  appendLogLine(job.logFile, "Cancelled by user.");
-
   const completedAt = nowIso();
-  let nextJob = null;
-  // PR #346 review: cancellation is the terminal launch/cancel transition, so
-  // the state row and stored job file are updated from one read-modify-write
-  // instead of a stale stored-job write followed by a separate state patch.
-  updateState(workspaceRoot, (state) => {
-    const jobIndex = state.jobs.findIndex((candidate) => candidate.id === job.id);
-    const stateJob = jobIndex === -1 ? job : state.jobs[jobIndex];
-    const latestStoredJob = readStoredJob(workspaceRoot, job.id) ?? existing;
-    nextJob = {
+  const cancellation = updateJobStores(workspaceRoot, job.id, ({ stateJob, storedJob }) => {
+    const latestStateJob = stateJob ?? job;
+    const latestStoredJob = storedJob ?? existing;
+    const nextJob = {
       ...latestStoredJob,
-      ...stateJob,
+      ...latestStateJob,
       status: "cancelled",
       phase: "cancelled",
       pid: null,
@@ -1460,18 +1401,18 @@ async function handleCancel(argv) {
       updatedAt: completedAt,
       errorMessage: "Cancelled by user."
     };
-
-    if (jobIndex === -1) {
-      state.jobs.unshift(nextJob);
-    } else {
-      state.jobs[jobIndex] = nextJob;
-    }
-
-    writeJobFile(workspaceRoot, job.id, {
-      ...nextJob,
-      cancelledAt: completedAt
-    });
+    return {
+      stateJob: nextJob,
+      storedJob: { ...nextJob, cancelledAt: completedAt },
+      value: {
+        nextJob,
+        pid: latestStoredJob.pid ?? latestStateJob.pid ?? job.pid ?? Number.NaN
+      }
+    };
   });
+  const { nextJob, pid } = cancellation.value;
+  terminateProcessTree(pid);
+  appendLogLine(nextJob.logFile ?? job.logFile, "Cancelled by user.");
 
   const payload = {
     jobId: job.id,
