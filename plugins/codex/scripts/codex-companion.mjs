@@ -69,7 +69,8 @@ import {
 import { buildTaskDispatchedStatusToken } from "./lib/task-status-token.mjs";
 import {
   commitSpawnedTaskWorker as commitSpawnedWorker,
-  runClaimedTaskWorker as runClaimedWorker
+  runClaimedTaskWorker as runClaimedWorker,
+  WORKER_TURN_STATES
 } from "./lib/task-launch-state.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -78,6 +79,12 @@ const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const FOREGROUND_TASK_POLL_INTERVAL_MS = 100;
 const FOREGROUND_TASK_MISSING_JOB_RETRY_MS = 5000;
+const CANCEL_TURN_RESOLUTION_TIMEOUT_MS = 5000;
+const CANCEL_TURN_RESOLUTION_POLL_MS = 10;
+const TERMINAL_WORKER_TURN_STATES = new Set([
+  WORKER_TURN_STATES.INTERRUPTED,
+  WORKER_TURN_STATES.STOPPED
+]);
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
@@ -451,7 +458,8 @@ async function executeReviewRun(request) {
     const result = await runAppServerReview(request.cwd, {
       target: reviewTarget,
       model: request.model,
-      onProgress: request.onProgress
+      onProgress: request.onProgress,
+      turnLifecycle: request.turnLifecycle
     });
     const payload = {
       review: reviewName,
@@ -483,6 +491,7 @@ async function executeReviewRun(request) {
       summary: firstMeaningfulLine(result.reviewText, `${reviewName} completed.`),
       jobTitle: `Codex ${reviewName}`,
       jobClass: "review",
+      cancelled: result.cancelled,
       targetLabel: target.label
     };
   }
@@ -494,7 +503,8 @@ async function executeReviewRun(request) {
     model: request.model,
     sandbox: "read-only",
     outputSchema: readOutputSchema(REVIEW_SCHEMA),
-    onProgress: request.onProgress
+    onProgress: request.onProgress,
+    turnLifecycle: request.turnLifecycle
   });
   const parsed = parseStructuredOutput(result.finalMessage, {
     status: result.status,
@@ -534,6 +544,7 @@ async function executeReviewRun(request) {
     summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
     jobTitle: `Codex ${reviewName}`,
     jobClass: "review",
+    cancelled: result.cancelled,
     targetLabel: context.target.label
   };
 }
@@ -574,7 +585,8 @@ async function executeTaskRun(request) {
     persistThread: true,
     // Keep the workspace-boundary notice ephemeral by adding it only to turn input, not stored prompts or thread names.
     boundaryNote: request.write ? buildWorkspaceBoundaryNotice(workspaceRoot) : null,
-    threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
+    threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT),
+    turnLifecycle: request.turnLifecycle
   });
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
@@ -609,6 +621,7 @@ async function executeTaskRun(request) {
     summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
     jobTitle: taskMetadata.title,
     jobClass: "task",
+    cancelled: result.cancelled,
     write: Boolean(request.write)
   };
 }
@@ -1265,7 +1278,7 @@ async function handleClaimedWorker(argv, config) {
     workspaceRoot,
     jobId,
     process.pid,
-    async (storedJob) => {
+    async (storedJob, turnLifecycle) => {
       const request = storedJob.request;
       if (!request || typeof request !== "object") {
         throw new Error(`Stored job ${jobId} is missing its ${config.requestKind} request payload.`);
@@ -1289,7 +1302,8 @@ async function handleClaimedWorker(argv, config) {
         () =>
           config.executeRun({
             ...request,
-            onProgress: progress
+            onProgress: progress,
+            turnLifecycle
           }),
         { logFile }
       );
@@ -1432,19 +1446,6 @@ async function handleCancel(argv) {
   const reference = positionals[0] ?? "";
   const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
   const existing = readStoredJob(workspaceRoot, job.id) ?? {};
-  const threadId = existing.threadId ?? job.threadId ?? null;
-  const turnId = existing.turnId ?? job.turnId ?? null;
-
-  const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
-  if (interrupt.attempted) {
-    appendLogLine(
-      job.logFile,
-      interrupt.interrupted
-        ? `Requested Codex turn interrupt for ${turnId} on ${threadId}.`
-        : `Codex turn interrupt failed${interrupt.detail ? `: ${interrupt.detail}` : "."}`
-    );
-  }
-
   const completedAt = nowIso();
   const cancellation = updateJobStores(workspaceRoot, job.id, ({ stateJob, storedJob }) => {
     const latestStateJob = stateJob ?? job;
@@ -1464,13 +1465,37 @@ async function handleCancel(argv) {
       storedJob: { ...nextJob, cancelledAt: completedAt },
       value: {
         nextJob,
-        pid: latestStoredJob.pid ?? latestStateJob.pid ?? job.pid ?? Number.NaN
+        pid: latestStoredJob.pid ?? latestStateJob.pid ?? job.pid ?? Number.NaN,
+        threadId: nextJob.threadId ?? null,
+        turnId: nextJob.turnId ?? null,
+        turnLifecycle: nextJob.turnLifecycle ?? null
       }
     };
   });
   const { nextJob, pid } = cancellation.value;
-  terminateProcessTree(pid);
   appendLogLine(nextJob.logFile ?? job.logFile, "Cancelled by user.");
+
+  const interrupt = await resolveCancelledJobTurn(cwd, workspaceRoot, job.id, {
+    ...nextJob,
+    threadId: cancellation.value.threadId,
+    turnId: cancellation.value.turnId,
+    turnLifecycle: cancellation.value.turnLifecycle
+  });
+  if (interrupt.attempted) {
+    appendLogLine(
+      nextJob.logFile ?? job.logFile,
+      interrupt.interrupted
+        ? `Requested Codex turn interrupt for ${interrupt.turnId} on ${interrupt.threadId}.`
+        : `Codex turn interrupt failed${interrupt.detail ? `: ${interrupt.detail}` : "."}`
+    );
+  }
+  if (!interrupt.confirmed) {
+    const errorMessage = `Cancellation was recorded for ${job.id}, but the Codex turn could not be confirmed stopped${interrupt.detail ? `: ${interrupt.detail}` : "."}`;
+    appendLogLine(nextJob.logFile ?? job.logFile, errorMessage);
+    throw new Error(errorMessage);
+  }
+
+  terminateProcessTree(pid);
 
   const payload = {
     jobId: job.id,
@@ -1481,6 +1506,140 @@ async function handleCancel(argv) {
   };
 
   outputCommandResult(payload, renderCancelReport(nextJob), options.json);
+}
+
+async function resolveCancelledJobTurn(cwd, workspaceRoot, jobId, initialJob) {
+  const deadline = Date.now() + CANCEL_TURN_RESOLUTION_TIMEOUT_MS;
+  let latestJob = initialJob;
+  let lastInterrupt = null;
+
+  while (true) {
+    const lifecycle = latestJob?.turnLifecycle ?? null;
+    const lifecycleState = lifecycle?.state ?? null;
+    const threadId = latestJob?.threadId ?? lifecycle?.threadId ?? null;
+    const turnId = latestJob?.turnId ?? lifecycle?.turnId ?? null;
+
+    if (
+      lifecycleState === WORKER_TURN_STATES.INTERRUPTED ||
+      lifecycleState === WORKER_TURN_STATES.STOPPED
+    ) {
+      return {
+        attempted: true,
+        // Preserve the public field's existing meaning: at least one interrupt
+        // RPC was accepted. The separate lifecycle state is the stronger proof
+        // that the worker observed terminal turn completion.
+        interrupted:
+          lifecycleState === WORKER_TURN_STATES.INTERRUPTED || Boolean(lastInterrupt?.interrupted),
+        confirmed: true,
+        threadId,
+        turnId,
+        detail: lifecycle.detail ?? `Worker interrupted ${turnId} on ${threadId}.`
+      };
+    }
+
+    if (
+      lifecycleState === WORKER_TURN_STATES.SUPPRESSED ||
+      lifecycleState === WORKER_TURN_STATES.START_REJECTED
+    ) {
+      return {
+        attempted: false,
+        interrupted: false,
+        confirmed: true,
+        threadId,
+        turnId,
+        detail:
+          lifecycleState === WORKER_TURN_STATES.SUPPRESSED
+            ? "turn start was suppressed"
+            : "app-server rejected turn start"
+      };
+    }
+
+    if (threadId && turnId && !lastInterrupt) {
+      lastInterrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
+      if (!lastInterrupt.interrupted && lifecycleState !== WORKER_TURN_STATES.INTERRUPTING) {
+        return {
+          ...lastInterrupt,
+          confirmed: false,
+          threadId,
+          turnId
+        };
+      }
+    }
+
+    // STARTING is durable before the RPC is sent. Do not kill its worker or
+    // report cancellation success until one side has interrupted the published
+    // turn, suppressed the request, or proved that the server rejected it.
+    const handoffPending =
+      lifecycleState === WORKER_TURN_STATES.STARTING ||
+      lifecycleState === WORKER_TURN_STATES.STARTED ||
+      lifecycleState === WORKER_TURN_STATES.INTERRUPTING ||
+      lifecycleState === WORKER_TURN_STATES.START_UNKNOWN;
+    if (!handoffPending) {
+      return {
+        attempted: Boolean(lastInterrupt?.attempted),
+        interrupted: false,
+        confirmed: !lastInterrupt,
+        threadId,
+        turnId,
+        detail: lastInterrupt?.detail ?? "no Codex turn was handed off"
+      };
+    }
+
+    if (Date.now() >= deadline) {
+      return {
+        attempted: Boolean(lastInterrupt?.attempted),
+        interrupted: false,
+        confirmed: false,
+        threadId,
+        turnId,
+        detail: lastInterrupt?.interrupted
+          ? "turn interrupt was accepted, but terminal turn completion was not observed"
+          : lastInterrupt?.detail ?? "timed out waiting for the worker turn-start handshake"
+      };
+    }
+
+    await sleep(CANCEL_TURN_RESOLUTION_POLL_MS);
+    latestJob = readConsistentCancellationHandshake(workspaceRoot, jobId) ?? latestJob;
+  }
+}
+
+function readConsistentCancellationHandshake(workspaceRoot, jobId) {
+  const transaction = updateJobStores(workspaceRoot, jobId, ({ stateJob, storedJob }) => {
+    if (!stateJob || !storedJob) {
+      return { value: storedJob ?? stateJob };
+    }
+
+    const terminalSource = [stateJob, storedJob].find((candidate) =>
+      TERMINAL_WORKER_TURN_STATES.has(candidate.turnLifecycle?.state)
+    );
+    if (terminalSource && stateJob.status === "cancelled" && storedJob.status === "cancelled") {
+      // A process can stop between the two atomic file replacements. Repair the
+      // unfinished side while holding the same lock, then let /cancel terminate
+      // the worker only after both stores carry the terminal acknowledgement.
+      const repairedJob = {
+        ...storedJob,
+        ...stateJob,
+        ...terminalSource,
+        status: "cancelled",
+        phase: "cancelled",
+        pid: null,
+        turnLifecycle: terminalSource.turnLifecycle
+      };
+      return {
+        stateJob: repairedJob,
+        storedJob: repairedJob,
+        value: repairedJob
+      };
+    }
+
+    return {
+      value: {
+        ...storedJob,
+        ...stateJob
+      }
+    };
+  });
+  return transaction.value;
 }
 
 async function main() {

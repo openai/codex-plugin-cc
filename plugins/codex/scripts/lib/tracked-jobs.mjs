@@ -185,6 +185,17 @@ export async function runTrackedJob(job, runner, options = {}) {
 
   try {
     const execution = await runner();
+    if (execution.cancelled) {
+      const cancelledJob = readStoredJobOrNull(job.workspaceRoot, job.id);
+      if (cancelledJob?.status !== "cancelled") {
+        throw new Error(`Runner reported cancellation for ${job.id}, but its durable job record is not cancelled.`);
+      }
+      appendLogLine(
+        options.logFile ?? job.logFile ?? null,
+        "Worker stopped without changing the cancelled job status."
+      );
+      return execution;
+    }
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
     writeJobFile(job.workspaceRoot, job.id, {

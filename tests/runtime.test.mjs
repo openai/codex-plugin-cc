@@ -3124,6 +3124,116 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
+test("cancel waits for an in-flight turn handoff before reporting success", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const gatePath = path.join(binDir, "release-turn-start");
+  const interruptCompletionGatePath = path.join(binDir, "release-interrupt-completion");
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "gated-turn-start");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    FAKE_CODEX_TURN_START_GATE: gatePath,
+    FAKE_CODEX_INTERRUPT_COMPLETION_GATE: interruptCompletionGatePath
+  };
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "fix the cancellation handoff"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+  const stateDir = resolveStateDir(repo);
+
+  await waitFor(() => {
+    if (!fs.existsSync(fakeStatePath)) {
+      return false;
+    }
+    const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+    const trackedJob = state.jobs.find((candidate) => candidate.id === jobId);
+    return fakeState.lastTurnStart && trackedJob?.turnLifecycle?.state === "starting";
+  }, { timeoutMs: 15000 });
+
+  const cancel = spawn(process.execPath, [SCRIPT, "cancel", jobId, "--json"], {
+    cwd: repo,
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true
+  });
+  let cancelStdout = "";
+  let cancelStderr = "";
+  cancel.stdout.setEncoding("utf8");
+  cancel.stderr.setEncoding("utf8");
+  cancel.stdout.on("data", (chunk) => {
+    cancelStdout += chunk;
+  });
+  cancel.stderr.on("data", (chunk) => {
+    cancelStderr += chunk;
+  });
+  const cancelExit = new Promise((resolve, reject) => {
+    cancel.once("error", reject);
+    cancel.once("close", (code, signal) => resolve({ code, signal }));
+  });
+  t.after(() => {
+    if (cancel.exitCode === null && cancel.signalCode === null) {
+      cancel.kill("SIGKILL");
+    }
+  });
+
+  await waitFor(() => {
+    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+    return state.jobs.find((candidate) => candidate.id === jobId)?.status === "cancelled";
+  });
+  assert.equal(cancel.exitCode, null, "cancel must not report success while the turn-start handoff is unresolved");
+
+  fs.writeFileSync(gatePath, "release\n", "utf8");
+  const interruptedState = await waitFor(() => {
+    const state = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+    return state.lastInterrupt ? state : null;
+  });
+  assert.equal(cancel.exitCode, null, "cancel must wait for terminal turn completion, not only interrupt acceptance");
+
+  fs.writeFileSync(interruptCompletionGatePath, "release\n", "utf8");
+  const cancelResult = await cancelExit;
+  assert.equal(cancelResult.signal, null);
+  assert.equal(cancelResult.code, 0, cancelStderr);
+  const cancelPayload = JSON.parse(cancelStdout);
+  assert.equal(cancelPayload.status, "cancelled");
+  assert.equal(cancelPayload.turnInterruptAttempted, true);
+  assert.equal(cancelPayload.turnInterrupted, true);
+
+  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.deepEqual(fakeState.lastInterrupt, interruptedState.lastInterrupt);
+  assert.equal(fakeState.gatedTurnWriteApplied, undefined);
+
+  const stateJob = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs.find(
+    (candidate) => candidate.id === jobId
+  );
+  const storedJob = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${jobId}.json`), "utf8"));
+  assert.equal(stateJob.status, "cancelled");
+  assert.equal(storedJob.status, "cancelled");
+  assert.equal(stateJob.turnLifecycle.state, "interrupted");
+  assert.equal(storedJob.turnLifecycle.state, "interrupted");
+  assert.equal(stateJob.threadId, fakeState.lastInterrupt.threadId);
+  assert.equal(stateJob.turnId, fakeState.lastInterrupt.turnId);
+  assert.match(fs.readFileSync(stateJob.logFile, "utf8"), /cancelled job/i);
+
+  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      cwd: repo
+    })
+  });
+  assert.equal(cleanup.status, 0, cleanup.stderr);
+});
+
 test("session end fully cleans up jobs for the ending session", async (t) => {
   const repo = makeTempDir();
   initGitRepo(repo);

@@ -322,3 +322,38 @@ test("cancellation between worker read and claim skips the runner before launche
   assert.equal(listJobs(workspace).find((job) => job.id === jobId).status, "cancelled");
   assert.equal(readJobFile(resolveJobFile(workspace, jobId)).status, "cancelled");
 });
+
+test("task worker revalidates cancellation after claim before entering the runner", async () => {
+  const workspace = makeTempDir();
+  const jobId = "task-cancel-after-worker-claim";
+  const workerPid = 424248;
+  seedTaskJob(workspace, jobId);
+
+  let runnerCalls = 0;
+  const skippedStatuses = [];
+  const outcome = await taskLaunchState.runClaimedTaskWorker(
+    workspace,
+    jobId,
+    workerPid,
+    async () => {
+      runnerCalls += 1;
+    },
+    {
+      beforeRunner(claimed) {
+        assert.equal(claimed.claimed, true);
+        assert.equal(claimed.status, "running");
+        cancelTaskJob(workspace, jobId);
+      },
+      onSkip(skipped) {
+        skippedStatuses.push(skipped.status);
+      }
+    }
+  );
+
+  assert.equal(outcome.claimed, false);
+  assert.equal(outcome.status, "cancelled");
+  assert.equal(runnerCalls, 0);
+  assert.deepEqual(skippedStatuses, ["cancelled"]);
+  assert.equal(listJobs(workspace).find((job) => job.id === jobId).status, "cancelled");
+  assert.equal(readJobFile(resolveJobFile(workspace, jobId)).status, "cancelled");
+});

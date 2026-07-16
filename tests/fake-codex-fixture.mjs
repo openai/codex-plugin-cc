@@ -180,6 +180,28 @@ function emitTurnCompletedLater(threadId, turnId, item, delayMs) {
   }, delayMs);
 }
 
+function whenFileGateOpens(envName, callback) {
+  const gatePath = process.env[envName];
+  if (!gatePath) {
+    throw new Error(envName + " is required for gated-turn-start behavior");
+  }
+  const checkGate = () => {
+    if (!fs.existsSync(gatePath)) {
+      return false;
+    }
+    callback();
+    return true;
+  };
+  if (checkGate()) {
+    return;
+  }
+  const timer = setInterval(() => {
+    if (checkGate()) {
+      clearInterval(timer);
+    }
+  }, 5);
+}
+
 function nativeReviewText(target) {
   if (target.type === "baseBranch") {
     return "Reviewed changes against " + target.branch + ".\\nNo material issues found.";
@@ -453,11 +475,12 @@ rl.on("line", (line) => {
 	          prompt
 	        };
 	        saveState(state);
-	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
-
-        const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
-          ? structuredReviewPayload(prompt)
-          : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
+	        const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
+	          ? structuredReviewPayload(prompt)
+	          : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
+	        if (BEHAVIOR !== "gated-turn-start") {
+	          send({ id: message.id, result: { turn: buildTurn(turnId) } });
+	        }
 
         if (
           BEHAVIOR === "with-subagent" ||
@@ -586,7 +609,35 @@ rl.on("line", (line) => {
           }
         ];
 
-	        if (BEHAVIOR === "interruptible-slow-task") {
+	        if (BEHAVIOR === "gated-turn-start") {
+	          const timer = setTimeout(() => {
+	            if (!interruptibleTurns.has(turnId)) {
+	              return;
+	            }
+	            interruptibleTurns.delete(turnId);
+	            state.gatedTurnWriteApplied = true;
+	            saveState(state);
+	            send({
+	              method: "item/completed",
+	              params: {
+	                threadId: thread.id,
+	                turnId,
+	                item: {
+	                  type: "fileChange",
+	                  id: "gated_write_" + turnId,
+	                  status: "completed",
+	                  changes: [{ path: "must-not-land.txt", kind: "add" }]
+	                }
+	              }
+	            });
+	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+	          }, 5000);
+	          interruptibleTurns.set(turnId, { threadId: thread.id, timer });
+	          whenFileGateOpens("FAKE_CODEX_TURN_START_GATE", () => {
+	            send({ id: message.id, result: { turn: buildTurn(turnId) } });
+	            send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          });
+	        } else if (BEHAVIOR === "interruptible-slow-task") {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          const timer = setTimeout(() => {
 	            if (!interruptibleTurns.has(turnId)) {
@@ -616,7 +667,10 @@ rl.on("line", (line) => {
 	        };
 	        saveState(state);
 	        const pending = interruptibleTurns.get(message.params.turnId);
-	        if (pending) {
+	        const completeInterrupt = () => {
+	          if (!pending || !interruptibleTurns.has(message.params.turnId)) {
+	            return;
+	          }
 	          clearTimeout(pending.timer);
 	          interruptibleTurns.delete(message.params.turnId);
 	          send({
@@ -626,7 +680,13 @@ rl.on("line", (line) => {
 	              turn: buildTurn(message.params.turnId, "interrupted")
 	            }
 	          });
+	        };
+	        if (BEHAVIOR === "gated-turn-start" && process.env.FAKE_CODEX_INTERRUPT_COMPLETION_GATE) {
+	          send({ id: message.id, result: {} });
+	          whenFileGateOpens("FAKE_CODEX_INTERRUPT_COMPLETION_GATE", completeInterrupt);
+	          break;
 	        }
+	        completeInterrupt();
 	        send({ id: message.id, result: {} });
 	        break;
 	      }

@@ -31,7 +31,14 @@
  *   messages: Array<{ lifecycle: string, phase: string | null, text: string }>,
  *   fileChanges: ThreadItem[],
  *   commandExecutions: ThreadItem[],
- *   onProgress: ProgressReporter | null
+ *   onProgress: ProgressReporter | null,
+ *   cancelled: boolean,
+ *   cancellationStage: "before-start" | "after-start" | null,
+ *   turnStartHandled: boolean,
+ *   turnInterrupt: { attempted: boolean, interrupted: boolean, transport: string | null, detail: string } | null,
+ *   turnInterruptCompletion: AppServerNotification | null,
+ *   turnInterruptRecorded: boolean,
+ *   turnInterruptPromise: Promise<unknown> | null
  * }} TurnCaptureState
  */
 import crypto from "node:crypto";
@@ -339,7 +346,14 @@ function createTurnCaptureState(threadId, options = {}) {
     messages: [],
     fileChanges: [],
     commandExecutions: [],
-    onProgress: options.onProgress ?? null
+    onProgress: options.onProgress ?? null,
+    cancelled: false,
+    cancellationStage: null,
+    turnStartHandled: false,
+    turnInterrupt: null,
+    turnInterruptCompletion: null,
+    turnInterruptRecorded: false,
+    turnInterruptPromise: null
   };
 }
 
@@ -563,18 +577,219 @@ function applyTurnNotification(state, message) {
   }
 }
 
-async function captureTurn(client, threadId, startRequest, options = {}) {
+function shouldProceedWithTurn(decision) {
+  return decision == null || decision === true || decision.proceed !== false;
+}
+
+async function interruptTurnWithClient(client, { threadId, turnId }) {
+  try {
+    await client.request("turn/interrupt", { threadId, turnId });
+    return {
+      attempted: true,
+      interrupted: true,
+      transport: client.transport ?? null,
+      detail: `Interrupted ${turnId} on ${threadId}.`
+    };
+  } catch (error) {
+    return {
+      attempted: true,
+      interrupted: false,
+      transport: client.transport ?? null,
+      detail: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
+export async function captureAppServerTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
+  const turnLifecycle = options.turnLifecycle ?? null;
+
+  const finalizeCancellationInterrupt = () => {
+    if (!state.turnInterrupt || state.turnInterruptRecorded) {
+      return;
+    }
+
+    const completion = state.turnInterruptCompletion;
+    if (state.turnInterrupt.interrupted && !completion) {
+      return;
+    }
+
+    const completionStatus = completion?.params?.turn?.status ?? null;
+    const result = completion
+      ? {
+          ...state.turnInterrupt,
+          interrupted: completionStatus === "interrupted",
+          confirmed: true,
+          detail: `Turn ${state.turnId} completed with status ${completionStatus}.`
+        }
+      : {
+          ...state.turnInterrupt,
+          confirmed: false
+        };
+    state.turnInterrupt = result;
+    state.turnInterruptRecorded = true;
+    const lifecycleOutcome = turnLifecycle?.onTurnInterrupt?.(result);
+    if (lifecycleOutcome?.cancelled) {
+      state.cancelled = true;
+    }
+    emitProgress(
+      state.onProgress,
+      result.confirmed
+        ? `Confirmed Codex turn ${state.turnId} stopped with status ${completionStatus}.`
+        : `Failed to interrupt Codex turn ${state.turnId}: ${result.detail}`,
+      result.confirmed && state.cancelled ? "cancelled" : result.confirmed ? "finalizing" : "failed",
+      { threadId: state.threadId, turnId: state.turnId }
+    );
+    if (completion) {
+      applyTurnNotification(state, completion);
+      return;
+    }
+
+    state.error = new Error(`Could not interrupt Codex turn ${state.turnId}: ${result.detail}`);
+    completeTurn(state, buildTurnCaptureResult(state.turnId, "failed"));
+  };
+
+  const startCancellationInterrupt = (startedThreadId, startedTurnId, options = {}) => {
+    if (state.turnInterruptPromise) {
+      return;
+    }
+
+    state.cancelled = options.cancelled ?? true;
+    state.cancellationStage = "after-start";
+    const stopReason = state.cancelled ? "cancelled job" : "inactive job";
+    emitProgress(
+      state.onProgress,
+      `Interrupting Codex turn ${startedTurnId} for ${stopReason}.`,
+      state.cancelled ? "cancelled" : "failed",
+      { threadId: startedThreadId, turnId: startedTurnId }
+    );
+    // Use the client that observed turn start so the interrupt is sent before
+    // this capture accepts any subsequent item/file-change notifications.
+    state.turnInterruptPromise = interruptTurnWithClient(client, {
+      threadId: startedThreadId,
+      turnId: startedTurnId
+    }).then((result) => {
+      state.turnInterrupt = result;
+      finalizeCancellationInterrupt();
+      return result;
+    }).catch((error) => {
+      state.error = error;
+      state.rejectCompletion(error);
+      return null;
+    });
+  };
+
+  const handlePrimaryTurnStarted = (startedThreadId, turn, notification = null) => {
+    if (!startedThreadId || !turn?.id) {
+      return false;
+    }
+    if (state.turnStartHandled) {
+      return state.turnId === turn.id;
+    }
+
+    if (options.allowPrimaryThreadChange && startedThreadId !== state.threadId) {
+      state.threadId = startedThreadId;
+      registerThread(state, startedThreadId);
+    }
+    if (startedThreadId !== state.threadId) {
+      return false;
+    }
+
+    state.turnStartHandled = true;
+    state.turnId = turn.id;
+    state.threadTurnIds.set(startedThreadId, turn.id);
+    // The lifecycle callback synchronously persists IDs and re-reads terminal
+    // state under updateJobStores. Its decision therefore reflects whichever
+    // side won the worker/cancel transaction at this protocol boundary.
+    let decision;
+    try {
+      decision = turnLifecycle?.onTurnStarted?.({
+        threadId: startedThreadId,
+        turnId: turn.id
+      });
+    } catch (error) {
+      state.error = error;
+      emitProgress(
+        state.onProgress,
+        `Could not persist Codex turn identifiers; interrupting turn ${turn.id}: ${error instanceof Error ? error.message : String(error)}`,
+        "failed",
+        { threadId: startedThreadId, turnId: turn.id }
+      );
+      startCancellationInterrupt(startedThreadId, turn.id, { cancelled: false });
+    }
+    applyTurnNotification(
+      state,
+      notification ?? {
+        method: "turn/started",
+        params: { threadId: startedThreadId, turn }
+      }
+    );
+    if (!shouldProceedWithTurn(decision)) {
+      startCancellationInterrupt(startedThreadId, turn.id, { cancelled: decision?.status === "cancelled" });
+    }
+    return true;
+  };
 
   client.setNotificationHandler((message) => {
+    if (message.method === "thread/started" || message.method === "thread/name/updated") {
+      applyTurnNotification(state, message);
+      return;
+    }
+
+    if (message.method === "turn/started" && !state.turnStartHandled) {
+      if (handlePrimaryTurnStarted(message.params.threadId ?? null, message.params.turn, message)) {
+        return;
+      }
+    }
+    if (
+      message.method === "turn/started" &&
+      state.turnStartHandled &&
+      message.params.threadId === state.threadId &&
+      message.params.turn?.id === state.turnId
+    ) {
+      return;
+    }
+
+    if (message.method === "turn/completed" && state.turnId && belongsToTurn(state, message)) {
+      if (state.turnInterruptPromise) {
+        state.turnInterruptCompletion = message;
+        finalizeCancellationInterrupt();
+        return;
+      }
+
+      let lifecycleOutcome;
+      try {
+        lifecycleOutcome = turnLifecycle?.onTurnCompleted?.({
+          threadId: message.params.threadId ?? state.threadId,
+          turnId: message.params.turn?.id ?? state.turnId,
+          status: message.params.turn?.status ?? "unknown"
+        });
+      } catch (error) {
+        state.error = error;
+        state.rejectCompletion(error);
+        return;
+      }
+      if (lifecycleOutcome?.cancelled) {
+        state.cancelled = true;
+        state.cancellationStage = "after-start";
+        emitProgress(
+          state.onProgress,
+          `Observed terminal Codex turn ${state.turnId} after job cancellation.`,
+          "cancelled",
+          { threadId: state.threadId, turnId: state.turnId }
+        );
+        applyTurnNotification(state, message);
+        return;
+      }
+    }
+
     if (!state.turnId) {
       state.bufferedNotifications.push(message);
       return;
     }
 
-    if (message.method === "thread/started" || message.method === "thread/name/updated") {
-      applyTurnNotification(state, message);
+    if ((state.cancelled || state.turnInterruptPromise) && belongsToTurn(state, message)) {
       return;
     }
 
@@ -589,14 +804,38 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   });
 
   try {
-    const response = await startRequest();
+    const preflight = await turnLifecycle?.beforeTurnStart?.({ threadId: state.threadId });
+    if (!shouldProceedWithTurn(preflight)) {
+      state.cancelled = preflight?.status === "cancelled";
+      state.cancellationStage = "before-start";
+      emitProgress(
+        state.onProgress,
+        `Skipped Codex turn start because job is ${preflight?.status ?? "inactive"}.`,
+        state.cancelled ? "cancelled" : "failed",
+        { threadId: state.threadId }
+      );
+      completeTurn(state, buildTurnCaptureResult("not-started", state.cancelled ? "interrupted" : "failed"));
+      return await state.completion;
+    }
+
+    let response;
+    try {
+      response = await startRequest();
+    } catch (error) {
+      turnLifecycle?.onTurnStartFailed?.(error);
+      throw error;
+    }
     options.onResponse?.(response, state);
-    state.turnId = response.turn?.id ?? null;
-    if (state.turnId) {
-      state.threadTurnIds.set(state.threadId, state.turnId);
+    if (!state.turnStartHandled && response.turn?.id) {
+      handlePrimaryTurnStarted(state.threadId, response.turn);
     }
     for (const message of state.bufferedNotifications) {
-      if (belongsToTurn(state, message)) {
+      if ((state.cancelled || state.turnInterruptPromise) && belongsToTurn(state, message)) {
+        continue;
+      }
+      if (message.method === "turn/started" && !state.turnStartHandled) {
+        handlePrimaryTurnStarted(message.params.threadId ?? null, message.params.turn, message);
+      } else if (belongsToTurn(state, message)) {
         applyTurnNotification(state, message);
       } else {
         if (previousHandler) {
@@ -615,6 +854,15 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
   }
+}
+
+function buildTurnCaptureResult(turnId, status) {
+  return {
+    id: turnId,
+    status,
+    items: [],
+    error: null
+  };
 }
 
 async function withAppServer(cwd, fn) {
@@ -987,13 +1235,7 @@ export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
   let client = null;
   try {
     client = await CodexAppServerClient.connect(cwd, { reuseExistingBroker: true });
-    await client.request("turn/interrupt", { threadId, turnId });
-    return {
-      attempted: true,
-      interrupted: true,
-      transport: client.transport,
-      detail: `Interrupted ${turnId} on ${threadId}.`
-    };
+    return await interruptTurnWithClient(client, { threadId, turnId });
   } catch (error) {
     return {
       attempted: true,
@@ -1026,7 +1268,7 @@ export async function runAppServerReview(cwd, options = {}) {
     });
     const delivery = options.delivery ?? "inline";
 
-    const turnState = await captureTurn(
+    const turnState = await captureAppServerTurn(
       client,
       sourceThreadId,
       () =>
@@ -1037,6 +1279,8 @@ export async function runAppServerReview(cwd, options = {}) {
         }),
       {
         onProgress: options.onProgress,
+        turnLifecycle: options.turnLifecycle,
+        allowPrimaryThreadChange: delivery === "detached",
         onResponse(response, state) {
           if (response.reviewThreadId) {
             state.threadIds.add(response.reviewThreadId);
@@ -1057,6 +1301,8 @@ export async function runAppServerReview(cwd, options = {}) {
       reasoningSummary: turnState.reasoningSummary,
       turn: turnState.finalTurn,
       error: turnState.error,
+      cancelled: turnState.cancelled,
+      cancellationStage: turnState.cancellationStage,
       stderr: cleanCodexStderr(client.stderr)
     };
   });
@@ -1136,7 +1382,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       throw new Error("A prompt is required for this Codex run.");
     }
 
-    const turnState = await captureTurn(
+    const turnState = await captureAppServerTurn(
       client,
       threadId,
       () =>
@@ -1147,7 +1393,10 @@ export async function runAppServerTurn(cwd, options = {}) {
           effort: options.effort ?? null,
           outputSchema: options.outputSchema ?? null
         }),
-      { onProgress: options.onProgress }
+      {
+        onProgress: options.onProgress,
+        turnLifecycle: options.turnLifecycle
+      }
     );
 
     return {
@@ -1158,6 +1407,8 @@ export async function runAppServerTurn(cwd, options = {}) {
       reasoningSummary: turnState.reasoningSummary,
       turn: turnState.finalTurn,
       error: turnState.error,
+      cancelled: turnState.cancelled,
+      cancellationStage: turnState.cancellationStage,
       stderr: cleanCodexStderr(client.stderr),
       fileChanges: turnState.fileChanges,
       touchedFiles: collectTouchedFiles(turnState.fileChanges),
