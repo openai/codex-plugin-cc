@@ -30,7 +30,10 @@ import {
   generateJobId,
   getConfig,
   listJobs,
+  resolveJobLogFile,
   setConfig,
+  updateJobStores,
+  updateState,
   upsertJob,
   writeJobFile
 } from "./lib/state.mjs";
@@ -63,12 +66,26 @@ import {
   renderStatusReport,
   renderTaskResult
 } from "./lib/render.mjs";
+import { buildTaskDispatchedStatusToken } from "./lib/task-status-token.mjs";
+import {
+  commitSpawnedTaskWorker as commitSpawnedWorker,
+  runClaimedTaskWorker as runClaimedWorker,
+  WORKER_TURN_STATES
+} from "./lib/task-launch-state.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
-const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
+const FOREGROUND_TASK_POLL_INTERVAL_MS = 100;
+const FOREGROUND_TASK_MISSING_JOB_RETRY_MS = 5000;
+const CANCEL_TURN_RESOLUTION_TIMEOUT_MS = 5000;
+const CANCEL_TURN_RESOLUTION_POLL_MS = 10;
+const TERMINAL_WORKER_TURN_STATES = new Set([
+  WORKER_TURN_STATES.INTERRUPTED,
+  WORKER_TURN_STATES.STOPPED
+]);
+const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
@@ -79,7 +96,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--resume-thread <id>|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh|ultra|max>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -121,7 +138,7 @@ function normalizeReasoningEffort(effort) {
   }
   if (!VALID_REASONING_EFFORTS.has(normalized)) {
     throw new Error(
-      `Unsupported reasoning effort "${effort}". Use one of: none, minimal, low, medium, high, xhigh.`
+      `Unsupported reasoning effort "${effort}". Use one of: none, minimal, low, medium, high, xhigh, ultra, max.`
     );
   }
   return normalized;
@@ -158,6 +175,38 @@ function resolveCommandWorkspace(options = {}) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeWorkerPid(pid) {
+  const normalized = Number(pid);
+  return Number.isInteger(normalized) && normalized > 0 ? normalized : null;
+}
+
+function isProcessAlive(pid) {
+  // A pid that answers signal 0 still has a live process table entry. EPERM also
+  // means the process exists but this user cannot signal it.
+  const normalizedPid = normalizeWorkerPid(pid);
+  if (!normalizedPid) {
+    return false;
+  }
+
+  try {
+    process.kill(normalizedPid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+function hasExitedActiveWorker(job) {
+  // Active jobs with a recorded worker pid should keep that worker alive until
+  // the job reaches a terminal state; a missing process means launch failed.
+  const workerPid = normalizeWorkerPid(job?.pid);
+  return Boolean(workerPid && isActiveJobStatus(job?.status) && !isProcessAlive(workerPid));
+}
+
+function isMissingJobError(error) {
+  return String(error?.message ?? "").startsWith("No job found for ");
 }
 
 function shorten(text, limit = 96) {
@@ -291,6 +340,13 @@ function isActiveJobStatus(status) {
   return status === "queued" || status === "running";
 }
 
+function isTerminalJobRecord(stateJob, storedJob = null) {
+  // PR #346 review: launch/cancel races can expose either the summary state row
+  // or the per-job file first, so both records must agree the job is active
+  // before a launcher writes worker-owned fields such as pid.
+  return !isActiveJobStatus(stateJob?.status) || Boolean(storedJob && !isActiveJobStatus(storedJob.status));
+}
+
 function getCurrentClaudeSessionId() {
   return process.env[SESSION_ID_ENV] ?? null;
 }
@@ -318,17 +374,49 @@ function findLatestResumableTaskJob(jobs) {
 async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
   const timeoutMs = Math.max(0, Number(options.timeoutMs) || DEFAULT_STATUS_WAIT_TIMEOUT_MS);
   const pollIntervalMs = Math.max(100, Number(options.pollIntervalMs) || DEFAULT_STATUS_POLL_INTERVAL_MS);
+  const retryMissingJobMs = Math.max(0, Number(options.retryMissingJobMs) || FOREGROUND_TASK_MISSING_JOB_RETRY_MS);
   const deadline = Date.now() + timeoutMs;
-  let snapshot = buildSingleJobSnapshot(cwd, reference);
+  const missingJobDeadline = Date.now() + retryMissingJobMs;
 
-  while (isActiveJobStatus(snapshot.job.status) && Date.now() < deadline) {
-    await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
+  const readSnapshot = () => {
+    try {
+      return buildSingleJobSnapshot(cwd, reference);
+    } catch (error) {
+      if (options.retryMissingJob && isMissingJobError(error) && Date.now() < missingJobDeadline) {
+        return null;
+      }
+      throw error;
+    }
+  };
+
+  let snapshot = readSnapshot();
+
+  while ((!snapshot || isActiveJobStatus(snapshot.job.status)) && Date.now() < deadline) {
+    if (snapshot && options.failWhenWorkerExits && hasExitedActiveWorker(snapshot.job)) {
+      return {
+        ...snapshot,
+        waitTimedOut: false,
+        workerExited: true,
+        timeoutMs
+      };
+    }
+
+    // Foreground task workers write state concurrently with the foreground
+    // waiter. If a transient read sees no parseable job, retry briefly instead
+    // of failing before the queued record becomes readable.
+    const activeDeadline = snapshot ? deadline : Math.min(deadline, missingJobDeadline);
+    await sleep(Math.min(pollIntervalMs, Math.max(0, activeDeadline - Date.now())));
+    snapshot = readSnapshot();
+  }
+
+  if (!snapshot) {
     snapshot = buildSingleJobSnapshot(cwd, reference);
   }
 
   return {
     ...snapshot,
     waitTimedOut: isActiveJobStatus(snapshot.job.status),
+    workerExited: Boolean(options.failWhenWorkerExits && hasExitedActiveWorker(snapshot.job)),
     timeoutMs
   };
 }
@@ -370,7 +458,8 @@ async function executeReviewRun(request) {
     const result = await runAppServerReview(request.cwd, {
       target: reviewTarget,
       model: request.model,
-      onProgress: request.onProgress
+      onProgress: request.onProgress,
+      turnLifecycle: request.turnLifecycle
     });
     const payload = {
       review: reviewName,
@@ -402,6 +491,7 @@ async function executeReviewRun(request) {
       summary: firstMeaningfulLine(result.reviewText, `${reviewName} completed.`),
       jobTitle: `Codex ${reviewName}`,
       jobClass: "review",
+      cancelled: result.cancelled,
       targetLabel: target.label
     };
   }
@@ -413,7 +503,8 @@ async function executeReviewRun(request) {
     model: request.model,
     sandbox: "read-only",
     outputSchema: readOutputSchema(REVIEW_SCHEMA),
-    onProgress: request.onProgress
+    onProgress: request.onProgress,
+    turnLifecycle: request.turnLifecycle
   });
   const parsed = parseStructuredOutput(result.finalMessage, {
     status: result.status,
@@ -453,6 +544,7 @@ async function executeReviewRun(request) {
     summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
     jobTitle: `Codex ${reviewName}`,
     jobClass: "review",
+    cancelled: result.cancelled,
     targetLabel: context.target.label
   };
 }
@@ -464,11 +556,11 @@ async function executeTaskRun(request) {
 
   const taskMetadata = buildTaskRunMetadata({
     prompt: request.prompt,
-    resumeLast: request.resumeLast
+    resumeLast: Boolean(request.resumeLast || request.resumeThreadId)
   });
 
-  let resumeThreadId = null;
-  if (request.resumeLast) {
+  let resumeThreadId = request.resumeThreadId ?? null;
+  if (!resumeThreadId && request.resumeLast) {
     const latestThread = await resolveLatestTrackedTaskThread(workspaceRoot, {
       excludeJobId: request.jobId
     });
@@ -491,7 +583,10 @@ async function executeTaskRun(request) {
     sandbox: request.write ? "workspace-write" : "read-only",
     onProgress: request.onProgress,
     persistThread: true,
-    threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
+    // Keep the workspace-boundary notice ephemeral by adding it only to turn input, not stored prompts or thread names.
+    boundaryNote: request.write ? buildWorkspaceBoundaryNotice(workspaceRoot) : null,
+    threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT),
+    turnLifecycle: request.turnLifecycle
   });
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
@@ -500,6 +595,7 @@ async function executeTaskRun(request) {
     {
       rawOutput,
       failureMessage,
+      status: result.status,
       reasoningSummary: result.reasoningSummary
     },
     {
@@ -525,6 +621,7 @@ async function executeTaskRun(request) {
     summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
     jobTitle: taskMetadata.title,
     jobClass: "task",
+    cancelled: result.cancelled,
     write: Boolean(request.write)
   };
 }
@@ -553,8 +650,26 @@ function buildTaskRunMetadata({ prompt, resumeLast = false }) {
   };
 }
 
-function renderQueuedTaskLaunch(payload) {
-  return `${payload.title} started in the background as ${payload.jobId}. Check /codex:status ${payload.jobId} for progress.\n`;
+function renderQueuedJobLaunch(payload, options = {}) {
+  // PR #346 review: a terminal enqueue payload means launch did not dispatch a
+  // worker, so emitting the dispatched sentinel would make hooks and humans
+  // believe there is live background work to poll.
+  if (!isActiveJobStatus(payload.status)) {
+    const launchLabel = options.launchLabel ?? payload.title;
+    if (payload.status === "cancelled") {
+      return `${launchLabel} ${payload.jobId} was cancelled before a worker launched; no work started.\n`;
+    }
+    const detail = payload.errorMessage ? `: ${payload.errorMessage}` : ".";
+    return `${launchLabel} ${payload.jobId} failed before a worker launched${detail}\n`;
+  }
+
+  const statusToken = buildTaskDispatchedStatusToken(payload.jobId);
+  return [
+    statusToken,
+    `${payload.title} dispatched as background job ${payload.jobId}.`,
+    `No automatic notification will arrive; poll /codex:status ${payload.jobId}.`,
+    `To be notified on completion, run with the Bash tool (run_in_background): node "\${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" status ${payload.jobId} --wait --timeout-ms 1800000  (re-arm it if it returns still-running).`
+  ].join("\n") + "\n";
 }
 
 function getJobKindLabel(kind, jobClass) {
@@ -601,7 +716,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, resumeThreadId, jobId }) {
   return {
     cwd,
     model,
@@ -609,8 +724,13 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId
     prompt,
     write,
     resumeLast,
+    resumeThreadId: resumeThreadId ?? null,
     jobId
   };
+}
+
+function buildWorkspaceBoundaryNotice(cwd) {
+  return `WORKSPACE: this run has write access ONLY within ${cwd}. Everything outside ${cwd} is read-only (Codex workspace-write sandbox). Do NOT probe, test, or investigate the sandbox boundary. If completing this task requires creating or modifying files outside ${cwd}, stop immediately and report that it must be re-dispatched with \`--cwd <target-directory>\` — do not attempt workarounds.`;
 }
 
 function renderTransferResult(payload) {
@@ -649,9 +769,9 @@ function readTaskPrompt(cwd, options, positionals) {
   return positionalPrompt || readStdinIfPiped();
 }
 
-function requireTaskRequest(prompt, resumeLast) {
-  if (!prompt && !resumeLast) {
-    throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
+function requireTaskRequest(prompt, resume) {
+  if (!prompt && !resume) {
+    throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last/--resume-thread.");
   }
 }
 
@@ -668,45 +788,316 @@ async function runForegroundCommand(job, runner, options = {}) {
   return execution;
 }
 
-function spawnDetachedTaskWorker(cwd, jobId) {
-  const scriptPath = path.join(ROOT_DIR, "scripts", "codex-companion.mjs");
-  const child = spawn(process.execPath, [scriptPath, "task-worker", "--cwd", cwd, "--job-id", jobId], {
-    cwd,
-    env: process.env,
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true
-  });
-  child.unref();
-  return child;
+function formatSpawnFailureMessage(error) {
+  const detail = error instanceof Error ? error.message : String(error ?? "");
+  return detail ? `Failed to launch background worker: ${detail}` : "Failed to launch background worker.";
 }
 
-function enqueueBackgroundTask(cwd, job, request) {
+function persistQueuedJobRecord(workspaceRoot, queuedRecord) {
+  // PR #346 review: the launch record is inserted through updateState so the
+  // summary row and stored job file are created from the same read-modify-write
+  // transition before any worker is allowed to observe the request.
+  updateState(workspaceRoot, (state) => {
+    const existingIndex = state.jobs.findIndex((candidate) => candidate.id === queuedRecord.id);
+    const nextRecord = {
+      ...queuedRecord,
+      updatedAt: nowIso()
+    };
+    if (existingIndex === -1) {
+      state.jobs.unshift(nextRecord);
+    } else {
+      state.jobs[existingIndex] = {
+        ...state.jobs[existingIndex],
+        ...nextRecord
+      };
+    }
+    writeJobFile(workspaceRoot, queuedRecord.id, nextRecord);
+  });
+}
+
+function markJobLaunchFailed(workspaceRoot, jobId, errorMessage, fallbackLogFile = null) {
+  let failedJob = null;
+  let preservedJob = null;
+
+  // PR #346 review: launch failures must become a durable failed job via one
+  // state read-modify-write, otherwise foreground waiters can hang on a queued
+  // record whose worker never existed.
+  updateState(workspaceRoot, (state) => {
+    const jobIndex = state.jobs.findIndex((candidate) => candidate.id === jobId);
+    if (jobIndex === -1) {
+      return;
+    }
+
+    const stateJob = state.jobs[jobIndex];
+    const storedJob = readStoredJob(workspaceRoot, jobId);
+    if (isTerminalJobRecord(stateJob, storedJob)) {
+      preservedJob = {
+        ...stateJob,
+        ...(storedJob ?? {})
+      };
+      return;
+    }
+
+    const completedAt = nowIso();
+    failedJob = {
+      ...(storedJob ?? {}),
+      ...stateJob,
+      status: "failed",
+      phase: "failed",
+      pid: null,
+      completedAt,
+      updatedAt: completedAt,
+      errorMessage,
+      logFile: stateJob.logFile ?? storedJob?.logFile ?? fallbackLogFile
+    };
+    state.jobs[jobIndex] = failedJob;
+    writeJobFile(workspaceRoot, jobId, failedJob);
+  });
+
+  if (failedJob) {
+    appendLogLine(failedJob.logFile, errorMessage);
+    return failedJob;
+  }
+  return preservedJob;
+}
+
+function spawnDetachedWorker(cwd, jobId, workerSubcommand = "task-worker", options = {}) {
+  const scriptPath = path.join(ROOT_DIR, "scripts", "codex-companion.mjs");
+  let child = null;
+
+  try {
+    child = spawn(process.execPath, [scriptPath, workerSubcommand, "--cwd", cwd, "--job-id", jobId], {
+      cwd,
+      env: process.env,
+      detached: true,
+      stdio: "ignore",
+      shell: false,
+      windowsHide: true
+    });
+  } catch (error) {
+    return { child: null, error };
+  }
+
+  const handleSpawnError = (error) => {
+    options.onError?.(error);
+  };
+  if (typeof child.once === "function") {
+    child.once("error", handleSpawnError);
+  } else if (typeof child.on === "function") {
+    child.on("error", handleSpawnError);
+  }
+
+  child.unref();
+  if (!normalizeWorkerPid(child.pid)) {
+    return { child, error: new Error("missing worker pid") };
+  }
+  return { child, error: null };
+}
+
+function enqueueBackgroundJob(cwd, job, request, workerSubcommand = "task-worker") {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
+  // The queued record is written before spawning so the detached worker can always
+  // load its request, and foreground callers can wait on the job immediately.
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
     request
   };
-  writeJobFile(job.workspaceRoot, job.id, queuedRecord);
-  upsertJob(job.workspaceRoot, queuedRecord);
+  persistQueuedJobRecord(job.workspaceRoot, queuedRecord);
+
+  // PR #346 review: /codex:cancel can land after the durable queued record is
+  // written but before worker launch; re-read the job and do not spawn a worker
+  // for a record that is already terminal.
+  const latestQueuedRecord = readStoredJob(job.workspaceRoot, job.id) ?? queuedRecord;
+  if (!isActiveJobStatus(latestQueuedRecord.status)) {
+    appendLogLine(logFile, `Skipped background worker launch because job is ${latestQueuedRecord.status}.`);
+    return {
+      payload: {
+        jobId: job.id,
+        status: latestQueuedRecord.status ?? "cancelled",
+        title: job.title,
+        summary: job.summary,
+        logFile
+      },
+      logFile
+    };
+  }
+
+  const recordLaunchFailure = (error) =>
+    markJobLaunchFailed(job.workspaceRoot, job.id, formatSpawnFailureMessage(error), logFile);
+  const { child, error: spawnError } = spawnDetachedWorker(cwd, job.id, workerSubcommand, {
+    onError: recordLaunchFailure
+  });
+  if (spawnError || !child) {
+    const failedJob = recordLaunchFailure(spawnError ?? new Error("missing child process"));
+    return {
+      payload: {
+        jobId: job.id,
+        status: failedJob?.status ?? "failed",
+        title: job.title,
+        summary: job.summary,
+        logFile,
+        errorMessage: failedJob?.errorMessage ?? formatSpawnFailureMessage(spawnError)
+      },
+      logFile
+    };
+  }
+
+  const { shouldKillWorker, launchStatus } = commitSpawnedWorker(job.workspaceRoot, job.id, child.pid);
+  if (shouldKillWorker) {
+    appendLogLine(logFile, `Terminating background worker because job is ${launchStatus}.`);
+  }
 
   return {
     payload: {
       jobId: job.id,
-      status: "queued",
+      status: launchStatus,
       title: job.title,
       summary: job.summary,
       logFile
     },
     logFile
   };
+}
+
+function enqueueBackgroundTask(cwd, job, request) {
+  return enqueueBackgroundJob(cwd, job, request);
+}
+
+function buildWorkerExitedError(jobId) {
+  // The worker drives the turn, but the shared app-server applies file edits, so
+  // edits in flight when the worker died can still land AFTER this point. Carry
+  // the verify-on-disk discipline in the message so callers re-check rather than
+  // trust a single (possibly mid-write) snapshot.
+  return `background worker exited before completing; check /codex:status ${jobId}. Files it was editing may have already landed or may still be landing via the shared app-server — re-check disk state (\`git status\`) before concluding, and do not trust a single snapshot.`;
+}
+
+function failActiveWorkerJob(workspaceRoot, job, errorMessage) {
+  // Re-read before marking failed so a concurrent cancellation or completion is
+  // not overwritten by the foreground waiter.
+  const latestStoredJob = readStoredJob(workspaceRoot, job.id) ?? {};
+  const latestJob = {
+    ...job,
+    ...latestStoredJob
+  };
+  if (!isActiveJobStatus(latestJob.status)) {
+    return latestJob;
+  }
+
+  const completedAt = nowIso();
+  const failedJob = {
+    ...latestJob,
+    status: "failed",
+    phase: "failed",
+    pid: null,
+    completedAt,
+    errorMessage
+  };
+
+  writeJobFile(workspaceRoot, job.id, failedJob);
+  upsertJob(workspaceRoot, {
+    id: job.id,
+    status: "failed",
+    phase: "failed",
+    pid: null,
+    completedAt,
+    errorMessage
+  });
+  appendLogLine(failedJob.logFile, errorMessage);
+  return failedJob;
+}
+
+function ensureTrailingNewline(value) {
+  const output = String(value ?? "");
+  return output.endsWith("\n") ? output : `${output}\n`;
+}
+
+function renderStoredTaskWorkerResult(job, storedJob) {
+  if (typeof storedJob?.rendered === "string" && storedJob.rendered) {
+    return ensureTrailingNewline(storedJob.rendered);
+  }
+  return renderStoredJobResult(job, storedJob);
+}
+
+function resolveStoredTaskExitStatus(job, storedJob) {
+  if (job.status === "completed") {
+    return 0;
+  }
+
+  const storedStatus = Number(storedJob?.result?.status);
+  if (Number.isInteger(storedStatus) && storedStatus !== 0) {
+    return storedStatus;
+  }
+
+  return 1;
+}
+
+function buildStoredTaskWorkerPayload(job, storedJob) {
+  const hasStoredResult =
+    storedJob?.result && typeof storedJob.result === "object" && !Array.isArray(storedJob.result);
+  const storedResult = hasStoredResult ? storedJob.result : {};
+  return {
+    ...storedResult,
+    job,
+    storedJob
+  };
+}
+
+async function runForegroundTaskWorker(cwd, job, request, options = {}) {
+  enqueueBackgroundTask(cwd, job, request);
+
+  // Foreground tasks run in the same detached worker as background tasks, then wait inline for
+  // the stored result so Bash auto-backgrounding and subagent teardown do not kill the Codex turn.
+  const snapshot = await waitForSingleJobSnapshot(cwd, job.id, {
+    // PR #346 review: foreground xhigh waits must survive beyond the 240s status default.
+    timeoutMs: Infinity,
+    pollIntervalMs: FOREGROUND_TASK_POLL_INTERVAL_MS,
+    retryMissingJob: true,
+    // PR #346 review: an unbounded wait must still fail fast when its detached
+    // worker pid has exited while the job remains queued/running.
+    failWhenWorkerExits: true
+  });
+  if (snapshot.workerExited) {
+    const errorMessage = buildWorkerExitedError(snapshot.job.id);
+    const failedJob = failActiveWorkerJob(snapshot.workspaceRoot, snapshot.job, errorMessage);
+    if (options.json) {
+      outputCommandResult({ job: failedJob, errorMessage }, `${errorMessage}\n`, true);
+    } else {
+      process.stderr.write(`${errorMessage}\n`);
+    }
+    process.exitCode = 1;
+    return;
+  }
+  if (snapshot.waitTimedOut) {
+    outputCommandResult(snapshot, renderJobStatusReport(snapshot.job), options.json);
+    process.exitCode = 1;
+    return;
+  }
+
+  const storedJob = readStoredJob(snapshot.workspaceRoot, snapshot.job.id);
+  const payload = buildStoredTaskWorkerPayload(snapshot.job, storedJob);
+  const exitStatus = resolveStoredTaskExitStatus(snapshot.job, storedJob);
+  const rendered = renderStoredTaskWorkerResult(snapshot.job, storedJob);
+
+  if (
+    snapshot.job.status === "failed" &&
+    !storedJob?.rendered &&
+    storedJob?.errorMessage &&
+    !options.json
+  ) {
+    process.stderr.write(`${storedJob.errorMessage}\n`);
+  } else {
+    outputCommandResult(payload, rendered, options.json);
+  }
+
+  if (exitStatus !== 0) {
+    process.exitCode = exitStatus;
+  }
 }
 
 async function handleReviewCommand(argv, config) {
@@ -720,6 +1111,9 @@ async function handleReviewCommand(argv, config) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
+  if (options.background && options.wait) {
+    throw new Error("Choose either --background or --wait, not both.");
+  }
   const focusText = positionals.join(" ").trim();
   const target = resolveReviewTarget(cwd, {
     base: options.base,
@@ -736,16 +1130,30 @@ async function handleReviewCommand(argv, config) {
     jobClass: "review",
     summary: metadata.summary
   });
+  const request = {
+    cwd,
+    base: options.base,
+    scope: options.scope,
+    model: options.model,
+    focusText,
+    reviewName: config.reviewName
+  };
+
+  if (options.background) {
+    ensureCodexAvailable(cwd);
+    const { payload } = enqueueBackgroundJob(cwd, job, request, "review-worker");
+    outputCommandResult(payload, renderQueuedJobLaunch(payload), options.json);
+    if (!isActiveJobStatus(payload.status)) {
+      process.exitCode = 1;
+    }
+    return;
+  }
+
   await runForegroundCommand(
     job,
     (progress) =>
       executeReviewRun({
-        cwd,
-        base: options.base,
-        scope: options.scope,
-        model: options.model,
-        focusText,
-        reviewName: config.reviewName,
+        ...request,
         onProgress: progress
       }),
     { json: options.json }
@@ -761,8 +1169,8 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "resume-thread"],
+    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "wait"],
     aliasMap: {
       m: "model"
     }
@@ -775,19 +1183,26 @@ async function handleTask(argv) {
   const prompt = readTaskPrompt(cwd, options, positionals);
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
+  const resumeThreadId = options["resume-thread"] || null;
   const fresh = Boolean(options.fresh);
   if (resumeLast && fresh) {
     throw new Error("Choose either --resume/--resume-last or --fresh.");
   }
+  if (options.background && options.wait) {
+    throw new Error("Choose either --background or --wait, not both.");
+  }
+  if (resumeThreadId && (resumeLast || fresh)) {
+    throw new Error("Choose either --resume-thread or --resume/--resume-last/--fresh.");
+  }
   const write = Boolean(options.write);
   const taskMetadata = buildTaskRunMetadata({
     prompt,
-    resumeLast
+    resumeLast: resumeLast || Boolean(resumeThreadId)
   });
 
   if (options.background) {
     ensureCodexAvailable(cwd);
-    requireTaskRequest(prompt, resumeLast);
+    requireTaskRequest(prompt, resumeLast || Boolean(resumeThreadId));
 
     const job = buildTaskJob(workspaceRoot, taskMetadata, write);
     const request = buildTaskRequest({
@@ -797,27 +1212,40 @@ async function handleTask(argv) {
       prompt,
       write,
       resumeLast,
+      resumeThreadId,
       jobId: job.id
     });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
-    outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
+    outputCommandResult(payload, renderQueuedJobLaunch(payload, { launchLabel: "Codex task" }), options.json);
+    // PR #346 review: exit non-zero unless a live background job was actually
+    // dispatched (queued/running). A terminal launch — `failed`, or `cancelled`
+    // when a concurrent cancel won before worker spawn — means there is no job to
+    // poll, so callers keying off exit status must not treat it as a successful
+    // dispatch (they would skip retry/escalation).
+    if (!isActiveJobStatus(payload.status)) {
+      process.exitCode = 1;
+    }
     return;
   }
 
+  ensureCodexAvailable(cwd);
+  requireTaskRequest(prompt, resumeLast || Boolean(resumeThreadId));
+
   const job = buildTaskJob(workspaceRoot, taskMetadata, write);
-  await runForegroundCommand(
+  const request = buildTaskRequest({
+    cwd,
+    model,
+    effort,
+    prompt,
+    write,
+    resumeLast,
+    resumeThreadId,
+    jobId: job.id
+  });
+  await runForegroundTaskWorker(
+    cwd,
     job,
-    (progress) =>
-      executeTaskRun({
-        cwd,
-        model,
-        effort,
-        prompt,
-        write,
-        resumeLast,
-        jobId: job.id,
-        onProgress: progress
-      }),
+    request,
     { json: options.json }
   );
 }
@@ -835,49 +1263,86 @@ async function handleTransfer(argv) {
   outputCommandResult(payload, rendered, options.json);
 }
 
-async function handleTaskWorker(argv) {
+async function handleClaimedWorker(argv, config) {
   const { options } = parseCommandInput(argv, {
     valueOptions: ["cwd", "job-id"]
   });
 
   if (!options["job-id"]) {
-    throw new Error("Missing required --job-id for task-worker.");
+    throw new Error(`Missing required --job-id for ${config.subcommand}.`);
   }
 
-  const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
-  if (!storedJob) {
-    throw new Error(`No stored job found for ${options["job-id"]}.`);
-  }
+  const jobId = options["job-id"];
+  await runClaimedWorker(
+    workspaceRoot,
+    jobId,
+    process.pid,
+    async (storedJob, turnLifecycle) => {
+      const request = storedJob.request;
+      if (!request || typeof request !== "object") {
+        throw new Error(`Stored job ${jobId} is missing its ${config.requestKind} request payload.`);
+      }
 
-  const request = storedJob.request;
-  if (!request || typeof request !== "object") {
-    throw new Error(`Stored job ${options["job-id"]} is missing its task request payload.`);
-  }
-
-  const { logFile, progress } = createTrackedProgress(
-    {
-      ...storedJob,
-      workspaceRoot
+      const { logFile, progress } = createTrackedProgress(
+        {
+          ...storedJob,
+          workspaceRoot
+        },
+        {
+          logFile: storedJob.logFile ?? null
+        }
+      );
+      await runTrackedJob(
+        {
+          ...storedJob,
+          workspaceRoot,
+          logFile
+        },
+        () =>
+          config.executeRun({
+            ...request,
+            onProgress: progress,
+            turnLifecycle
+          }),
+        { logFile }
+      );
     },
     {
-      logFile: storedJob.logFile ?? null
+      onSkip(outcome) {
+        const logFile = outcome.job?.logFile ?? resolveJobLogFile(workspaceRoot, jobId);
+        appendLogLine(logFile, `Skipped ${config.workerLabel} execution because job is ${outcome.status}.`);
+      }
     }
   );
-  await runTrackedJob(
-    {
-      ...storedJob,
-      workspaceRoot,
-      logFile
-    },
-    () =>
-      executeTaskRun({
-        ...request,
-        onProgress: progress
-      }),
-    { logFile }
-  );
+}
+
+async function handleTaskWorker(argv) {
+  return handleClaimedWorker(argv, {
+    subcommand: "task-worker",
+    requestKind: "task",
+    workerLabel: "task worker",
+    executeRun: executeTaskRun
+  });
+}
+
+async function handleReviewWorker(argv) {
+  return handleClaimedWorker(argv, {
+    subcommand: "review-worker",
+    requestKind: "review",
+    workerLabel: "review worker",
+    executeRun: executeReviewRun
+  });
+}
+
+function reconcileExitedStatusWorker(snapshot) {
+  if (!snapshot.workerExited && !hasExitedActiveWorker(snapshot.job)) {
+    return snapshot.job;
+  }
+
+  // Watcher dead-worker reliability fix: status/status --wait are the first
+  // readers that can convert a stale running worker into a durable failure.
+  return failActiveWorkerJob(snapshot.workspaceRoot, snapshot.job, buildWorkerExitedError(snapshot.job.id));
 }
 
 async function handleStatus(argv) {
@@ -892,10 +1357,22 @@ async function handleStatus(argv) {
     const snapshot = options.wait
       ? await waitForSingleJobSnapshot(cwd, reference, {
           timeoutMs: options["timeout-ms"],
-          pollIntervalMs: options["poll-interval-ms"]
+          pollIntervalMs: options["poll-interval-ms"],
+          // Watcher dead-worker reliability fix: the background completion
+          // watcher reaches detached workers through status --wait.
+          failWhenWorkerExits: true
         })
       : buildSingleJobSnapshot(cwd, reference);
-    outputCommandResult(snapshot, renderJobStatusReport(snapshot.job), options.json);
+    if (snapshot.workerExited) {
+      const failedJob = reconcileExitedStatusWorker(snapshot);
+      outputCommandResult({ ...snapshot, job: failedJob }, renderJobStatusReport(failedJob), options.json);
+      return;
+    }
+
+    // Watcher dead-worker reliability fix: a plain status read also repairs
+    // stale running state for result, hooks, and later status callers.
+    const reconciledJob = reconcileExitedStatusWorker(snapshot);
+    outputCommandResult({ ...snapshot, job: reconciledJob }, renderJobStatusReport(reconciledJob), options.json);
     return;
   }
 
@@ -931,7 +1408,6 @@ function handleTaskResumeCandidate(argv) {
     booleanOptions: ["json"]
   });
 
-  const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const sessionId = getCurrentClaudeSessionId();
   const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
@@ -970,45 +1446,56 @@ async function handleCancel(argv) {
   const reference = positionals[0] ?? "";
   const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
   const existing = readStoredJob(workspaceRoot, job.id) ?? {};
-  const threadId = existing.threadId ?? job.threadId ?? null;
-  const turnId = existing.turnId ?? job.turnId ?? null;
+  const completedAt = nowIso();
+  const cancellation = updateJobStores(workspaceRoot, job.id, ({ stateJob, storedJob }) => {
+    const latestStateJob = stateJob ?? job;
+    const latestStoredJob = storedJob ?? existing;
+    const nextJob = {
+      ...latestStoredJob,
+      ...latestStateJob,
+      status: "cancelled",
+      phase: "cancelled",
+      pid: null,
+      completedAt,
+      updatedAt: completedAt,
+      errorMessage: "Cancelled by user."
+    };
+    return {
+      stateJob: nextJob,
+      storedJob: { ...nextJob, cancelledAt: completedAt },
+      value: {
+        nextJob,
+        pid: latestStoredJob.pid ?? latestStateJob.pid ?? job.pid ?? Number.NaN,
+        threadId: nextJob.threadId ?? null,
+        turnId: nextJob.turnId ?? null,
+        turnLifecycle: nextJob.turnLifecycle ?? null
+      }
+    };
+  });
+  const { nextJob, pid } = cancellation.value;
+  appendLogLine(nextJob.logFile ?? job.logFile, "Cancelled by user.");
 
-  const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
+  const interrupt = await resolveCancelledJobTurn(cwd, workspaceRoot, job.id, {
+    ...nextJob,
+    threadId: cancellation.value.threadId,
+    turnId: cancellation.value.turnId,
+    turnLifecycle: cancellation.value.turnLifecycle
+  });
   if (interrupt.attempted) {
     appendLogLine(
-      job.logFile,
+      nextJob.logFile ?? job.logFile,
       interrupt.interrupted
-        ? `Requested Codex turn interrupt for ${turnId} on ${threadId}.`
+        ? `Requested Codex turn interrupt for ${interrupt.turnId} on ${interrupt.threadId}.`
         : `Codex turn interrupt failed${interrupt.detail ? `: ${interrupt.detail}` : "."}`
     );
   }
+  if (!interrupt.confirmed) {
+    const errorMessage = `Cancellation was recorded for ${job.id}, but the Codex turn could not be confirmed stopped${interrupt.detail ? `: ${interrupt.detail}` : "."}`;
+    appendLogLine(nextJob.logFile ?? job.logFile, errorMessage);
+    throw new Error(errorMessage);
+  }
 
-  terminateProcessTree(job.pid ?? Number.NaN);
-  appendLogLine(job.logFile, "Cancelled by user.");
-
-  const completedAt = nowIso();
-  const nextJob = {
-    ...job,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    completedAt,
-    errorMessage: "Cancelled by user."
-  };
-
-  writeJobFile(workspaceRoot, job.id, {
-    ...existing,
-    ...nextJob,
-    cancelledAt: completedAt
-  });
-  upsertJob(workspaceRoot, {
-    id: job.id,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    errorMessage: "Cancelled by user.",
-    completedAt
-  });
+  terminateProcessTree(pid);
 
   const payload = {
     jobId: job.id,
@@ -1019,6 +1506,140 @@ async function handleCancel(argv) {
   };
 
   outputCommandResult(payload, renderCancelReport(nextJob), options.json);
+}
+
+async function resolveCancelledJobTurn(cwd, workspaceRoot, jobId, initialJob) {
+  const deadline = Date.now() + CANCEL_TURN_RESOLUTION_TIMEOUT_MS;
+  let latestJob = initialJob;
+  let lastInterrupt = null;
+
+  while (true) {
+    const lifecycle = latestJob?.turnLifecycle ?? null;
+    const lifecycleState = lifecycle?.state ?? null;
+    const threadId = latestJob?.threadId ?? lifecycle?.threadId ?? null;
+    const turnId = latestJob?.turnId ?? lifecycle?.turnId ?? null;
+
+    if (
+      lifecycleState === WORKER_TURN_STATES.INTERRUPTED ||
+      lifecycleState === WORKER_TURN_STATES.STOPPED
+    ) {
+      return {
+        attempted: true,
+        // Preserve the public field's existing meaning: at least one interrupt
+        // RPC was accepted. The separate lifecycle state is the stronger proof
+        // that the worker observed terminal turn completion.
+        interrupted:
+          lifecycleState === WORKER_TURN_STATES.INTERRUPTED || Boolean(lastInterrupt?.interrupted),
+        confirmed: true,
+        threadId,
+        turnId,
+        detail: lifecycle.detail ?? `Worker interrupted ${turnId} on ${threadId}.`
+      };
+    }
+
+    if (
+      lifecycleState === WORKER_TURN_STATES.SUPPRESSED ||
+      lifecycleState === WORKER_TURN_STATES.START_REJECTED
+    ) {
+      return {
+        attempted: false,
+        interrupted: false,
+        confirmed: true,
+        threadId,
+        turnId,
+        detail:
+          lifecycleState === WORKER_TURN_STATES.SUPPRESSED
+            ? "turn start was suppressed"
+            : "app-server rejected turn start"
+      };
+    }
+
+    if (threadId && turnId && !lastInterrupt) {
+      lastInterrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
+      if (!lastInterrupt.interrupted && lifecycleState !== WORKER_TURN_STATES.INTERRUPTING) {
+        return {
+          ...lastInterrupt,
+          confirmed: false,
+          threadId,
+          turnId
+        };
+      }
+    }
+
+    // STARTING is durable before the RPC is sent. Do not kill its worker or
+    // report cancellation success until one side has interrupted the published
+    // turn, suppressed the request, or proved that the server rejected it.
+    const handoffPending =
+      lifecycleState === WORKER_TURN_STATES.STARTING ||
+      lifecycleState === WORKER_TURN_STATES.STARTED ||
+      lifecycleState === WORKER_TURN_STATES.INTERRUPTING ||
+      lifecycleState === WORKER_TURN_STATES.START_UNKNOWN;
+    if (!handoffPending) {
+      return {
+        attempted: Boolean(lastInterrupt?.attempted),
+        interrupted: false,
+        confirmed: !lastInterrupt,
+        threadId,
+        turnId,
+        detail: lastInterrupt?.detail ?? "no Codex turn was handed off"
+      };
+    }
+
+    if (Date.now() >= deadline) {
+      return {
+        attempted: Boolean(lastInterrupt?.attempted),
+        interrupted: false,
+        confirmed: false,
+        threadId,
+        turnId,
+        detail: lastInterrupt?.interrupted
+          ? "turn interrupt was accepted, but terminal turn completion was not observed"
+          : lastInterrupt?.detail ?? "timed out waiting for the worker turn-start handshake"
+      };
+    }
+
+    await sleep(CANCEL_TURN_RESOLUTION_POLL_MS);
+    latestJob = readConsistentCancellationHandshake(workspaceRoot, jobId) ?? latestJob;
+  }
+}
+
+function readConsistentCancellationHandshake(workspaceRoot, jobId) {
+  const transaction = updateJobStores(workspaceRoot, jobId, ({ stateJob, storedJob }) => {
+    if (!stateJob || !storedJob) {
+      return { value: storedJob ?? stateJob };
+    }
+
+    const terminalSource = [stateJob, storedJob].find((candidate) =>
+      TERMINAL_WORKER_TURN_STATES.has(candidate.turnLifecycle?.state)
+    );
+    if (terminalSource && stateJob.status === "cancelled" && storedJob.status === "cancelled") {
+      // A process can stop between the two atomic file replacements. Repair the
+      // unfinished side while holding the same lock, then let /cancel terminate
+      // the worker only after both stores carry the terminal acknowledgement.
+      const repairedJob = {
+        ...storedJob,
+        ...stateJob,
+        ...terminalSource,
+        status: "cancelled",
+        phase: "cancelled",
+        pid: null,
+        turnLifecycle: terminalSource.turnLifecycle
+      };
+      return {
+        stateJob: repairedJob,
+        storedJob: repairedJob,
+        value: repairedJob
+      };
+    }
+
+    return {
+      value: {
+        ...storedJob,
+        ...stateJob
+      }
+    };
+  });
+  return transaction.value;
 }
 
 async function main() {
@@ -1048,6 +1669,9 @@ async function main() {
       break;
     case "task-worker":
       await handleTaskWorker(argv);
+      break;
+    case "review-worker":
+      await handleReviewWorker(argv);
       break;
     case "status":
       await handleStatus(argv);

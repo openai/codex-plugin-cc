@@ -11,7 +11,7 @@ function read(relativePath) {
   return fs.readFileSync(path.join(PLUGIN_ROOT, relativePath), "utf8");
 }
 
-test("review command uses AskUserQuestion and background Bash while staying review-only", () => {
+test("review command uses AskUserQuestion and native background dispatch while staying review-only", () => {
   const source = read("commands/review.md");
   assert.match(source, /AskUserQuestion/);
   assert.match(source, /\bBash\(/);
@@ -19,27 +19,23 @@ test("review command uses AskUserQuestion and background Bash while staying revi
   assert.match(source, /review-only/i);
   assert.match(source, /return Codex's output verbatim to the user/i);
   assert.match(source, /```bash/);
-  assert.match(source, /```typescript/);
   assert.match(source, /review "\$ARGUMENTS"/);
   assert.match(source, /\[--scope auto\|working-tree\|branch\]/);
-  assert.match(source, /run_in_background:\s*true/);
-  assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" review "\$ARGUMENTS"`/);
-  assert.match(source, /description:\s*"Codex review"/);
-  assert.match(source, /Do not call `BashOutput`/);
+  assert.doesNotMatch(source, /run_in_background:\s*true/);
   assert.match(source, /Return the command stdout verbatim, exactly as-is/i);
   assert.match(source, /git status --short --untracked-files=all/);
   assert.match(source, /git diff --shortstat/);
   assert.match(source, /Treat untracked files or directories as reviewable work/i);
   assert.match(source, /Recommend waiting only when the review is clearly tiny, roughly 1-2 files total/i);
   assert.match(source, /In every other case, including unclear size, recommend background/i);
-  assert.match(source, /The companion script parses `--wait` and `--background`/i);
-  assert.match(source, /Claude Code's `Bash\(..., run_in_background: true\)` is what actually detaches the run/i);
+  assert.match(source, /The companion script owns background detachment/i);
+  assert.match(source, /do not use Claude Code's `run_in_background`/i);
   assert.match(source, /When in doubt, run the review/i);
   assert.match(source, /\(Recommended\)/);
   assert.match(source, /does not support staged-only review, unstaged-only review, or extra focus text/i);
 });
 
-test("adversarial review command uses AskUserQuestion and background Bash while staying review-only", () => {
+test("adversarial review command uses AskUserQuestion and native background dispatch while staying review-only", () => {
   const source = read("commands/adversarial-review.md");
   assert.match(source, /AskUserQuestion/);
   assert.match(source, /\bBash\(/);
@@ -47,21 +43,17 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /review-only/i);
   assert.match(source, /return Codex's output verbatim to the user/i);
   assert.match(source, /```bash/);
-  assert.match(source, /```typescript/);
   assert.match(source, /adversarial-review "\$ARGUMENTS"/);
   assert.match(source, /\[--scope auto\|working-tree\|branch\] \[focus \.\.\.\]/);
-  assert.match(source, /run_in_background:\s*true/);
-  assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" adversarial-review "\$ARGUMENTS"`/);
-  assert.match(source, /description:\s*"Codex adversarial review"/);
-  assert.match(source, /Do not call `BashOutput`/);
+  assert.doesNotMatch(source, /run_in_background:\s*true/);
   assert.match(source, /Return the command stdout verbatim, exactly as-is/i);
   assert.match(source, /git status --short --untracked-files=all/);
   assert.match(source, /git diff --shortstat/);
   assert.match(source, /Treat untracked files or directories as reviewable work/i);
   assert.match(source, /Recommend waiting only when the scoped review is clearly tiny, roughly 1-2 files total/i);
   assert.match(source, /In every other case, including unclear size, recommend background/i);
-  assert.match(source, /The companion script parses `--wait` and `--background`/i);
-  assert.match(source, /Claude Code's `Bash\(..., run_in_background: true\)` is what actually detaches the run/i);
+  assert.match(source, /The companion script owns background detachment/i);
+  assert.match(source, /do not use Claude Code's `run_in_background`/i);
   assert.match(source, /When in doubt, run the review/i);
   assert.match(source, /\(Recommended\)/);
   assert.match(source, /uses the same review target selection as `\/codex:review`/i);
@@ -104,14 +96,28 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /--background\|--wait/);
   assert.match(rescue, /--resume\|--fresh/);
   assert.match(rescue, /--model <model\|spark>/);
-  assert.match(rescue, /--effort <none\|minimal\|low\|medium\|high\|xhigh>/);
+  assert.match(rescue, /--effort <none\|minimal\|low\|medium\|high\|xhigh\|ultra\|max>/);
   assert.match(rescue, /task-resume-candidate --json/);
   assert.match(rescue, /AskUserQuestion/);
   assert.match(rescue, /Continue current Codex thread/);
   assert.match(rescue, /Start a new Codex thread/);
-  assert.match(rescue, /run the `codex:codex-rescue` subagent in the background/i);
-  assert.match(rescue, /default to foreground/i);
-  assert.match(rescue, /Do not forward them to `task`/i);
+  assert.match(rescue, /pass `--background` to the `codex:codex-rescue` subagent/i);
+  assert.match(rescue, /For long, substantial, or open-ended rescues, pass `--background`/i);
+  assert.match(rescue, /status <jobId> --wait --timeout-ms 1800000/);
+  assert.match(rescue, /run_in_background=true/);
+  assert.match(rescue, /`\/codex:result <jobId>`/);
+  // Fix: a foreground task call inside the subagent is auto-backgrounded and
+  // reaped at ~143s (kills the worker mid-run). Default must be --background.
+  assert.match(rescue, /default to `--background`/i);
+  assert.match(rescue, /Only stay foreground when `--wait` is explicit/i);
+  assert.match(rescue, /running inside the subagent is auto-backgrounded by the harness and then reaped/i);
+  assert.match(rescue, /observed at ~143s/i);
+  assert.doesNotMatch(rescue, /foreground rescue is capped by the Bash tool at roughly 600 seconds/i);
+  assert.match(agent, /Default to `task --background` whenever the user did NOT explicitly pass `--wait`/i);
+  assert.match(agent, /reaped when the subagent ends \(observed at ~143s\)/i);
+  assert.doesNotMatch(agent, /capped by the Bash tool at roughly 600 seconds/i);
+  assert.match(rescue, /Preserve the execution choice/i);
+  assert.match(rescue, /strip them only from the natural-language task text/i);
   assert.match(rescue, /`--model` and `--effort` are runtime-selection flags/i);
   assert.match(rescue, /Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort/i);
   assert.match(rescue, /If they ask for `spark`, map it to `gpt-5\.3-codex-spark`/i);
@@ -122,13 +128,19 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /thin forwarder only/i);
   assert.match(rescue, /Return the Codex companion stdout verbatim to the user/i);
   assert.match(rescue, /Do not paraphrase, summarize, rewrite, or add commentary before or after it/i);
+  assert.match(rescue, /\[\[codex-task status=complete\]\]/);
+  assert.match(rescue, /\[\[codex-task status=dispatched id=<jobId>\]\]/);
+  assert.match(rescue, /Trust this sentinel, companion state, and the PostToolUse hook over any prose/i);
   assert.match(rescue, /return that command's stdout as-is/i);
   assert.match(rescue, /Leave `--resume` and `--fresh` in the forwarded request/i);
   assert.match(agent, /--resume/);
   assert.match(agent, /--fresh/);
   assert.match(agent, /thin forwarding wrapper/i);
-  assert.match(agent, /prefer foreground for a small, clearly bounded rescue request/i);
-  assert.match(agent, /If the user did not explicitly choose `--background` or `--wait` and the task looks complicated, open-ended, multi-step, or likely to keep Codex running for a long time, prefer background execution/i);
+  assert.match(agent, /Explicit `--background` in the request means invoke `task --background`/i);
+  assert.match(agent, /Explicit `--wait` means invoke foreground `task`/i);
+  assert.match(agent, /ONLY for a short, clearly bounded request/i);
+  assert.match(agent, /Default to `task --background` whenever the user did NOT explicitly pass `--wait`/i);
+  assert.match(agent, /never run substantial work foreground from here/i);
   assert.match(agent, /Use exactly one `Bash` call/i);
   assert.match(agent, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
   assert.match(agent, /Do not call `review`, `adversarial-review`, `status`, `result`, or `cancel`/i);
@@ -148,9 +160,15 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /Leave `--effort` unset unless the user explicitly requests a specific effort/i);
   assert.match(runtimeSkill, /Leave model unset by default/i);
   assert.match(runtimeSkill, /Map `spark` to `--model gpt-5\.3-codex-spark`/i);
-  assert.match(runtimeSkill, /If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only/i);
-  assert.match(runtimeSkill, /Strip it before calling `task`/i);
-  assert.match(runtimeSkill, /`--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`/i);
+  assert.match(runtimeSkill, /If the forwarded request includes `--background`, pass that execution mode through by invoking `task --background`/i);
+  assert.match(runtimeSkill, /strip the flag token only from the natural-language prompt text/i);
+  assert.match(runtimeSkill, /If the forwarded request includes `--wait`, invoke foreground `task`/i);
+  assert.match(runtimeSkill, /do not pass `--wait` to `task`/i);
+  assert.match(runtimeSkill, /Do not drop an explicit execution mode while stripping tokens from prompt text/i);
+  assert.match(runtimeSkill, /Foreground task runs are capped by the Bash tool/i);
+  assert.match(runtimeSkill, /auto-backgrounded and orphaned/i);
+  assert.match(runtimeSkill, /long work belongs in `task --background`/i);
+  assert.match(runtimeSkill, /`--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `ultra`, `max`/i);
   assert.match(runtimeSkill, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
   assert.match(runtimeSkill, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
   assert.match(readme, /`codex:codex-rescue` subagent/i);
@@ -185,6 +203,10 @@ test("transfer, result, and cancel commands are exposed as deterministic runtime
   assert.match(cancel, /codex-companion\.mjs" cancel "\$ARGUMENTS"/);
   assert.match(resultHandling, /do not turn a failed or incomplete Codex run into a Claude-side implementation attempt/i);
   assert.match(resultHandling, /if Codex was never successfully invoked, do not generate a substitute answer at all/i);
+  assert.match(resultHandling, /\[\[codex-task status=complete\]\]/);
+  assert.match(resultHandling, /No automatic push notification will arrive/i);
+  assert.match(resultHandling, /status <jobId> --wait --timeout-ms 1800000/);
+  assert.match(resultHandling, /run_in_background=true/);
 });
 
 test("internal docs use task terminology for rescue runs", () => {
@@ -206,6 +228,9 @@ test("hooks keep session-end cleanup and stop gating enabled", () => {
   const source = read("hooks/hooks.json");
   assert.match(source, /SessionStart/);
   assert.match(source, /SessionEnd/);
+  assert.match(source, /PostToolUse/);
+  assert.match(source, /matcher":\s*"Agent"/);
+  assert.match(source, /codex-rescue-completion-hook\.mjs/);
   assert.match(source, /stop-review-gate-hook\.mjs/);
   assert.match(source, /session-lifecycle-hook\.mjs/);
 });

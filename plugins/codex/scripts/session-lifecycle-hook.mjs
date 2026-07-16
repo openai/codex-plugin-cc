@@ -13,7 +13,7 @@ import {
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
+import { resolveStateFile, updateState } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -50,8 +50,11 @@ function cleanupSessionJobs(cwd, sessionId) {
     return;
   }
 
-  const state = loadState(workspaceRoot);
-  const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
+  let removedJobs = [];
+  updateState(workspaceRoot, (state) => {
+    removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
+    state.jobs = state.jobs.filter((job) => job.sessionId !== sessionId);
+  });
   if (removedJobs.length === 0) {
     return;
   }
@@ -67,11 +70,6 @@ function cleanupSessionJobs(cwd, sessionId) {
       // Ignore teardown failures during session shutdown.
     }
   }
-
-  saveState(workspaceRoot, {
-    ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
-  });
 }
 
 function handleSessionStart(input) {

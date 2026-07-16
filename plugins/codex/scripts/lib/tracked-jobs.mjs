@@ -5,6 +5,19 @@ import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
+let stderrErrorGuardInstalled = false;
+let stderrWriteUnavailable = false;
+
+function ensureStderrErrorGuard() {
+  if (stderrErrorGuardInstalled) {
+    return;
+  }
+  process.stderr.on("error", () => {
+    stderrWriteUnavailable = true;
+  });
+  stderrErrorGuardInstalled = true;
+}
+
 export function nowIso() {
   return new Date().toISOString();
 }
@@ -119,15 +132,34 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
     return null;
   }
 
+  let stderrWriteFailed = false;
+  if (stderr) {
+    ensureStderrErrorGuard();
+  }
+
   return (eventOrMessage) => {
     const event = normalizeProgressEvent(eventOrMessage);
     const stderrMessage = event.stderrMessage ?? event.message;
-    if (stderr && stderrMessage) {
-      process.stderr.write(`[codex] ${stderrMessage}\n`);
-    }
     appendLogLine(logFile, event.message);
     appendLogBlock(logFile, event.logTitle, event.logBody);
     onEvent?.(event);
+    if (!stderr || !stderrMessage || stderrWriteFailed || stderrWriteUnavailable) {
+      return;
+    }
+
+    const stopStderrWrites = () => {
+      stderrWriteFailed = true;
+      stderrWriteUnavailable = true;
+    };
+    try {
+      process.stderr.write(`[codex] ${stderrMessage}\n`, (error) => {
+        if (error) {
+          stopStderrWrites();
+        }
+      });
+    } catch {
+      stopStderrWrites();
+    }
   };
 }
 
@@ -153,6 +185,17 @@ export async function runTrackedJob(job, runner, options = {}) {
 
   try {
     const execution = await runner();
+    if (execution.cancelled) {
+      const cancelledJob = readStoredJobOrNull(job.workspaceRoot, job.id);
+      if (cancelledJob?.status !== "cancelled") {
+        throw new Error(`Runner reported cancellation for ${job.id}, but its durable job record is not cancelled.`);
+      }
+      appendLogLine(
+        options.logFile ?? job.logFile ?? null,
+        "Worker stopped without changing the cancelled job status."
+      );
+      return execution;
+    }
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
     writeJobFile(job.workspaceRoot, job.id, {

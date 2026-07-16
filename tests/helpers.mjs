@@ -4,6 +4,17 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 
+// Claude Code exports these values into plugin processes. Tests set them only
+// when exercising that integration; inherited values would route fixture state
+// into the installed plugin and scope status results to the live Claude session.
+for (const key of [
+  "CLAUDE_PLUGIN_DATA",
+  "CODEX_COMPANION_SESSION_ID",
+  "CODEX_COMPANION_TRANSCRIPT_PATH"
+]) {
+  delete process.env[key];
+}
+
 export function makeTempDir(prefix = "codex-plugin-test-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }

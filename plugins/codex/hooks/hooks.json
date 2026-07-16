@@ -1,5 +1,5 @@
 {
-  "description": "Optional stop-time review gate for Codex Companion.",
+  "description": "Codex Companion lifecycle hooks, stop-time review gate, and codex-rescue completion context.",
   "hooks": {
     "SessionStart": [
       {
@@ -30,6 +30,18 @@
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/stop-review-gate-hook.mjs\"",
             "timeout": 900
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-rescue-completion-hook.mjs\"",
+            "timeout": 5
           }
         ]
       }

@@ -2,11 +2,12 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { spawn, spawnSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
@@ -15,6 +16,17 @@ const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
+
+function writePreloadScript(dir, source) {
+  const preloadPath = path.join(dir, "preload.cjs");
+  fs.writeFileSync(preloadPath, source, "utf8");
+  return preloadPath;
+}
+
+function extendNodeOptions(preloadPath) {
+  const previous = process.env.NODE_OPTIONS ? `${process.env.NODE_OPTIONS} ` : "";
+  return `${previous}--require=${preloadPath}`;
+}
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   const start = Date.now();
@@ -26,6 +38,52 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
   throw new Error("Timed out waiting for condition.");
+}
+
+function seedRunningJob(workspace, { id, pid, jobClass = "task", title = "Codex Task" }) {
+  // Status reads the summary state row first and the reconciler re-reads the
+  // stored job file before persisting a terminal state.
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const logFile = path.join(jobsDir, `${id}.log`);
+  const job = {
+    id,
+    kind: jobClass === "review" ? "review" : "task",
+    status: "running",
+    phase: "running",
+    title,
+    jobClass,
+    summary: "Investigate flaky test",
+    pid,
+    logFile,
+    createdAt: "2026-03-18T15:30:00.000Z",
+    startedAt: "2026-03-18T15:30:01.000Z",
+    updatedAt: "2026-03-18T15:30:02.000Z"
+  };
+
+  fs.writeFileSync(logFile, `[2026-03-18T15:30:00.000Z] Starting ${title}.\n`, "utf8");
+  fs.writeFileSync(path.join(jobsDir, `${id}.json`), `${JSON.stringify(job, null, 2)}\n`, "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [job] }, null, 2)}\n`,
+    "utf8"
+  );
+
+  return { stateDir, jobsDir, job, logFile };
+}
+
+function isPidDead(pid) {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    if (error?.code === "ESRCH") {
+      return true;
+    }
+    throw error;
+  }
 }
 
 test("setup reports ready when fake codex is installed and authenticated", () => {
@@ -500,7 +558,59 @@ test("task --resume-last resumes the latest persisted task thread", () => {
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
+  assert.equal(result.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n[[codex-task status=complete]]\n");
+});
+
+test("task --resume-thread resumes the specified thread", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const firstRun = run("node", [SCRIPT, "task", "--json", "initial task"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+  const firstPayload = JSON.parse(firstRun.stdout);
+  assert.ok(firstPayload.threadId, "first run should report a threadId");
+
+  const result = run(
+    "node",
+    [SCRIPT, "task", "--resume-thread", firstPayload.threadId, "--json", "follow up"],
+    {
+      cwd: repo,
+      env: buildEnv(binDir)
+    }
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.threadId, firstPayload.threadId);
+  assert.equal(payload.rawOutput, "Resumed the prior run.\nFollow-up prompt accepted.");
+});
+
+test("task --resume-thread rejects --resume-last and --fresh", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  for (const conflicting of ["--resume-last", "--fresh"]) {
+    const result = run(
+      "node",
+      [SCRIPT, "task", "--resume-thread", "thr_explicit", conflicting, "follow up"],
+      {
+        cwd: repo,
+        env: buildEnv(binDir)
+      }
+    );
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Choose either --resume-thread/);
+  }
 });
 
 test("task-resume-candidate returns the latest rescue thread from the current session", () => {
@@ -713,7 +823,190 @@ test("write task output focuses on the Codex result without generic follow-up hi
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n[[codex-task status=complete]]\n");
+});
+
+test("foreground task enqueues a detached worker and prints the stored result", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "--write", "fix the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n[[codex-task status=complete]]\n");
+
+  const stateDir = resolveStateDir(repo);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const job = state.jobs.find((candidate) => candidate.jobClass === "task");
+  assert.ok(job, "expected foreground task to create a tracked task job");
+  assert.equal(job.status, "completed");
+
+  const storedJob = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${job.id}.json`), "utf8"));
+  const log = fs.readFileSync(storedJob.logFile, "utf8");
+  assert.equal(storedJob.request.jobId, job.id);
+  assert.equal(storedJob.request.prompt, "fix the failing test");
+  assert.match(log, /Queued for background execution\./);
+  assert.equal(result.stdout, storedJob.rendered);
+});
+
+test("foreground task worker wait is not bounded by the default status timeout", () => {
+  const source = fs.readFileSync(SCRIPT, "utf8");
+  const match = source.match(/async function runForegroundTaskWorker[\s\S]*?\n}\n\nasync function handleTask/);
+
+  assert.ok(match, "expected to locate runForegroundTaskWorker");
+  assert.match(match[0], /timeoutMs:\s*Infinity/);
+  assert.match(match[0], /pollIntervalMs:\s*FOREGROUND_TASK_POLL_INTERVAL_MS/);
+});
+
+test("foreground task reports an error when the detached worker pid is already dead", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const preloadPath = writePreloadScript(
+    binDir,
+    `
+const childProcess = require("node:child_process");
+const { syncBuiltinESMExports } = require("node:module");
+const originalSpawn = childProcess.spawn;
+childProcess.spawn = function patchedSpawn(command, args, options) {
+  if (Array.isArray(args) && args[1] === "task-worker") {
+    return { pid: 987654321, unref() {} };
+  }
+  return originalSpawn.apply(this, arguments);
+};
+syncBuiltinESMExports();
+`
+  );
+
+  const result = spawnSync(process.execPath, [SCRIPT, "task", "--write", "fix the failing test"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      NODE_OPTIONS: extendNodeOptions(preloadPath)
+    },
+    encoding: "utf8",
+    timeout: 3000,
+    windowsHide: true
+  });
+
+  assert.notEqual(result.error?.code, "ETIMEDOUT", "foreground task hung waiting for a dead worker pid");
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /background worker exited before completing; check \/codex:status/);
+
+  const stateDir = resolveStateDir(repo);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const job = state.jobs.find((candidate) => candidate.jobClass === "task");
+  assert.equal(job.status, "failed");
+  assert.equal(job.pid, null);
+  assert.match(job.errorMessage, /background worker exited before completing/);
+});
+
+test("write task run prepends the workspace-boundary notice to the turn input", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "--write", "fix the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.input.length, 2);
+  assert.equal(fakeState.lastTurnStart.input[0].type, "text");
+  assert.match(fakeState.lastTurnStart.input[0].text, /write access ONLY within/);
+  assert.match(fakeState.lastTurnStart.input[0].text, /Do NOT probe/);
+  assert.match(fakeState.lastTurnStart.input[0].text, /--cwd/);
+  assert.match(fakeState.lastTurnStart.input[0].text, new RegExp(repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.deepEqual(fakeState.lastTurnStart.input[1], {
+    type: "text",
+    text: "fix the failing test",
+    text_elements: []
+  });
+});
+
+test("the workspace-boundary notice is ephemeral for write task runs", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const launched = run("node", [SCRIPT, "task", "--background", "--write", "--json", "implement scoped update"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(launched.status, 0, launched.stderr);
+  const launchPayload = JSON.parse(launched.stdout);
+  const jobFile = path.join(resolveStateDir(repo), "jobs", `${launchPayload.jobId}.json`);
+  const queuedJob = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  assert.equal(queuedJob.request.prompt, "implement scoped update");
+  assert.doesNotMatch(queuedJob.request.prompt, /WORKSPACE:/);
+  assert.doesNotMatch(queuedJob.request.prompt, /write access ONLY within/);
+
+  await waitFor(() => {
+    const storedJob = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+    return storedJob.status === "completed" ? storedJob : null;
+  }, { timeoutMs: 15000 });
+
+  const completedJob = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  assert.equal(completedJob.request.prompt, "implement scoped update");
+  assert.doesNotMatch(completedJob.request.prompt, /WORKSPACE:/);
+
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const taskThread = fakeState.threads.find((thread) => thread.id === fakeState.lastTurnStart.threadId);
+  assert.match(taskThread.name, /^Codex Companion Task: implement scoped update/);
+  assert.doesNotMatch(taskThread.name, /WORKSPACE:/);
+  assert.doesNotMatch(taskThread.name, /write access ONLY within/);
+});
+
+test("read-only task run does not get the workspace-boundary notice", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "diagnose the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.deepEqual(fakeState.lastTurnStart.input, [
+    {
+      type: "text",
+      text: "diagnose the failing test",
+      text_elements: []
+    }
+  ]);
 });
 
 test("task --resume acts like --resume-last without leaking the flag into the prompt", () => {
@@ -784,6 +1077,29 @@ test("task forwards model selection and reasoning effort to app-server turn/star
   assert.equal(fakeState.lastTurnStart.effort, "low");
 });
 
+test("task accepts ultra and max reasoning efforts", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n", "utf8");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  for (const effort of ["ultra", "max"]) {
+    const result = run(
+      "node",
+      [SCRIPT, "task", "--effort", effort, `reason with ${effort} effort`],
+      { cwd: repo, env: buildEnv(binDir) }
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.equal(fakeState.lastTurnStart.effort, effort);
+  }
+});
+
 test("task logs reasoning summaries and assistant messages to the job log", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -851,7 +1167,7 @@ test("task waits for the main thread to complete before returning the final resu
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n[[codex-task status=complete]]\n");
 });
 
 test("task ignores later subagent messages when choosing the final returned output", () => {
@@ -869,7 +1185,7 @@ test("task ignores later subagent messages when choosing the final returned outp
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n[[codex-task status=complete]]\n");
 });
 
 test("task can finish after subagent work even if the parent turn/completed event is missing", () => {
@@ -887,7 +1203,7 @@ test("task can finish after subagent work even if the parent turn/completed even
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n[[codex-task status=complete]]\n");
 });
 
 test("task using the shared broker still completes when Codex spawns subagents", () => {
@@ -917,7 +1233,7 @@ test("task using the shared broker still completes when Codex spawns subagents",
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n[[codex-task status=complete]]\n");
 });
 
 test("task --background enqueues a detached worker and exposes per-job status", async () => {
@@ -938,6 +1254,17 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   const launchPayload = JSON.parse(launched.stdout);
   assert.equal(launchPayload.status, "queued");
   assert.match(launchPayload.jobId, /^task-/);
+
+  const stateDir = resolveStateDir(repo);
+  const launchedState = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const launchedJob = launchedState.jobs.find((candidate) => candidate.id === launchPayload.jobId);
+  assert.ok(Number.isInteger(launchedJob?.pid) && launchedJob.pid > 0, "expected launched job to record worker pid");
+
+  const launchedStoredJob = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${launchPayload.jobId}.json`), "utf8"));
+  assert.ok(
+    Number.isInteger(launchedStoredJob.pid) && launchedStoredJob.pid > 0,
+    "expected stored launched job to record worker pid"
+  );
 
   const waitedStatus = run(
     "node",
@@ -967,6 +1294,730 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.equal(resultPayload.job.id, launchPayload.jobId);
   assert.equal(resultPayload.job.status, "completed");
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
+});
+
+test("task background persists its complete request in both stores before spawning", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const spawnMarker = path.join(binDir, "persist-before-spawn.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const preloadPath = writePreloadScript(
+    binDir,
+    [
+      'const fs = require("node:fs");',
+      'const path = require("node:path");',
+      'const childProcess = require("node:child_process");',
+      'const { syncBuiltinESMExports } = require("node:module");',
+      'const originalSpawn = childProcess.spawn;',
+      'const originalWriteFileSync = fs.writeFileSync;',
+      'childProcess.spawn = function patchedSpawn(command, args, options) {',
+      '  if (Array.isArray(args) && args[1] === "task-worker") {',
+      '    const jobId = args[args.indexOf("--job-id") + 1];',
+      '    const stateDir = process.env.ORDERING_STATE_DIR;',
+      '    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));',
+      '    const stateJob = state.jobs.find((job) => job.id === jobId);',
+      '    const storedJob = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", jobId + ".json"), "utf8"));',
+      '    originalWriteFileSync(process.env.SPAWN_MARKER, JSON.stringify({ stateJob, storedJob }), "utf8");',
+      '    return {',
+      '      pid: 424248,',
+      '      unref() {},',
+      '      once() { return this; },',
+      '      on() { return this; }',
+      '    };',
+      '  }',
+      '  return originalSpawn.apply(this, arguments);',
+      '};',
+      'syncBuiltinESMExports();'
+    ].join("\n")
+  );
+
+  const stateDir = resolveStateDir(repo);
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "persist this exact request"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      NODE_OPTIONS: extendNodeOptions(preloadPath),
+      ORDERING_STATE_DIR: stateDir,
+      SPAWN_MARKER: spawnMarker
+    }
+  });
+
+  assert.equal(launched.status, 0, launched.stderr);
+  const launchPayload = JSON.parse(launched.stdout);
+  const atSpawn = JSON.parse(fs.readFileSync(spawnMarker, "utf8"));
+  const expectedRequest = {
+    cwd: fs.realpathSync(repo),
+    model: null,
+    effort: null,
+    prompt: "persist this exact request",
+    write: false,
+    resumeLast: false,
+    resumeThreadId: null,
+    jobId: launchPayload.jobId
+  };
+  assert.equal(atSpawn.stateJob.status, "queued");
+  assert.equal(atSpawn.stateJob.pid, null);
+  assert.deepEqual(atSpawn.stateJob.request, expectedRequest);
+  assert.equal(atSpawn.storedJob.status, "queued");
+  assert.equal(atSpawn.storedJob.pid, null);
+  assert.deepEqual(atSpawn.storedJob.request, expectedRequest);
+});
+
+test("task worker logs a cancelled no-op without entering the app-server runner", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  const jobId = "task-worker-cancelled-before-claim";
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n", "utf8");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  const logFile = path.join(jobsDir, `${jobId}.log`);
+  const cancelledJob = {
+    id: jobId,
+    kind: "task",
+    jobClass: "task",
+    title: "Codex Task",
+    status: "cancelled",
+    phase: "cancelled",
+    pid: null,
+    logFile,
+    request: {
+      cwd: repo,
+      model: null,
+      effort: null,
+      prompt: "This runner must never start.",
+      write: true,
+      resumeLast: false,
+      jobId
+    },
+    createdAt: "2026-07-16T12:00:00.000Z",
+    updatedAt: "2026-07-16T12:00:01.000Z",
+    completedAt: "2026-07-16T12:00:01.000Z",
+    cancelledAt: "2026-07-16T12:00:01.000Z",
+    errorMessage: "Cancelled by user."
+  };
+  fs.mkdirSync(jobsDir, { recursive: true });
+  fs.writeFileSync(logFile, "[2026-07-16T12:00:00.000Z] Queued for background execution.\n", "utf8");
+  fs.writeFileSync(path.join(jobsDir, `${jobId}.json`), `${JSON.stringify(cancelledJob, null, 2)}\n`, "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [cancelledJob] }, null, 2)}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "task-worker", "--cwd", repo, "--job-id", jobId], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(fakeStatePath), false, "task worker entered the app-server runner");
+  assert.match(fs.readFileSync(logFile, "utf8"), /Skipped task worker execution because job is cancelled\./);
+  const stateJob = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs[0];
+  const storedJob = JSON.parse(fs.readFileSync(path.join(jobsDir, `${jobId}.json`), "utf8"));
+  assert.equal(stateJob.status, "cancelled");
+  assert.equal(stateJob.errorMessage, "Cancelled by user.");
+  assert.equal(storedJob.status, "cancelled");
+  assert.equal(storedJob.errorMessage, "Cancelled by user.");
+});
+
+test("review worker skips a cancelled job without entering the app-server runner", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  const jobId = "review-worker-cancelled-before-claim";
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n", "utf8");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n", "utf8");
+
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  const logFile = path.join(jobsDir, `${jobId}.log`);
+  const cancelledJob = {
+    id: jobId,
+    kind: "review",
+    jobClass: "review",
+    title: "Codex Review",
+    status: "cancelled",
+    phase: "cancelled",
+    pid: null,
+    logFile,
+    request: {
+      cwd: repo,
+      base: null,
+      scope: null,
+      model: null,
+      focusText: "",
+      reviewName: "Review"
+    },
+    createdAt: "2026-07-16T12:00:00.000Z",
+    updatedAt: "2026-07-16T12:00:01.000Z",
+    completedAt: "2026-07-16T12:00:01.000Z",
+    cancelledAt: "2026-07-16T12:00:01.000Z",
+    errorMessage: "Cancelled by user."
+  };
+  fs.mkdirSync(jobsDir, { recursive: true });
+  fs.writeFileSync(logFile, "[2026-07-16T12:00:00.000Z] Queued for background execution.\n", "utf8");
+  fs.writeFileSync(path.join(jobsDir, `${jobId}.json`), `${JSON.stringify(cancelledJob, null, 2)}\n`, "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [cancelledJob] }, null, 2)}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "review-worker", "--cwd", repo, "--job-id", jobId], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(fakeStatePath), false, "review worker entered the app-server runner");
+  assert.match(fs.readFileSync(logFile, "utf8"), /Skipped review worker execution because job is cancelled\./);
+  const stateJob = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs[0];
+  const storedJob = JSON.parse(fs.readFileSync(path.join(jobsDir, `${jobId}.json`), "utf8"));
+  assert.equal(stateJob.status, "cancelled");
+  assert.equal(stateJob.errorMessage, "Cancelled by user.");
+  assert.equal(storedJob.status, "cancelled");
+  assert.equal(storedJob.errorMessage, "Cancelled by user.");
+});
+
+test("task --background skips spawning when the queued job was cancelled before worker launch", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const spawnMarker = path.join(binDir, "task-worker-spawned.json");
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const preloadPath = writePreloadScript(
+    binDir,
+    `
+const fs = require("node:fs");
+const path = require("node:path");
+const childProcess = require("node:child_process");
+const { syncBuiltinESMExports } = require("node:module");
+const spawnMarker = ${JSON.stringify(spawnMarker)};
+const originalWriteFileSync = fs.writeFileSync;
+const originalSpawn = childProcess.spawn;
+let rewriting = false;
+
+function cancelQueuedTask(job) {
+  return {
+    ...job,
+    status: "cancelled",
+    phase: "cancelled",
+    pid: null,
+    errorMessage: "Cancelled before worker launch.",
+    cancelledAt: new Date().toISOString()
+  };
+}
+
+function rewriteJson(filePath, payload) {
+  rewriting = true;
+  try {
+    originalWriteFileSync(filePath, JSON.stringify(payload, null, 2) + "\\n", "utf8");
+  } finally {
+    rewriting = false;
+  }
+}
+
+fs.writeFileSync = function patchedWriteFileSync(file, data, options) {
+  originalWriteFileSync.apply(this, arguments);
+  if (rewriting) {
+    return;
+  }
+
+  const filePath = String(file);
+  if (!filePath.includes(".json")) {
+    return;
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(String(data));
+  } catch {
+    return;
+  }
+
+  if (filePath.includes(path.sep + "jobs" + path.sep) && parsed?.jobClass === "task" && parsed.status === "queued") {
+    rewriteJson(filePath, cancelQueuedTask(parsed));
+    return;
+  }
+
+  if (filePath.includes(path.sep + "state.json") && Array.isArray(parsed.jobs)) {
+    let changed = false;
+    const jobs = parsed.jobs.map((job) => {
+      if (job?.jobClass !== "task" || job.status !== "queued") {
+        return job;
+      }
+      changed = true;
+      return cancelQueuedTask(job);
+    });
+    if (changed) {
+      rewriteJson(filePath, { ...parsed, jobs });
+    }
+  }
+};
+
+childProcess.spawn = function patchedSpawn(command, args, options) {
+  if (Array.isArray(args) && args[1] === "task-worker") {
+    originalWriteFileSync(spawnMarker, JSON.stringify({ command, args }, null, 2) + "\\n", "utf8");
+    return { pid: 424242, unref() {} };
+  }
+  return originalSpawn.apply(this, arguments);
+};
+
+syncBuiltinESMExports();
+`
+  );
+
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate the failing test"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      NODE_OPTIONS: extendNodeOptions(preloadPath)
+    }
+  });
+
+  // PR #346 review: a cancelled launch dispatched no live job, so exit is non-zero.
+  assert.notEqual(launched.status, 0, launched.stderr);
+  const launchPayload = JSON.parse(launched.stdout);
+  assert.equal(launchPayload.status, "cancelled");
+  assert.equal(fs.existsSync(spawnMarker), false, "expected cancellation guard to skip task-worker spawn");
+
+  const stateDir = resolveStateDir(repo);
+  const job = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs.find(
+    (candidate) => candidate.id === launchPayload.jobId
+  );
+  assert.equal(job.status, "cancelled");
+  assert.equal(job.pid, null);
+
+  const storedJob = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${launchPayload.jobId}.json`), "utf8"));
+  assert.equal(storedJob.status, "cancelled");
+  assert.equal(storedJob.pid, null);
+});
+
+test("task --background does not persist a worker pid when cancellation wins after spawn", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const killMarker = path.join(binDir, "task-worker-killed.json");
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const preloadPath = writePreloadScript(
+    binDir,
+    `
+const fs = require("node:fs");
+const path = require("node:path");
+const childProcess = require("node:child_process");
+const processModule = require("node:process");
+const { syncBuiltinESMExports } = require("node:module");
+const killMarker = ${JSON.stringify(killMarker)};
+const originalReadFileSync = fs.readFileSync;
+const originalWriteFileSync = fs.writeFileSync;
+const originalSpawn = childProcess.spawn;
+const originalKill = processModule.kill;
+let spawnedTaskWorker = false;
+let injectedCancellation = false;
+let rewriting = false;
+
+function encodeLikeOriginal(value, options) {
+  return options === "utf8" || options?.encoding === "utf8" ? value : Buffer.from(value);
+}
+
+function cancelTaskJob(job) {
+  return {
+    ...job,
+    status: "cancelled",
+    phase: "cancelled",
+    pid: null,
+    errorMessage: "Cancelled after worker spawn.",
+    cancelledAt: new Date().toISOString()
+  };
+}
+
+function writeJson(filePath, payload) {
+  rewriting = true;
+  try {
+    originalWriteFileSync(filePath, JSON.stringify(payload, null, 2) + "\\n", "utf8");
+  } finally {
+    rewriting = false;
+  }
+}
+
+fs.readFileSync = function patchedReadFileSync(file, options) {
+  const filePath = String(file);
+  const data = originalReadFileSync.apply(this, arguments);
+  if (!spawnedTaskWorker || injectedCancellation || rewriting || !filePath.endsWith(path.sep + "state.json")) {
+    return data;
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(String(data));
+  } catch {
+    return data;
+  }
+
+  if (!Array.isArray(parsed.jobs)) {
+    return data;
+  }
+
+  let cancelledJob = null;
+  const jobs = parsed.jobs.map((job) => {
+    if (!cancelledJob && job?.jobClass === "task" && job.status === "queued") {
+      cancelledJob = cancelTaskJob(job);
+      return cancelledJob;
+    }
+    return job;
+  });
+  if (!cancelledJob) {
+    return data;
+  }
+
+  injectedCancellation = true;
+  const cancelledState = { ...parsed, jobs };
+  writeJson(filePath, cancelledState);
+  writeJson(path.join(path.dirname(filePath), "jobs", cancelledJob.id + ".json"), cancelledJob);
+  return encodeLikeOriginal(JSON.stringify(cancelledState, null, 2) + "\\n", options);
+};
+
+childProcess.spawn = function patchedSpawn(command, args, options) {
+  if (Array.isArray(args) && args[1] === "task-worker") {
+    spawnedTaskWorker = true;
+    return {
+      pid: 424242,
+      unref() {},
+      once() {
+        return this;
+      },
+      on() {
+        return this;
+      }
+    };
+  }
+  return originalSpawn.apply(this, arguments);
+};
+
+processModule.kill = function patchedKill(pid, signal) {
+  if (pid === -424242 || pid === 424242) {
+    originalWriteFileSync(killMarker, JSON.stringify({ pid, signal }, null, 2) + "\\n", "utf8");
+    return true;
+  }
+  return originalKill.apply(this, arguments);
+};
+
+syncBuiltinESMExports();
+`
+  );
+
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate the failing test"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      NODE_OPTIONS: extendNodeOptions(preloadPath)
+    }
+  });
+
+  // PR #346 review: a cancelled launch dispatched no live job, so exit is non-zero.
+  assert.notEqual(launched.status, 0, launched.stderr);
+  const launchPayload = JSON.parse(launched.stdout);
+  assert.equal(launchPayload.status, "cancelled");
+  assert.equal(fs.existsSync(killMarker), true, "expected the orphaned task-worker process group to be killed");
+
+  const stateDir = resolveStateDir(repo);
+  const job = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs.find(
+    (candidate) => candidate.id === launchPayload.jobId
+  );
+  assert.equal(job.status, "cancelled");
+  assert.equal(job.pid, null);
+
+  const storedJob = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${launchPayload.jobId}.json`), "utf8"));
+  assert.equal(storedJob.status, "cancelled");
+  assert.equal(storedJob.pid, null);
+});
+
+test("foreground task reports a structured failure when the detached worker spawn fails", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const preloadPath = writePreloadScript(
+    binDir,
+    `
+const childProcess = require("node:child_process");
+const { EventEmitter } = require("node:events");
+const { syncBuiltinESMExports } = require("node:module");
+const originalSpawn = childProcess.spawn;
+
+childProcess.spawn = function patchedSpawn(command, args, options) {
+  if (Array.isArray(args) && args[1] === "task-worker") {
+    const child = new EventEmitter();
+    child.pid = undefined;
+    child.unref = function unref() {};
+    process.nextTick(() => {
+      const error = new Error("spawn ENOENT task-worker");
+      error.code = "ENOENT";
+      child.emit("error", error);
+    });
+    return child;
+  }
+  return originalSpawn.apply(this, arguments);
+};
+
+syncBuiltinESMExports();
+`
+  );
+
+  const result = spawnSync(process.execPath, [SCRIPT, "task", "--write", "--json", "fix the failing test"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      NODE_OPTIONS: extendNodeOptions(preloadPath)
+    },
+    encoding: "utf8",
+    timeout: 3000,
+    windowsHide: true
+  });
+
+  assert.notEqual(result.error?.code, "ETIMEDOUT", "foreground task hung waiting for a worker that never launched");
+  assert.notEqual(result.status, 0);
+  assert.doesNotMatch(result.stderr, /Unhandled 'error' event/);
+
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.job.status, "failed");
+  assert.equal(payload.job.pid, null);
+  assert.match(payload.storedJob.errorMessage, /Failed to launch background worker|missing worker pid|spawn ENOENT/);
+});
+
+test("task --background exits non-zero when the worker spawn fails", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const preloadPath = writePreloadScript(
+    binDir,
+    `
+const childProcess = require("node:child_process");
+const { EventEmitter } = require("node:events");
+const { syncBuiltinESMExports } = require("node:module");
+const originalSpawn = childProcess.spawn;
+
+childProcess.spawn = function patchedSpawn(command, args, options) {
+  if (Array.isArray(args) && args[1] === "task-worker") {
+    const child = new EventEmitter();
+    child.pid = undefined;
+    child.unref = function unref() {};
+    process.nextTick(() => {
+      const error = new Error("spawn ENOENT task-worker");
+      error.code = "ENOENT";
+      child.emit("error", error);
+    });
+    return child;
+  }
+  return originalSpawn.apply(this, arguments);
+};
+
+syncBuiltinESMExports();
+`
+  );
+
+  const result = spawnSync(process.execPath, [SCRIPT, "task", "--background", "--json", "fix the failing test"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      NODE_OPTIONS: extendNodeOptions(preloadPath)
+    },
+    encoding: "utf8",
+    timeout: 3000,
+    windowsHide: true
+  });
+
+  assert.notEqual(result.error?.code, "ETIMEDOUT", "background task hung after a worker launch failure");
+  assert.notEqual(result.status, 0);
+  assert.doesNotMatch(result.stderr, /Unhandled 'error' event/);
+
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.status, "failed");
+});
+
+test("task --background cancelled before launch renders terminal text without a dispatched token", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const preloadPath = writePreloadScript(
+    binDir,
+    `
+const fs = require("node:fs");
+const path = require("node:path");
+const childProcess = require("node:child_process");
+const { syncBuiltinESMExports } = require("node:module");
+const originalWriteFileSync = fs.writeFileSync;
+const originalSpawn = childProcess.spawn;
+let rewriting = false;
+
+function cancelQueuedTask(job) {
+  return {
+    ...job,
+    status: "cancelled",
+    phase: "cancelled",
+    pid: null,
+    errorMessage: "Cancelled before worker launch.",
+    cancelledAt: new Date().toISOString()
+  };
+}
+
+function rewriteJson(filePath, payload) {
+  rewriting = true;
+  try {
+    originalWriteFileSync(filePath, JSON.stringify(payload, null, 2) + "\\n", "utf8");
+  } finally {
+    rewriting = false;
+  }
+}
+
+fs.writeFileSync = function patchedWriteFileSync(file, data, options) {
+  originalWriteFileSync.apply(this, arguments);
+  if (rewriting) {
+    return;
+  }
+
+  const filePath = String(file);
+  if (!filePath.includes(".json")) {
+    return;
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(String(data));
+  } catch {
+    return;
+  }
+
+  if (filePath.includes(path.sep + "jobs" + path.sep) && parsed?.jobClass === "task" && parsed.status === "queued") {
+    rewriteJson(filePath, cancelQueuedTask(parsed));
+    return;
+  }
+
+  if (filePath.includes(path.sep + "state.json") && Array.isArray(parsed.jobs)) {
+    let changed = false;
+    const jobs = parsed.jobs.map((job) => {
+      if (job?.jobClass !== "task" || job.status !== "queued") {
+        return job;
+      }
+      changed = true;
+      return cancelQueuedTask(job);
+    });
+    if (changed) {
+      rewriteJson(filePath, { ...parsed, jobs });
+    }
+  }
+};
+
+childProcess.spawn = function patchedSpawn(command, args, options) {
+  if (Array.isArray(args) && args[1] === "task-worker") {
+    throw new Error("task-worker should not launch after cancellation");
+  }
+  return originalSpawn.apply(this, arguments);
+};
+
+syncBuiltinESMExports();
+`
+  );
+
+  const launched = run("node", [SCRIPT, "task", "--background", "investigate the failing test"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      NODE_OPTIONS: extendNodeOptions(preloadPath)
+    }
+  });
+
+  // PR #346 review: a cancelled launch dispatched no live job, so exit is non-zero.
+  assert.notEqual(launched.status, 0, launched.stderr);
+  assert.doesNotMatch(launched.stdout, /\[\[codex-task status=dispatched/);
+  assert.doesNotMatch(launched.stdout, /dispatched as background job/);
+  assert.match(launched.stdout, /was cancelled before a worker launched; no work started\./);
+});
+
+test("task --background emits a dispatched token without promising notification", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const launched = run("node", [SCRIPT, "task", "--background", "investigate the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(launched.status, 0, launched.stderr);
+  assert.match(launched.stdout, /^\[\[codex-task status=dispatched id=task-[^\]\s]+\]\]\n/);
+  const jobId = launched.stdout.match(/id=(task-[^\]\s]+)/)?.[1];
+  assert.ok(jobId, "expected dispatched token to include a task job id");
+  assert.match(launched.stdout, new RegExp(`No automatic notification will arrive; poll /codex:status ${jobId}\\.`));
+  assert.match(
+    launched.stdout,
+    new RegExp(
+      `To be notified on completion, run with the Bash tool \\(run_in_background\\): node "\\$\\{CLAUDE_PLUGIN_ROOT\\}/scripts/codex-companion\\.mjs" status ${jobId} --wait --timeout-ms 1800000  \\(re-arm it if it returns still-running\\)\\.`
+    )
+  );
+  assert.doesNotMatch(launched.stdout, /will notify|will be notified|you will be notified/i);
+});
+
+test("task rejects conflicting background and wait flags before dispatching a job", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "--background", "--wait", "investigate the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  const stateFile = path.join(resolveStateDir(repo), "state.json");
+  const stateJobs = fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, "utf8")).jobs : [];
+  assert.deepEqual(stateJobs, []);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Choose either --background or --wait, not both\./);
 });
 
 test("review rejects focus text because it is native-review only", () => {
@@ -1031,7 +2082,7 @@ test("adversarial review rejects staged-only scope to match review target select
   assert.match(result.stderr, /Use one of: auto, working-tree, branch, or pass --base <ref>/i);
 });
 
-test("review accepts --background while still running as a tracked review job", () => {
+test("review --background dispatches and stores retrievable result output", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
@@ -1048,18 +2099,174 @@ test("review accepts --background while still running as a tracked review job", 
 
   assert.equal(launched.status, 0, launched.stderr);
   const launchPayload = JSON.parse(launched.stdout);
-  assert.equal(launchPayload.review, "Review");
-  assert.match(launchPayload.codex.stdout, /No material issues found/);
+  assert.match(launchPayload.jobId, /^review-/);
+  assert.ok(["queued", "running"].includes(launchPayload.status));
+  assert.equal(launchPayload.title, "Codex Review");
 
-  const status = run("node", [SCRIPT, "status"], {
+  const status = run("node", [SCRIPT, "status", launchPayload.jobId, "--wait", "--timeout-ms", "15000", "--json"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
 
   assert.equal(status.status, 0, status.stderr);
-  assert.match(status.stdout, /# Codex Status/);
-  assert.match(status.stdout, /Codex Review/);
-  assert.match(status.stdout, /completed/);
+  assert.equal(JSON.parse(status.stdout).job.status, "completed");
+
+  const result = run("node", [SCRIPT, "result", launchPayload.jobId, "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const resultPayload = JSON.parse(result.stdout);
+  assert.equal(resultPayload.job.id, launchPayload.jobId);
+  assert.equal(resultPayload.job.status, "completed");
+  assert.match(resultPayload.storedJob.rendered, /No material issues found/);
+});
+
+test("adversarial-review --background dispatches through the shared review worker", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0];\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0].id;\n");
+
+  const launched = run("node", [SCRIPT, "adversarial-review", "--background", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(launched.status, 0, launched.stderr);
+  const launchPayload = JSON.parse(launched.stdout);
+  assert.match(launchPayload.jobId, /^review-/);
+  assert.ok(["queued", "running"].includes(launchPayload.status));
+  assert.equal(launchPayload.title, "Codex Adversarial Review");
+
+  const status = run("node", [SCRIPT, "status", launchPayload.jobId, "--wait", "--timeout-ms", "15000", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(status.status, 0, status.stderr);
+  assert.equal(JSON.parse(status.stdout).job.status, "completed");
+
+  const result = run("node", [SCRIPT, "result", launchPayload.jobId], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Missing empty-state guard/);
+});
+
+test("review --background emits the dispatched sentinel and watcher guidance", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  const launched = run("node", [SCRIPT, "review", "--background"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(launched.status, 0, launched.stderr);
+  assert.match(launched.stdout, /^\[\[codex-task status=dispatched id=review-[^\]\s]+\]\]\n/);
+  const jobId = launched.stdout.match(/id=(review-[^\]\s]+)/)?.[1];
+  assert.ok(jobId);
+  assert.match(launched.stdout, new RegExp(`Codex Review dispatched as background job ${jobId}\\.`));
+  assert.match(launched.stdout, new RegExp(`poll /codex:status ${jobId}\\.`));
+});
+
+test("review --background renders cancellation without a dispatched sentinel when cancellation wins before spawn", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  const preloadPath = writePreloadScript(
+    binDir,
+    [
+      'const fs = require("node:fs");',
+      'const childProcess = require("node:child_process");',
+      'const { syncBuiltinESMExports } = require("node:module");',
+      'const originalWriteFileSync = fs.writeFileSync;',
+      'const originalSpawn = childProcess.spawn;',
+      'let rewriting = false;',
+      'function cancel(job) {',
+      '  return { ...job, status: "cancelled", phase: "cancelled", pid: null, errorMessage: "Cancelled before worker launch.", cancelledAt: new Date().toISOString() };',
+      '}',
+      'fs.writeFileSync = function patchedWriteFileSync(file, data, options) {',
+      '  originalWriteFileSync.apply(this, arguments);',
+      '  if (rewriting) return;',
+      '  let parsed;',
+      '  try { parsed = JSON.parse(String(data)); } catch { return; }',
+      '  let replacement = parsed;',
+      '  let changed = false;',
+      '  if (parsed?.jobClass === "review" && parsed.status === "queued") {',
+      '    replacement = cancel(parsed);',
+      '    changed = true;',
+      '  } else if (Array.isArray(parsed?.jobs)) {',
+      '    replacement = { ...parsed, jobs: parsed.jobs.map((job) => {',
+      '      if (job?.jobClass !== "review" || job.status !== "queued") return job;',
+      '      changed = true;',
+      '      return cancel(job);',
+      '    }) };',
+      '  }',
+      '  if (!changed) return;',
+      '  rewriting = true;',
+      '  try { originalWriteFileSync(file, JSON.stringify(replacement, null, 2), "utf8"); } finally { rewriting = false; }',
+      '};',
+      'childProcess.spawn = function patchedSpawn(command, args, options) {',
+      '  if (Array.isArray(args) && args[1] === "review-worker") throw new Error("review-worker must not spawn");',
+      '  return originalSpawn.apply(this, arguments);',
+      '};',
+      'syncBuiltinESMExports();'
+    ].join("\n")
+  );
+
+  const launched = run("node", [SCRIPT, "review", "--background"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      NODE_OPTIONS: extendNodeOptions(preloadPath)
+    }
+  });
+
+  assert.notEqual(launched.status, 0, launched.stderr);
+  assert.doesNotMatch(launched.stdout, /\[\[codex-task status=dispatched/);
+  assert.doesNotMatch(launched.stdout, /dispatched as background job/);
+  assert.match(launched.stdout, /was cancelled before a worker launched; no work started\./);
+});
+
+test("review rejects conflicting background and wait flags before dispatch", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  const result = run("node", [SCRIPT, "review", "--background", "--wait"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  const stateFile = path.join(resolveStateDir(repo), "state.json");
+  const jobs = fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, "utf8")).jobs : [];
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Choose either --background or --wait, not both\./);
+  assert.deepEqual(jobs, []);
 });
 
 test("status shows phases, hints, and the latest finished job", () => {
@@ -1350,6 +2557,122 @@ test("status --wait times out cleanly when a job is still active", () => {
   assert.equal(payload.job.id, "task-live");
   assert.equal(payload.job.status, "running");
   assert.equal(payload.waitTimedOut, true);
+});
+
+test("status and status --wait reconcile dead review workers to failed", () => {
+  for (const wait of [false, true]) {
+    const workspace = makeTempDir();
+    const id = wait ? "review-dead-wait" : "review-dead-nowait";
+    const { stateDir } = seedRunningJob(workspace, {
+      id,
+      pid: 987654321,
+      jobClass: "review",
+      title: "Codex Review"
+    });
+    const args = [SCRIPT, "status", id, ...(wait ? ["--wait", "--timeout-ms", "600000"] : []), "--json"];
+    const result = spawnSync(process.execPath, args, {
+      cwd: workspace,
+      encoding: "utf8",
+      timeout: 3000,
+      windowsHide: true
+    });
+
+    assert.notEqual(result.error?.code, "ETIMEDOUT", `status${wait ? " --wait" : ""} hung on a dead review worker`);
+    assert.equal(result.status, 0, result.stderr);
+    const payload = JSON.parse(result.stdout);
+    assert.equal(payload.job.id, id);
+    assert.equal(payload.job.jobClass, "review");
+    assert.equal(payload.job.status, "failed");
+    assert.match(payload.job.errorMessage, /background worker exited before completing/);
+
+    const persisted = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs.find(
+      (job) => job.id === id
+    );
+    assert.equal(persisted.status, "failed");
+    assert.equal(persisted.pid, null);
+  }
+});
+
+test("status --wait reports a crashed worker instead of hanging when the worker pid is dead", () => {
+  const workspace = makeTempDir();
+  const { stateDir } = seedRunningJob(workspace, { id: "task-dead-wait", pid: 987654321 });
+
+  const result = spawnSync(
+    process.execPath,
+    [SCRIPT, "status", "task-dead-wait", "--wait", "--timeout-ms", "600000", "--json"],
+    {
+      cwd: workspace,
+      encoding: "utf8",
+      timeout: 3000,
+      windowsHide: true
+    }
+  );
+
+  assert.notEqual(result.error?.code, "ETIMEDOUT", "status --wait hung waiting for a dead worker pid");
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.job.id, "task-dead-wait");
+  assert.equal(payload.job.status, "failed");
+  assert.match(payload.job.errorMessage, /background worker exited before completing/);
+  // The failure message must carry the verify-on-disk warning: edits can still
+  // land via the shared app-server after the worker pid dies, so a single
+  // snapshot is not trustworthy.
+  assert.match(payload.job.errorMessage, /still be landing via the shared app-server|re-check disk state/i);
+
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const job = state.jobs.find((candidate) => candidate.id === "task-dead-wait");
+  assert.equal(job.status, "failed");
+  assert.equal(job.pid, null);
+  assert.match(job.errorMessage, /background worker exited before completing/);
+});
+
+test("status (no --wait) reconciles a dead-worker job to failed", () => {
+  const workspace = makeTempDir();
+  const { stateDir } = seedRunningJob(workspace, { id: "task-dead-nowait", pid: 987654321 });
+
+  const result = run("node", [SCRIPT, "status", "task-dead-nowait", "--json"], {
+    cwd: workspace
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.job.id, "task-dead-nowait");
+  assert.equal(payload.job.status, "failed");
+  assert.match(payload.job.errorMessage, /background worker exited before completing/);
+
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const job = state.jobs.find((candidate) => candidate.id === "task-dead-nowait");
+  assert.equal(job.status, "failed");
+  assert.equal(job.pid, null);
+  assert.match(job.errorMessage, /background worker exited before completing/);
+});
+
+test("status --wait keeps waiting when the active worker pid is alive", () => {
+  const workspace = makeTempDir();
+  const { stateDir } = seedRunningJob(workspace, { id: "task-live-pid", pid: process.pid });
+
+  const result = spawnSync(
+    process.execPath,
+    [SCRIPT, "status", "task-live-pid", "--wait", "--timeout-ms", "60", "--json"],
+    {
+      cwd: workspace,
+      encoding: "utf8",
+      timeout: 3000,
+      windowsHide: true
+    }
+  );
+
+  assert.notEqual(result.error?.code, "ETIMEDOUT", "status --wait did not honor the short timeout");
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.job.id, "task-live-pid");
+  assert.equal(payload.job.status, "running");
+  assert.equal(payload.waitTimedOut, true);
+
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const job = state.jobs.find((candidate) => candidate.id === "task-live-pid");
+  assert.equal(job.status, "running");
+  assert.equal(job.pid, process.pid);
 });
 
 test("result returns the stored output for the latest finished job by default", () => {
@@ -1801,6 +3124,116 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
+test("cancel waits for an in-flight turn handoff before reporting success", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const gatePath = path.join(binDir, "release-turn-start");
+  const interruptCompletionGatePath = path.join(binDir, "release-interrupt-completion");
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "gated-turn-start");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    FAKE_CODEX_TURN_START_GATE: gatePath,
+    FAKE_CODEX_INTERRUPT_COMPLETION_GATE: interruptCompletionGatePath
+  };
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "fix the cancellation handoff"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+  const stateDir = resolveStateDir(repo);
+
+  await waitFor(() => {
+    if (!fs.existsSync(fakeStatePath)) {
+      return false;
+    }
+    const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+    const trackedJob = state.jobs.find((candidate) => candidate.id === jobId);
+    return fakeState.lastTurnStart && trackedJob?.turnLifecycle?.state === "starting";
+  }, { timeoutMs: 15000 });
+
+  const cancel = spawn(process.execPath, [SCRIPT, "cancel", jobId, "--json"], {
+    cwd: repo,
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true
+  });
+  let cancelStdout = "";
+  let cancelStderr = "";
+  cancel.stdout.setEncoding("utf8");
+  cancel.stderr.setEncoding("utf8");
+  cancel.stdout.on("data", (chunk) => {
+    cancelStdout += chunk;
+  });
+  cancel.stderr.on("data", (chunk) => {
+    cancelStderr += chunk;
+  });
+  const cancelExit = new Promise((resolve, reject) => {
+    cancel.once("error", reject);
+    cancel.once("close", (code, signal) => resolve({ code, signal }));
+  });
+  t.after(() => {
+    if (cancel.exitCode === null && cancel.signalCode === null) {
+      cancel.kill("SIGKILL");
+    }
+  });
+
+  await waitFor(() => {
+    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+    return state.jobs.find((candidate) => candidate.id === jobId)?.status === "cancelled";
+  });
+  assert.equal(cancel.exitCode, null, "cancel must not report success while the turn-start handoff is unresolved");
+
+  fs.writeFileSync(gatePath, "release\n", "utf8");
+  const interruptedState = await waitFor(() => {
+    const state = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+    return state.lastInterrupt ? state : null;
+  });
+  assert.equal(cancel.exitCode, null, "cancel must wait for terminal turn completion, not only interrupt acceptance");
+
+  fs.writeFileSync(interruptCompletionGatePath, "release\n", "utf8");
+  const cancelResult = await cancelExit;
+  assert.equal(cancelResult.signal, null);
+  assert.equal(cancelResult.code, 0, cancelStderr);
+  const cancelPayload = JSON.parse(cancelStdout);
+  assert.equal(cancelPayload.status, "cancelled");
+  assert.equal(cancelPayload.turnInterruptAttempted, true);
+  assert.equal(cancelPayload.turnInterrupted, true);
+
+  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.deepEqual(fakeState.lastInterrupt, interruptedState.lastInterrupt);
+  assert.equal(fakeState.gatedTurnWriteApplied, undefined);
+
+  const stateJob = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs.find(
+    (candidate) => candidate.id === jobId
+  );
+  const storedJob = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${jobId}.json`), "utf8"));
+  assert.equal(stateJob.status, "cancelled");
+  assert.equal(storedJob.status, "cancelled");
+  assert.equal(stateJob.turnLifecycle.state, "interrupted");
+  assert.equal(storedJob.turnLifecycle.state, "interrupted");
+  assert.equal(stateJob.threadId, fakeState.lastInterrupt.threadId);
+  assert.equal(stateJob.turnId, fakeState.lastInterrupt.turnId);
+  assert.match(fs.readFileSync(stateJob.logFile, "utf8"), /cancelled job/i);
+
+  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      cwd: repo
+    })
+  });
+  assert.equal(cleanup.status, 0, cleanup.stderr);
+});
+
 test("session end fully cleans up jobs for the ending session", async (t) => {
   const repo = makeTempDir();
   initGitRepo(repo);
@@ -2114,6 +3547,120 @@ test("stop hook runs the actual task when auth status looks stale", () => {
   const payload = JSON.parse(allowed.stdout);
   assert.equal(payload.decision, "block");
   assert.match(payload.reason, /Missing empty-state guard/i);
+});
+
+test("locally-spawned codex app-server is reaped when the host process exits without close()", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const hostScript = path.join(repo, "host-exits-with-direct-app-server.mjs");
+  const appServerModule = pathToFileURL(path.join(PLUGIN_ROOT, "scripts", "lib", "app-server.mjs")).href;
+  let appServerPid = null;
+
+  installFakeCodex(binDir, "interruptible-slow-task");
+
+  fs.writeFileSync(
+    hostScript,
+    `import { CodexAppServerClient } from ${JSON.stringify(appServerModule)};
+
+const cwd = ${JSON.stringify(repo)};
+const client = await CodexAppServerClient.connect(cwd, { disableBroker: true, env: process.env });
+const thread = await client.request("thread/start", { cwd, ephemeral: true });
+await client.request("turn/start", {
+  threadId: thread.thread.id,
+  input: [{ type: "text", text: "keep the fake app-server alive until the host exits" }]
+});
+
+process.stdout.write(String(client.proc.pid) + "\\n", () => {
+  process.exit(0);
+});
+`,
+    "utf8"
+  );
+
+  t.after(() => {
+    if (appServerPid !== null) {
+      try {
+        process.kill(appServerPid, "SIGKILL");
+      } catch {
+        // Ignore a process that was already reaped by the exit handler under test.
+      }
+    }
+  });
+
+  const host = spawn(process.execPath, [hostScript], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  let stdout = "";
+  let stderr = "";
+  host.stdout.setEncoding("utf8");
+  host.stderr.setEncoding("utf8");
+  host.stdout.on("data", (chunk) => {
+    stdout += chunk;
+  });
+  host.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+
+  const hostResult = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      host.kill("SIGKILL");
+      reject(new Error("Timed out waiting for host process to exit."));
+    }, 5000);
+    host.on("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    host.on("close", (code, signal) => {
+      clearTimeout(timeout);
+      resolve({ code, signal });
+    });
+  });
+
+  assert.equal(hostResult.code, 0, stderr);
+  assert.equal(hostResult.signal, null, stderr);
+  appServerPid = Number.parseInt(stdout.trim(), 10);
+  assert.equal(Number.isInteger(appServerPid), true, `invalid app-server pid output: ${stdout}`);
+
+  await waitFor(() => isPidDead(appServerPid), { timeoutMs: 4000, intervalMs: 50 });
+});
+
+test("close() removes the exit reaper for locally-spawned codex app-server clients", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const beforeExitListeners = process.listenerCount("exit");
+  let client = null;
+  let appServerPid = null;
+
+  installFakeCodex(binDir);
+
+  try {
+    client = await CodexAppServerClient.connect(repo, {
+      disableBroker: true,
+      env: buildEnv(binDir)
+    });
+    appServerPid = client.proc.pid;
+
+    assert.equal(client.transport, "direct");
+    assert.equal(process.listenerCount("exit"), beforeExitListeners + 1);
+
+    await client.close();
+
+    await waitFor(() => isPidDead(appServerPid), { timeoutMs: 4000, intervalMs: 50 });
+    assert.equal(process.listenerCount("exit"), beforeExitListeners);
+  } finally {
+    if (client) {
+      await client.close().catch(() => {});
+    }
+    if (appServerPid !== null) {
+      try {
+        process.kill(appServerPid, "SIGKILL");
+      } catch {
+        // Ignore a process that close() or the child exit event already reaped.
+      }
+    }
+  }
 });
 
 test("commands lazily start and reuse one shared app-server after first use", async () => {
