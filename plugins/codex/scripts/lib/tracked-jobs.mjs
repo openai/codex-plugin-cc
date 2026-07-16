@@ -5,6 +5,19 @@ import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
+let stderrErrorGuardInstalled = false;
+let stderrWriteUnavailable = false;
+
+function ensureStderrErrorGuard() {
+  if (stderrErrorGuardInstalled) {
+    return;
+  }
+  process.stderr.on("error", () => {
+    stderrWriteUnavailable = true;
+  });
+  stderrErrorGuardInstalled = true;
+}
+
 export function nowIso() {
   return new Date().toISOString();
 }
@@ -119,15 +132,34 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
     return null;
   }
 
+  let stderrWriteFailed = false;
+  if (stderr) {
+    ensureStderrErrorGuard();
+  }
+
   return (eventOrMessage) => {
     const event = normalizeProgressEvent(eventOrMessage);
     const stderrMessage = event.stderrMessage ?? event.message;
-    if (stderr && stderrMessage) {
-      process.stderr.write(`[codex] ${stderrMessage}\n`);
-    }
     appendLogLine(logFile, event.message);
     appendLogBlock(logFile, event.logTitle, event.logBody);
     onEvent?.(event);
+    if (!stderr || !stderrMessage || stderrWriteFailed || stderrWriteUnavailable) {
+      return;
+    }
+
+    const stopStderrWrites = () => {
+      stderrWriteFailed = true;
+      stderrWriteUnavailable = true;
+    };
+    try {
+      process.stderr.write(`[codex] ${stderrMessage}\n`, (error) => {
+        if (error) {
+          stopStderrWrites();
+        }
+      });
+    } catch {
+      stopStderrWrites();
+    }
   };
 }
 
