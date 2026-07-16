@@ -1024,6 +1024,29 @@ test("task forwards model selection and reasoning effort to app-server turn/star
   assert.equal(fakeState.lastTurnStart.effort, "low");
 });
 
+test("task accepts ultra and max reasoning efforts", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n", "utf8");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  for (const effort of ["ultra", "max"]) {
+    const result = run(
+      "node",
+      [SCRIPT, "task", "--effort", effort, `reason with ${effort} effort`],
+      { cwd: repo, env: buildEnv(binDir) }
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.equal(fakeState.lastTurnStart.effort, effort);
+  }
+});
+
 test("task logs reasoning summaries and assistant messages to the job log", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
