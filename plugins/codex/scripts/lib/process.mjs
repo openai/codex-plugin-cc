@@ -1,6 +1,78 @@
 import { spawnSync } from "node:child_process";
 import process from "node:process";
 
+function isValidPid(pid) {
+  return Number.isSafeInteger(pid) && pid > 0;
+}
+
+function isProcessTreeRunning(pid, options = {}) {
+  if (!isValidPid(pid)) {
+    return false;
+  }
+  const platform = options.platform ?? process.platform;
+  const signalTarget = platform === "win32" ? pid : -pid;
+  const killImpl = options.killImpl ?? process.kill.bind(process);
+  try {
+    killImpl(signalTarget, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") {
+      return false;
+    }
+    if (error?.code === "EPERM") {
+      return true;
+    }
+    throw error;
+  }
+}
+
+export async function waitForProcessExit(pid, options = {}) {
+  if (!isValidPid(pid)) {
+    return false;
+  }
+  const timeoutMs = options.timeoutMs ?? 2000;
+  const intervalMs = options.intervalMs ?? 25;
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (!isProcessTreeRunning(pid, options)) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return !isProcessTreeRunning(pid, options);
+}
+
+export function processHasLaunchToken(pid, token, options = {}) {
+  if (!isValidPid(pid) || typeof token !== "string" || token.length < 16) {
+    return false;
+  }
+
+  const platform = options.platform ?? process.platform;
+  const runCommandImpl = options.runCommandImpl ?? runCommand;
+  const result =
+    platform === "win32"
+      ? runCommandImpl(
+          "powershell.exe",
+          [
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            `$p = Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'; if ($null -ne $p) { [Console]::Out.Write($p.CommandLine) }`
+          ],
+          { timeout: options.timeoutMs ?? 2000, killSignal: "SIGTERM" }
+        )
+      : runCommandImpl("ps", ["-ww", "-p", String(pid), "-o", "command="], {
+          timeout: options.timeoutMs ?? 2000,
+          killSignal: "SIGTERM"
+        });
+
+  if (result.error || result.status !== 0) {
+    return false;
+  }
+  const commandLine = String(result.stdout ?? "");
+  return commandLine.includes(options.marker ?? "--worker-token") && commandLine.includes(token);
+}
+
 export function runCommand(command, args = [], options = {}) {
   const result = spawnSync(command, args, {
     cwd: options.cwd,
@@ -8,6 +80,8 @@ export function runCommand(command, args = [], options = {}) {
     encoding: "utf8",
     input: options.input,
     maxBuffer: options.maxBuffer,
+    timeout: options.timeout,
+    killSignal: options.killSignal,
     stdio: options.stdio ?? "pipe",
     shell: options.shell ?? (process.platform === "win32" ? (process.env.SHELL || true) : false),
     windowsHide: true
@@ -55,7 +129,7 @@ function looksLikeMissingProcessMessage(text) {
 }
 
 export function terminateProcessTree(pid, options = {}) {
-  if (!Number.isFinite(pid)) {
+  if (!isValidPid(pid)) {
     return { attempted: false, delivered: false, method: null };
   }
 
@@ -66,7 +140,9 @@ export function terminateProcessTree(pid, options = {}) {
   if (platform === "win32") {
     const result = runCommandImpl("taskkill", ["/PID", String(pid), "/T", "/F"], {
       cwd: options.cwd,
-      env: options.env
+      env: options.env,
+      timeout: options.timeoutMs ?? 2000,
+      killSignal: "SIGTERM"
     });
 
     if (!result.error && result.status === 0) {
