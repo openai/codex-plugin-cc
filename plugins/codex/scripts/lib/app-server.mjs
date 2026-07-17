@@ -14,7 +14,7 @@ import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
-import { terminateProcessTree } from "./process.mjs";
+import { resolveWindowsShell, terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
@@ -191,7 +191,18 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       cwd: this.cwd,
       env: this.options.env ?? process.env,
       stdio: ["pipe", "pipe", "pipe"],
-      shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
+      // Always use the deterministic Windows shell (System32\cmd.exe, resolved via
+      // resolveWindowsShell) to wrap this spawn, never process.env.SHELL or
+      // process.env.ComSpec (plain `shell: true` falls back to the latter). This wrapper
+      // only resolves the codex executable (npm installs ship a .cmd shim that
+      // CreateProcess cannot exec directly); it has no bearing on what shell Codex uses
+      // internally for its own command-execution tool, since SHELL is passed through via
+      // `env` above regardless of this option. Trusting an arbitrary user-configured
+      // SHELL or ComSpec here (git-bash, WSL's bash.exe shim, an unresolvable literal
+      // path, a non-cmd.exe ComSpec, etc.) to wrap a JSON-RPC stdio pipe is unpredictable
+      // and can hang the handshake indefinitely with no surfaced error (#236). See also
+      // #138/#178.
+      shell: process.platform === "win32" ? resolveWindowsShell() : false,
       windowsHide: true
     });
 

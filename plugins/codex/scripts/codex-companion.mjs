@@ -7,6 +7,10 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
+import { tierDefaultsForVerb } from "./lib/rig-edition.mjs";
+import { loadFanoutBriefsFromFile, runFanout } from "./lib/fanout.mjs";
+import { runCouncil } from "./lib/council.mjs";
+import { CLOUD_SUBCOMMANDS, runCloudCommand } from "./lib/cloud.mjs";
 import {
     buildPersistentTaskThreadName,
     DEFAULT_CONTINUE_PROMPT,
@@ -23,7 +27,7 @@ import {
   } from "./lib/codex.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
-import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
+import { collectReviewContext, ensureGitRepository, getRepoRoot, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
@@ -58,6 +62,9 @@ import {
   renderReviewResult,
   renderStoredJobResult,
   renderCancelReport,
+  renderCloudResult,
+  renderCouncilResult,
+  renderFanoutResult,
   renderJobStatusReport,
   renderSetupReport,
   renderStatusReport,
@@ -79,7 +86,10 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [--tier <sol|terra|luna>] [prompt]",
+      "  node scripts/codex-companion.mjs fanout --briefs <path.json> --root <worktree-root> [--concurrency <n>] [--cleanup] [--json]",
+      "  node scripts/codex-companion.mjs council [--seats <n>] [--tier <sol|terra|luna>] [--effort <effort>] [--topic-file <path>] [topic]",
+      "  node scripts/codex-companion.mjs cloud <exec|status|list|apply|diff> [task-id] [--env <id>] [--branch <ref>] [--attempts <n>] [--attempt <n>] [--limit <n>] [--cursor <cursor>] [--json]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -761,7 +771,7 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "tier"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
     aliasMap: {
       m: "model"
@@ -770,8 +780,12 @@ async function handleTask(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const model = normalizeRequestedModel(options.model);
-  const effort = normalizeReasoningEffort(options.effort);
+  // --tier resolves model + effort via the rig-edition tier table, bypassing
+  // the legacy --model/--effort normalizers below. Omit --tier to keep the
+  // prior behavior unchanged.
+  const tierDefaults = options.tier ? tierDefaultsForVerb("delegate", { tier: options.tier, effort: options.effort }) : null;
+  const model = tierDefaults ? tierDefaults.modelId : normalizeRequestedModel(options.model);
+  const effort = tierDefaults ? tierDefaults.effort : normalizeReasoningEffort(options.effort);
   const prompt = readTaskPrompt(cwd, options, positionals);
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
@@ -820,6 +834,88 @@ async function handleTask(argv) {
       }),
     { json: options.json }
   );
+}
+
+async function handleFanout(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "briefs", "root", "concurrency"],
+    booleanOptions: ["json", "cleanup"]
+  });
+
+  if (!options.briefs) {
+    throw new Error("Provide --briefs <path-to-json-file>.");
+  }
+  if (!options.root) {
+    throw new Error("Provide --root <worktree-root-directory>.");
+  }
+
+  const cwd = resolveCommandCwd(options);
+  ensureGitRepository(cwd);
+  const repoRoot = getRepoRoot(cwd);
+  const briefs = loadFanoutBriefsFromFile(path.resolve(cwd, options.briefs));
+  const worktreeRoot = path.resolve(cwd, options.root);
+
+  const aggregate = await runFanout(repoRoot, worktreeRoot, briefs, {
+    concurrency: options.concurrency,
+    cleanup: Boolean(options.cleanup)
+  });
+
+  outputResult(options.json ? aggregate : renderFanoutResult(aggregate), options.json);
+}
+
+async function handleCouncil(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "seats", "tier", "effort", "topic-file"],
+    booleanOptions: ["json"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const topic = options["topic-file"]
+    ? fs.readFileSync(path.resolve(cwd, options["topic-file"]), "utf8")
+    : positionals.join(" ") || readStdinIfPiped();
+
+  if (!topic || !topic.trim()) {
+    throw new Error("Provide a topic, a --topic-file, or piped stdin.");
+  }
+
+  const result = await runCouncil(cwd, topic, {
+    seats: options.seats ? Number(options.seats) : undefined,
+    tier: options.tier,
+    effort: options.effort
+  });
+
+  outputResult(options.json ? result : renderCouncilResult(result), options.json);
+}
+
+async function handleCloud(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "env", "branch", "attempts", "attempt", "limit", "cursor"],
+    booleanOptions: ["json"]
+  });
+
+  const [subcommand, ...rest] = positionals;
+  if (!subcommand || !CLOUD_SUBCOMMANDS.includes(subcommand)) {
+    throw new Error(`Provide a "codex cloud" subcommand. Use one of: ${CLOUD_SUBCOMMANDS.join(", ")}.`);
+  }
+
+  const cwd = resolveCommandCwd(options);
+  const taskId = ["status", "apply", "diff"].includes(subcommand) ? rest[0] : undefined;
+  const query = subcommand === "exec" ? rest.join(" ") : undefined;
+
+  const result = runCloudCommand(subcommand, {
+    cwd,
+    env: options.env,
+    branch: options.branch,
+    attempts: options.attempts,
+    attempt: options.attempt,
+    limit: options.limit,
+    cursor: options.cursor,
+    json: options.json,
+    taskId,
+    query
+  });
+
+  outputResult(options.json ? result : renderCloudResult(result), options.json);
 }
 
 async function handleTransfer(argv) {
@@ -1042,6 +1138,15 @@ async function main() {
       break;
     case "task":
       await handleTask(argv);
+      break;
+    case "fanout":
+      await handleFanout(argv);
+      break;
+    case "council":
+      await handleCouncil(argv);
+      break;
+    case "cloud":
+      await handleCloud(argv);
       break;
     case "transfer":
       await handleTransfer(argv);

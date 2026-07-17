@@ -445,6 +445,72 @@ export function renderStoredJobResult(job, storedJob) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
+export function renderFanoutResult(aggregate) {
+  const lines = [
+    "# Codex Fanout",
+    "",
+    `Results: ${aggregate.results.length}  Failed: ${aggregate.failed.length}  Quota exhausted: ${aggregate.quota_exhausted.length}`,
+    ""
+  ];
+
+  if (aggregate.results.length > 0) {
+    lines.push("Results:");
+    for (const entry of aggregate.results) {
+      lines.push(`- ${entry.id} [${entry.envelope?.status ?? "no-envelope"}] ${entry.workspace}`);
+    }
+    lines.push("");
+  }
+
+  if (aggregate.failed.length > 0) {
+    lines.push("Failed:");
+    for (const entry of aggregate.failed) {
+      lines.push(`- ${entry.id}: ${entry.error}`);
+    }
+    lines.push("");
+  }
+
+  if (aggregate.quota_exhausted.length > 0) {
+    lines.push("Quota exhausted:");
+    for (const entry of aggregate.quota_exhausted) {
+      lines.push(`- ${entry.id}: ${entry.envelope?.summary ?? "quota exhausted"}`);
+    }
+    lines.push("");
+  }
+
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+export function renderCouncilResult(result) {
+  const lines = ["# Codex Council", "", `Verdict: ${result.verdict}`, "", "Seat outputs:"];
+
+  for (const seat of result.seat_outputs) {
+    lines.push(`- Seat ${seat.seat} (${seat.stance}): ${seat.summary || "(no summary)"}`);
+  }
+
+  if (result.agreement_notes.length > 0) {
+    lines.push("", "Agreement notes:");
+    for (const note of result.agreement_notes) {
+      lines.push(`- ${note}`);
+    }
+  }
+
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+export function renderCloudResult(result) {
+  const lines = ["# Codex Cloud", "", `Status: ${result.envelope.status}`, ""];
+
+  if (result.stdout?.trim()) {
+    lines.push(result.stdout.trim());
+  }
+
+  if (result.envelope.status !== "DONE" && result.stderr?.trim()) {
+    lines.push("", "stderr:", "", "```text", result.stderr.trim(), "```");
+  }
+
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
 export function renderCancelReport(job) {
   const lines = [
     "# Codex Cancel",

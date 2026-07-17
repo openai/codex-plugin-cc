@@ -1,5 +1,19 @@
 import { spawnSync } from "node:child_process";
+import path from "node:path";
 import process from "node:process";
+
+// Resolve the Windows command interpreter deterministically. Passing `shell: true` on
+// Windows would otherwise let Node fall back to process.env.ComSpec, and this project
+// intentionally never consults process.env.SHELL either -- both are arbitrary,
+// user-configurable env vars that are not a safe or predictable wrapper for spawning a
+// subprocess on Windows (#236: a nonstandard SHELL or ComSpec can silently break the
+// spawn wrapper for a JSON-RPC stdio pipe). SystemRoot is set by the OS itself, so
+// resolving System32\cmd.exe through it keeps this wrapper deterministic regardless of
+// either env var. See app-server.mjs for the codex app-server spawn that shares this.
+export function resolveWindowsShell() {
+  const systemRoot = process.env.SystemRoot || "C:\\Windows";
+  return path.join(systemRoot, "System32", "cmd.exe");
+}
 
 export function runCommand(command, args = [], options = {}) {
   const result = spawnSync(command, args, {
@@ -9,7 +23,7 @@ export function runCommand(command, args = [], options = {}) {
     input: options.input,
     maxBuffer: options.maxBuffer,
     stdio: options.stdio ?? "pipe",
-    shell: options.shell ?? (process.platform === "win32" ? (process.env.SHELL || true) : false),
+    shell: options.shell ?? (process.platform === "win32" ? resolveWindowsShell() : false),
     windowsHide: true
   });
 
