@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -24,7 +25,7 @@ import {
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
-import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import { binaryAvailable, processHasLaunchToken, terminateProcessTree, waitForProcessExit } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
@@ -50,7 +51,8 @@ import {
   createProgressReporter,
   nowIso,
   runTrackedJob,
-  SESSION_ID_ENV
+  SESSION_ID_ENV,
+  waitForWorkerJob
 } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
@@ -668,15 +670,30 @@ async function runForegroundCommand(job, runner, options = {}) {
   return execution;
 }
 
-function spawnDetachedTaskWorker(cwd, jobId) {
+function spawnDetachedTaskWorker(cwd, jobId, workerToken, logFile) {
   const scriptPath = path.join(ROOT_DIR, "scripts", "codex-companion.mjs");
-  const child = spawn(process.execPath, [scriptPath, "task-worker", "--cwd", cwd, "--job-id", jobId], {
-    cwd,
-    env: process.env,
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true
-  });
+  const logFd = fs.openSync(logFile, "a");
+  let child;
+  try {
+    child = spawn(process.execPath, [
+      scriptPath,
+      "task-worker",
+      "--cwd",
+      cwd,
+      "--job-id",
+      jobId,
+      "--worker-token",
+      workerToken
+    ], {
+      cwd,
+      env: process.env,
+      detached: true,
+      stdio: ["ignore", logFd, logFd],
+      windowsHide: true
+    });
+  } finally {
+    fs.closeSync(logFd);
+  }
   child.unref();
   return child;
 }
@@ -685,15 +702,48 @@ function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
-  const queuedRecord = {
+  const workerToken = randomUUID();
+  const pendingRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
+    workerToken,
     logFile,
     request
   };
+  writeJobFile(job.workspaceRoot, job.id, pendingRecord);
+  upsertJob(job.workspaceRoot, pendingRecord);
+
+  let child;
+  try {
+    child = spawnDetachedTaskWorker(cwd, job.id, workerToken, logFile);
+  } catch (error) {
+    const failedRecord = {
+      ...pendingRecord,
+      status: "failed",
+      phase: "failed",
+      completedAt: nowIso(),
+      errorMessage: error instanceof Error ? error.message : String(error)
+    };
+    writeJobFile(job.workspaceRoot, job.id, failedRecord);
+    upsertJob(job.workspaceRoot, failedRecord);
+    throw error;
+  }
+  if (!Number.isSafeInteger(child.pid) || child.pid <= 0) {
+    const error = new Error(`Detached worker for ${job.id} did not report a valid process ID.`);
+    const failedRecord = {
+      ...pendingRecord,
+      status: "failed",
+      phase: "failed",
+      completedAt: nowIso(),
+      errorMessage: error.message
+    };
+    writeJobFile(job.workspaceRoot, job.id, failedRecord);
+    upsertJob(job.workspaceRoot, failedRecord);
+    throw error;
+  }
+  const queuedRecord = { ...pendingRecord, pid: child.pid };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
 
@@ -837,7 +887,7 @@ async function handleTransfer(argv) {
 
 async function handleTaskWorker(argv) {
   const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "job-id"]
+    valueOptions: ["cwd", "job-id", "worker-token"]
   });
 
   if (!options["job-id"]) {
@@ -846,10 +896,13 @@ async function handleTaskWorker(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
-  if (!storedJob) {
-    throw new Error(`No stored job found for ${options["job-id"]}.`);
-  }
+  if (!options["worker-token"]) throw new Error("Missing required --worker-token for task-worker.");
+  const storedJob = await waitForWorkerJob(
+    workspaceRoot,
+    options["job-id"],
+    options["worker-token"],
+    process.pid
+  );
 
   const request = storedJob.request;
   if (!request || typeof request !== "object") {
@@ -973,6 +1026,10 @@ async function handleCancel(argv) {
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
 
+  if (!processHasLaunchToken(job.pid, job.workerToken)) {
+    throw new Error(`Cannot verify that process ${job.pid ?? "unknown"} owns Codex job ${job.id}; state was preserved.`);
+  }
+
   const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
   if (interrupt.attempted) {
     appendLogLine(
@@ -983,7 +1040,13 @@ async function handleCancel(argv) {
     );
   }
 
-  terminateProcessTree(job.pid ?? Number.NaN);
+  if (!processHasLaunchToken(job.pid, job.workerToken)) {
+    throw new Error(`Codex job ${job.id} process ownership changed before termination; state was preserved.`);
+  }
+  terminateProcessTree(job.pid);
+  if (!(await waitForProcessExit(job.pid))) {
+    throw new Error(`Codex job ${job.id} process ${job.pid} did not exit; state was preserved.`);
+  }
   appendLogLine(job.logFile, "Cancelled by user.");
 
   const completedAt = nowIso();

@@ -102,4 +102,25 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
       .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
       .sort()
   );
+  assert.equal(fs.existsSync(path.join(resolveStateDir(workspace), "state.lock")), false);
+});
+
+test("saveState fails closed on a stale lock instead of reclaiming it unsafely", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const lockDir = path.join(stateDir, "state.lock");
+  fs.mkdirSync(lockDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(lockDir, "owner"),
+    `${JSON.stringify({ pid: 999999, token: "stale-owner-token", createdAt: "2026-01-01T00:00:00.000Z" })}\n`,
+    "utf8"
+  );
+  const staleTime = new Date(Date.now() - 60000);
+  fs.utimesSync(lockDir, staleTime, staleTime);
+
+  assert.throws(
+    () => saveState(workspace, { jobs: [] }),
+    /requires verified manual removal.*owner PID 999999 is not running/i
+  );
+  assert.equal(fs.existsSync(lockDir), true);
 });

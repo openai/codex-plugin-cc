@@ -1,20 +1,72 @@
 import fs from "node:fs";
 import path from "node:path";
-import test from "node:test";
+import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
-import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { consumeTempDirs, initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import {
+  clearBrokerSession,
+  loadBrokerSession,
+  saveBrokerSession,
+  shutdownBrokerSession
+} from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import {
+  processHasLaunchToken,
+  terminateProcessTree,
+  waitForProcessExit
+} from "../plugins/codex/scripts/lib/process.mjs";
+import { loadState, resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
+
+async function cleanupActiveTestProcesses(cwd) {
+  const failures = [];
+  for (const job of loadState(cwd).jobs) {
+    const isActive = job.status === "queued" || job.status === "running";
+    if (!isActive || !Number.isSafeInteger(job.pid) || job.pid <= 0) {
+      continue;
+    }
+    try {
+      if (!processHasLaunchToken(job.pid, job.workerToken)) {
+        throw new Error(`Cannot verify test job ${job.id} process ${job.pid}; refusing unsafe cleanup.`);
+      }
+      terminateProcessTree(job.pid);
+      if (!(await waitForProcessExit(job.pid))) {
+        throw new Error(`Test job ${job.id} process ${job.pid} did not exit.`);
+      }
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length > 0) {
+    throw new AggregateError(failures, "Failed to stop all test job processes.");
+  }
+}
+
+afterEach(async () => {
+  const failures = [];
+  for (const cwd of consumeTempDirs()) {
+    try {
+      await cleanupActiveTestProcesses(cwd);
+    } catch (error) {
+      failures.push(error);
+    }
+    try {
+      await shutdownBrokerSession(cwd, { killProcess: terminateProcessTree });
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length > 0) {
+    throw new AggregateError(failures, "Failed to stop all test broker processes.");
+  }
+});
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   const start = Date.now();
@@ -26,6 +78,23 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
   throw new Error("Timed out waiting for condition.");
+}
+
+function launchDetachedSleeper(cwd, workerToken) {
+  const launcher = run(process.execPath, [
+    "-e",
+    `const { spawn } = require("node:child_process");
+const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", "--worker-token", ${JSON.stringify(workerToken)}], {
+  detached: true,
+  stdio: "ignore"
+});
+child.unref();
+process.stdout.write(String(child.pid));`
+  ], { cwd });
+  assert.equal(launcher.status, 0, launcher.stderr);
+  const pid = Number.parseInt(launcher.stdout, 10);
+  assert.ok(Number.isSafeInteger(pid));
+  return pid;
 }
 
 test("setup reports ready when fake codex is installed and authenticated", () => {
@@ -907,9 +976,7 @@ test("task using the shared broker still completes when Codex spawns subagents",
   });
   assert.equal(review.status, 0, review.stderr);
 
-  if (!loadBrokerSession(repo)) {
-    return;
-  }
+  assert.ok(loadBrokerSession(repo), "review must start the shared broker");
 
   const result = run("node", [SCRIPT, "task", "challenge the current design"], {
     cwd: repo,
@@ -1545,12 +1612,8 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
   const jobsDir = path.join(stateDir, "jobs");
   fs.mkdirSync(jobsDir, { recursive: true });
 
-  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
-    cwd: workspace,
-    detached: true,
-    stdio: "ignore"
-  });
-  sleeper.unref();
+  const workerToken = "worker-token-cancel-1234567890";
+  const sleeper = { pid: launchDetachedSleeper(workspace, workerToken) };
 
   t.after(() => {
     try {
@@ -1595,6 +1658,7 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
             jobClass: "task",
             summary: "Investigate flaky test",
             pid: sleeper.pid,
+            workerToken,
             logFile,
             createdAt: "2026-03-18T15:30:00.000Z",
             startedAt: "2026-03-18T15:30:01.000Z",
@@ -1689,7 +1753,7 @@ test("cancel without a job id ignores active jobs from other Claude sessions", (
   assert.equal(state.jobs[0].status, "running");
 });
 
-test("cancel with a job id can still target an active job from another Claude session", () => {
+test("cancel with a job id preserves an unverifiable active job from another session", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
   const jobsDir = path.join(stateDir, "jobs");
@@ -1730,11 +1794,11 @@ test("cancel with a job id can still target an active job from another Claude se
     cwd: workspace,
     env
   });
-  assert.equal(cancel.status, 0, cancel.stderr);
-  assert.equal(JSON.parse(cancel.stdout).jobId, "task-other");
+  assert.equal(cancel.status, 1);
+  assert.match(cancel.stderr, /Cannot verify that process unknown owns Codex job task-other/);
 
   const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
-  assert.equal(state.jobs[0].status, "cancelled");
+  assert.equal(state.jobs[0].status, "running");
 });
 
 test("cancel sends turn interrupt to the shared app-server before killing a brokered task", async () => {
@@ -1824,12 +1888,8 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   fs.writeFileSync(completedJobFile, JSON.stringify({ id: "review-completed" }, null, 2), "utf8");
   fs.writeFileSync(otherJobFile, JSON.stringify({ id: "review-other" }, null, 2), "utf8");
 
-  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
-    cwd: repo,
-    detached: true,
-    stdio: "ignore"
-  });
-  sleeper.unref();
+  const workerToken = "worker-token-session-end-1234";
+  const sleeper = { pid: launchDetachedSleeper(repo, workerToken) };
   fs.writeFileSync(runningJobFile, JSON.stringify({ id: "review-running" }, null, 2), "utf8");
 
   t.after(() => {
@@ -1866,6 +1926,7 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
             title: "Codex Review",
             sessionId: "sess-current",
             pid: sleeper.pid,
+            workerToken,
             logFile: runningLog,
             createdAt: "2026-03-18T15:32:00.000Z",
             updatedAt: "2026-03-18T15:33:00.000Z"
@@ -2137,9 +2198,7 @@ test("commands lazily start and reuse one shared app-server after first use", as
   assert.equal(review.status, 0, review.stderr);
 
   const brokerSession = loadBrokerSession(repo);
-  if (!brokerSession) {
-    return;
-  }
+  assert.ok(brokerSession, "review must start the shared broker");
 
   const adversarial = run("node", [SCRIPT, "adversarial-review"], {
     cwd: repo,
@@ -2182,9 +2241,7 @@ test("setup reuses an existing shared app-server without starting another one", 
   assert.equal(review.status, 0, review.stderr);
 
   const brokerSession = loadBrokerSession(repo);
-  if (!brokerSession) {
-    return;
-  }
+  assert.ok(brokerSession, "review must start the shared broker");
 
   const setup = run("node", [SCRIPT, "setup", "--json"], {
     cwd: repo,
@@ -2222,9 +2279,7 @@ test("status reports shared session runtime when a lazy broker is active", () =>
   });
   assert.equal(review.status, 0, review.stderr);
 
-  if (!loadBrokerSession(repo)) {
-    return;
-  }
+  assert.ok(loadBrokerSession(repo), "review must start the shared broker");
 
   const result = run("node", [SCRIPT, "status"], {
     cwd: repo,
@@ -2256,4 +2311,5 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
   const payload = JSON.parse(setup.stdout);
   assert.equal(payload.sessionRuntime.mode, "shared");
   assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
+  clearBrokerSession(targetWorkspace);
 });

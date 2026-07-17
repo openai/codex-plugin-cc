@@ -52,7 +52,7 @@ async function main() {
   }
 
   const { options } = parseArgs(argv, {
-    valueOptions: ["cwd", "pid-file", "endpoint"]
+    valueOptions: ["cwd", "pid-file", "endpoint", "instance-token"]
   });
 
   if (!options.endpoint) {
@@ -63,6 +63,7 @@ async function main() {
   const endpoint = String(options.endpoint);
   const listenTarget = parseBrokerEndpoint(endpoint);
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
+  const instanceToken = options["instance-token"] ? String(options["instance-token"]) : null;
   writePidFile(pidFile);
 
   const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
@@ -158,7 +159,17 @@ async function main() {
         }
 
         if (message.id !== undefined && message.method === "broker/shutdown") {
-          send(socket, { id: message.id, result: {} });
+          if (!instanceToken || message.params?.instanceToken !== instanceToken) {
+            send(socket, {
+              id: message.id,
+              error: buildJsonRpcError(-32003, "Broker shutdown identity did not match this instance.")
+            });
+            continue;
+          }
+          send(socket, {
+            id: message.id,
+            result: { pid: process.pid, instanceToken }
+          });
           await shutdown(server);
           process.exit(0);
         }

@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { processHasLaunchToken, terminateProcessTree, waitForProcessExit } from "./process.mjs";
+import { loadState, readJobFile, resolveJobFile, resolveJobLogFile, updateState, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
@@ -128,6 +129,112 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
     appendLogLine(logFile, event.message);
     appendLogBlock(logFile, event.logTitle, event.logBody);
     onEvent?.(event);
+  };
+}
+
+export async function waitForWorkerJob(workspaceRoot, jobId, workerToken, workerPid, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 2000;
+  const intervalMs = options.intervalMs ?? 25;
+  const start = Date.now();
+
+  while (Date.now() - start < timeoutMs) {
+    const jobFile = resolveJobFile(workspaceRoot, jobId);
+    if (fs.existsSync(jobFile)) {
+      const storedJob = readJobFile(jobFile);
+      if (storedJob.workerToken !== workerToken) {
+        throw new Error(`Stored job ${jobId} worker identity does not match this process.`);
+      }
+      const indexedJob = loadState(workspaceRoot).jobs.find((job) => job.id === jobId);
+      if (
+        storedJob.pid === workerPid &&
+        indexedJob?.pid === workerPid &&
+        indexedJob.workerToken === workerToken
+      ) {
+        return storedJob;
+      }
+      if (storedJob.pid !== null && storedJob.pid !== undefined && storedJob.pid !== workerPid) {
+        throw new Error(`Stored job ${jobId} belongs to worker process ${storedJob.pid}, not ${workerPid}.`);
+      }
+      if (
+        indexedJob?.pid !== null &&
+        indexedJob?.pid !== undefined &&
+        indexedJob.pid !== workerPid
+      ) {
+        throw new Error(`Indexed job ${jobId} belongs to worker process ${indexedJob.pid}, not ${workerPid}.`);
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+
+  throw new Error(`Timed out waiting for stored job ${jobId} to register worker process ${workerPid}.`);
+}
+
+export async function cleanupSessionJobs(workspaceRoot, sessionId, options = {}) {
+  if (!sessionId && !options.all) {
+    return { removed: [], retained: [] };
+  }
+
+  const state = loadState(workspaceRoot);
+  const removedJobs = [];
+  const retainedJobs = [];
+  const failures = [];
+
+  for (const job of state.jobs) {
+    const belongsToSession = options.all || job.sessionId === sessionId;
+    if (!belongsToSession) {
+      continue;
+    }
+
+    const isActive = job.status === "queued" || job.status === "running";
+    if (isActive) {
+      try {
+        const ownsProcess = options.verifyProcess
+          ? options.verifyProcess(job.pid, job.workerToken)
+          : processHasLaunchToken(job.pid, job.workerToken, {
+              platform: options.platform,
+              timeoutMs: options.timeoutMs,
+              runCommandImpl: options.runCommandImpl
+            });
+        if (!ownsProcess) {
+          throw new Error(
+            `Cannot verify that process ${job.pid ?? "unknown"} owns Codex job ${job.id}; state was preserved.`
+          );
+        }
+        terminateProcessTree(job.pid, {
+          platform: options.platform,
+          timeoutMs: options.timeoutMs,
+          runCommandImpl: options.runCommandImpl,
+          killImpl: options.killImpl
+        });
+        const exited = await waitForProcessExit(job.pid, {
+          platform: options.platform,
+          timeoutMs: options.timeoutMs,
+          intervalMs: options.intervalMs,
+          killImpl: options.killImpl
+        });
+        if (!exited) {
+          throw new Error(`Codex job ${job.id} process ${job.pid ?? "unknown"} did not exit.`);
+        }
+      } catch (error) {
+        retainedJobs.push(job);
+        failures.push(error);
+        continue;
+      }
+    }
+
+    removedJobs.push(job);
+  }
+
+  const removedIds = new Set(removedJobs.map((job) => job.id));
+  updateState(workspaceRoot, (freshState) => {
+    freshState.jobs = freshState.jobs.filter((job) => !removedIds.has(job.id));
+  });
+  if (failures.length > 0) {
+    throw new AggregateError(failures, "Failed to stop all Codex session jobs.");
+  }
+  return {
+    removed: removedJobs.map((job) => job.id),
+    retained: retainedJobs.map((job) => job.id)
   };
 }
 

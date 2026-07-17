@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,8 +9,13 @@ const STATE_VERSION = 1;
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
 const STATE_FILE_NAME = "state.json";
+const STATE_LOCK_DIR_NAME = "state.lock";
+const STATE_LOCK_OWNER_FILE_NAME = "owner";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
+const LOCK_TIMEOUT_MS = 2000;
+const STALE_LOCK_MS = 30000;
+const sleepBuffer = new Int32Array(new SharedArrayBuffer(4));
 
 function nowIso() {
   return new Date().toISOString();
@@ -55,6 +60,91 @@ export function ensureStateDir(cwd) {
   fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
 }
 
+function processExists(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+function readLockOwner(lockDir) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(lockDir, STATE_LOCK_OWNER_FILE_NAME), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function staleLockDescription(lockDir) {
+  try {
+    const ageMs = Date.now() - fs.statSync(lockDir).mtimeMs;
+    if (ageMs < STALE_LOCK_MS) return null;
+    const owner = readLockOwner(lockDir);
+    if (owner && processExists(owner.pid)) return null;
+    return owner?.pid ? `owner PID ${owner.pid} is not running` : "owner metadata is missing or invalid";
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function tryPublishStateLock(lockDir, owner) {
+  const candidateDir = `${lockDir}.candidate-${owner.token}`;
+  fs.mkdirSync(candidateDir);
+  fs.writeFileSync(
+    path.join(candidateDir, STATE_LOCK_OWNER_FILE_NAME),
+    `${JSON.stringify(owner)}\n`,
+    "utf8"
+  );
+  try {
+    fs.renameSync(candidateDir, lockDir);
+    return true;
+  } catch (error) {
+    fs.rmSync(candidateDir, { recursive: true, force: true });
+    if (error?.code === "EEXIST" || error?.code === "ENOTEMPTY") return false;
+    throw error;
+  }
+}
+
+function releaseStateLock(lockDir, ownerToken) {
+  const owner = readLockOwner(lockDir);
+  if (owner?.token !== ownerToken) {
+    throw new Error(`Codex companion state lock ownership changed before release: ${lockDir}`);
+  }
+  const releaseDir = `${lockDir}.release-${ownerToken}`;
+  fs.renameSync(lockDir, releaseDir);
+  fs.rmSync(releaseDir, { recursive: true, force: true });
+}
+
+function withStateLock(cwd, operation) {
+  ensureStateDir(cwd);
+  const lockDir = path.join(resolveStateDir(cwd), STATE_LOCK_DIR_NAME);
+  const start = Date.now();
+  const owner = { pid: process.pid, token: randomUUID(), createdAt: nowIso() };
+
+  while (!tryPublishStateLock(lockDir, owner)) {
+    const staleDescription = staleLockDescription(lockDir);
+    if (staleDescription) {
+      throw new Error(
+        `Stale Codex companion state lock requires verified manual removal (${staleDescription}): ${lockDir}`
+      );
+    }
+    if (Date.now() - start >= LOCK_TIMEOUT_MS) {
+      throw new Error(`Timed out waiting for Codex companion state lock: ${lockDir}`);
+    }
+    Atomics.wait(sleepBuffer, 0, 0, 10);
+  }
+
+  try {
+    return operation();
+  } finally {
+    releaseStateLock(lockDir, owner.token);
+  }
+}
+
 export function loadState(cwd) {
   const stateFile = resolveStateFile(cwd);
   if (!fs.existsSync(stateFile)) {
@@ -89,7 +179,7 @@ function removeFileIfExists(filePath) {
   }
 }
 
-export function saveState(cwd, state) {
+function saveStateUnlocked(cwd, state) {
   const previousJobs = loadState(cwd).jobs;
   ensureStateDir(cwd);
   const nextJobs = pruneJobs(state.jobs ?? []);
@@ -102,23 +192,30 @@ export function saveState(cwd, state) {
     jobs: nextJobs
   };
 
+  const stateFile = resolveStateFile(cwd);
+  const temporaryFile = `${stateFile}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+  fs.writeFileSync(temporaryFile, `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  fs.renameSync(temporaryFile, stateFile);
+
   const retainedIds = new Set(nextJobs.map((job) => job.id));
   for (const job of previousJobs) {
-    if (retainedIds.has(job.id)) {
-      continue;
-    }
+    if (retainedIds.has(job.id)) continue;
     removeJobFile(resolveJobFile(cwd, job.id));
     removeFileIfExists(job.logFile);
   }
-
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
   return nextState;
 }
 
+export function saveState(cwd, state) {
+  return withStateLock(cwd, () => saveStateUnlocked(cwd, state));
+}
+
 export function updateState(cwd, mutate) {
-  const state = loadState(cwd);
-  mutate(state);
-  return saveState(cwd, state);
+  return withStateLock(cwd, () => {
+    const state = loadState(cwd);
+    mutate(state);
+    return saveStateUnlocked(cwd, state);
+  });
 }
 
 export function generateJobId(prefix = "job") {

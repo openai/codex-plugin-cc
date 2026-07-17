@@ -4,8 +4,18 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 
+const tempDirs = new Set();
+
 export function makeTempDir(prefix = "codex-plugin-test-") {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  tempDirs.add(tempDir);
+  return tempDir;
+}
+
+export function consumeTempDirs() {
+  const dirs = [...tempDirs];
+  tempDirs.clear();
+  return dirs;
 }
 
 export function writeExecutable(filePath, source) {
