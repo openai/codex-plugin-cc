@@ -413,6 +413,10 @@ async function executeReviewRun(request) {
     model: request.model,
     sandbox: "read-only",
     outputSchema: readOutputSchema(REVIEW_SCHEMA),
+    /* LOCAL PATCH (two-turn-review): if the investigation turn ends without the
+     * forced JSON, resume the thread once to elicit the verdict. */
+    structuredRetryPrompt:
+      "Output ONLY the JSON review object matching the required schema, based on the investigation you just completed. Do not run any commands or include any prose outside the JSON.",
     onProgress: request.onProgress
   });
   const parsed = parseStructuredOutput(result.finalMessage, {

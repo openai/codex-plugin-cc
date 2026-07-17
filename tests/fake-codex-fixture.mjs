@@ -567,6 +567,43 @@ rl.on("line", (line) => {
           break;
         }
 
+        // Reproduces codex-cli 0.142.3: the first outputSchema turn investigates
+        // (commentary + a command) and completes WITHOUT a final_answer; only the
+        // follow-up JSON-only turn emits the structured verdict.
+        if (
+          BEHAVIOR === "adversarial-tooluse-then-json" &&
+          message.params.outputSchema &&
+          message.params.outputSchema.properties &&
+          message.params.outputSchema.properties.verdict
+        ) {
+          const isRetry = prompt.includes("Output ONLY the JSON");
+          if (isRetry) {
+            emitTurnCompleted(thread.id, turnId, [
+              { completed: { type: "agentMessage", id: "msg_" + turnId, text: payload, phase: "final_answer" } }
+            ]);
+          } else {
+            send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+            send({
+              method: "item/completed",
+              params: {
+                threadId: thread.id,
+                turnId,
+                item: { type: "agentMessage", id: "msg_" + turnId, text: "I'll inspect the diff before answering.", phase: "commentary" }
+              }
+            });
+            send({
+              method: "item/completed",
+              params: {
+                threadId: thread.id,
+                turnId,
+                item: { type: "commandExecution", id: "cmd_" + turnId, command: "git diff HEAD~1", status: "completed", exitCode: 0 }
+              }
+            });
+            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+          }
+          break;
+        }
+
         const items = [
           ...(BEHAVIOR === "with-reasoning"
             ? [

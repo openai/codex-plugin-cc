@@ -87,6 +87,34 @@ function buildTurnInput(prompt) {
   return [{ type: "text", text: prompt, text_elements: [] }];
 }
 
+/* LOCAL PATCH (two-turn-review): codex-cli omits the forced-schema final_answer
+ * when a turn also runs tools, leaving only a prose preamble. These helpers let
+ * runAppServerTurn detect that and parseStructuredOutput tolerate fenced JSON.
+ * Auto-re-applied by ~/Documents/claude-setup-review-loop-with-codex/hooks/commit-review-loop.mjs. */
+function stripJsonFences(text) {
+  const trimmed = String(text ?? "").trim();
+  if (!trimmed.startsWith("```")) {
+    return trimmed;
+  }
+  return trimmed
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "")
+    .trim();
+}
+
+function looksLikeJson(text) {
+  const candidate = stripJsonFences(text);
+  if (!candidate || (candidate[0] !== "{" && candidate[0] !== "[")) {
+    return false;
+  }
+  try {
+    JSON.parse(candidate);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function shorten(text, limit = 72) {
   const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
   if (!normalized) {
@@ -1143,13 +1171,54 @@ export async function runAppServerTurn(cwd, options = {}) {
       { onProgress: options.onProgress }
     );
 
+    let finalMessage = turnState.lastAgentMessage;
+    let reasoningSummary = turnState.reasoningSummary;
+    let finalTurn = turnState.finalTurn;
+    let turnId = turnState.turnId;
+
+    /* LOCAL PATCH (two-turn-review): when a schema is requested but the first
+     * turn ran tools, codex-cli ends the turn without emitting the forced JSON
+     * final_answer, so finalMessage holds only a prose preamble (or nothing).
+     * Resume the same thread with a JSON-only prompt; the investigation context
+     * is retained, so the model emits the structured verdict it skipped. The
+     * JSON-only turn is itself flaky on codex-cli 0.142.3, so retry a few times. */
+    if (options.structuredRetryPrompt && options.outputSchema && !looksLikeJson(finalMessage)) {
+      const maxRetries = options.structuredRetryAttempts ?? 3;
+      for (let attempt = 1; attempt <= maxRetries && !looksLikeJson(finalMessage); attempt += 1) {
+        emitProgress(
+          options.onProgress,
+          `Structured output missing after investigation; requesting JSON verdict (attempt ${attempt}/${maxRetries}).`,
+          "finalizing"
+        );
+        const retryState = await captureTurn(
+          client,
+          threadId,
+          () =>
+            client.request("turn/start", {
+              threadId,
+              input: buildTurnInput(options.structuredRetryPrompt),
+              model: options.model ?? null,
+              effort: options.effort ?? null,
+              outputSchema: options.outputSchema ?? null
+            }),
+          { onProgress: options.onProgress }
+        );
+        reasoningSummary = mergeReasoningSections(reasoningSummary, retryState.reasoningSummary);
+        finalTurn = retryState.finalTurn ?? finalTurn;
+        turnId = retryState.turnId ?? turnId;
+        if (looksLikeJson(retryState.lastAgentMessage)) {
+          finalMessage = retryState.lastAgentMessage;
+        }
+      }
+    }
+
     return {
-      status: buildResultStatus(turnState),
+      status: finalTurn?.status === "completed" ? 0 : 1,
       threadId,
-      turnId: turnState.turnId,
-      finalMessage: turnState.lastAgentMessage,
-      reasoningSummary: turnState.reasoningSummary,
-      turn: turnState.finalTurn,
+      turnId,
+      finalMessage,
+      reasoningSummary,
+      turn: finalTurn,
       error: turnState.error,
       stderr: cleanCodexStderr(client.stderr),
       fileChanges: turnState.fileChanges,
@@ -1196,8 +1265,10 @@ export function parseStructuredOutput(rawOutput, fallback = {}) {
   }
 
   try {
+    /* LOCAL PATCH (two-turn-review): tolerate a ```json fenced block so a verdict
+     * wrapped in markdown still parses instead of failing at position 0. */
     return {
-      parsed: JSON.parse(rawOutput),
+      parsed: JSON.parse(stripJsonFences(rawOutput)),
       parseError: null,
       rawOutput,
       ...fallback
