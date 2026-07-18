@@ -268,13 +268,13 @@ function buildNativeReviewTarget(target) {
   return null;
 }
 
-function validateNativeReviewRequest(target, focusText) {
-  if (focusText.trim()) {
-    throw new Error(
-      `\`/codex:review\` now maps directly to the built-in reviewer and does not support custom focus text. Retry with \`/codex:adversarial-review ${focusText.trim()}\` for focused review instructions.`
-    );
-  }
-
+function validateNativeReviewRequest(target) {
+  // Parity with /codex:adversarial-review: positional focus text no longer
+  // aborts the native review. The native reviewer (review/start) does not
+  // consume focus text, so leftover positional words are silently ignored
+  // rather than rejecting the invocation. This keeps `/codex:review --model sol`
+  // usable when a host forwards residual positional text alongside flags,
+  // and removes an interface-parity gap with /codex:adversarial-review (#522).
   const nativeTarget = buildNativeReviewTarget(target);
   if (!nativeTarget) {
     throw new Error("This `/codex:review` target is not supported by the built-in reviewer. Retry with `/codex:adversarial-review` for custom targeting.");
@@ -363,10 +363,9 @@ async function executeReviewRun(request) {
     base: request.base,
     scope: request.scope
   });
-  const focusText = request.focusText?.trim() ?? "";
   const reviewName = request.reviewName ?? "Review";
   if (reviewName === "Review") {
-    const reviewTarget = validateNativeReviewRequest(target, focusText);
+    const reviewTarget = validateNativeReviewRequest(target);
     const result = await runAppServerReview(request.cwd, {
       target: reviewTarget,
       model: request.model,
@@ -407,6 +406,7 @@ async function executeReviewRun(request) {
   }
 
   const context = collectReviewContext(request.cwd, target);
+  const focusText = request.focusText?.trim() ?? "";
   const prompt = buildAdversarialReviewPrompt(context, focusText);
   const result = await runAppServerTurn(context.repoRoot, {
     prompt,
@@ -726,7 +726,7 @@ async function handleReviewCommand(argv, config) {
     scope: options.scope
   });
 
-  config.validateRequest?.(target, focusText);
+  config.validateRequest?.(target);
   const metadata = buildReviewJobMetadata(config.reviewName, target);
   const job = createCompanionJob({
     prefix: "review",

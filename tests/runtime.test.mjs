@@ -969,7 +969,7 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
 });
 
-test("review rejects focus text because it is native-review only", () => {
+test("review accepts (ignores) positional focus text for parity with adversarial-review", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
@@ -984,9 +984,13 @@ test("review rejects focus text because it is native-review only", () => {
     env: buildEnv(binDir)
   });
 
-  assert.equal(result.status > 0, true);
-  assert.match(result.stderr, /does not support custom focus text/i);
-  assert.match(result.stderr, /\/codex:adversarial-review focus on auth/i);
+  // Parity with /codex:adversarial-review: positional args no longer abort the
+  // native review. The native reviewer (review/start) does not consume focus
+  // text, so leftover words are ignored rather than rejecting the invocation.
+  // This keeps `/codex:review --model sol` usable when a host (e.g. Claude)
+  // forwards residual positional text alongside flags.
+  assert.equal(result.status, 0);
+  assert.doesNotMatch(result.stderr, /does not support custom focus text/i);
 });
 
 test("review rejects staged-only scope because it is native-review only", () => {

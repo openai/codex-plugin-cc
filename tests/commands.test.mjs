@@ -36,7 +36,8 @@ test("review command uses AskUserQuestion and background Bash while staying revi
   assert.match(source, /Claude Code's `Bash\(..., run_in_background: true\)` is what actually detaches the run/i);
   assert.match(source, /When in doubt, run the review/i);
   assert.match(source, /\(Recommended\)/);
-  assert.match(source, /does not support staged-only review, unstaged-only review, or extra focus text/i);
+  assert.match(source, /does not support staged-only review or unstaged-only review/i);
+  assert.match(source, /Positional focus text is ignored by the native reviewer/i);
 });
 
 test("adversarial review command uses AskUserQuestion and background Bash while staying review-only", () => {
