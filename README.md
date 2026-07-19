@@ -236,6 +236,26 @@ When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted
 > [!WARNING]
 > The review gate can create a long-running Claude/Codex loop and may drain usage limits quickly. Only enable it when you plan to actively monitor the session.
 
+## Troubleshooting
+
+### Claude says a `/codex:*` command is unavailable
+
+Claude Code can hide commands that set `disable-model-invocation: true` from the agent's available-skills list, even when you explicitly enter the command. This affects `/codex:review`, `/codex:adversarial-review`, `/codex:transfer`, `/codex:status`, `/codex:result`, and `/codex:cancel`.
+
+If Claude refuses one of these commands, ask it to **try the command through the Skill tool anyway**. This is a [known Claude Code issue](https://github.com/anthropics/claude-code/issues/50075); the command normally runs once Claude attempts the explicit invocation.
+
+To make the workaround persistent, add this guidance to your global `~/.claude/CLAUDE.md`:
+
+```md
+## Explicit slash commands
+
+When the user explicitly enters a slash command, try invoking it through the Skill
+tool even if it is missing from the available-skills list. Commands with
+`disable-model-invocation: true` are hidden from that list, but an explicit user
+command is not automatic model invocation. Only report that the command is
+unavailable if the Skill tool itself returns an error.
+```
+
 ## Typical Flows
 
 ### Review Before Shipping
