@@ -565,7 +565,7 @@ test("session start hook exports the Claude session id and plugin data dir for l
 test("write task output focuses on the Codex result without generic follow-up hints", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
-  installFakeCodex(binDir);
+  installFakeCodex(binDir, "task-shell-write");
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
   run("git", ["add", "README.md"], { cwd: repo });
@@ -1380,7 +1380,7 @@ test("result without a job id prefers the latest finished job from the current C
 test("result for a finished write-capable task returns the raw Codex final response", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
-  installFakeCodex(binDir);
+  installFakeCodex(binDir, "task-shell-write");
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
   run("git", ["add", "README.md"], { cwd: repo });
@@ -1791,7 +1791,7 @@ test("stop hook runs a stop-time review task and blocks on findings when the rev
   const repo = makeTempDir();
   const binDir = makeTempDir();
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");
-  installFakeCodex(binDir);
+  installFakeCodex(binDir, "task-shell-write");
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
   run("git", ["add", "README.md"], { cwd: repo });

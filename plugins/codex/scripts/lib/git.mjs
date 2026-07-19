@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -116,6 +117,32 @@ export function detectDefaultBranch(cwd) {
 
 export function getCurrentBranch(cwd) {
   return gitChecked(cwd, ["branch", "--show-current"]).stdout.trim() || "HEAD";
+}
+
+export function getWorkspaceWriteFingerprint(cwd) {
+  try {
+    const status = gitChecked(cwd, ["status", "--porcelain=v1", "-uall"]).stdout;
+    const unstagedDiff = gitChecked(cwd, ["diff"]).stdout;
+    const stagedDiff = gitChecked(cwd, ["diff", "--cached"]).stdout;
+    const untracked = gitChecked(cwd, ["ls-files", "--others", "--exclude-standard"])
+      .stdout.trim()
+      .split("\n")
+      .filter(Boolean)
+      .sort();
+    const untrackedStats = untracked.map((relativePath) => {
+      try {
+        const stats = fs.statSync(path.join(cwd, relativePath));
+        return `${relativePath}\0${stats.size}\0${stats.mtimeMs}`;
+      } catch {
+        return `${relativePath}\0unreadable`;
+      }
+    });
+    return createHash("sha256")
+      .update([status, unstagedDiff, stagedDiff, untrackedStats.join("\n")].join("\0"))
+      .digest("hex");
+  } catch {
+    return null;
+  }
 }
 
 export function getWorkingTreeState(cwd) {

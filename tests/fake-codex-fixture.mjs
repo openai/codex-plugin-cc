@@ -498,6 +498,13 @@ rl.on("line", (line) => {
           break;
         }
 
+        if (BEHAVIOR === "task-shell-write") {
+          fs.writeFileSync(path.join(thread.cwd, "shell-write.txt"), "shell write\\n");
+        }
+        if (BEHAVIOR === "task-shell-write-existing") {
+          fs.appendFileSync(path.join(thread.cwd, "README.md"), "appended by fake codex\\n");
+        }
+
         const items = [
           ...(BEHAVIOR === "with-reasoning"
             ? [
@@ -510,6 +517,18 @@ rl.on("line", (line) => {
                   }
               }
             ]
+            : []),
+          ...(BEHAVIOR === "task-write-file-change"
+            ? [
+                {
+                  completed: {
+                    type: "fileChange",
+                    id: "filechange_" + turnId,
+                    status: "completed",
+                    changes: [{ path: path.join(thread.cwd, "src", "app.js"), kind: "add" }]
+                  }
+                }
+              ]
             : []),
           {
             completed: { type: "agentMessage", id: "msg_" + turnId, text: payload, phase: "final_answer" }
