@@ -23,7 +23,7 @@ import {
   } from "./lib/codex.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
-import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
+import { collectReviewContext, ensureGitRepository, getWorkspaceWriteFingerprint, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
@@ -482,6 +482,8 @@ async function executeTaskRun(request) {
     throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
   }
 
+  const writeFingerprintBefore = request.write ? getWorkspaceWriteFingerprint(workspaceRoot) : null;
+
   const result = await runAppServerTurn(workspaceRoot, {
     resumeThreadId,
     prompt: request.prompt,
@@ -494,9 +496,26 @@ async function executeTaskRun(request) {
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
   });
 
+  // A write task that produced no apply_patch changes AND left the working tree
+  // fingerprint untouched landed zero workspace writes. Sandbox failures can
+  // reach this state while the turn itself reports success (the model narrates
+  // the loss in prose but nothing mechanical fails), so surface it as a failed,
+  // degraded job instead of "completed". Fingerprint unavailable (non-git
+  // workspace) skips detection rather than risking a false positive.
+  let degraded = null;
+  if (
+    request.write &&
+    result.status === 0 &&
+    (result.touchedFiles ?? []).length === 0 &&
+    writeFingerprintBefore !== null &&
+    getWorkspaceWriteFingerprint(workspaceRoot) === writeFingerprintBefore
+  ) {
+    degraded = "zero-writes";
+  }
+
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
   const failureMessage = result.error?.message ?? result.stderr ?? "";
-  const rendered = renderTaskResult(
+  let rendered = renderTaskResult(
     {
       rawOutput,
       failureMessage,
@@ -508,21 +527,30 @@ async function executeTaskRun(request) {
       write: Boolean(request.write)
     }
   );
+  if (degraded) {
+    rendered =
+      "DEGRADED: this write task landed zero workspace writes.\n" +
+      "No apply_patch changes were recorded and the working tree is unchanged. " +
+      "Treat the task as failed and check the job log before assuming any edits exist.\n\n" +
+      rendered;
+  }
   const payload = {
     status: result.status,
     threadId: result.threadId,
     rawOutput,
     touchedFiles: result.touchedFiles,
-    reasoningSummary: result.reasoningSummary
+    reasoningSummary: result.reasoningSummary,
+    ...(degraded ? { degraded } : {})
   };
 
+  const summary = firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`));
   return {
-    exitStatus: result.status,
+    exitStatus: degraded ? 1 : result.status,
     threadId: result.threadId,
     turnId: result.turnId,
     payload,
     rendered,
-    summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
+    summary: degraded ? `DEGRADED (zero workspace writes): ${summary}` : summary,
     jobTitle: taskMetadata.title,
     jobClass: "task",
     write: Boolean(request.write)
