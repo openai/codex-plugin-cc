@@ -29,13 +29,19 @@ export function resolveClaudeSessionPath(cwd, options = {}) {
   }
 
   let source;
-  let projects;
   try {
     source = fs.realpathSync(sourcePath);
-    projects = fs.realpathSync(CLAUDE_PROJECTS_DIR);
   } catch {
     throw new Error(`Claude session file not found: ${sourcePath}`);
   }
+
+  let projects;
+  try {
+    projects = fs.realpathSync(CLAUDE_PROJECTS_DIR);
+  } catch {
+    throw new Error(`Claude projects directory not found: ${CLAUDE_PROJECTS_DIR}`);
+  }
+
   const relative = path.relative(projects, source);
   if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
     throw new Error(`Codex can import Claude sessions only from ${CLAUDE_PROJECTS_DIR}: ${source}`);

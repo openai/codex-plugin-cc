@@ -327,6 +327,23 @@ test("transfer rejects sources outside the Claude projects directory", () => {
   assert.match(result.stderr, /only from .*\.claude.*projects/);
 });
 
+test("transfer distinguishes a missing Claude projects directory from a missing source", () => {
+  const home = makeTempDir();
+  const repo = path.join(home, "repo");
+  const sourcePath = path.join(home, "session.jsonl");
+  fs.mkdirSync(repo, { recursive: true });
+  fs.writeFileSync(sourcePath, "{}\n", "utf8");
+
+  const result = run("node", [SCRIPT, "transfer", "--source", sourcePath], {
+    cwd: repo,
+    env: { ...process.env, HOME: home }
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Claude projects directory not found:/);
+  assert.doesNotMatch(result.stderr, /Claude session file not found:/);
+});
+
 test("task reports the actual Codex auth error when the run is rejected", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
