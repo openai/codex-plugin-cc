@@ -86,7 +86,13 @@ Use it when you want:
 - a review of your current uncommitted changes
 - a review of your branch compared to a base branch like `main`
 
-Use `--base <ref>` for branch review. It also supports `--wait` and `--background`. It is not steerable and does not take custom focus text. Use [`/codex:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
+Use `--base <ref>` for branch review. Use `--scope auto|working-tree|branch` to control target selection:
+
+- `auto` reviews working tree changes when present, otherwise the branch diff
+- `working-tree` reviews staged, unstaged, and untracked changes
+- `branch` reviews the branch diff against the detected default branch
+
+Passing `--base <ref>` selects branch review against that ref regardless of `--scope`. The command also supports `--wait` and `--background`. It is not steerable and does not take custom focus text. Use [`/codex:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
 
 Examples:
 
