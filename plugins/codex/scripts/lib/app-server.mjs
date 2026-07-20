@@ -13,7 +13,12 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
+import {
+  assertBrokerSessionActive,
+  ensureBrokerSession,
+  resolveSessionId,
+  reuseBrokerSession
+} from "./broker-lifecycle.mjs";
 import { terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
@@ -334,14 +339,31 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
 
 export class CodexAppServerClient {
   static async connect(cwd, options = {}) {
+    const sessionId = resolveSessionId({ env: options.env });
     let brokerEndpoint = null;
-    if (!options.disableBroker) {
+    if (options.disableBroker) {
+      assertBrokerSessionActive(sessionId);
+    } else {
       brokerEndpoint = options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
-      if (!brokerEndpoint && options.reuseExistingBroker) {
-        brokerEndpoint = loadBrokerSession(cwd)?.endpoint ?? null;
+      if (brokerEndpoint) {
+        // A supplied endpoint bypasses the lifecycle functions that normally
+        // perform admission under the broker-state lock.
+        assertBrokerSessionActive(sessionId);
       }
-      if (!brokerEndpoint && !options.reuseExistingBroker) {
-        const brokerSession = await ensureBrokerSession(cwd, { env: options.env });
+      if (!brokerEndpoint && sessionId && options.reuseExistingBroker) {
+        const brokerSession = await reuseBrokerSession(cwd, {
+          ...options.brokerOptions,
+          env: options.env,
+          killProcess: terminateProcessTree
+        });
+        brokerEndpoint = brokerSession?.endpoint ?? null;
+      }
+      if (!brokerEndpoint && sessionId && !options.reuseExistingBroker) {
+        const brokerSession = await ensureBrokerSession(cwd, {
+          ...options.brokerOptions,
+          env: options.env,
+          killProcess: terminateProcessTree
+        });
         brokerEndpoint = brokerSession?.endpoint ?? null;
       }
     }
@@ -349,6 +371,12 @@ export class CodexAppServerClient {
       ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
       : new SpawnedCodexAppServerClient(cwd, options);
     await client.initialize();
+    try {
+      assertBrokerSessionActive(sessionId);
+    } catch (error) {
+      await client.close();
+      throw error;
+    }
     return client;
   }
 }

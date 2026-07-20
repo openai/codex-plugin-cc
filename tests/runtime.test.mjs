@@ -7,7 +7,13 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
-import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import {
+  loadBrokerSession,
+  saveBrokerSession,
+  teardownBrokerForCwd,
+  teardownBrokersForSession
+} from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -15,6 +21,37 @@ const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
+const TEST_PLUGIN_DATA = makeTempDir("codex-plugin-test-data-");
+
+// Runtime tests exercise real SessionEnd and broker teardown paths. Keep their
+// state out of the user's fallback /tmp/codex-companion directory so a test
+// session can never discover or clean a live plugin session.
+process.env.CLAUDE_PLUGIN_DATA = TEST_PLUGIN_DATA;
+test.after(async () => {
+  const stateRoot = path.join(TEST_PLUGIN_DATA, "state");
+  const sessionIds = new Set();
+  if (fs.existsSync(stateRoot)) {
+    for (const entry of fs.readdirSync(stateRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+      try {
+        const session = JSON.parse(fs.readFileSync(path.join(stateRoot, entry.name, "broker.json"), "utf8"));
+        for (const sessionId of session.sessionIds ?? [session.sessionId]) {
+          if (sessionId) {
+            sessionIds.add(sessionId);
+          }
+        }
+      } catch {
+        // No broker state for this workspace.
+      }
+    }
+  }
+  for (const sessionId of sessionIds) {
+    await teardownBrokersForSession(sessionId, { killProcess: terminateProcessTree });
+  }
+  fs.rmSync(TEST_PLUGIN_DATA, { recursive: true, force: true });
+});
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   const start = Date.now();
@@ -26,6 +63,21 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
   throw new Error("Timed out waiting for condition.");
+}
+
+function buildSessionEnv(binDir, sessionId) {
+  return {
+    ...buildEnv(binDir),
+    CODEX_COMPANION_SESSION_ID: sessionId
+  };
+}
+
+function registerBrokerCleanup(t, cwd, sessionId = null) {
+  t.after(async () => {
+    await teardownBrokerForCwd(cwd, sessionId, {
+      killProcess: terminateProcessTree
+    });
+  });
 }
 
 test("setup reports ready when fake codex is installed and authenticated", () => {
@@ -698,6 +750,38 @@ test("session start hook exports the Claude session id, transcript path, and plu
   );
 });
 
+test("session start hook runs when invoked through a symlinked plugin root", () => {
+  const repo = makeTempDir();
+  const linkParent = makeTempDir();
+  const pluginLink = path.join(linkParent, "codex-link");
+  fs.symlinkSync(PLUGIN_ROOT, pluginLink, process.platform === "win32" ? "junction" : "dir");
+
+  const envFile = path.join(makeTempDir(), "claude-env.sh");
+  fs.writeFileSync(envFile, "", "utf8");
+  const pluginDataDir = makeTempDir();
+  const symlinkedSessionHook = path.join(pluginLink, "scripts", "session-lifecycle-hook.mjs");
+
+  const result = run("node", [symlinkedSessionHook, "SessionStart"], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      CLAUDE_ENV_FILE: envFile,
+      CLAUDE_PLUGIN_DATA: pluginDataDir
+    },
+    input: JSON.stringify({
+      hook_event_name: "SessionStart",
+      session_id: "sess-symlink",
+      cwd: repo
+    })
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(
+    fs.readFileSync(envFile, "utf8"),
+    `export CODEX_COMPANION_SESSION_ID='sess-symlink'\nexport CLAUDE_PLUGIN_DATA='${pluginDataDir}'\n`
+  );
+});
+
 test("write task output focuses on the Codex result without generic follow-up hints", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -890,7 +974,7 @@ test("task can finish after subagent work even if the parent turn/completed even
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
-test("task using the shared broker still completes when Codex spawns subagents", () => {
+test("task using the shared broker still completes when Codex spawns subagents", (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir, "with-subagent");
@@ -900,16 +984,16 @@ test("task using the shared broker still completes when Codex spawns subagents",
   run("git", ["commit", "-m", "init"], { cwd: repo });
   fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
 
-  const env = buildEnv(binDir);
+  const sessionId = "sess-shared-subagents";
+  const env = buildSessionEnv(binDir, sessionId);
+  registerBrokerCleanup(t, repo, sessionId);
   const review = run("node", [SCRIPT, "review"], {
     cwd: repo,
     env
   });
   assert.equal(review.status, 0, review.stderr);
 
-  if (!loadBrokerSession(repo)) {
-    return;
-  }
+  assert.ok(loadBrokerSession(repo));
 
   const result = run("node", [SCRIPT, "task", "challenge the current design"], {
     cwd: repo,
@@ -1737,7 +1821,7 @@ test("cancel with a job id can still target an active job from another Claude se
   assert.equal(state.jobs[0].status, "cancelled");
 });
 
-test("cancel sends turn interrupt to the shared app-server before killing a brokered task", async () => {
+test("cancel sends turn interrupt to the shared app-server before killing a brokered task", async (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");
@@ -1747,7 +1831,9 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const env = buildEnv(binDir);
+  const sessionId = "sess-cancel-shared-turn";
+  const env = buildSessionEnv(binDir, sessionId);
+  registerBrokerCleanup(t, repo, sessionId);
   const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate the flaky worker timeout"], {
     cwd: repo,
     env
@@ -1790,15 +1876,6 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
     turnId: runningJob.turnId
   });
 
-  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
-    cwd: repo,
-    env,
-    input: JSON.stringify({
-      hook_event_name: "SessionEnd",
-      cwd: repo
-    })
-  });
-  assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
 test("session end fully cleans up jobs for the ending session", async (t) => {
@@ -2116,7 +2193,7 @@ test("stop hook runs the actual task when auth status looks stale", () => {
   assert.match(payload.reason, /Missing empty-state guard/i);
 });
 
-test("commands lazily start and reuse one shared app-server after first use", async () => {
+test("commands without a session owner use a direct app-server", (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");
@@ -2129,6 +2206,34 @@ test("commands lazily start and reuse one shared app-server after first use", as
   fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
 
   const env = buildEnv(binDir);
+  registerBrokerCleanup(t, repo);
+
+  const review = run("node", [SCRIPT, "review"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(review.status, 0, review.stderr);
+  assert.equal(loadBrokerSession(repo), null);
+
+  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.equal(fakeState.appServerStarts, 1);
+});
+
+test("commands lazily start and reuse one shared app-server after first use", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  const sessionId = "sess-lazy-shared-runtime";
+  const env = buildSessionEnv(binDir, sessionId);
+  registerBrokerCleanup(t, repo, sessionId);
 
   const review = run("node", [SCRIPT, "review"], {
     cwd: repo,
@@ -2137,9 +2242,7 @@ test("commands lazily start and reuse one shared app-server after first use", as
   assert.equal(review.status, 0, review.stderr);
 
   const brokerSession = loadBrokerSession(repo);
-  if (!brokerSession) {
-    return;
-  }
+  assert.ok(brokerSession);
 
   const adversarial = run("node", [SCRIPT, "adversarial-review"], {
     cwd: repo,
@@ -2150,18 +2253,9 @@ test("commands lazily start and reuse one shared app-server after first use", as
   const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
   assert.equal(fakeState.appServerStarts, 1);
 
-  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
-    cwd: repo,
-    env,
-    input: JSON.stringify({
-      hook_event_name: "SessionEnd",
-      cwd: repo
-    })
-  });
-  assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
-test("setup reuses an existing shared app-server without starting another one", () => {
+test("setup reuses an existing shared app-server without starting another one", (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");
@@ -2173,7 +2267,9 @@ test("setup reuses an existing shared app-server without starting another one", 
   run("git", ["commit", "-m", "init"], { cwd: repo });
   fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
 
-  const env = buildEnv(binDir);
+  const sessionId = "sess-setup-shared-runtime";
+  const env = buildSessionEnv(binDir, sessionId);
+  registerBrokerCleanup(t, repo, sessionId);
 
   const review = run("node", [SCRIPT, "review"], {
     cwd: repo,
@@ -2182,9 +2278,7 @@ test("setup reuses an existing shared app-server without starting another one", 
   assert.equal(review.status, 0, review.stderr);
 
   const brokerSession = loadBrokerSession(repo);
-  if (!brokerSession) {
-    return;
-  }
+  assert.ok(brokerSession);
 
   const setup = run("node", [SCRIPT, "setup", "--json"], {
     cwd: repo,
@@ -2195,18 +2289,9 @@ test("setup reuses an existing shared app-server without starting another one", 
   const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
   assert.equal(fakeState.appServerStarts, 1);
 
-  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
-    cwd: repo,
-    env,
-    input: JSON.stringify({
-      hook_event_name: "SessionEnd",
-      cwd: repo
-    })
-  });
-  assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
-test("status reports shared session runtime when a lazy broker is active", () => {
+test("status reports shared session runtime when a lazy broker is active", (t) => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
@@ -2216,19 +2301,21 @@ test("status reports shared session runtime when a lazy broker is active", () =>
   run("git", ["commit", "-m", "init"], { cwd: repo });
   fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
 
+  const sessionId = "sess-status-shared-runtime";
+  const env = buildSessionEnv(binDir, sessionId);
+  registerBrokerCleanup(t, repo, sessionId);
+
   const review = run("node", [SCRIPT, "review"], {
     cwd: repo,
-    env: buildEnv(binDir)
+    env
   });
   assert.equal(review.status, 0, review.stderr);
 
-  if (!loadBrokerSession(repo)) {
-    return;
-  }
+  assert.ok(loadBrokerSession(repo));
 
   const result = run("node", [SCRIPT, "status"], {
     cwd: repo,
-    env: buildEnv(binDir)
+    env
   });
 
   assert.equal(result.status, 0, result.stderr);
