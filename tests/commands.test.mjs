@@ -12,7 +12,7 @@ function read(relativePath) {
 }
 
 test("review command uses AskUserQuestion and background Bash while staying review-only", () => {
-  const source = read("commands/review.md");
+  const source = read("commands/review-codex.md");
   assert.match(source, /AskUserQuestion/);
   assert.match(source, /\bBash\(/);
   assert.match(source, /Do not fix issues/i);
@@ -64,7 +64,7 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /Claude Code's `Bash\(..., run_in_background: true\)` is what actually detaches the run/i);
   assert.match(source, /When in doubt, run the review/i);
   assert.match(source, /\(Recommended\)/);
-  assert.match(source, /uses the same review target selection as `\/codex:review`/i);
+  assert.match(source, /uses the same review target selection as `\/codex:review-codex`/i);
   assert.match(source, /supports working-tree review, branch review, and `--base <ref>`/i);
   assert.match(source, /does not support `--scope staged` or `--scope unstaged`/i);
   assert.match(source, /can still take extra focus text after the flags/i);
@@ -77,7 +77,7 @@ test("continue is not exposed as a user-facing command", () => {
     "cancel.md",
     "rescue.md",
     "result.md",
-    "review.md",
+    "review-codex.md",
     "setup.md",
     "status.md",
     "transfer.md"
@@ -159,9 +159,9 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(readme, /`spark`, the plugin maps that to `gpt-5\.3-codex-spark`/i);
   assert.match(readme, /continue a previous Codex task/i);
   assert.match(readme, /### `\/codex:setup`/);
-  assert.match(readme, /### `\/codex:review`/);
+  assert.match(readme, /### `\/codex:review-codex`/);
   assert.match(readme, /### `\/codex:adversarial-review`/);
-  assert.match(readme, /uses the same review target selection as `\/codex:review`/i);
+  assert.match(readme, /uses the same review target selection as `\/codex:review-codex`/i);
   assert.match(readme, /--base main challenge whether this was the right caching and retry design/);
   assert.match(readme, /### `\/codex:rescue`/);
   assert.match(readme, /### `\/codex:transfer`/);

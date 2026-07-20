@@ -9,7 +9,7 @@ they already have.
 
 ## What You Get
 
-- `/codex:review` for a normal read-only Codex review
+- `/codex:review-codex` for a normal read-only Codex review
 - `/codex:adversarial-review` for a steerable challenge review
 - `/codex:rescue`, `/codex:transfer`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work, hand off sessions, and manage background jobs
 
@@ -67,14 +67,14 @@ After install, you should see:
 One simple first run is:
 
 ```bash
-/codex:review --background
+/codex:review-codex --background
 /codex:status
 /codex:result
 ```
 
 ## Usage
 
-### `/codex:review`
+### `/codex:review-codex`
 
 Runs a normal Codex review on your current work. It gives you the same quality of code review as running `/review` inside Codex directly.
 
@@ -91,9 +91,9 @@ Use `--base <ref>` for branch review. It also supports `--wait` and `--backgroun
 Examples:
 
 ```bash
-/codex:review
-/codex:review --base main
-/codex:review --background
+/codex:review-codex
+/codex:review-codex --base main
+/codex:review-codex --background
 ```
 
 This command is read-only and will not perform any changes. When run in the background you can use [`/codex:status`](#codexstatus) to check on the progress and [`/codex:cancel`](#codexcancel) to cancel the ongoing task.
@@ -104,8 +104,8 @@ Runs a **steerable** review that questions the chosen implementation and design.
 
 It can be used to pressure-test assumptions, tradeoffs, failure modes, and whether a different approach would have been safer or simpler.
 
-It uses the same review target selection as `/codex:review`, including `--base <ref>` for branch review.
-It also supports `--wait` and `--background`. Unlike `/codex:review`, it can take extra focus text after the flags.
+It uses the same review target selection as `/codex:review-codex`, including `--base <ref>` for branch review.
+It also supports `--wait` and `--background`. Unlike `/codex:review-codex`, it can take extra focus text after the flags.
 
 Use it when you want:
 
@@ -241,7 +241,7 @@ When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted
 ### Review Before Shipping
 
 ```bash
-/codex:review
+/codex:review-codex
 ```
 
 ### Hand A Problem To Codex

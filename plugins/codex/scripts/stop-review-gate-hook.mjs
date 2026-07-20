@@ -72,7 +72,7 @@ function parseStopReviewOutput(rawOutput) {
     return {
       ok: false,
       reason:
-        "The stop-time Codex review task returned no final output. Run /codex:review --wait manually or bypass the gate."
+        "The stop-time Codex review task returned no final output. Run /codex:review-codex --wait manually or bypass the gate."
     };
   }
 
@@ -91,7 +91,7 @@ function parseStopReviewOutput(rawOutput) {
   return {
     ok: false,
     reason:
-      "The stop-time Codex review task returned an unexpected answer. Run /codex:review --wait manually or bypass the gate."
+      "The stop-time Codex review task returned an unexpected answer. Run /codex:review-codex --wait manually or bypass the gate."
   };
 }
 
@@ -113,7 +113,7 @@ function runStopReview(cwd, input = {}) {
     return {
       ok: false,
       reason:
-        "The stop-time Codex review task timed out after 15 minutes. Run /codex:review --wait manually or bypass the gate."
+        "The stop-time Codex review task timed out after 15 minutes. Run /codex:review-codex --wait manually or bypass the gate."
     };
   }
 
@@ -123,7 +123,7 @@ function runStopReview(cwd, input = {}) {
       ok: false,
       reason: detail
         ? `The stop-time Codex review task failed: ${detail}`
-        : "The stop-time Codex review task failed. Run /codex:review --wait manually or bypass the gate."
+        : "The stop-time Codex review task failed. Run /codex:review-codex --wait manually or bypass the gate."
     };
   }
 
@@ -134,7 +134,7 @@ function runStopReview(cwd, input = {}) {
     return {
       ok: false,
       reason:
-        "The stop-time Codex review task returned invalid JSON. Run /codex:review --wait manually or bypass the gate."
+        "The stop-time Codex review task returned invalid JSON. Run /codex:review-codex --wait manually or bypass the gate."
     };
   }
 }
