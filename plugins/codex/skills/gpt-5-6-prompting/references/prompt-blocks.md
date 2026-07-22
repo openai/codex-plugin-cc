@@ -2,6 +2,7 @@
 
 Use these blocks selectively when composing Codex or GPT-5.6 prompts.
 Wrap each block in the XML tag shown in its heading.
+Pick at most one block per concern, and never restate a rule that already appears in another block — GPT-5.6 reconciles repeated or conflicting instructions at the cost of reasoning tokens.
 
 ## Core Wrapper
 
@@ -31,7 +32,7 @@ Put the highest-value findings or decisions first.
 
 ### `compact_output_contract`
 
-Use when you want concise prose instead of a schema.
+Use only when a specific shape or brevity requirement exists. GPT-5.6 is concise by default — blanket brevity orders under-deliver detail.
 
 ```xml
 <compact_output_contract>
@@ -113,6 +114,17 @@ Prefer primary sources.
 ```
 
 ## Safety and Scope
+
+### `authorization_boundary`
+
+Use in every run to state what the request authorizes.
+
+```xml
+<authorization_boundary>
+For requests to answer, explain, review, diagnose, or plan: inspect the relevant materials and report the result. Do not implement changes.
+For fix or implementation requests: edits within the stated scope are authorized. Confirm before destructive or irreversible actions.
+</authorization_boundary>
+```
 
 ### `action_safety`
 

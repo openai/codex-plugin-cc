@@ -2,6 +2,7 @@
 
 Use these as starting templates for Codex task prompts or other Codex/GPT-5.6 prompt construction.
 Copy the smallest recipe that fits the task, then trim anything you do not need.
+Always put a one-line plain-text task title above the first XML block — it becomes the persistent thread's name in `codex resume` and the Codex desktop app.
 In `codex:codex-rescue`, run diagnosis and fix-oriented recipes in write mode by default unless the user explicitly asked for read-only behavior.
 
 ## Diagnosis
@@ -20,13 +21,9 @@ Return a compact diagnosis with:
 </compact_output_contract>
 
 <default_follow_through_policy>
-Keep going until you have enough evidence to identify the root cause confidently.
+Keep going until you have enough evidence to identify the root cause confidently, and verify the proposed cause against the observed evidence before finalizing.
 Only stop to ask questions when a missing detail changes correctness materially.
 </default_follow_through_policy>
-
-<verification_loop>
-Before finalizing, verify that the proposed root cause matches the observed evidence.
-</verification_loop>
 
 <missing_context_gating>
 Do not guess missing repository facts.
@@ -52,12 +49,8 @@ Return:
 
 <default_follow_through_policy>
 Default to the most reasonable low-risk interpretation and keep going.
-</default_follow_through_policy>
-
-<completeness_contract>
-Resolve the task fully before stopping.
 Do not stop after identifying the issue without applying the fix.
-</completeness_contract>
+</default_follow_through_policy>
 
 <verification_loop>
 Before finalizing, verify that the fix matches the task requirements and that the changed code is coherent.
@@ -75,6 +68,7 @@ Avoid unrelated refactors or cleanup.
 <task>
 Analyze this change for the most likely correctness or regression issues.
 Focus on the provided repository context only.
+Report findings only. Do not modify files.
 </task>
 
 <structured_output_contract>
@@ -122,6 +116,20 @@ Prefer breadth first, then go deeper only where the evidence changes the recomme
 Back important claims with explicit references to the sources you inspected.
 Prefer primary sources.
 </citation_rules>
+```
+
+## Bounded Aggregation
+
+Use when the task is filtering, joining, ranking, or aggregating many tool or command outputs. Avoid it when intermediate outputs need fresh judgment or an approval checkpoint.
+
+```xml
+<task>
+Process the results of the bounded stage in code instead of reading every result yourself: run the eligible commands, filter/join/rank the outputs in a script, and return only the reduced result.
+</task>
+
+<structured_output_contract>
+Return exactly the requested output schema. Do not include raw intermediate outputs.
+</structured_output_contract>
 ```
 
 ## Prompt-Patching

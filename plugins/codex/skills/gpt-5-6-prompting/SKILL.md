@@ -12,17 +12,19 @@ Model selection (GPT-5.6 family, requires codex-cli >= 0.144):
 - `gpt-5.6-sol` — flagship. Default for all delegated coding, review, diagnosis, and research tasks.
 - `gpt-5.6-terra` — mid tier. Use when latency matters more than depth on routine tasks.
 - `gpt-5.6-luna` — fast tier. Mechanical transforms, quick lookups, high-volume small calls.
-- Reasoning effort: `-c model_reasoning_effort="high"` by default; `xhigh` for the hardest diagnosis or adversarial-review runs; `minimal`/`low`/`medium` for mechanical work. Effort is a config flag, not part of the model name.
+- Reasoning effort: GPT-5.6's native scale is `none`/`low`/`medium`/`high`/`xhigh`/`max` (`minimal` was dropped, `max` added). Default `high` via `-c model_reasoning_effort="high"`; try one level lower than your old baseline before raising. The companion's `--effort` flag caps at `xhigh` and still accepts legacy `minimal`; `max` requires a direct `-c model_reasoning_effort` config.
 - Prefer tightening the prompt contract before raising model tier or effort.
 
-Prompt Codex like an operator, not a collaborator. Keep prompts compact and block-structured with XML tags. State the task, the output contract, the follow-through defaults, and the small set of extra constraints that matter.
+Prompt Codex like an operator, not a collaborator. Keep prompts lean: OpenAI measured ~10-15% better evals and 41-66% fewer tokens from leaner system prompts. State each instruction exactly once — GPT-5.6 tries to reconcile repeated or conflicting rules and burns reasoning tokens doing it. Use XML-tagged blocks only where they add a real contract.
 
 Core rules:
+- Start every prompt with one plain-text title line (≤50 chars, e.g. `Fix flaky auth test retry logic`) before any XML block. The companion names the persistent Codex thread from the prompt's first characters, and that name is what appears in the `codex resume` picker and the Codex desktop app — a leading `<task>` tag turns every thread name into identical noise.
 - Prefer one clear task per Codex run. Split unrelated asks into separate runs.
 - Tell Codex what done looks like. Do not assume it will infer the desired end state.
+- State what the run is authorized to do. Review, diagnosis, explanation, and planning requests mean inspect and report — say no changes are authorized. Write-capable runs get the inverse: name the authorized change scope.
 - Add explicit grounding and verification rules for any task where unsupported guesses would hurt quality.
+- GPT-5.6 is more concise by default than earlier 5.x models. Do not add blanket brevity orders; constrain length only where a specific output shape requires it.
 - Prefer better prompt contracts over raising reasoning or adding long natural-language explanations.
-- Use XML tags consistently so the prompt has stable internal structure.
 
 Default prompt recipe:
 - `<task>`: the concrete job and the relevant repository or failure context.
@@ -31,11 +33,12 @@ Default prompt recipe:
 - `<verification_loop>` or `<completeness_contract>`: required for debugging, implementation, or risky fixes.
 - `<grounding_rules>` or `<citation_rules>`: required for review, research, or anything that could drift into unsupported claims.
 
-When to add blocks:
-- Coding or debugging: add `completeness_contract`, `verification_loop`, and `missing_context_gating`.
-- Review or adversarial review: add `grounding_rules`, `structured_output_contract`, and `dig_deeper_nudge`.
+When to add blocks — pick at most one block per concern; overlapping blocks (`completeness_contract` vs `verification_loop`, a brevity line repeated across contracts) cost tokens and can conflict:
+- Coding or debugging: add `verification_loop`; add `missing_context_gating` only when guessing is a real risk.
+- Review or adversarial review: add `grounding_rules` and `structured_output_contract`; add `dig_deeper_nudge` only for adversarial passes.
 - Research or recommendation tasks: add `research_mode` and `citation_rules`.
 - Write-capable tasks: add `action_safety` so Codex stays narrow and avoids unrelated refactors.
+- Every run: state the authorization boundary — inline in `<task>` or via the `authorization_boundary` block.
 
 How to choose prompt shape:
 - Use built-in `review` or `adversarial-review` commands when the job is reviewing local git changes. Those prompts already carry the review contract.
