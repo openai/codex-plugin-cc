@@ -32,6 +32,15 @@
             "timeout": 900
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-advisor-backstop.mjs\"",
+            "timeout": 15
+          }
+        ]
       }
     ]
   }

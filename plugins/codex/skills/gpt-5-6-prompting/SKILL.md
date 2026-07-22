@@ -1,12 +1,19 @@
 ---
-name: gpt-5-4-prompting
-description: Internal guidance for composing Codex and GPT-5.4 prompts for coding, review, diagnosis, and research tasks inside the Codex Claude Code plugin
+name: gpt-5-6-prompting
+description: Internal guidance for composing Codex and GPT-5.6 prompts for coding, review, diagnosis, and research tasks inside the Codex Claude Code plugin
 user-invocable: false
 ---
 
-# GPT-5.4 Prompting
+# GPT-5.6 Prompting
 
-Use this skill when `codex:codex-rescue` needs to ask Codex or another GPT-5.4-based workflow for help.
+Use this skill when `codex:codex-rescue` needs to ask Codex or another GPT-5.6-based workflow for help.
+
+Model selection (GPT-5.6 family, requires codex-cli >= 0.144):
+- `gpt-5.6-sol` — flagship. Default for all delegated coding, review, diagnosis, and research tasks.
+- `gpt-5.6-terra` — mid tier. Use when latency matters more than depth on routine tasks.
+- `gpt-5.6-luna` — fast tier. Mechanical transforms, quick lookups, high-volume small calls.
+- Reasoning effort: `-c model_reasoning_effort="high"` by default; `xhigh` for the hardest diagnosis or adversarial-review runs; `minimal`/`low`/`medium` for mechanical work. Effort is a config flag, not part of the model name.
+- Prefer tightening the prompt contract before raising model tier or effort.
 
 Prompt Codex like an operator, not a collaborator. Keep prompts compact and block-structured with XML tags. State the task, the output contract, the follow-through defaults, and the small set of extra constraints that matter.
 
