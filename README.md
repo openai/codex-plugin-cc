@@ -159,7 +159,7 @@ Ask Codex to redesign the database connection to be more resilient.
 **Notes:**
 
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
-- if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
+- if you say `spark`, the plugin maps that to `gpt-5.6-luna` (the fast tier; the old `gpt-5.3-codex-spark` is rejected on ChatGPT-account auth)
 - follow-up rescue requests can continue the latest Codex task in the repo
 
 ### `/codex:transfer`
