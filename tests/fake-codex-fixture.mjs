@@ -349,7 +349,10 @@ rl.on("line", (line) => {
         const thread = ensureThread(state, message.params.threadId);
         thread.updatedAt = now();
         saveState(state);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        const sandbox = BEHAVIOR === "resume-ignores-sandbox"
+          ? { type: "workspaceWrite", writableRoots: [], networkAccess: false }
+          : { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false };
+        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox, reasoningEffort: null } });
         break;
       }
 

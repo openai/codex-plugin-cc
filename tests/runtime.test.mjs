@@ -1031,6 +1031,30 @@ test("task --read-only pins resumed app-server threads", () => {
   assert.equal(fakeState.lastThreadResume.sandbox, "read-only");
 });
 
+test("task --read-only refuses a resumed write-capable app-server thread", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "resume-ignores-sandbox");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const firstRun = run("node", [SCRIPT, "task", "initial task"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+
+  const result = run("node", [SCRIPT, "task", "--read-only", "--resume-last", "read-only follow up"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /read-only/i);
+});
+
 test("task rejects --write with --read-only", () => {
   const result = run("node", [SCRIPT, "task", "--write", "--read-only", "inspect the failing test"], {
     cwd: ROOT
