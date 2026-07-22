@@ -28,6 +28,12 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   throw new Error("Timed out waiting for condition.");
 }
 
+function readPersistedJob(repo) {
+  const stateDir = resolveStateDir(repo);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  return JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${state.jobs[0].id}.json`), "utf8"));
+}
+
 test("setup reports ready when fake codex is installed and authenticated", () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
@@ -726,6 +732,30 @@ test("write task output focuses on the Codex result without generic follow-up hi
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(fakeState.lastThreadStart.sandbox, "workspace-write");
+});
+
+test("task persists config-driven write capability and shows review hints", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "config-write-sandbox");
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "fix the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const persistedJob = readPersistedJob(repo);
+  assert.equal(persistedJob.write, true);
+
+  const status = run("node", [SCRIPT, "status", persistedJob.id], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(status.status, 0, status.stderr);
+  assert.match(status.stdout, /Review changes: \/codex:review --wait/);
 });
 
 test("task --resume acts like --resume-last without leaking the flag into the prompt", () => {

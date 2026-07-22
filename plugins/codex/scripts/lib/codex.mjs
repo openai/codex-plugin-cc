@@ -1155,6 +1155,7 @@ export async function runAppServerTurn(cwd, options = {}) {
     return {
       status: buildResultStatus(turnState),
       threadId,
+      sandbox: response.sandbox ?? null,
       turnId: turnState.turnId,
       finalMessage: turnState.lastAgentMessage,
       reasoningSummary: turnState.reasoningSummary,
