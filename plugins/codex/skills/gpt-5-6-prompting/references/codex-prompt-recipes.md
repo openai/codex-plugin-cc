@@ -1,6 +1,6 @@
 # Codex Prompt Recipes
 
-Use these as starting templates for Codex task prompts or other Codex/GPT-5.4 prompt construction.
+Use these as starting templates for Codex task prompts or other Codex/GPT-5.6 prompt construction.
 Copy the smallest recipe that fits the task, then trim anything you do not need.
 In `codex:codex-rescue`, run diagnosis and fix-oriented recipes in write mode by default unless the user explicitly asked for read-only behavior.
 
@@ -128,7 +128,7 @@ Prefer primary sources.
 
 ```xml
 <task>
-Diagnose why this existing prompt is underperforming and propose the smallest high-leverage changes to improve it for Codex or GPT-5.4.
+Diagnose why this existing prompt is underperforming and propose the smallest high-leverage changes to improve it for Codex or GPT-5.6.
 </task>
 
 <structured_output_contract>

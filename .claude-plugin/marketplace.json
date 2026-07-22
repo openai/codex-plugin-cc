@@ -1,17 +1,17 @@
 {
-  "name": "openai-codex",
+  "name": "codex-fork",
   "owner": {
-    "name": "OpenAI"
+    "name": "Giordano Pistagni"
   },
   "metadata": {
-    "description": "Codex plugins to use in Claude Code for delegation and code review.",
-    "version": "1.0.6"
+    "description": "Personal fork of the OpenAI Codex plugin for Claude Code: GPT-5.6 guidance, image generation, and the codex-advisor second-opinion hook.",
+    "version": "1.0.6-fork.1"
   },
   "plugins": [
     {
       "name": "codex",
       "description": "Use Codex from Claude Code to review code or delegate tasks.",
-      "version": "1.0.6",
+      "version": "1.0.6-fork.1",
       "author": {
         "name": "OpenAI"
       },
