@@ -2,6 +2,7 @@ export function parseArgs(argv, config = {}) {
   const valueOptions = new Set(config.valueOptions ?? []);
   const booleanOptions = new Set(config.booleanOptions ?? []);
   const aliasMap = config.aliasMap ?? {};
+  const rejectUnknownOptions = Boolean(config.rejectUnknownOptions);
   const options = {};
   const positionals = [];
   let passthrough = false;
@@ -45,6 +46,10 @@ export function parseArgs(argv, config = {}) {
         continue;
       }
 
+      if (rejectUnknownOptions) {
+        throw new Error(`Unknown option: --${rawKey}`);
+      }
+
       positionals.push(token);
       continue;
     }
@@ -65,6 +70,10 @@ export function parseArgs(argv, config = {}) {
       options[key] = nextValue;
       index += 1;
       continue;
+    }
+
+    if (rejectUnknownOptions) {
+      throw new Error(`Unknown option: -${shortKey}`);
     }
 
     positionals.push(token);
