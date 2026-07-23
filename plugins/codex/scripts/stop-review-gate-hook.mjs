@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import fs from "node:fs";
 import process from "node:process";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -12,19 +11,16 @@ import { getConfig, listJobs } from "./lib/state.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
 import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
+import { readHookInput } from "./lib/hook-stdin.mjs";
 
 const STOP_REVIEW_TIMEOUT_MS = 15 * 60 * 1000;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
-
-function readHookInput() {
-  const raw = fs.readFileSync(0, "utf8").trim();
-  if (!raw) {
-    return {};
-  }
-  return JSON.parse(raw);
-}
+// Gate-off path must not wait on Windows stdin EOF (#530). Keep this short.
+const DISABLED_GATE_STDIN_TIMEOUT_MS = 500;
+// Gate-on still needs the payload; bound the wait so a stuck pipe cannot eat the full hook budget.
+const ENABLED_GATE_STDIN_TIMEOUT_MS = 30_000;
 
 function emitDecision(payload) {
   process.stdout.write(`${JSON.stringify(payload)}\n`);
@@ -139,17 +135,34 @@ function runStopReview(cwd, input = {}) {
   }
 }
 
-function main() {
-  const input = readHookInput();
-  const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const config = getConfig(workspaceRoot);
-
+function logRunningTaskNote(workspaceRoot, input = {}) {
   const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), input));
   const runningJob = jobs.find((job) => job.status === "queued" || job.status === "running");
   const runningTaskNote = runningJob
     ? `Codex task ${runningJob.id} is still running. Check /codex:status and use /codex:cancel ${runningJob.id} if you want to stop it before ending the session.`
     : null;
+  return runningTaskNote;
+}
+
+async function main() {
+  // Resolve config from env/cwd first so a disabled gate never waits on stdin EOF (#530).
+  const cwdGuess = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  const preliminaryRoot = resolveWorkspaceRoot(cwdGuess);
+  const preliminaryConfig = getConfig(preliminaryRoot);
+
+  if (!preliminaryConfig.stopReviewGate) {
+    const input = await readHookInput(DISABLED_GATE_STDIN_TIMEOUT_MS);
+    const cwd = input.cwd || cwdGuess;
+    const workspaceRoot = resolveWorkspaceRoot(cwd);
+    logNote(logRunningTaskNote(workspaceRoot, input));
+    return;
+  }
+
+  const input = await readHookInput(ENABLED_GATE_STDIN_TIMEOUT_MS);
+  const cwd = input.cwd || cwdGuess;
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const config = getConfig(workspaceRoot);
+  const runningTaskNote = logRunningTaskNote(workspaceRoot, input);
 
   if (!config.stopReviewGate) {
     logNote(runningTaskNote);
@@ -176,9 +189,8 @@ function main() {
 }
 
 try {
-  main();
+  await main();
 } catch (error) {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${message}\n`);
-  process.exitCode = 1;
+  process.stderr.write(`${error?.stack || error}\n`);
+  process.exit(1);
 }

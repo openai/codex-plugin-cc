@@ -2036,6 +2036,62 @@ test("stop hook logs running tasks to stderr without blocking when the review ga
   assert.match(blocked.stderr, /\/codex:cancel task-live/i);
 });
 
+test("stop hook with disabled gate exits quickly when stdin never receives EOF", async () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const stateDir = resolveStateDir(repo);
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [] }, null, 2)}\n`,
+    "utf8"
+  );
+
+  const child = spawn(process.execPath, [STOP_HOOK], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      CLAUDE_PROJECT_DIR: repo
+    },
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+
+  // Write a partial payload but never end stdin (Windows EOF hang repro).
+  child.stdin.write(`${JSON.stringify({ cwd: repo })}\n`);
+
+  const started = Date.now();
+  const [status, stdout, stderr] = await new Promise((resolve, reject) => {
+    let out = "";
+    let err = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      reject(new Error("stop hook hung longer than 3s with review gate disabled"));
+    }, 3000);
+    child.stdout.on("data", (chunk) => {
+      out += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      err += chunk;
+    });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve([code, out, err]);
+    });
+  });
+
+  assert.equal(status, 0, stderr);
+  assert.equal(stdout.trim(), "");
+  assert.ok(Date.now() - started < 2500, `expected fast exit, took ${Date.now() - started}ms`);
+});
+
 test("stop hook allows the stop when the review gate is enabled and the stop-time review task is clean", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
