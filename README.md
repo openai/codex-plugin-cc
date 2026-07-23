@@ -146,6 +146,7 @@ Examples:
 /codex:rescue fix the failing test with the smallest safe patch
 /codex:rescue --resume apply the top fix from the last run
 /codex:rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
+/codex:rescue --model gpt-5.6-luna --effort max investigate a complex failure
 /codex:rescue --model spark fix the issue quickly
 /codex:rescue --background investigate the regression
 ```
@@ -159,6 +160,7 @@ Ask Codex to redesign the database connection to be more resilient.
 **Notes:**
 
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
+- `max` is accepted for models that advertise support for maximum reasoning effort.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
 
