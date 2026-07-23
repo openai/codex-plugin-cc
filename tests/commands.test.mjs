@@ -204,10 +204,14 @@ test("internal docs use task terminology for rescue runs", () => {
 
 test("hooks keep session-end cleanup and stop gating enabled", () => {
   const source = read("hooks/hooks.json");
+  const config = JSON.parse(source);
+  const sessionEndHook = config.hooks.SessionEnd[0].hooks[0];
+
   assert.match(source, /SessionStart/);
   assert.match(source, /SessionEnd/);
   assert.match(source, /stop-review-gate-hook\.mjs/);
   assert.match(source, /session-lifecycle-hook\.mjs/);
+  assert.equal(sessionEndHook.timeout, 3);
 });
 
 test("setup command can offer Codex install and still points users to codex login", () => {
