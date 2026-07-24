@@ -68,6 +68,7 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
+const DEFAULT_FOREGROUND_RECOVERY_HINT_MS = 8 * 60 * 1000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
@@ -660,7 +661,47 @@ async function runForegroundCommand(job, runner, options = {}) {
     logFile: options.logFile,
     stderr: !options.json
   });
-  const execution = await runTrackedJob(job, () => runner(progress), { logFile });
+  let recoveryTimer = null;
+  let recoveryThreadId = null;
+  const configuredDelay = Number(process.env.CODEX_COMPANION_FOREGROUND_RECOVERY_HINT_MS);
+  const recoveryHintDelayMs =
+    Number.isFinite(configuredDelay) && configuredDelay >= 0
+      ? configuredDelay
+      : DEFAULT_FOREGROUND_RECOVERY_HINT_MS;
+  const progressWithRecovery = (event) => {
+    progress?.(event);
+    const threadId =
+      event && typeof event === "object" && typeof event.threadId === "string"
+        ? event.threadId
+        : null;
+    if (
+      !options.recoveryHint ||
+      options.json ||
+      recoveryTimer ||
+      !threadId ||
+      threadId === recoveryThreadId
+    ) {
+      return;
+    }
+    recoveryThreadId = threadId;
+    recoveryTimer = setTimeout(() => {
+      fs.writeSync(
+        1,
+        `Codex task is still running. If the host stops it, resume with: codex resume ${threadId}\n`
+      );
+      recoveryTimer = null;
+    }, recoveryHintDelayMs);
+    recoveryTimer.unref?.();
+  };
+
+  let execution;
+  try {
+    execution = await runTrackedJob(job, () => runner(progressWithRecovery), { logFile });
+  } finally {
+    if (recoveryTimer) {
+      clearTimeout(recoveryTimer);
+    }
+  }
   outputResult(options.json ? execution.payload : execution.rendered, options.json);
   if (execution.exitStatus !== 0) {
     process.exitCode = execution.exitStatus;
@@ -818,7 +859,7 @@ async function handleTask(argv) {
         jobId: job.id,
         onProgress: progress
       }),
-    { json: options.json }
+    { json: options.json, recoveryHint: true }
   );
 }
 
