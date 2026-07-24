@@ -658,6 +658,23 @@ function sourceContentSha256(sourcePath) {
   return crypto.createHash("sha256").update(fs.readFileSync(sourcePath)).digest("hex");
 }
 
+function normalizeLedgerPath(sourcePath) {
+  // On Windows, Codex records ledger paths with the \\?\ extended-length
+  // prefix (e.g. \\?\C:\Users\...), while fs.realpathSync returns the plain
+  // form. Strip the prefix (including the \\?\UNC\ variant) and compare
+  // case-insensitively so ledger records match realpath output.
+  let normalized = String(sourcePath);
+  if (process.platform === "win32") {
+    if (normalized.startsWith("\\\\?\\UNC\\")) {
+      normalized = `\\\\${normalized.slice(8)}`;
+    } else if (normalized.startsWith("\\\\?\\")) {
+      normalized = normalized.slice(4);
+    }
+    return normalized.toLowerCase();
+  }
+  return normalized;
+}
+
 function importedThreadIdForSource(sourcePath) {
   const ledgerPath = path.join(resolveCodexHome(), "external_agent_session_imports.json");
   if (!fs.existsSync(ledgerPath)) {
@@ -665,12 +682,13 @@ function importedThreadIdForSource(sourcePath) {
   }
   const ledger = readJsonFile(ledgerPath);
   const canonicalSource = fs.realpathSync(sourcePath);
+  const normalizedSource = normalizeLedgerPath(canonicalSource);
   const contentSha256 = sourceContentSha256(canonicalSource);
   const records = Array.isArray(ledger?.records) ? ledger.records : [];
   const match = records
     .filter(
       (record) =>
-        record?.source_path === canonicalSource &&
+        normalizeLedgerPath(record?.source_path) === normalizedSource &&
         record?.content_sha256 === contentSha256 &&
         typeof record?.imported_thread_id === "string"
     )
