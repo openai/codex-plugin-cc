@@ -156,6 +156,11 @@ function main() {
     return;
   }
 
+  if (input.stop_hook_active) {
+    logNote(runningTaskNote);
+    return;
+  }
+
   const setupNote = buildSetupNote(cwd);
   if (setupNote) {
     logNote(setupNote);

@@ -1979,6 +1979,33 @@ test("stop hook runs a stop-time review task and blocks on findings when the rev
   assert.match(status.stdout, /Codex Stop Gate Review/);
 });
 
+test("stop hook does not rerun the review when handling a blocked stop retry", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const retry = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: JSON.stringify({
+      cwd: repo,
+      session_id: "sess-stop-review-retry",
+      stop_hook_active: true,
+      last_assistant_message: "This response was already reviewed."
+    })
+  });
+
+  assert.equal(retry.status, 0, retry.stderr);
+  assert.equal(retry.stdout.trim(), "");
+});
+
 test("stop hook logs running tasks to stderr without blocking when the review gate is disabled", () => {
   const repo = makeTempDir();
   initGitRepo(repo);
