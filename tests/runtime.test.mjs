@@ -920,6 +920,35 @@ test("task using the shared broker still completes when Codex spawns subagents",
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
+test("long foreground tasks print a recovery command before completion", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "investigate the long-running failure"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_COMPANION_FOREGROUND_RECOVERY_HINT_MS: "25"
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(
+    result.stdout,
+    /Codex task is still running\. If the host stops it, resume with: codex resume thr_1/
+  );
+  assert.match(result.stdout, /Handled the requested task/);
+  assert.ok(
+    result.stdout.indexOf("codex resume thr_1") <
+      result.stdout.indexOf("Handled the requested task")
+  );
+});
+
 test("task --background enqueues a detached worker and exposes per-job status", async () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
