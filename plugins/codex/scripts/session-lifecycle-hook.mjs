@@ -4,16 +4,8 @@ import fs from "node:fs";
 import process from "node:process";
 
 import { terminateProcessTree } from "./lib/process.mjs";
-import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
-import {
-  clearBrokerSession,
-  LOG_FILE_ENV,
-  loadBrokerSession,
-  PID_FILE_ENV,
-  sendBrokerShutdown,
-  teardownBrokerSession
-} from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
+import { shutdownBrokerSession } from "./lib/broker-lifecycle.mjs";
+import { resolveStateFile, updateState } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -50,27 +42,21 @@ function cleanupSessionJobs(cwd, sessionId) {
     return;
   }
 
-  const state = loadState(workspaceRoot);
-  const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
-  if (removedJobs.length === 0) {
-    return;
-  }
-
-  for (const job of removedJobs) {
-    const stillRunning = job.status === "queued" || job.status === "running";
-    if (!stillRunning) {
-      continue;
+  updateState(workspaceRoot, (state) => {
+    const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
+    for (const job of removedJobs) {
+      const stillRunning = job.status === "queued" || job.status === "running";
+      if (!stillRunning) {
+        continue;
+      }
+      try {
+        terminateProcessTree(job.pid ?? Number.NaN);
+      } catch {
+        // Ignore teardown failures during session shutdown.
+      }
     }
-    try {
-      terminateProcessTree(job.pid ?? Number.NaN);
-    } catch {
-      // Ignore teardown failures during session shutdown.
-    }
-  }
 
-  saveState(workspaceRoot, {
-    ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
+    state.jobs = state.jobs.filter((job) => job.sessionId !== sessionId);
   });
 }
 
@@ -82,35 +68,25 @@ function handleSessionStart(input) {
 
 async function handleSessionEnd(input) {
   const cwd = input.cwd || process.cwd();
-  const brokerSession =
-    loadBrokerSession(cwd) ??
-    (process.env[BROKER_ENDPOINT_ENV]
-      ? {
-          endpoint: process.env[BROKER_ENDPOINT_ENV],
-          pidFile: process.env[PID_FILE_ENV] ?? null,
-          logFile: process.env[LOG_FILE_ENV] ?? null
-        }
-      : null);
-  const brokerEndpoint = brokerSession?.endpoint ?? null;
-  const pidFile = brokerSession?.pidFile ?? null;
-  const logFile = brokerSession?.logFile ?? null;
-  const sessionDir = brokerSession?.sessionDir ?? null;
-  const pid = brokerSession?.pid ?? null;
+  const failures = [];
 
-  if (brokerEndpoint) {
-    await sendBrokerShutdown(brokerEndpoint);
+  try {
+    cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
+  } catch (error) {
+    failures.push(error);
   }
 
-  cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
-  teardownBrokerSession({
-    endpoint: brokerEndpoint,
-    pidFile,
-    logFile,
-    sessionDir,
-    pid,
-    killProcess: terminateProcessTree
-  });
-  clearBrokerSession(cwd);
+  try {
+    await shutdownBrokerSession(cwd, {
+      killProcess: terminateProcessTree
+    });
+  } catch (error) {
+    failures.push(error);
+  }
+
+  if (failures.length > 0) {
+    throw new AggregateError(failures, `Codex session cleanup did not finish: ${failures.join("; ")}`);
+  }
 }
 
 async function main() {

@@ -3,6 +3,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import {
+  ensurePrivateDir,
+  removeFileIfExists,
+  writeJsonFileAtomic,
+  writePrivateFile
+} from "./fs.mjs";
+import { withLockSync } from "./locking.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
@@ -52,7 +59,11 @@ export function resolveJobsDir(cwd) {
 }
 
 export function ensureStateDir(cwd) {
-  fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
+  const stateDir = resolveStateDir(cwd);
+  const jobsDir = resolveJobsDir(cwd);
+  for (const dir of [stateDir, jobsDir]) {
+    ensurePrivateDir(dir);
+  }
 }
 
 export function loadState(cwd) {
@@ -83,15 +94,12 @@ function pruneJobs(jobs) {
     .slice(0, MAX_JOBS);
 }
 
-function removeFileIfExists(filePath) {
-  if (filePath && fs.existsSync(filePath)) {
-    fs.unlinkSync(filePath);
-  }
+function resolveStateLockDir(cwd) {
+  return path.join(resolveStateDir(cwd), ".state.lock");
 }
 
-export function saveState(cwd, state) {
+function saveStateLocked(cwd, state) {
   const previousJobs = loadState(cwd).jobs;
-  ensureStateDir(cwd);
   const nextJobs = pruneJobs(state.jobs ?? []);
   const nextState = {
     version: STATE_VERSION,
@@ -107,18 +115,26 @@ export function saveState(cwd, state) {
     if (retainedIds.has(job.id)) {
       continue;
     }
-    removeJobFile(resolveJobFile(cwd, job.id));
+    removeFileIfExists(resolveJobFile(cwd, job.id));
     removeFileIfExists(job.logFile);
   }
 
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  writeJsonFileAtomic(resolveStateFile(cwd), nextState);
   return nextState;
 }
 
+export function saveState(cwd, state) {
+  ensureStateDir(cwd);
+  return withLockSync(resolveStateLockDir(cwd), () => saveStateLocked(cwd, state));
+}
+
 export function updateState(cwd, mutate) {
-  const state = loadState(cwd);
-  mutate(state);
-  return saveState(cwd, state);
+  ensureStateDir(cwd);
+  return withLockSync(resolveStateLockDir(cwd), () => {
+    const state = loadState(cwd);
+    mutate(state);
+    return saveStateLocked(cwd, state);
+  });
 }
 
 export function generateJobId(prefix = "job") {
@@ -166,18 +182,12 @@ export function getConfig(cwd) {
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  writePrivateFile(jobFile, `${JSON.stringify(payload, null, 2)}\n`);
   return jobFile;
 }
 
 export function readJobFile(jobFile) {
   return JSON.parse(fs.readFileSync(jobFile, "utf8"));
-}
-
-function removeJobFile(jobFile) {
-  if (fs.existsSync(jobFile)) {
-    fs.unlinkSync(jobFile);
-  }
 }
 
 export function resolveJobLogFile(cwd, jobId) {

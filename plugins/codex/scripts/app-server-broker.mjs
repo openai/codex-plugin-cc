@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import process from "node:process";
@@ -8,6 +7,7 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
+import { ensurePrivateDir, removeFileIfExists, writePrivateFile } from "./lib/fs.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 
@@ -41,28 +41,34 @@ function writePidFile(pidFile) {
   if (!pidFile) {
     return;
   }
-  fs.mkdirSync(path.dirname(pidFile), { recursive: true });
-  fs.writeFileSync(pidFile, `${process.pid}\n`, "utf8");
+  ensurePrivateDir(path.dirname(pidFile));
+  writePrivateFile(pidFile, `${process.pid}\n`);
 }
 
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (subcommand !== "serve") {
-    throw new Error("Usage: node scripts/app-server-broker.mjs serve --endpoint <value> [--cwd <path>] [--pid-file <path>]");
+    throw new Error(
+      "Usage: node scripts/app-server-broker.mjs serve --endpoint <value> --instance-token <value> [--cwd <path>] [--pid-file <path>]"
+    );
   }
 
   const { options } = parseArgs(argv, {
-    valueOptions: ["cwd", "pid-file", "endpoint"]
+    valueOptions: ["cwd", "pid-file", "endpoint", "instance-token"]
   });
 
   if (!options.endpoint) {
     throw new Error("Missing required --endpoint.");
+  }
+  if (!options["instance-token"]) {
+    throw new Error("Missing required --instance-token.");
   }
 
   const cwd = options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
   const endpoint = String(options.endpoint);
   const listenTarget = parseBrokerEndpoint(endpoint);
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
+  const instanceToken = String(options["instance-token"]);
   writePidFile(pidFile);
 
   const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
@@ -99,18 +105,20 @@ async function main() {
     }
   }
 
-  async function shutdown(server) {
+  async function shutdown(server, responseSocket = null) {
     for (const socket of sockets) {
-      socket.end();
+      if (socket === responseSocket) {
+        socket.destroySoon();
+      } else {
+        socket.destroy();
+      }
     }
     await appClient.close().catch(() => {});
     await new Promise((resolve) => server.close(resolve));
-    if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
-      fs.unlinkSync(listenTarget.path);
+    if (listenTarget.kind === "unix") {
+      removeFileIfExists(listenTarget.path);
     }
-    if (pidFile && fs.existsSync(pidFile)) {
-      fs.unlinkSync(pidFile);
-    }
+    removeFileIfExists(pidFile);
   }
 
   appClient.setNotificationHandler(routeNotification);
@@ -158,8 +166,18 @@ async function main() {
         }
 
         if (message.id !== undefined && message.method === "broker/shutdown") {
-          send(socket, { id: message.id, result: {} });
-          await shutdown(server);
+          if (message.params?.instanceToken !== instanceToken) {
+            send(socket, {
+              id: message.id,
+              error: buildJsonRpcError(-32003, "Broker shutdown identity did not match this instance.")
+            });
+            continue;
+          }
+          send(socket, {
+            id: message.id,
+            result: { pid: process.pid, instanceToken }
+          });
+          await shutdown(server, socket);
           process.exit(0);
         }
 
@@ -233,15 +251,12 @@ async function main() {
     });
   });
 
-  process.on("SIGTERM", async () => {
-    await shutdown(server);
-    process.exit(0);
-  });
-
-  process.on("SIGINT", async () => {
-    await shutdown(server);
-    process.exit(0);
-  });
+  for (const signal of ["SIGTERM", "SIGINT"]) {
+    process.on(signal, async () => {
+      await shutdown(server);
+      process.exit(0);
+    });
+  }
 
   server.listen(listenTarget.path);
 }

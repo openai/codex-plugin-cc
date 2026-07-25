@@ -1923,6 +1923,31 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   assert.equal(otherJob.logFile, otherSessionLog);
 });
 
+test("session end reports the underlying cleanup failure", (t) => {
+  const repo = makeTempDir();
+  const brokerStateFile = path.join(resolveStateDir(repo), "broker.json");
+  t.after(() => fs.rmSync(brokerStateFile, { force: true }));
+  saveBrokerSession(repo, {
+    endpoint: "unsupported:broker",
+    pid: process.pid,
+    pidFile: null,
+    logFile: null,
+    sessionDir: null,
+    instanceToken: "instance-token-1234567890"
+  });
+
+  const result = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      cwd: repo
+    })
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Unsupported broker endpoint: unsupported:broker/);
+});
+
 test("stop hook runs a stop-time review task and blocks on findings when the review gate is enabled", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -2233,6 +2258,16 @@ test("status reports shared session runtime when a lazy broker is active", () =>
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Session runtime: shared session/);
+
+  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      cwd: repo
+    })
+  });
+  assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
 test("setup and status honor --cwd when reading shared session runtime", () => {

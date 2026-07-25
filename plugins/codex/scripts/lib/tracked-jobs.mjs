@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
+import { writePrivateFile } from "./fs.mjs";
 import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
@@ -50,7 +51,7 @@ export function appendLogBlock(logFile, title, body) {
 
 export function createJobLogFile(workspaceRoot, jobId, title) {
   const logFile = resolveJobLogFile(workspaceRoot, jobId);
-  fs.writeFileSync(logFile, "", "utf8");
+  writePrivateFile(logFile, "");
   if (title) {
     appendLogLine(logFile, `Starting ${title}.`);
   }

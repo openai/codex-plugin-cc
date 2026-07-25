@@ -18,7 +18,7 @@
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-lifecycle-hook.mjs\" SessionEnd",
-            "timeout": 5
+            "timeout": 30
           }
         ]
       }
