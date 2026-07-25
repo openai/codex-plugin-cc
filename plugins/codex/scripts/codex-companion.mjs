@@ -23,7 +23,6 @@ import {
   } from "./lib/codex.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
-import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
@@ -52,6 +51,12 @@ import {
   runTrackedJob,
   SESSION_ID_ENV
 } from "./lib/tracked-jobs.mjs";
+import {
+  collectReviewContext,
+  estimateReview,
+  requireReviewWorkspace,
+  resolveReviewTarget
+} from "./lib/vcs/index.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
   renderNativeReviewResult,
@@ -81,8 +86,9 @@ function printUsage() {
     [
       "Usage:",
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
-      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
+      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--vcs <auto|git|arc>]",
+      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--vcs <auto|git|arc>] [focus text]",
+      "  node scripts/codex-companion.mjs review-estimate [--base <ref>] [--scope <auto|working-tree|branch>] [--vcs <auto|git|arc>] [--json]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|sol|terra|luna>] [--effort <none|minimal|low|medium|high|xhigh|max>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
@@ -260,7 +266,10 @@ function ensureCodexAvailable(cwd) {
   }
 }
 
-function buildNativeReviewTarget(target) {
+function buildNativeReviewTarget(context, target) {
+  if (context.vcsKind !== "git") {
+    return null;
+  }
   if (target.mode === "working-tree") {
     return { type: "uncommittedChanges" };
   }
@@ -272,19 +281,26 @@ function buildNativeReviewTarget(target) {
   return null;
 }
 
-function validateNativeReviewRequest(target, focusText) {
+function validateReviewRequest(context, target, focusText) {
   if (focusText.trim()) {
     throw new Error(
       `\`/codex:review\` now maps directly to the built-in reviewer and does not support custom focus text. Retry with \`/codex:adversarial-review ${focusText.trim()}\` for focused review instructions.`
     );
   }
 
-  const nativeTarget = buildNativeReviewTarget(target);
-  if (!nativeTarget) {
+  if (context.vcsKind === "git" && !buildNativeReviewTarget(context, target)) {
     throw new Error("This `/codex:review` target is not supported by the built-in reviewer. Retry with `/codex:adversarial-review` for custom targeting.");
   }
+}
 
-  return nativeTarget;
+function buildArcReviewInstructions(context) {
+  return [
+    "Review the following Yandex Arc changes. Report actionable correctness, security, reliability, and maintainability findings only.",
+    "Treat the supplied context as scoped to the opened project. Do not inspect this target through Git.",
+    context.collectionGuidance,
+    "",
+    context.content
+  ].join("\n");
 }
 
 function renderStatusPayload(report, asJson) {
@@ -361,17 +377,30 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
 
 async function executeReviewRun(request) {
   ensureCodexAvailable(request.cwd);
-  ensureGitRepository(request.cwd);
-
-  const target = resolveReviewTarget(request.cwd, {
+  const workspaceContext = request.workspaceContext ?? requireReviewWorkspace(request.cwd, {
+    vcs: request.vcs
+  });
+  const target = request.target ?? resolveReviewTarget(workspaceContext, {
     base: request.base,
     scope: request.scope
   });
   const focusText = request.focusText?.trim() ?? "";
   const reviewName = request.reviewName ?? "Review";
   if (reviewName === "Review") {
-    const reviewTarget = validateNativeReviewRequest(target, focusText);
-    const result = await runAppServerReview(request.cwd, {
+    validateReviewRequest(workspaceContext, target, focusText);
+    let reviewContext = null;
+    let reviewTarget = buildNativeReviewTarget(workspaceContext, target);
+    if (workspaceContext.vcsKind === "arc") {
+      reviewContext = collectReviewContext(workspaceContext, target);
+      reviewTarget = {
+        type: "custom",
+        instructions: buildArcReviewInstructions(reviewContext)
+      };
+    }
+    if (!reviewTarget) {
+      throw new Error("The selected VCS review target is not supported.");
+    }
+    const result = await runAppServerReview(workspaceContext.workspaceRoot, {
       target: reviewTarget,
       model: request.model,
       onProgress: request.onProgress
@@ -379,6 +408,17 @@ async function executeReviewRun(request) {
     const payload = {
       review: reviewName,
       target,
+      vcs: workspaceContext.vcsKind,
+      ...(reviewContext
+        ? {
+            context: {
+              workspaceRoot: reviewContext.workspaceRoot,
+              branch: reviewContext.branch,
+              summary: reviewContext.summary,
+              inputMode: reviewContext.inputMode
+            }
+          }
+        : {}),
       threadId: result.threadId,
       sourceThreadId: result.sourceThreadId,
       codex: {
@@ -410,9 +450,9 @@ async function executeReviewRun(request) {
     };
   }
 
-  const context = collectReviewContext(request.cwd, target);
+  const context = collectReviewContext(workspaceContext, target);
   const prompt = buildAdversarialReviewPrompt(context, focusText);
-  const result = await runAppServerTurn(context.repoRoot, {
+  const result = await runAppServerTurn(context.workspaceRoot, {
     prompt,
     model: request.model,
     sandbox: "read-only",
@@ -428,6 +468,8 @@ async function executeReviewRun(request) {
     target,
     threadId: result.threadId,
     context: {
+      vcs: context.vcs,
+      workspaceRoot: context.workspaceRoot,
       repoRoot: context.repoRoot,
       branch: context.branch,
       summary: context.summary
@@ -568,7 +610,7 @@ function getJobKindLabel(kind, jobClass) {
   return jobClass === "review" ? "review" : "rescue";
 }
 
-function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false }) {
+function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false, vcs = null }) {
   return createJobRecord({
     id: generateJobId(prefix),
     kind,
@@ -577,7 +619,8 @@ function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summ
     workspaceRoot,
     jobClass,
     summary,
-    write
+    write,
+    ...(vcs ? { vcs } : {})
   });
 }
 
@@ -715,7 +758,7 @@ function enqueueBackgroundTask(cwd, job, request) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+    valueOptions: ["base", "scope", "model", "cwd", "vcs"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
       m: "model"
@@ -723,14 +766,15 @@ async function handleReviewCommand(argv, config) {
   });
 
   const cwd = resolveCommandCwd(options);
-  const workspaceRoot = resolveCommandWorkspace(options);
+  const workspaceContext = requireReviewWorkspace(cwd, { vcs: options.vcs });
+  const workspaceRoot = workspaceContext.workspaceRoot;
   const focusText = positionals.join(" ").trim();
-  const target = resolveReviewTarget(cwd, {
+  const target = resolveReviewTarget(workspaceContext, {
     base: options.base,
     scope: options.scope
   });
 
-  config.validateRequest?.(target, focusText);
+  config.validateRequest?.(workspaceContext, target, focusText);
   const metadata = buildReviewJobMetadata(config.reviewName, target);
   const job = createCompanionJob({
     prefix: "review",
@@ -738,7 +782,8 @@ async function handleReviewCommand(argv, config) {
     title: metadata.title,
     workspaceRoot,
     jobClass: "review",
-    summary: metadata.summary
+    summary: metadata.summary,
+    vcs: workspaceContext.vcsKind
   });
   await runForegroundCommand(
     job,
@@ -750,6 +795,9 @@ async function handleReviewCommand(argv, config) {
         model: options.model,
         focusText,
         reviewName: config.reviewName,
+        vcs: options.vcs,
+        workspaceContext,
+        target,
         onProgress: progress
       }),
     { json: options.json }
@@ -759,8 +807,34 @@ async function handleReviewCommand(argv, config) {
 async function handleReview(argv) {
   return handleReviewCommand(argv, {
     reviewName: "Review",
-    validateRequest: validateNativeReviewRequest
+    validateRequest: validateReviewRequest
   });
+}
+
+function handleReviewEstimate(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["base", "scope", "cwd", "vcs"],
+    booleanOptions: ["json", "background", "wait"]
+  });
+  const cwd = resolveCommandCwd(options);
+  const workspaceContext = requireReviewWorkspace(cwd, { vcs: options.vcs });
+  const target = resolveReviewTarget(workspaceContext, {
+    base: options.base,
+    scope: options.scope
+  });
+  const estimate = estimateReview(workspaceContext, target);
+  outputResult(
+    options.json
+      ? estimate
+      : [
+          `VCS: ${estimate.vcs}`,
+          `Target: ${target.label}`,
+          `Files: ${estimate.fileCount}`,
+          `Diff bytes: ${estimate.diffBytes}`,
+          `Recommended mode: ${estimate.recommendedMode}`
+        ].join("\n") + "\n",
+    options.json
+  );
 }
 
 async function handleTask(argv) {
@@ -1043,6 +1117,9 @@ async function main() {
       await handleReviewCommand(argv, {
         reviewName: "Adversarial Review"
       });
+      break;
+    case "review-estimate":
+      handleReviewEstimate(argv);
       break;
     case "task":
       await handleTask(argv);

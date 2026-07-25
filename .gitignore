@@ -148,3 +148,6 @@ vite.config.ts.timestamp-*
 
 output/
 plugins/codex/.generated/
+
+# Local OpenSpec planning artifacts
+openspec/

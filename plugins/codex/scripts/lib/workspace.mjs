@@ -1,9 +1,5 @@
-import { ensureGitRepository } from "./git.mjs";
+import { resolveWorkspaceContext } from "./vcs/index.mjs";
 
-export function resolveWorkspaceRoot(cwd) {
-  try {
-    return ensureGitRepository(cwd);
-  } catch {
-    return cwd;
-  }
+export function resolveWorkspaceRoot(cwd, options = {}) {
+  return resolveWorkspaceContext(cwd, options).workspaceRoot;
 }

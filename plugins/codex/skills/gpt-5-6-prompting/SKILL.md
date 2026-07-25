@@ -52,7 +52,7 @@ Add only what the task needs:
 
 ## Handoff rules
 
-- Use built-in `review` or `adversarial-review` for local git review.
+- Use built-in `review` or `adversarial-review` for local Git or Yandex Arc review.
 - Use `task` for diagnosis, planning, research, or implementation.
 - For a resumed thread, forward only the delta unless the objective or constraints changed materially.
 - Do not encode `--model`, `--effort`, `--resume`, `--fresh`, `--wait`, or `--background` inside the natural-language prompt.

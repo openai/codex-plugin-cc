@@ -1,7 +1,7 @@
 ---
 description: Run a Codex review that challenges the implementation approach and design choices
 argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [focus ...]'
-allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
+allowed-tools: Read, Glob, Grep, Bash(node:*), AskUserQuestion
 ---
 
 Run an adversarial Codex review through the shared plugin runtime.
@@ -21,14 +21,11 @@ Execution mode rules:
 - If the raw arguments include `--wait`, do not ask. Run in the foreground.
 - If the raw arguments include `--background`, do not ask. Run in a Claude background task.
 - Otherwise, estimate the review size before asking:
-  - For working-tree review, start with `git status --short --untracked-files=all`.
-  - For working-tree review, also inspect both `git diff --shortstat --cached` and `git diff --shortstat`.
-  - For base-branch review, use `git diff --shortstat <base>...HEAD`.
-  - Treat untracked files or directories as reviewable work for auto or working-tree review even when `git diff --shortstat` is empty.
-  - Only conclude there is nothing to review when the relevant scope is actually empty.
-  - Recommend waiting only when the scoped review is clearly tiny, roughly 1-2 files total and no sign of a broader directory-sized change.
-  - In every other case, including unclear size, recommend background.
-  - When in doubt, run the review instead of declaring that there is nothing to review.
+  - Run `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" review-estimate "$ARGUMENTS --json"` exactly once.
+  - Parse its JSON fields `vcs`, `target`, `fileCount`, `diffBytes`, `isEmpty`, and `recommendedMode`.
+  - Use `recommendedMode` for the first option. Do not run Git or Arc commands directly.
+  - Treat `isEmpty` as authoritative only when the estimator completed successfully.
+  - If estimation fails or its output is unclear, recommend background and run the review rather than declaring that there is nothing to review.
 - Then use `AskUserQuestion` exactly once with two options, putting the recommended option first and suffixing its label with `(Recommended)`:
   - `Wait for results`
   - `Run in background`

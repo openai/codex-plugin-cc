@@ -406,6 +406,11 @@ rl.on("line", (line) => {
 
       case "review/start": {
         const thread = ensureThread(state, message.params.threadId);
+        state.lastReviewStart = {
+          threadId: message.params.threadId,
+          target: message.params.target
+        };
+        saveState(state);
         let reviewThread = thread;
         if (message.params.delivery === "detached") {
           reviewThread = nextThread(state, thread.cwd, true);
