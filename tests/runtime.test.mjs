@@ -193,6 +193,56 @@ test("task runs without auth preflight so Codex can refresh an expired session",
   assert.match(result.stdout, /Handled the requested task/);
 });
 
+test("task preserves a single free-text prompt without parsing its contents as options", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const prompt = [
+    "Review the plan: swap to claude -p --model claude-haiku --output-format json.",
+    String.raw`Config lives at C:\Users\me\Projects\my-app\config\app-config.json.`,
+    'The log line was "RUN ERROR: exit 1: Not logged in" and then --write the summary.'
+  ].join("\n");
+  const result = run(process.execPath, [SCRIPT, "task", prompt], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    shell: false
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.prompt, prompt);
+  assert.equal(fakeState.lastTurnStart.model, null);
+});
+
+test("task keeps runtime options before the explicit prompt boundary", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const prompt = "Explain why --model claude-haiku must stay in the prompt.";
+  const result = run(process.execPath, [SCRIPT, "task", "--model", "spark", "--", prompt], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    shell: false
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.prompt, prompt);
+  assert.equal(fakeState.lastTurnStart.model, "gpt-5.3-codex-spark");
+});
+
 test("transfer delegates the current Claude session directly to native import", () => {
   const home = makeTempDir();
   const repo = path.join(home, "repo");

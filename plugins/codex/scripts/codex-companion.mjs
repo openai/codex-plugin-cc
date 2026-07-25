@@ -79,7 +79,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [--prompt-file <path>|-- <prompt>]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -127,8 +127,8 @@ function normalizeReasoningEffort(effort) {
   return normalized;
 }
 
-function normalizeArgv(argv) {
-  if (argv.length === 1) {
+function normalizeArgv(argv, options = {}) {
+  if (options.splitSingleArgument !== false && argv.length === 1) {
     const [raw] = argv;
     if (!raw || !raw.trim()) {
       return [];
@@ -139,11 +139,12 @@ function normalizeArgv(argv) {
 }
 
 function parseCommandInput(argv, config = {}) {
-  return parseArgs(normalizeArgv(argv), {
-    ...config,
+  const { splitSingleArgument, ...parseConfig } = config;
+  return parseArgs(normalizeArgv(argv, { splitSingleArgument }), {
+    ...parseConfig,
     aliasMap: {
       C: "cwd",
-      ...(config.aliasMap ?? {})
+      ...(parseConfig.aliasMap ?? {})
     }
   });
 }
@@ -761,6 +762,10 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
+    // A task prompt is free text, not a shell command line. Re-tokenizing a
+    // single prompt argument strips quotes/backslashes and lets prose such as
+    // "--model" or "--write" mutate runtime options.
+    splitSingleArgument: false,
     valueOptions: ["model", "effort", "cwd", "prompt-file"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
     aliasMap: {
