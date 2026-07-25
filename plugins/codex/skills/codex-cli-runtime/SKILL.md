@@ -9,7 +9,7 @@ user-invocable: false
 Use this skill only inside the `codex:codex-rescue` subagent.
 
 Primary helper:
-- `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task "<raw arguments>"`
+- `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task [runtime flags] -- "<raw prompt>"`
 
 Execution rules:
 - The rescue subagent is a forwarder, not an orchestrator. Its only job is to invoke `task` once and return that stdout unchanged.
@@ -25,6 +25,7 @@ Execution rules:
 
 Command selection:
 - Use exactly one `task` invocation per rescue handoff.
+- Pass runtime flags as separate arguments before `--`, then pass the complete user request as one prompt argument after `--`. This boundary keeps flag-like prose, quotes, backslashes, and newlines inside the prompt.
 - If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Strip it before calling `task`, and do not treat it as part of the natural-language task text.
 - If the forwarded request includes `--model`, normalize `spark` to `gpt-5.3-codex-spark` and pass it through to `task`.
 - If the forwarded request includes `--effort`, pass it through to `task`.
