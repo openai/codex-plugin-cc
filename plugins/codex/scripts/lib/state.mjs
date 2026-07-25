@@ -12,6 +12,11 @@ const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
 
+function resolveStateRoot() {
+  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
+  return pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -38,9 +43,7 @@ export function resolveStateDir(cwd) {
   const slugSource = path.basename(workspaceRoot) || "workspace";
   const slug = slugSource.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex").slice(0, 16);
-  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
-  const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
-  return path.join(stateRoot, `${slug}-${hash}`);
+  return path.join(resolveStateRoot(), `${slug}-${hash}`);
 }
 
 export function resolveStateFile(cwd) {
@@ -148,6 +151,48 @@ export function upsertJob(cwd, jobPatch) {
 
 export function listJobs(cwd) {
   return loadState(cwd).jobs;
+}
+
+export function listJobsAcrossWorkspaces() {
+  const stateRoot = resolveStateRoot();
+  if (!fs.existsSync(stateRoot)) {
+    return [];
+  }
+
+  const jobs = [];
+  for (const entry of fs.readdirSync(stateRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+
+    const stateDir = path.join(stateRoot, entry.name);
+    const stateFile = path.join(stateDir, STATE_FILE_NAME);
+    if (!fs.existsSync(stateFile)) {
+      continue;
+    }
+
+    try {
+      const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+      for (const job of Array.isArray(parsed.jobs) ? parsed.jobs : []) {
+        if (!job || typeof job.id !== "string" || typeof job.workspaceRoot !== "string") {
+          continue;
+        }
+
+        // A state file is only authoritative for its own workspace. Do not
+        // trust a record that points at another directory merely because it
+        // was found beneath the shared plugin-data root.
+        if (path.resolve(resolveStateDir(job.workspaceRoot)) !== path.resolve(stateDir)) {
+          continue;
+        }
+        jobs.push(job);
+      }
+    } catch {
+      // Match loadState(): one damaged workspace index must not hide healthy
+      // job records belonging to other workspaces.
+    }
+  }
+
+  return jobs;
 }
 
 export function setConfig(cwd, key, value) {

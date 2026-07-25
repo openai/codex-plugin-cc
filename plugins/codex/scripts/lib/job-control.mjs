@@ -1,7 +1,9 @@
 import fs from "node:fs";
+import path from "node:path";
+import process from "node:process";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
+import { getConfig, listJobs, listJobsAcrossWorkspaces, readJobFile, resolveJobFile } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -188,7 +190,7 @@ export function readStoredJob(workspaceRoot, jobId) {
   return readJobFile(jobFile);
 }
 
-function matchJobReference(jobs, reference, predicate = () => true) {
+function matchJobReference(jobs, reference, predicate = () => true, options = {}) {
   const filtered = jobs.filter(predicate);
   if (!reference) {
     return filtered[0] ?? null;
@@ -207,7 +209,56 @@ function matchJobReference(jobs, reference, predicate = () => true) {
     throw new Error(`Job reference "${reference}" is ambiguous. Use a longer job id.`);
   }
 
+  if (options.allowMissing) {
+    return null;
+  }
   throw new Error(`No job found for "${reference}". Run /codex:status to list known jobs.`);
+}
+
+function matchJobAcrossWorkspaces(reference, predicate = () => true, options = {}) {
+  if (!reference) {
+    return null;
+  }
+
+  const entries = [];
+  const seen = new Set();
+  const addJob = (job, workspaceRoot) => {
+    if (!job || !workspaceRoot || !predicate(job)) {
+      return;
+    }
+    const key = `${pathKey(workspaceRoot)}\0${job.id}`;
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    entries.push({ workspaceRoot, job });
+  };
+
+  for (const job of options.currentJobs ?? []) {
+    addJob(job, options.currentWorkspaceRoot ?? job.workspaceRoot);
+  }
+  for (const job of listJobsAcrossWorkspaces()) {
+    addJob(job, job.workspaceRoot);
+  }
+
+  const exact = entries.find((entry) => entry.job.id === reference);
+  if (exact) {
+    return exact;
+  }
+
+  const prefixMatches = entries.filter((entry) => entry.job.id.startsWith(reference));
+  if (prefixMatches.length === 1) {
+    return prefixMatches[0];
+  }
+  if (prefixMatches.length > 1) {
+    throw new Error(`Job reference "${reference}" is ambiguous. Use a longer job id.`);
+  }
+  return null;
+}
+
+function pathKey(value) {
+  const resolved = path.resolve(value);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
 export function buildStatusSnapshot(cwd, options = {}) {
@@ -242,33 +293,55 @@ export function buildStatusSnapshot(cwd, options = {}) {
 export function buildSingleJobSnapshot(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
-  const selected = matchJobReference(jobs, reference);
-  if (!selected) {
+  const matched = matchJobAcrossWorkspaces(reference, () => true, {
+    currentWorkspaceRoot: workspaceRoot,
+    currentJobs: jobs
+  });
+  if (!matched) {
     throw new Error(`No job found for "${reference}". Run /codex:status to inspect known jobs.`);
   }
 
   return {
-    workspaceRoot,
-    job: enrichJob(selected, { maxProgressLines: options.maxProgressLines })
+    workspaceRoot: matched.workspaceRoot,
+    job: enrichJob(matched.job, { maxProgressLines: options.maxProgressLines })
   };
 }
 
 export function resolveResultJob(cwd, reference) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const jobs = sortJobsNewestFirst(reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot)));
-  const selected = matchJobReference(
-    jobs,
-    reference,
-    (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled"
-  );
-
-  if (selected) {
-    return { workspaceRoot, job: selected };
+  if (!reference) {
+    const selected = matchJobReference(
+      jobs,
+      null,
+      (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled",
+      { allowMissing: true }
+    );
+    if (selected) {
+      return { workspaceRoot, job: selected };
+    }
+  } else {
+    const finished = matchJobAcrossWorkspaces(
+      reference,
+      (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled",
+      { currentWorkspaceRoot: workspaceRoot, currentJobs: jobs }
+    );
+    if (finished) {
+      return finished;
+    }
   }
 
-  const active = matchJobReference(jobs, reference, (job) => job.status === "queued" || job.status === "running");
+  const active = reference
+    ? matchJobAcrossWorkspaces(
+        reference,
+        (job) => job.status === "queued" || job.status === "running",
+        { currentWorkspaceRoot: workspaceRoot, currentJobs: jobs }
+      )
+    : null;
   if (active) {
-    throw new Error(`Job ${active.id} is still ${active.status}. Check /codex:status and try again once it finishes.`);
+    throw new Error(
+      `Job ${active.job.id} is still ${active.job.status}. Check /codex:status and try again once it finishes.`
+    );
   }
 
   if (reference) {
