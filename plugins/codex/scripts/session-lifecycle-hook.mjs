@@ -11,7 +11,7 @@ import {
   loadBrokerSession,
   PID_FILE_ENV,
   sendBrokerShutdown,
-  teardownBrokerSession
+  teardownBrokerSession,
 } from "./lib/broker-lifecycle.mjs";
 import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
@@ -33,10 +33,31 @@ function shellEscape(value) {
 }
 
 function appendEnvVar(name, value) {
-  if (!process.env.CLAUDE_ENV_FILE || value == null || value === "") {
+  const envFile = process.env.CLAUDE_ENV_FILE;
+  if (!envFile || value == null || value === "") {
     return;
   }
-  fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `export ${name}=${shellEscape(value)}\n`, "utf8");
+
+  const line = `export ${name}=${shellEscape(value)}`;
+  let existingContent = "";
+
+  try {
+    existingContent = fs.readFileSync(envFile, "utf8");
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+  }
+
+  const existingLines = existingContent.split(/\r?\n/);
+  if (existingLines.includes(line)) {
+    return;
+  }
+
+  const separator =
+    existingContent.length > 0 && !existingContent.endsWith("\n") ? "\n" : "";
+
+  fs.appendFileSync(envFile, `${separator}${line}\n`, "utf8");
 }
 
 function cleanupSessionJobs(cwd, sessionId) {
@@ -70,7 +91,7 @@ function cleanupSessionJobs(cwd, sessionId) {
 
   saveState(workspaceRoot, {
     ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
+    jobs: state.jobs.filter((job) => job.sessionId !== sessionId),
   });
 }
 
@@ -88,7 +109,7 @@ async function handleSessionEnd(input) {
       ? {
           endpoint: process.env[BROKER_ENDPOINT_ENV],
           pidFile: process.env[PID_FILE_ENV] ?? null,
-          logFile: process.env[LOG_FILE_ENV] ?? null
+          logFile: process.env[LOG_FILE_ENV] ?? null,
         }
       : null);
   const brokerEndpoint = brokerSession?.endpoint ?? null;
@@ -108,7 +129,7 @@ async function handleSessionEnd(input) {
     logFile,
     sessionDir,
     pid,
-    killProcess: terminateProcessTree
+    killProcess: terminateProcessTree,
   });
   clearBrokerSession(cwd);
 }
@@ -128,6 +149,8 @@ async function main() {
 }
 
 main().catch((error) => {
-  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+  process.stderr.write(
+    `${error instanceof Error ? error.message : String(error)}\n`,
+  );
   process.exit(1);
 });
