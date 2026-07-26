@@ -5,7 +5,11 @@ import path from "node:path";
 import { ensureAbsolutePath } from "./fs.mjs";
 
 export const TRANSCRIPT_PATH_ENV = "CODEX_COMPANION_TRANSCRIPT_PATH";
-const CLAUDE_PROJECTS_DIR = path.join(os.homedir(), ".claude", "projects");
+
+// Resolved per call so tests can relocate the home directory.
+function claudeProjectsDir() {
+  return path.join(os.homedir(), ".claude", "projects");
+}
 
 function resolveUserPath(cwd, value) {
   if (value === "~") {
@@ -28,17 +32,18 @@ export function resolveClaudeSessionPath(cwd, options = {}) {
     throw new Error(`Claude session source must be a JSONL file: ${sourcePath}`);
   }
 
+  const projectsDir = claudeProjectsDir();
   let source;
   let projects;
   try {
     source = fs.realpathSync(sourcePath);
-    projects = fs.realpathSync(CLAUDE_PROJECTS_DIR);
+    projects = fs.realpathSync(projectsDir);
   } catch {
     throw new Error(`Claude session file not found: ${sourcePath}`);
   }
   const relative = path.relative(projects, source);
   if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-    throw new Error(`Codex can import Claude sessions only from ${CLAUDE_PROJECTS_DIR}: ${source}`);
+    throw new Error(`Codex can import Claude sessions only from ${projectsDir}: ${source}`);
   }
   return source;
 }

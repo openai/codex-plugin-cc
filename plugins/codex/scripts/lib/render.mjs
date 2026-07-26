@@ -322,6 +322,22 @@ export function renderTaskResult(parsedResult, meta) {
   return `${message}\n`;
 }
 
+export function renderContextBriefNotice(stats) {
+  const parts = [`mode ${stats.mode}`];
+  parts.push(stats.hasSummary ? "compact summary included" : "no compact summary");
+  parts.push(`${stats.includedTurnCount} turn(s)`);
+  if (stats.droppedTurnCount > 0) {
+    parts.push(`${stats.droppedTurnCount} omitted`);
+  }
+  parts.push(`${Math.round(stats.totalChars / 1024)} KiB`);
+
+  const lines = [`[codex] Attached Claude session context: ${parts.join(", ")}.`];
+  if (stats.staleSummary) {
+    lines.push("[codex] The compact summary is over an hour old. Run /compact for a fresher brief.");
+  }
+  return lines.join("\n");
+}
+
 export function renderStatusReport(report) {
   const lines = [
     "# Codex Status",

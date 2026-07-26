@@ -21,6 +21,7 @@ import {
     runAppServerReview,
     runAppServerTurn
   } from "./lib/codex.mjs";
+import { buildClaudeContextBrief, composeTaskPromptWithBrief, normalizeContextMode } from "./lib/claude-context-brief.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
@@ -54,6 +55,7 @@ import {
 } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
+  renderContextBriefNotice,
   renderNativeReviewResult,
   renderReviewResult,
   renderStoredJobResult,
@@ -79,7 +81,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [--session-context] [--session-context-mode <auto|summary|recent|full|none>] [--session-turns <count>] [--session-max-chars <count>] [--source <claude-jsonl>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -761,8 +763,17 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    valueOptions: [
+      "model",
+      "effort",
+      "cwd",
+      "prompt-file",
+      "session-context-mode",
+      "session-turns",
+      "session-max-chars",
+      "source"
+    ],
+    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "session-context"],
     aliasMap: {
       m: "model"
     }
@@ -772,16 +783,34 @@ async function handleTask(argv) {
   const workspaceRoot = resolveCommandWorkspace(options);
   const model = normalizeRequestedModel(options.model);
   const effort = normalizeReasoningEffort(options.effort);
-  const prompt = readTaskPrompt(cwd, options, positionals);
+  const requestedPrompt = readTaskPrompt(cwd, options, positionals);
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
   const fresh = Boolean(options.fresh);
   if (resumeLast && fresh) {
     throw new Error("Choose either --resume/--resume-last or --fresh.");
   }
+
+  // A resumed thread already carries the earlier brief, so only the newer turns are worth resending.
+  const requestedContextMode = normalizeContextMode(
+    options["session-context-mode"] ?? (options["session-context"] ? "auto" : undefined)
+  );
+  const contextMode = resumeLast && requestedContextMode === "auto" ? "recent" : requestedContextMode;
+  const brief = buildClaudeContextBrief(cwd, {
+    mode: contextMode,
+    source: options.source,
+    recentTurns: options["session-turns"],
+    maxChars: options["session-max-chars"],
+    now: Date.now()
+  });
+  if (brief && !options.json) {
+    process.stderr.write(`${renderContextBriefNotice(brief.stats)}\n`);
+  }
+
+  const prompt = brief ? composeTaskPromptWithBrief(brief, requestedPrompt) : requestedPrompt;
   const write = Boolean(options.write);
   const taskMetadata = buildTaskRunMetadata({
-    prompt,
+    prompt: requestedPrompt || (brief ? "Continue from Claude Code handoff brief" : requestedPrompt),
     resumeLast
   });
 

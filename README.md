@@ -162,11 +162,57 @@ Ask Codex to redesign the database connection to be more resilient.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
 
+#### Carrying the Claude conversation into the rescue
+
+By default a rescue only receives the task text you typed. Codex still reads the same repository,
+but it does not know what you and Claude already discussed, ruled out, or tried and abandoned.
+
+Add `--session-context` to attach the current Claude session as a handoff brief:
+
+```bash
+/codex:rescue --session-context fix the failing login test
+/codex:rescue --session-context                  # no task text needed, continues the thread of work
+/codex:rescue --session-context --session-context-mode full --background investigate the regression
+```
+
+The brief is assembled by the companion script straight from the Claude transcript, so Claude does
+not have to read or summarize the conversation itself. It contains the compact summary written by
+`/compact`, the turns recorded after that summary, and the branch and uncommitted file list at
+handoff time. Tool calls, thinking blocks, and subagent chatter are excluded.
+
+This mirrors how Claude Code survives its own compaction: the compact summary carries the earlier
+session and the post-boundary turns close the gap. Running `/compact` before a rescue therefore
+produces a denser, cheaper brief than a raw transcript, and it frees your own Claude context at the
+same time.
+
+Modes:
+
+| Mode | What it attaches |
+| --- | --- |
+| `--session-context` | compact summary plus the turns recorded after it (the `auto` default) |
+| `--session-context-mode summary` | compact summary only |
+| `--session-context-mode recent` | recent turns only, no summary |
+| `--session-context-mode full` | every turn in the transcript, ignoring the recent-turn cap |
+| `--session-context-mode none` | nothing; identical to omitting the flag |
+
+`--session-context-mode` implies `--session-context`, so you never need both.
+
+**Notes:**
+
+- `--session-turns <count>` caps how many recent turns are attached (default 30).
+- `--session-max-chars <count>` caps the assembled brief (default 49152). Oldest turns are dropped first and the brief says how many were omitted.
+- with `--resume`, the `auto` mode narrows to `recent`, because the resumed Codex thread already contains the earlier brief.
+- if the compact summary is more than an hour old the plugin says so, so you can run `/compact` for a fresher brief.
+- the brief is framed as third-party background, and instructs Codex to verify it against the repository rather than trust it.
+- `--source <claude-jsonl>` overrides transcript discovery, the same way `/codex:transfer` does.
+
 ### `/codex:transfer`
 
 Creates a persistent Codex thread from the current Claude Code session and prints a `codex resume <session-id>` command.
 
 Use it when you started a debugging or implementation conversation in Claude Code and want to continue that same context directly in Codex.
+
+To keep working inside Claude Code and hand Codex a single task with that same context instead of moving over entirely, use [`/codex:rescue --session-context`](#carrying-the-claude-conversation-into-the-rescue).
 
 Examples:
 

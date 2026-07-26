@@ -1,6 +1,6 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up rescue work to the Codex rescue subagent
-argument-hint: "[--background|--wait] [--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [what Codex should investigate, solve, or continue]"
+argument-hint: "[--background|--wait] [--resume|--fresh] [--session-context] [--session-context-mode <auto|summary|recent|full>] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [what Codex should investigate, solve, or continue]"
 allowed-tools: Bash(node:*), AskUserQuestion, Agent
 ---
 
@@ -18,6 +18,9 @@ Execution mode:
 - If neither flag is present, default to foreground.
 - `--background` and `--wait` are execution flags for Claude Code. Do not forward them to `task`, and do not treat them as part of the natural-language task text.
 - `--model` and `--effort` are runtime-selection flags. Preserve them for the forwarded `task` call, but do not treat them as part of the natural-language task text.
+- `--session-context`, `--session-context-mode`, `--session-turns`, and `--session-max-chars` are context-selection flags. Preserve them for the forwarded `task` call, but do not treat them as part of the natural-language task text.
+- `--session-context` attaches this Claude session's compact summary and recent turns to the Codex prompt so Codex starts with the same background. The companion script assembles it directly from the transcript, so do not read, summarize, or paste the conversation yourself.
+- When `--session-context` is present the task text is optional. If the user only says something like "continue" or "take it from here", forward `--session-context` with no task text and let the companion supply the continuation request.
 - If the request includes `--resume`, do not ask whether to continue. The user already chose.
 - If the request includes `--fresh`, do not ask whether to continue. The user already chose.
 - Otherwise, before starting Codex, check for a resumable rescue thread from this Claude session by running:
