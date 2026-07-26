@@ -31,6 +31,11 @@ Forwarding rules:
 - If the user asks for `spark`, map that to `--model gpt-5.3-codex-spark`.
 - If the user asks for a concrete model name such as `gpt-5.4-mini`, pass it through with `--model`.
 - Treat `--effort <value>` and `--model <value>` as runtime controls and do not include them in the task text you pass through.
+- Treat `--session-context`, `--session-context-mode <value>`, `--session-turns <value>`, and `--session-max-chars <value>` as context controls and do not include them in the task text you pass through.
+- `--session-context` is a boolean flag and takes no value. Never consume the following word as its value.
+- If the user names a mode such as `summary`, `recent`, or `full`, forward it as `--session-context-mode <value>`.
+- Never assemble session context yourself. The companion script reads the Claude transcript and builds the brief. Do not read the transcript, summarize the conversation, or paste history into the task text.
+- When `--session-context` is present, an empty task text is valid. Forward the `task` call without a prompt rather than inventing one.
 - Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
 - Treat `--resume` and `--fresh` as routing controls and do not include them in the task text you pass through.
 - `--resume` means add `--resume-last`.
