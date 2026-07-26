@@ -50,7 +50,18 @@ function appendEnvVar(name, value) {
   }
 
   const existingLines = existingContent.split(/\r?\n/);
-  if (existingLines.includes(line)) {
+  const exportPrefix = `export ${name}=`;
+
+  let lastAssignment = null;
+
+  for (let index = existingLines.length - 1; index >= 0; index -= 1) {
+    if (existingLines[index].startsWith(exportPrefix)) {
+      lastAssignment = existingLines[index];
+      break;
+    }
+  }
+
+  if (lastAssignment === line) {
     return;
   }
 

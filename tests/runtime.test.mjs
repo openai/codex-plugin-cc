@@ -764,13 +764,22 @@ test("task --resume-last ignores running tasks from other Claude sessions", () =
   );
 });
 
-test("session start hook does not duplicate environment exports", () => {
+test("session start hook keeps the current managed export last", () => {
   const repo = makeTempDir();
   const envFile = path.join(makeTempDir(), "claude-env.sh");
   const pluginDataDir = makeTempDir();
   const transcriptPath = path.join(repo, "session.jsonl");
 
-  fs.writeFileSync(envFile, "export OTHER_PLUGIN_VALUE='keep-me'\n", "utf8");
+  fs.writeFileSync(
+    envFile,
+    [
+      "export CODEX_COMPANION_SESSION_ID='sess-current'",
+      "export OTHER_PLUGIN_VALUE='keep-me'",
+      "export CODEX_COMPANION_SESSION_ID='sess-old'",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
 
   const runSessionStart = () =>
     run("node", [SESSION_HOOK, "SessionStart"], {
@@ -789,38 +798,25 @@ test("session start hook does not duplicate environment exports", () => {
     });
 
   const first = runSessionStart();
-  const second = runSessionStart();
-  const third = runSessionStart();
-
   assert.equal(first.status, 0, first.stderr);
+
+  const contentAfterFirstRun = fs.readFileSync(envFile, "utf8");
+  const sessionExports = contentAfterFirstRun
+    .trim()
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("export CODEX_COMPANION_SESSION_ID="));
+
+  assert.equal(
+    sessionExports.at(-1),
+    "export CODEX_COMPANION_SESSION_ID='sess-current'",
+  );
+
+  assert.match(contentAfterFirstRun, /export OTHER_PLUGIN_VALUE='keep-me'/);
+
+  const second = runSessionStart();
   assert.equal(second.status, 0, second.stderr);
-  assert.equal(third.status, 0, third.stderr);
 
-  const lines = fs.readFileSync(envFile, "utf8").trim().split(/\r?\n/);
-
-  assert.equal(
-    lines.filter(
-      (line) => line === "export CODEX_COMPANION_SESSION_ID='sess-current'",
-    ).length,
-    1,
-  );
-
-  assert.equal(
-    lines.filter(
-      (line) =>
-        line === `export CODEX_COMPANION_TRANSCRIPT_PATH='${transcriptPath}'`,
-    ).length,
-    1,
-  );
-
-  assert.equal(
-    lines.filter(
-      (line) => line === `export CLAUDE_PLUGIN_DATA='${pluginDataDir}'`,
-    ).length,
-    1,
-  );
-
-  assert.ok(lines.includes("export OTHER_PLUGIN_VALUE='keep-me'"));
+  assert.equal(fs.readFileSync(envFile, "utf8"), contentAfterFirstRun);
 });
 
 test("write task output focuses on the Codex result without generic follow-up hints", () => {
