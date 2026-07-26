@@ -413,7 +413,8 @@ async function executeReviewRun(request) {
     model: request.model,
     sandbox: "read-only",
     outputSchema: readOutputSchema(REVIEW_SCHEMA),
-    onProgress: request.onProgress
+    onProgress: request.onProgress,
+    persistThread: true
   });
   const parsed = parseStructuredOutput(result.finalMessage, {
     status: result.status,
