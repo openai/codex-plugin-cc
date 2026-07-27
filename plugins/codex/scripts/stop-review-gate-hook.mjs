@@ -156,6 +156,17 @@ function main() {
     return;
   }
 
+  if (input.stop_hook_active) {
+    // Claude Code re-invokes the Stop hook with stop_hook_active: true when a
+    // prior invocation returned a "block" decision. Running the review again
+    // here would just block again -- every non-ok outcome (no output, timeout,
+    // failure, invalid JSON) re-blocks unconditionally -- until the harness's
+    // forced-retry cap kicks in and ends the turn anyway. Skip the re-run and
+    // let this retry succeed instead of repeating it up to the cap.
+    logNote(runningTaskNote);
+    return;
+  }
+
   const setupNote = buildSetupNote(cwd);
   if (setupNote) {
     logNote(setupNote);
