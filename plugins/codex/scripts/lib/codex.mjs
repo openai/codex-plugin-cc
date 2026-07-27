@@ -610,7 +610,24 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   }
 }
 
+const APP_SERVER_MODE_ENV = "CODEX_COMPANION_APP_SERVER_MODE";
+
+function resolveAppServerMode(env = process.env) {
+  const value = env[APP_SERVER_MODE_ENV];
+  if (value == null || value === "") {
+    return "default";
+  }
+  if (value === "direct") {
+    return "direct";
+  }
+  throw new Error(`Unsupported ${APP_SERVER_MODE_ENV} value: ${value}`);
+}
+
 async function withAppServer(cwd, fn) {
+  if (resolveAppServerMode() === "direct") {
+    return withDirectAppServer(cwd, fn);
+  }
+
   let client = null;
   try {
     client = await CodexAppServerClient.connect(cwd);

@@ -2161,6 +2161,113 @@ test("commands lazily start and reuse one shared app-server after first use", as
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
+test("direct app-server mode starts a fresh process for every command", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  const sharedEnv = buildEnv(binDir);
+  const directEnv = {
+    ...sharedEnv,
+    CODEX_COMPANION_APP_SERVER_MODE: "direct"
+  };
+
+  try {
+    const review = run("node", [SCRIPT, "review"], { cwd: repo, env: sharedEnv });
+    assert.equal(review.status, 0, review.stderr);
+    const sharedStarts = JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts;
+    assert.ok(sharedStarts >= 1);
+    const brokerSession = loadBrokerSession(repo);
+
+    const adversarial = run("node", [SCRIPT, "adversarial-review"], {
+      cwd: repo,
+      env: directEnv
+    });
+    assert.equal(adversarial.status, 0, adversarial.stderr);
+    assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts, sharedStarts + 1);
+
+    const task = run("node", [SCRIPT, "task", "challenge the current design"], {
+      cwd: repo,
+      env: directEnv
+    });
+    assert.equal(task.status, 0, task.stderr);
+    assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts, sharedStarts + 2);
+    if (brokerSession) {
+      assert.equal(loadBrokerSession(repo)?.endpoint, brokerSession.endpoint);
+    }
+  } finally {
+    run("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo,
+      env: sharedEnv,
+      input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+    });
+  }
+});
+
+test("direct app-server mode does not retry a failed runtime", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+
+  installFakeCodex(binDir, "auth-run-fails");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "check failed auth"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_COMPANION_APP_SERVER_MODE: "direct"
+    }
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /authentication expired; run codex login/);
+  assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts, 1);
+
+  const state = JSON.parse(
+    fs.readFileSync(path.join(resolveStateDir(repo), "state.json"), "utf8")
+  );
+  assert.equal(state.jobs.length, 1);
+  assert.equal(state.jobs[0].kind, "task");
+  assert.equal(state.jobs[0].status, "failed");
+});
+
+test("unsupported app-server mode fails before starting a runtime", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "reject invalid mode"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_COMPANION_APP_SERVER_MODE: "shared-typo"
+    }
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(
+    result.stderr,
+    /Unsupported CODEX_COMPANION_APP_SERVER_MODE value: shared-typo/
+  );
+  assert.equal(fs.existsSync(path.join(binDir, "fake-codex-state.json")), false);
+});
+
 test("setup reuses an existing shared app-server without starting another one", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
