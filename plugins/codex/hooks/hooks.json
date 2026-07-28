@@ -23,6 +23,18 @@
         ]
       }
     ],
+    "PostToolUse": [
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/exit-plan-second-opinion-hook.mjs\"",
+            "timeout": 480
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

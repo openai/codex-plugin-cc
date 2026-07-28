@@ -37,14 +37,21 @@ for (let i = 0; i < parsed.length; i++) {
 }
 if (lastAdvisorIdx === -1) allow(); // no advisor used this session
 
-// did the agent invoke codex-advisor after the latest advisor result?
+// Did a codex-advisor run actually PRODUCE output after the latest advisor result?
+// Evidence = a tool_result carrying the second-opinion banner, or the "[codex-advisor]"
+// skip/error prefix (skips count as compliance per the operating rule). A Bash command
+// merely MENTIONING codex-advisor is NOT evidence — that hole let failed or wrong-path
+// attempts satisfy this gate.
+const textOf = (c) => typeof c === 'string' ? c
+  : Array.isArray(c) ? c.map((x) => (x && x.text) || '').join('\n')
+  : c ? JSON.stringify(c) : '';
 for (let i = lastAdvisorIdx + 1; i < parsed.length; i++) {
   const c = parsed[i]?.message?.content;
   if (!Array.isArray(c)) continue;
   for (const b of c) {
-    if (b.type === 'tool_use' && b.name === 'Bash' &&
-        typeof b.input?.command === 'string' && b.input.command.includes('codex-advisor')) {
-      allow();
+    if (b.type === 'tool_result') {
+      const t = textOf(b.content);
+      if (t.includes('SECOND OPINION (codex-advisor') || t.includes('[codex-advisor]')) allow();
     }
   }
 }

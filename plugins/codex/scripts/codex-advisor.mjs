@@ -1,14 +1,18 @@
 #!/usr/bin/env node
-// codex-advisor — second opinion after Claude Code's built-in `advisor` tool.
-// Reconstructs the FULL session transcript (true parity with what the advisor saw)
-// plus the advisor's verdict, sends it to GPT via `codex exec`, and prints
-// Codex's independent second opinion to stdout. Non-fatal on any failure (exit 0).
+// codex-advisor — independent GPT second opinion for Claude Code. Two subjects, auto-selected:
+//   1) the latest built-in `advisor` verdict in the transcript (original behavior), or
+//   2) with --plan-file <path>: an approved ExitPlanMode plan (decoupled trigger — the
+//      built-in advisor never fires on Fable 5 mains, so the exit-plan hook feeds plans here).
+// Reconstructs the FULL session transcript for context, runs `codex exec` READ-ONLY from the
+// repo root with instructions to verify claims against the actual code, and prints the
+// opinion to stdout. Non-fatal on any failure (exit 0).
 //
 // Env overrides: CODEX_ADVISOR_MODEL (default gpt-5.6-sol), CODEX_ADVISOR_EFFORT (default high).
-// Arg override:  --transcript <path>  to point at a specific session jsonl.
+// Arg overrides: --transcript <path> (specific session jsonl); --plan-file <path> (plan mode).
 
 import { readFileSync, writeFileSync, readdirSync, statSync, existsSync, mkdirSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -97,24 +101,58 @@ function reconstruct(path) {
 const path = findTranscript();
 if (!path) done('[codex-advisor] no transcript found; skipping.');
 const { transcript, verdict, verdictId } = reconstruct(path);
-if (!verdict) done('[codex-advisor] no advisor verdict in transcript; skipping.');
 
-// Dedup: exactly one Codex opinion per advisor verdict. A second invocation for the same
-// verdict — e.g. a council sub-agent, which SHARES this session's CLAUDE_CODE_SESSION_ID —
-// skips. The main agent runs first (right after advisor()), so it wins the marker and
+// Subject: an explicit --plan-file beats the advisor-verdict path.
+const planFile = argVal('--plan-file');
+let plan = null;
+if (planFile) { try { plan = readFileSync(planFile, 'utf8').trim() || null; } catch {} }
+if (!plan && !verdict) done('[codex-advisor] no plan or advisor verdict to review; skipping.');
+const subjectId = plan
+  ? `plan_${createHash('sha1').update(plan).digest('hex').slice(0, 16)}`
+  : verdictId;
+
+// Dedup: exactly one Codex opinion per subject (advisor verdict or plan). A second
+// invocation for the same subject — e.g. a council sub-agent, which SHARES this session's
+// CLAUDE_CODE_SESSION_ID — skips. The main agent runs first, so it wins the marker and
 // sub-agents skip. CODEX_ADVISOR_FORCE=1 bypasses (for testing).
 const MARKER_DIR = join(HOME, '.claude', 'cache', 'codex-advisor');
-const markerPath = join(MARKER_DIR, `${(verdictId || 'unknown').replace(/[^A-Za-z0-9_-]/g, '_')}.json`);
-if (!process.env.CODEX_ADVISOR_FORCE && verdictId && existsSync(markerPath)) {
-  done('[codex-advisor] a second opinion already ran for this advisor verdict; skipping.');
+const markerPath = join(MARKER_DIR, `${(subjectId || 'unknown').replace(/[^A-Za-z0-9_-]/g, '_')}.json`);
+if (!process.env.CODEX_ADVISOR_FORCE && subjectId && existsSync(markerPath)) {
+  done('[codex-advisor] a second opinion already ran for this subject; skipping.');
 }
 try {
   mkdirSync(MARKER_DIR, { recursive: true });
-  writeFileSync(markerPath, JSON.stringify({ sid: process.env.CLAUDE_CODE_SESSION_ID || null, verdictId, transcript: path, ts: new Date().toISOString() }));
+  writeFileSync(markerPath, JSON.stringify({ sid: process.env.CLAUDE_CODE_SESSION_ID || null, subjectId, transcript: path, ts: new Date().toISOString() }));
 } catch {}
 
-const prompt = [
-  'You are GPT-5.5 acting as a SECOND ADVISOR. Below is the FULL session a first (Claude) advisor reviewed — every user/assistant message, the assistant\'s REASONING TRACE, and every tool call and result. The session is CONTEXT. The Claude advisor verdict you must give a second opinion on is the SINGLE block appended at the very end (the MOST RECENT verdict); any earlier "CLAUDE ADVISOR VERDICT" blocks appearing inline within the session are context only — do not review those. Give an INDEPENDENT second opinion on that most-recent verdict.',
+// Ground the opinion in the actual repository, not just the transcript: run codex from the
+// repo root so its read-only sandbox can verify claims against real code.
+const rootProbe = spawnSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' });
+const REPO_ROOT = rootProbe.status === 0 ? rootProbe.stdout.trim() : process.cwd();
+const GROUNDING = `You have READ-ONLY access to the repository at ${REPO_ROOT} (your working directory). Before agreeing or disagreeing with anything, VERIFY the load-bearing claims against the actual code with read-only commands (ls, cat, grep, git log/diff). Cite the files you checked. An opinion that cites no repository evidence is incomplete.`;
+
+const prompt = (plan ? [
+  'You are GPT acting as an independent SECOND ADVISOR. Claude (the assistant) has just had an implementation PLAN approved; it is the SINGLE block appended at the very end. Below it is the FULL session that led to the plan — every user/assistant message, the assistant\'s REASONING TRACE, and every tool call and result. The session is CONTEXT; your review is of the PLAN.',
+  '',
+  GROUNDING,
+  '',
+  'Specifically:',
+  '1) Flaws, risks, and missing steps in the plan — and any simpler approach that would do. Be concrete.',
+  '2) REASONING-TRACE AUDIT: scrutinize the assistant\'s reasoning blocks and explicitly flag any logical flaws, invalid inferences, unjustified leaps, or factual errors that shaped the plan. Quote the specific step.',
+  '3) What should change BEFORE execution starts, in priority order. If nothing, say so plainly.',
+  'Be direct and concise. Do not restate the session back to me.',
+  '',
+  '================ FULL SESSION ================',
+  transcript,
+  '================ END SESSION ================',
+  '',
+  '================ THE APPROVED PLAN TO REVIEW (your second opinion is about THIS) ================',
+  plan,
+  '================ END PLAN ================',
+] : [
+  'You are GPT acting as a SECOND ADVISOR. Below is the FULL session a first (Claude) advisor reviewed — every user/assistant message, the assistant\'s REASONING TRACE, and every tool call and result. The session is CONTEXT. The Claude advisor verdict you must give a second opinion on is the SINGLE block appended at the very end (the MOST RECENT verdict); any earlier "CLAUDE ADVISOR VERDICT" blocks appearing inline within the session are context only — do not review those. Give an INDEPENDENT second opinion on that most-recent verdict.',
+  '',
+  GROUNDING,
   '',
   'Specifically:',
   '1) Where you AGREE or DISAGREE with the Claude advisor, and why. Be concrete.',
@@ -129,7 +167,7 @@ const prompt = [
   '================ THE ADVISOR VERDICT TO REVIEW (most recent — your second opinion is about THIS) ================',
   verdict,
   '================ END VERDICT ================',
-].join('\n');
+]).join('\n');
 
 // Persistent run log: ~/.claude/logs/codex-advisor/<runId>/ (runId = UTC ts + short session id).
 const ts = new Date().toISOString();
@@ -141,7 +179,9 @@ const writeMeta = (status) => {
     writeFileSync(join(LOG_DIR, 'meta.json'), JSON.stringify({
       session_id: process.env.CLAUDE_CODE_SESSION_ID || null,
       resolved_transcript_path: path,
-      verdict_id: verdictId,
+      subject_id: subjectId,
+      subject: plan ? 'plan' : 'advisor-verdict',
+      repo_root: REPO_ROOT,
       model: MODEL,
       effort: EFFORT,
       ts,
@@ -156,7 +196,7 @@ const r = spawnSync('codex', [
   'exec', '--skip-git-repo-check', '-m', MODEL, '-s', 'read-only',
   '-c', `model_reasoning_effort=${EFFORT}`,
   '-o', outFile, '-',
-], { input: prompt, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+], { input: prompt, cwd: REPO_ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
 
 if (r.error) { writeMeta('codex-error'); done(`[codex-advisor] codex unavailable: ${r.error.message}\n[codex-advisor] log: ${LOG_DIR}`); }
 let answer = '';
@@ -164,7 +204,7 @@ try { answer = readFileSync(outFile, 'utf8').trim(); } catch {}
 if (!answer) answer = (r.stdout || '').trim();
 if (!answer) { writeMeta('no-output'); done(`[codex-advisor] codex produced no output (exit ${r.status}). ${(r.stderr || '').slice(-400)}\n[codex-advisor] log: ${LOG_DIR}`); }
 
-console.log(`===== GPT-5.5 SECOND OPINION (codex-advisor · effort=${EFFORT}) =====\n`);
+console.log(`===== GPT SECOND OPINION (codex-advisor · ${MODEL} · ${plan ? 'plan' : 'advisor-verdict'} · effort=${EFFORT}) =====\n`);
 console.log(answer);
 writeMeta('ok');
 console.log(`\n[codex-advisor] log: ${LOG_DIR}`);
