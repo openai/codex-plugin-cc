@@ -524,7 +524,7 @@ async function executeTaskRun(request) {
     rendered,
     summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
     jobTitle: taskMetadata.title,
-    jobClass: "task",
+    jobClass: taskMetadata.jobClass,
     write: Boolean(request.write)
   };
 }
@@ -541,7 +541,8 @@ function buildTaskRunMetadata({ prompt, resumeLast = false }) {
   if (!resumeLast && String(prompt ?? "").includes(STOP_REVIEW_TASK_MARKER)) {
     return {
       title: "Codex Stop Gate Review",
-      summary: "Stop-gate review of previous Claude turn"
+      summary: "Stop-gate review of previous Claude turn",
+      jobClass: "stop-review"
     };
   }
 
@@ -549,7 +550,8 @@ function buildTaskRunMetadata({ prompt, resumeLast = false }) {
   const fallbackSummary = resumeLast ? DEFAULT_CONTINUE_PROMPT : "Task";
   return {
     title,
-    summary: shorten(prompt || fallbackSummary)
+    summary: shorten(prompt || fallbackSummary),
+    jobClass: "task"
   };
 }
 
@@ -595,7 +597,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
     kind: "task",
     title: taskMetadata.title,
     workspaceRoot,
-    jobClass: "task",
+    jobClass: taskMetadata.jobClass,
     summary: taskMetadata.summary,
     write
   });

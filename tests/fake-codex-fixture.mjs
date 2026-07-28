@@ -123,6 +123,7 @@ function nextThread(state, cwd, ephemeral) {
     name: null,
     preview: "",
     ephemeral: Boolean(ephemeral),
+    archived: false,
     createdAt: now(),
     updatedAt: now()
   };
@@ -234,6 +235,9 @@ function structuredReviewPayload(prompt) {
 
 function taskPayload(prompt, resume) {
   if (prompt.includes("<task>") && prompt.includes("Only review the work from the previous Claude turn.")) {
+    if (BEHAVIOR === "stop-unexpected-output") {
+      return "MAYBE: Review completed without a valid gate decision.";
+    }
     if (BEHAVIOR === "adversarial-clean") {
       return "ALLOW: No blocking issues found in the previous turn.";
     }
@@ -329,6 +333,9 @@ rl.on("line", (line) => {
 
       case "thread/list": {
         let threads = state.threads.slice();
+        threads = threads.filter((thread) =>
+          message.params.archived === true ? thread.archived === true : thread.archived !== true
+        );
         if (message.params.cwd) {
           threads = threads.filter((thread) => thread.cwd === message.params.cwd);
         }
@@ -337,6 +344,30 @@ rl.on("line", (line) => {
         }
         threads.sort((left, right) => right.updatedAt - left.updatedAt);
         send({ id: message.id, result: { data: threads.map(buildThread), nextCursor: null } });
+        break;
+      }
+
+      case "thread/archive": {
+        const thread = ensureThread(state, message.params.threadId);
+        if (BEHAVIOR === "archive-fails") {
+          send({
+            id: message.id,
+            error: { code: -32600, message: "archive unavailable for " + thread.id }
+          });
+          break;
+        }
+        thread.archived = true;
+        thread.updatedAt = now();
+        saveState(state);
+        if (BEHAVIOR === "archive-already-reported") {
+          send({
+            id: message.id,
+            error: { code: -32600, message: "no rollout found for thread id " + thread.id }
+          });
+          break;
+        }
+        send({ id: message.id, result: {} });
+        send({ method: "thread/archived", params: { threadId: thread.id } });
         break;
       }
 
@@ -457,6 +488,12 @@ rl.on("line", (line) => {
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)
           : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
+
+        if (BEHAVIOR === "stop-turn-fails" && prompt.includes("Only review the work from the previous Claude turn.")) {
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+          send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "failed") } });
+          break;
+        }
 
         if (
           BEHAVIOR === "with-subagent" ||
