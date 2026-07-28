@@ -999,6 +999,75 @@ export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
   }
 }
 
+export async function archiveAppServerThread(cwd, { threadId }) {
+  if (!threadId) {
+    return {
+      attempted: false,
+      archived: false,
+      transport: null,
+      detail: "missing threadId"
+    };
+  }
+
+  const availability = getCodexAvailability(cwd);
+  if (!availability.available) {
+    return {
+      attempted: false,
+      archived: false,
+      transport: null,
+      detail: availability.detail
+    };
+  }
+
+  try {
+    const result = await withAppServer(cwd, async (client) => {
+      try {
+        await client.request("thread/archive", { threadId });
+        return {
+          archived: true,
+          transport: client.transport,
+          detail: `Archived ${threadId}.`
+        };
+      } catch (archiveError) {
+        let cursor = null;
+        try {
+          do {
+            const response = await client.request("thread/list", {
+              archived: true,
+              cursor,
+              limit: 100,
+              sortKey: "updated_at",
+              sourceKinds: ["appServer"]
+            });
+            if (response.data.some((thread) => thread.id === threadId)) {
+              return {
+                archived: true,
+                transport: client.transport,
+                detail: `${threadId} was already archived.`
+              };
+            }
+            cursor = response.nextCursor ?? null;
+          } while (cursor);
+        } catch {
+          // Preserve the original archive error so broker failures can retry directly.
+        }
+        throw archiveError;
+      }
+    });
+    return {
+      attempted: true,
+      ...result
+    };
+  } catch (error) {
+    return {
+      attempted: true,
+      archived: false,
+      transport: null,
+      detail: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
 export async function runAppServerReview(cwd, options = {}) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {

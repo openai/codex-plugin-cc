@@ -1941,9 +1941,13 @@ test("stop hook runs a stop-time review task and blocks on findings when the rev
   const setupPayload = JSON.parse(setup.stdout);
   assert.equal(setupPayload.reviewGateEnabled, true);
 
+  const sessionEnv = {
+    ...buildEnv(binDir),
+    CODEX_COMPANION_SESSION_ID: "sess-stop-review"
+  };
   const taskResult = run("node", [SCRIPT, "task", "--write", "fix the issue"], {
     cwd: repo,
-    env: buildEnv(binDir)
+    env: sessionEnv
   });
   assert.equal(taskResult.status, 0, taskResult.stderr);
 
@@ -1967,6 +1971,26 @@ test("stop hook runs a stop-time review task and blocks on findings when the rev
   assert.match(fakeState.lastTurnStart.prompt, /<compact_output_contract>/i);
   assert.match(fakeState.lastTurnStart.prompt, /Only review the work from the previous Claude turn/i);
   assert.match(fakeState.lastTurnStart.prompt, /I completed the refactor and updated the retry logic\./);
+  const stopReviewThread = fakeState.threads.find(
+    (thread) => thread.id === fakeState.lastTurnStart.threadId
+  );
+  assert.equal(stopReviewThread.archived, true);
+  const rescueThread = fakeState.threads.find((thread) => thread.id !== stopReviewThread.id);
+  assert.equal(rescueThread?.archived, false);
+
+  const state = JSON.parse(
+    fs.readFileSync(path.join(resolveStateDir(repo), "state.json"), "utf8")
+  );
+  const stopReviewJob = state.jobs.find((job) => job.title === "Codex Stop Gate Review");
+  assert.equal(stopReviewJob?.jobClass, "stop-review");
+
+  const resumeCandidate = run(
+    "node",
+    [SCRIPT, "task-resume-candidate", "--json"],
+    { cwd: repo, env: sessionEnv }
+  );
+  assert.equal(resumeCandidate.status, 0, resumeCandidate.stderr);
+  assert.equal(JSON.parse(resumeCandidate.stdout).candidate.threadId, rescueThread.id);
 
   const status = run("node", [SCRIPT, "status"], {
     cwd: repo,
@@ -2039,6 +2063,7 @@ test("stop hook logs running tasks to stderr without blocking when the review ga
 test("stop hook allows the stop when the review gate is enabled and the stop-time review task is clean", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
   installFakeCodex(binDir, "adversarial-clean");
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
@@ -2059,6 +2084,180 @@ test("stop hook allows the stop when the review gate is enabled and the stop-tim
 
   assert.equal(allowed.status, 0, allowed.stderr);
   assert.equal(allowed.stdout.trim(), "");
+  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  const stopReviewThread = fakeState.threads.find(
+    (thread) => thread.id === fakeState.lastTurnStart.threadId
+  );
+  assert.equal(stopReviewThread.archived, true);
+});
+
+test("stop hook archives through direct fallback when the configured broker is stale", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const staleBrokerDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "adversarial-clean");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const allowed = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_COMPANION_APP_SERVER_ENDPOINT: `unix:${path.join(staleBrokerDir, "missing.sock")}`
+    },
+    input: JSON.stringify({ cwd: repo, session_id: "sess-stale-broker" })
+  });
+
+  assert.equal(allowed.status, 0, allowed.stderr);
+  assert.equal(allowed.stdout.trim(), "");
+  assert.doesNotMatch(allowed.stderr, /could not be archived/i);
+  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  const stopReviewThread = fakeState.threads.find(
+    (thread) => thread.id === fakeState.lastTurnStart.threadId
+  );
+  assert.equal(stopReviewThread.archived, true);
+});
+
+test("stop hook keeps an unrecognized review thread available for inspection", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "stop-unexpected-output");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const blocked = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: JSON.stringify({ cwd: repo, session_id: "sess-stop-unrecognized" })
+  });
+
+  assert.equal(blocked.status, 0, blocked.stderr);
+  const payload = JSON.parse(blocked.stdout);
+  assert.equal(payload.decision, "block");
+  assert.match(payload.reason, /unexpected answer/i);
+  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  const stopReviewThread = fakeState.threads.find(
+    (thread) => thread.id === fakeState.lastTurnStart.threadId
+  );
+  assert.equal(stopReviewThread.archived, false);
+});
+
+test("stop hook treats an already archived review thread as idempotent cleanup", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "archive-already-reported");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const blocked = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: JSON.stringify({ cwd: repo, session_id: "sess-stop-already-archived" })
+  });
+
+  assert.equal(blocked.status, 0, blocked.stderr);
+  const payload = JSON.parse(blocked.stdout);
+  assert.equal(payload.decision, "block");
+  assert.doesNotMatch(blocked.stderr, /could not be archived/i);
+  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  const stopReviewThread = fakeState.threads.find(
+    (thread) => thread.id === fakeState.lastTurnStart.threadId
+  );
+  assert.equal(stopReviewThread.archived, true);
+});
+
+test("stop hook keeps a failed review thread available for retry", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "stop-turn-fails");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const blocked = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: JSON.stringify({ cwd: repo, session_id: "sess-stop-failed" })
+  });
+
+  assert.equal(blocked.status, 0, blocked.stderr);
+  const payload = JSON.parse(blocked.stdout);
+  assert.equal(payload.decision, "block");
+  assert.match(payload.reason, /stop-time Codex review task failed/i);
+  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  const stopReviewThread = fakeState.threads.find(
+    (thread) => thread.id === fakeState.lastTurnStart.threadId
+  );
+  assert.equal(stopReviewThread.archived, false);
+});
+
+test("stop hook preserves the review decision when archive cleanup fails", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "archive-fails");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const blocked = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: JSON.stringify({ cwd: repo, session_id: "sess-stop-archive-failed" })
+  });
+
+  assert.equal(blocked.status, 0, blocked.stderr);
+  const payload = JSON.parse(blocked.stdout);
+  assert.equal(payload.decision, "block");
+  assert.match(payload.reason, /Missing empty-state guard/i);
+  assert.match(blocked.stderr, /thread could not be archived/i);
+  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  const stopReviewThread = fakeState.threads.find(
+    (thread) => thread.id === fakeState.lastTurnStart.threadId
+  );
+  assert.equal(stopReviewThread.archived, false);
 });
 
 test("stop hook does not block when Codex is unavailable even if the review gate is enabled", () => {

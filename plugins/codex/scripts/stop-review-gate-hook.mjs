@@ -6,7 +6,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { getCodexAvailability } from "./lib/codex.mjs";
+import { archiveAppServerThread, getCodexAvailability } from "./lib/codex.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { getConfig, listJobs } from "./lib/state.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
@@ -71,6 +71,7 @@ function parseStopReviewOutput(rawOutput) {
   if (!text) {
     return {
       ok: false,
+      recognized: false,
       reason:
         "The stop-time Codex review task returned no final output. Run /codex:review --wait manually or bypass the gate."
     };
@@ -78,24 +79,26 @@ function parseStopReviewOutput(rawOutput) {
 
   const firstLine = text.split(/\r?\n/, 1)[0].trim();
   if (firstLine.startsWith("ALLOW:")) {
-    return { ok: true, reason: null };
+    return { ok: true, recognized: true, reason: null };
   }
   if (firstLine.startsWith("BLOCK:")) {
     const reason = firstLine.slice("BLOCK:".length).trim() || text;
     return {
       ok: false,
+      recognized: true,
       reason: `Codex stop-time review found issues that still need fixes before ending the session: ${reason}`
     };
   }
 
   return {
     ok: false,
+    recognized: false,
     reason:
       "The stop-time Codex review task returned an unexpected answer. Run /codex:review --wait manually or bypass the gate."
   };
 }
 
-function runStopReview(cwd, input = {}) {
+async function runStopReview(cwd, input = {}) {
   const scriptPath = path.join(SCRIPT_DIR, "codex-companion.mjs");
   const prompt = buildStopReviewPrompt(input);
   const childEnv = {
@@ -129,7 +132,18 @@ function runStopReview(cwd, input = {}) {
 
   try {
     const payload = JSON.parse(result.stdout);
-    return parseStopReviewOutput(payload?.rawOutput);
+    const review = parseStopReviewOutput(payload?.rawOutput);
+    if (review.recognized && payload?.threadId) {
+      const archive = await archiveAppServerThread(cwd, { threadId: payload.threadId });
+      if (!archive.archived) {
+        logNote(
+          `Codex stop-time review completed, but its thread could not be archived${
+            archive.detail ? `: ${archive.detail}` : "."
+          }`
+        );
+      }
+    }
+    return review;
   } catch {
     return {
       ok: false,
@@ -139,7 +153,7 @@ function runStopReview(cwd, input = {}) {
   }
 }
 
-function main() {
+async function main() {
   const input = readHookInput();
   const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const workspaceRoot = resolveWorkspaceRoot(cwd);
@@ -163,7 +177,7 @@ function main() {
     return;
   }
 
-  const review = runStopReview(cwd, input);
+  const review = await runStopReview(cwd, input);
   if (!review.ok) {
     emitDecision({
       decision: "block",
@@ -175,10 +189,8 @@ function main() {
   logNote(runningTaskNote);
 }
 
-try {
-  main();
-} catch (error) {
+main().catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
   process.stderr.write(`${message}\n`);
   process.exitCode = 1;
-}
+});
