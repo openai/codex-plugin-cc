@@ -51,16 +51,14 @@ function cleanupSessionJobs(cwd, sessionId) {
   }
 
   const state = loadState(workspaceRoot);
-  const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
+  const removedJobs = state.jobs.filter(
+    (job) => job.sessionId === sessionId && (job.status === "queued" || job.status === "running")
+  );
   if (removedJobs.length === 0) {
     return;
   }
 
   for (const job of removedJobs) {
-    const stillRunning = job.status === "queued" || job.status === "running";
-    if (!stillRunning) {
-      continue;
-    }
     try {
       terminateProcessTree(job.pid ?? Number.NaN);
     } catch {
@@ -70,7 +68,9 @@ function cleanupSessionJobs(cwd, sessionId) {
 
   saveState(workspaceRoot, {
     ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
+    jobs: state.jobs.filter(
+      (job) => job.sessionId !== sessionId || (job.status !== "queued" && job.status !== "running")
+    )
   });
 }
 
