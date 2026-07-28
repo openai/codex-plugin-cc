@@ -53,3 +53,30 @@ test("terminateProcessTree treats missing Windows processes as already stopped",
   assert.equal(outcome.result.status, 128);
   assert.match(outcome.result.stdout, /not found/i);
 });
+
+test("terminateProcessTree falls back to the root process when taskkill only partially succeeds", () => {
+  let killedPid = null;
+  const outcome = terminateProcessTree(1234, {
+    platform: "win32",
+    runCommandImpl(command, args) {
+      return {
+        command,
+        args,
+        status: 128,
+        signal: null,
+        stdout: "",
+        stderr: "A child process could not be terminated.",
+        error: null
+      };
+    },
+    killImpl(pid) {
+      killedPid = pid;
+    }
+  });
+
+  assert.equal(killedPid, 1234);
+  assert.equal(outcome.attempted, true);
+  assert.equal(outcome.delivered, true);
+  assert.equal(outcome.method, "kill");
+  assert.equal(outcome.result.status, 128);
+});
