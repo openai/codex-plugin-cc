@@ -208,7 +208,39 @@ export function renderSetupReport(report) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
+function appendInvestigationBanner(lines, meta) {
+  if (meta.investigation?.truncated === true) {
+    const turns = meta.investigation.turnCount ?? "?";
+    lines.push(
+      `Investigation truncated at ${turns} turns; findings may be shallow. Use --max-investigation-turns to raise the cap.`,
+      ""
+    );
+  }
+}
+
 export function renderReviewResult(parsedResult, meta) {
+  if (parsedResult.failed) {
+    // The run failed before producing a structured verdict (transport drop,
+    // idle timeout, soft turn error). Report the real reason rather than
+    // parsing the leftover prose as JSON and surfacing a misleading parse error.
+    const lines = [
+      `# Codex ${meta.reviewLabel}`,
+      "",
+      "Codex could not complete the review.",
+      "",
+      `- Reason: ${parsedResult.failureMessage ?? "Codex run failed before producing output."}`
+    ];
+    appendInvestigationBanner(lines, meta);
+
+    if (parsedResult.rawOutput) {
+      lines.push("", "Partial investigation output:", "", "```text", parsedResult.rawOutput, "```");
+    }
+
+    appendReasoningSection(lines, meta.reasoningSummary ?? parsedResult.reasoningSummary);
+
+    return `${lines.join("\n").trimEnd()}\n`;
+  }
+
   if (!parsedResult.parsed) {
     const lines = [
       `# Codex ${meta.reviewLabel}`,
@@ -217,6 +249,7 @@ export function renderReviewResult(parsedResult, meta) {
       "",
       `- Parse error: ${parsedResult.parseError}`
     ];
+    appendInvestigationBanner(lines, meta);
 
     if (parsedResult.rawOutput) {
       lines.push("", "Raw final message:", "", "```text", parsedResult.rawOutput, "```");
@@ -237,6 +270,7 @@ export function renderReviewResult(parsedResult, meta) {
       "",
       `- Validation error: ${validationError}`
     ];
+    appendInvestigationBanner(lines, meta);
 
     if (parsedResult.rawOutput) {
       lines.push("", "Raw final message:", "", "```text", parsedResult.rawOutput, "```");
@@ -258,6 +292,7 @@ export function renderReviewResult(parsedResult, meta) {
     data.summary,
     ""
   ];
+  appendInvestigationBanner(lines, meta);
 
   if (findings.length === 0) {
     lines.push("No material findings.");

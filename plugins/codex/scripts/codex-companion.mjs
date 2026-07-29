@@ -18,6 +18,9 @@ import {
     interruptAppServerTurn,
     parseStructuredOutput,
     readOutputSchema,
+    resolveReviewTurnIdleTimeoutMs,
+    resolveRunExitStatus,
+    runAppServerInvestigation,
     runAppServerReview,
     runAppServerTurn
   } from "./lib/codex.mjs";
@@ -249,6 +252,24 @@ function buildAdversarialReviewPrompt(context, focusText) {
   });
 }
 
+function buildAdversarialInvestigatePrompt(context, focusText) {
+  const template = loadPromptTemplate(ROOT_DIR, "adversarial-review-investigate");
+  return interpolateTemplate(template, {
+    TARGET_LABEL: context.target.label,
+    USER_FOCUS: focusText || "No extra focus provided.",
+    REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
+    REVIEW_INPUT: context.content
+  });
+}
+
+function buildAdversarialFinalizePrompt(context, focusText) {
+  const template = loadPromptTemplate(ROOT_DIR, "adversarial-review-finalize");
+  return interpolateTemplate(template, {
+    TARGET_LABEL: context.target.label,
+    USER_FOCUS: focusText || "No extra focus provided."
+  });
+}
+
 function ensureCodexAvailable(cwd) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
@@ -378,7 +399,7 @@ async function executeReviewRun(request) {
       threadId: result.threadId,
       sourceThreadId: result.sourceThreadId,
       codex: {
-        status: result.status,
+        status: resolveRunExitStatus(result, result.reviewText),
         stderr: result.stderr,
         stdout: result.reviewText,
         reasoning: result.reasoningSummary
@@ -394,7 +415,7 @@ async function executeReviewRun(request) {
     );
 
     return {
-      exitStatus: result.status,
+      exitStatus: resolveRunExitStatus(result, result.reviewText),
       threadId: result.threadId,
       turnId: result.turnId,
       payload,
@@ -407,18 +428,127 @@ async function executeReviewRun(request) {
   }
 
   const context = collectReviewContext(request.cwd, target);
-  const prompt = buildAdversarialReviewPrompt(context, focusText);
-  const result = await runAppServerTurn(context.repoRoot, {
-    prompt,
-    model: request.model,
-    sandbox: "read-only",
-    outputSchema: readOutputSchema(REVIEW_SCHEMA),
-    onProgress: request.onProgress
-  });
-  const parsed = parseStructuredOutput(result.finalMessage, {
+
+  // Nothing to review. The common trigger is running on a clean working tree
+  // while sitting ON the default branch: the branch comparison resolves
+  // merge-base == HEAD, so the diff is empty. Feeding an empty diff to the
+  // model just burns reasoning tokens and returns nothing useful (it cannot
+  // find issues in code that did not change). Short-circuit to an approve
+  // verdict without calling the model.
+  if (context.fileCount === 0) {
+    const emptyVerdict = {
+      verdict: "approve",
+      summary: `No changes to review for ${target.label}.`,
+      findings: [],
+      next_steps: []
+    };
+    const parsed = {
+      parsed: emptyVerdict,
+      parseError: null,
+      rawOutput: JSON.stringify(emptyVerdict)
+    };
+    const payload = {
+      review: reviewName,
+      target,
+      threadId: null,
+      context: {
+        repoRoot: context.repoRoot,
+        branch: context.branch,
+        summary: context.summary
+      },
+      codex: { status: 0, stderr: "", stdout: "", reasoning: [] },
+      result: parsed.parsed,
+      rawOutput: parsed.rawOutput,
+      parseError: null,
+      failed: false,
+      failureMessage: null,
+      reasoningSummary: []
+    };
+    return {
+      exitStatus: 0,
+      threadId: null,
+      turnId: null,
+      payload,
+      rendered: renderReviewResult(parsed, {
+        reviewLabel: reviewName,
+        targetLabel: target.label,
+        reasoningSummary: []
+      }),
+      summary: emptyVerdict.summary,
+      jobTitle: `Codex ${reviewName}`,
+      jobClass: "review",
+      targetLabel: target.label
+    };
+  }
+
+  let result;
+  if (context.inputMode === "self-collect") {
+    if (!context.investigationInline) {
+      request.onProgress?.(
+        "Diff exceeds the investigation inline budget (CODEX_COMPANION_INVESTIGATION_INLINE_MAX_BYTES); Codex will re-derive it with read-only commands."
+      );
+    }
+    const investigatePrompt = buildAdversarialInvestigatePrompt(context, focusText);
+    const finalizePrompt = buildAdversarialFinalizePrompt(context, focusText);
+    result = await runAppServerInvestigation(context.repoRoot, {
+      investigatePrompt,
+      finalizePrompt,
+      outputSchema: readOutputSchema(REVIEW_SCHEMA),
+      model: request.model,
+      sandbox: "read-only",
+      maxInvestigationTurns: request.maxInvestigationTurns,
+      turnIdleTimeoutMs: request.turnIdleTimeoutMs,
+      onProgress: request.onProgress
+    });
+  } else {
+    const prompt = buildAdversarialReviewPrompt(context, focusText);
+    result = await runAppServerTurn(context.repoRoot, {
+      prompt,
+      model: request.model,
+      sandbox: "read-only",
+      outputSchema: readOutputSchema(REVIEW_SCHEMA),
+      turnIdleTimeoutMs: request.turnIdleTimeoutMs,
+      onProgress: request.onProgress
+    });
+  }
+  // Parse first, then decide. A run can carry a non-zero status / error from a
+  // transient reconnect yet still have produced valid structured output (the
+  // turn recovered) — mirror of fix #1 at the finalize boundary. Only report a
+  // failure when the run errored AND we have no usable structured verdict;
+  // otherwise the leftover prose would be JSON-parsed into a misleading
+  // "invalid JSON" error, or a recovered valid verdict would be discarded.
+  const runErrored = Boolean(result.error) || result.status !== 0;
+  const hasFinalMessage = Boolean(String(result.finalMessage ?? "").trim());
+  const structured = parseStructuredOutput(result.finalMessage, {
     status: result.status,
     failureMessage: result.error?.message ?? result.stderr
   });
+  let parsed;
+  if (runErrored && !structured.parsed) {
+    parsed = {
+      parsed: null,
+      parseError: null,
+      failed: true,
+      failureMessage:
+        result.error?.message ?? result.stderr ?? "Codex run failed before producing output.",
+      rawOutput: result.finalMessage ?? ""
+    };
+  } else if (!hasFinalMessage && !structured.parsed) {
+    // The turn completed (status 0, no error) but emitted no agent message —
+    // only reasoning, or nothing at all. This is NOT a malformed-JSON parse
+    // error (there is nothing to parse); reporting it as one renders an empty
+    // "- Parse error:" line. Flag it as a no-content failure so the renderer
+    // states the run could not complete and surfaces any reasoning instead.
+    parsed = {
+      parsed: null,
+      parseError: null,
+      failed: true,
+      failureMessage: "Codex completed the turn but returned no review content.",
+      rawOutput: ""
+    };
+  } else {
+    parsed = structured;
+  }
   const payload = {
     review: reviewName,
     target,
@@ -437,20 +567,34 @@ async function executeReviewRun(request) {
     result: parsed.parsed,
     rawOutput: parsed.rawOutput,
     parseError: parsed.parseError,
+    failed: parsed.failed ?? false,
+    failureMessage: parsed.failureMessage ?? null,
     reasoningSummary: result.reasoningSummary
   };
+  if (result.investigation) {
+    payload.investigation = result.investigation;
+  }
+
+  // A recovered finalize turn (transient reconnect/error, but valid structured
+  // output) carries a stale non-zero `result.status` from buildResultStatus.
+  // Since we produced a usable verdict and did not flag the run failed, exit
+  // success — otherwise the foreground command exits non-zero and background
+  // jobs are recorded as failed despite a valid review. Conversely, a genuinely
+  // failed run keeps its non-zero status.
+  const exitStatus = (!payload.failed && parsed.parsed) ? 0 : result.status;
 
   return {
-    exitStatus: result.status,
+    exitStatus,
     threadId: result.threadId,
     turnId: result.turnId,
     payload,
     rendered: renderReviewResult(parsed, {
       reviewLabel: reviewName,
       targetLabel: context.target.label,
-      reasoningSummary: result.reasoningSummary
+      reasoningSummary: result.reasoningSummary,
+      investigation: result.investigation ?? null
     }),
-    summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
+    summary: parsed.parsed?.summary ?? parsed.failureMessage ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
     jobTitle: `Codex ${reviewName}`,
     jobClass: "review",
     targetLabel: context.target.label
@@ -508,8 +652,9 @@ async function executeTaskRun(request) {
       write: Boolean(request.write)
     }
   );
+  const exitStatus = resolveRunExitStatus(result, result.finalMessage);
   const payload = {
-    status: result.status,
+    status: exitStatus,
     threadId: result.threadId,
     rawOutput,
     touchedFiles: result.touchedFiles,
@@ -517,7 +662,7 @@ async function executeTaskRun(request) {
   };
 
   return {
-    exitStatus: result.status,
+    exitStatus,
     threadId: result.threadId,
     turnId: result.turnId,
     payload,
@@ -711,12 +856,34 @@ function enqueueBackgroundTask(cwd, job, request) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+    valueOptions: ["base", "scope", "model", "cwd", "max-investigation-turns", "turn-idle-timeout"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
       m: "model"
     }
   });
+
+  const rawMaxTurns = options["max-investigation-turns"];
+  let maxInvestigationTurns;
+  if (rawMaxTurns !== undefined) {
+    if (!/^[1-9][0-9]*$/.test(String(rawMaxTurns))) {
+      throw new Error(`--max-investigation-turns must be a positive integer (got: ${rawMaxTurns})`);
+    }
+    maxInvestigationTurns = Number(rawMaxTurns);
+  }
+
+  const rawIdleTimeout = options["turn-idle-timeout"];
+  let explicitIdleTimeoutMs;
+  if (rawIdleTimeout !== undefined) {
+    if (!/^[1-9][0-9]*$/.test(String(rawIdleTimeout))) {
+      throw new Error(`--turn-idle-timeout must be a positive integer (seconds) (got: ${rawIdleTimeout})`);
+    }
+    explicitIdleTimeoutMs = Number(rawIdleTimeout) * 1000;
+  }
+  // Reviews always get an idle watchdog (default when no flag is given), so a
+  // stalled review never hangs forever. /codex:task deliberately does NOT, so a
+  // long-thinking task is not aborted; it passes no timeout to runAppServerTurn.
+  const turnIdleTimeoutMs = resolveReviewTurnIdleTimeoutMs(explicitIdleTimeoutMs);
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
@@ -746,6 +913,8 @@ async function handleReviewCommand(argv, config) {
         model: options.model,
         focusText,
         reviewName: config.reviewName,
+        maxInvestigationTurns,
+        turnIdleTimeoutMs,
         onProgress: progress
       }),
     { json: options.json }

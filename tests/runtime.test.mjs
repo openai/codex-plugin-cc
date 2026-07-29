@@ -395,7 +395,13 @@ test("adversarial review accepts the same base-branch targeting as review", () =
   fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0];\n");
   run("git", ["add", "src/app.js"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
+  // Commit the change on a feature branch so `--base main` resolves a NON-empty
+  // range. (A change left uncommitted on main is invisible to branch scope:
+  // merge-base == HEAD, the diff is empty, and there is nothing to review.)
+  run("git", ["checkout", "-b", "feature/base-target"], { cwd: repo });
   fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0].id;\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "tweak"], { cwd: repo });
 
   const result = run("node", [SCRIPT, "adversarial-review", "--base", "main"], {
     cwd: repo,
@@ -429,8 +435,14 @@ test("adversarial review asks Codex to inspect larger diffs itself", () => {
 
   assert.equal(result.status, 0, result.stderr);
   const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
-  assert.match(state.lastTurnStart.prompt, /lightweight summary/i);
-  assert.match(state.lastTurnStart.prompt, /read-only git commands/i);
+  // With the two-phase investigation flow, the default fake converges on turn 1
+  // (no commands, finalAnswer), then the finalize turn fires. lastTurnStart
+  // captures the finalize turn, which uses buildAdversarialFinalizePrompt.
+  // The investigate prompt (turn 1) contained the self-collect guidance; the
+  // finalize prompt (turn 2) references the investigation completed in prior turns.
+  assert.match(state.lastTurnStart.prompt, /investigation|structured review/i);
+  // The finalize prompt carries no repository context of its own — the diff was
+  // already established during the investigation turns it refers back to.
   assert.doesNotMatch(state.lastTurnStart.prompt, /PROMPT_SELF_COLLECT_[ABC]/);
 });
 
@@ -883,11 +895,34 @@ test("task can finish after subagent work even if the parent turn/completed even
 
   const result = run("node", [SCRIPT, "task", "challenge the current design"], {
     cwd: repo,
-    env: buildEnv(binDir)
+    // The subagent-completion fallback now uses a 15s default quiet window;
+    // shrink it via the env override so this test resolves in ms, not 15s.
+    env: { ...buildEnv(binDir), CODEX_INFERRED_COMPLETION_QUIET_MS: "50" }
   });
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+});
+
+test("CODEX_INFERRED_COMPLETION_QUIET_MS overrides the inferred-completion quiet window", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "with-subagent-no-main-turn-completed");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const start = Date.now();
+  const result = run("node", [SCRIPT, "task", "challenge the current design"], {
+    cwd: repo,
+    env: { ...buildEnv(binDir), CODEX_INFERRED_COMPLETION_QUIET_MS: "50" }
+  });
+  const elapsed = Date.now() - start;
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.ok(elapsed < 10000, `inference must fire on the short window (took ${elapsed}ms)`);
 });
 
 test("task using the shared broker still completes when Codex spawns subagents", () => {
@@ -2059,6 +2094,38 @@ test("stop hook allows the stop when the review gate is enabled and the stop-tim
 
   assert.equal(allowed.status, 0, allowed.stderr);
   assert.equal(allowed.stdout.trim(), "");
+});
+
+test("stop hook parses the ALLOW answer when the stop-time review task recovered from a transient error", () => {
+  // Regression: a gate review that survives a transient "Reconnecting..." notice
+  // still completes with a valid ALLOW answer. The task must exit 0 so the hook
+  // parses ALLOW/BLOCK instead of false-positive blocking on "task failed".
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "gate-recovered");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const result = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: JSON.stringify({
+      cwd: repo,
+      session_id: "sess-stop-recovered",
+      last_assistant_message: "I completed the refactor."
+    })
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "", "a recovered ALLOW review must NOT block the session");
 });
 
 test("stop hook does not block when Codex is unavailable even if the review gate is enabled", () => {

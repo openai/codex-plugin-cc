@@ -14,6 +14,7 @@
  *   threadTurnIds: Map<string, string>,
  *   threadLabels: Map<string, string>,
  *   turnId: string | null,
+ *   pendingTurnId: string | null,
  *   bufferedNotifications: AppServerNotification[],
  *   completion: Promise<TurnCaptureState>,
  *   resolveCompletion: (state: TurnCaptureState) => void,
@@ -21,6 +22,8 @@
  *   finalTurn: Turn | null,
  *   completed: boolean,
  *   finalAnswerSeen: boolean,
+ *   sawSubagentWork: boolean,
+ *   inferredCompletionQuietMs: number,
  *   pendingCollaborations: Set<string>,
  *   activeSubagentTurns: Set<string>,
  *   completionTimer: ReturnType<typeof setTimeout> | null,
@@ -48,6 +51,55 @@ const SERVICE_NAME = "claude_code_codex_plugin";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
 const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
+// A REVIEW turn that produces no notifications and no response for this long is
+// treated as a stalled upstream connection and aborted, instead of the RPC
+// promise hanging forever (it only settles on a response or a full socket
+// close, neither of which happens on a half-dead "Reconnecting..." link).
+// The timer is reset on every progress notification, so a slow-but-healthy
+// turn running many commands is never killed — only true silence triggers it.
+//
+// This default is REVIEW-ONLY. It must NOT be injected by the shared
+// runAppServerTurn/runAppServerInvestigation runners, because /codex:task also
+// calls runAppServerTurn: a long-thinking or long-single-command task would
+// otherwise be aborted at this threshold with no task-level way to raise or
+// disable it. Review callers opt in via resolveReviewTurnIdleTimeoutMs(); the
+// runners pass whatever they are given straight through to captureTurn, which
+// arms no watchdog for an absent/invalid value.
+// Measured 2026-07-27: healthy Bedrock gpt-5.6 xhigh turns go silent for well
+// over 600s while reasoning; 180s killed them routinely.
+const DEFAULT_TURN_IDLE_TIMEOUT_MS = 1_200_000;
+
+// Demoted-inference quiet window (Defect A). Inferred turn completion is a
+// FALLBACK for the subagent/collab case where the main thread never emits a
+// real turn/completed. It is eligible only after (a) the turn actually spawned
+// subagent/collab work, (b) that work has drained, and (c) the turn has been
+// silent for this long with no turn/completed. The window re-arms on every
+// belonging item/message, so only genuine silence triggers it. Plain recon
+// turns never infer — they wait for the real turn/completed.
+const DEFAULT_INFERRED_COMPLETION_QUIET_MS = 15_000;
+
+function resolveInferredCompletionQuietMs(explicitMs) {
+  if (Number.isFinite(explicitMs) && explicitMs > 0) {
+    return explicitMs;
+  }
+  const fromEnv = Number(process.env.CODEX_INFERRED_COMPLETION_QUIET_MS);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) {
+    return fromEnv;
+  }
+  return DEFAULT_INFERRED_COMPLETION_QUIET_MS;
+}
+
+/**
+ * Resolve the idle-watchdog timeout for REVIEW turns. Returns the review
+ * default when no explicit positive value is supplied. Task runs do not call
+ * this and therefore run without an idle watchdog.
+ * @param {number | null | undefined} explicitMs
+ * @returns {number}
+ */
+export function resolveReviewTurnIdleTimeoutMs(explicitMs) {
+  return Number.isFinite(explicitMs) && explicitMs > 0 ? explicitMs : DEFAULT_TURN_IDLE_TIMEOUT_MS;
+}
+
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
 const EXTERNAL_AGENT_IMPORT_TIMEOUT_MS = 2 * 60 * 1000;
 
@@ -315,6 +367,7 @@ function createTurnCaptureState(threadId, options = {}) {
     threadTurnIds: new Map(),
     threadLabels: new Map(),
     turnId: null,
+    pendingTurnId: null,
     bufferedNotifications: [],
     completion,
     resolveCompletion,
@@ -322,6 +375,8 @@ function createTurnCaptureState(threadId, options = {}) {
     finalTurn: null,
     completed: false,
     finalAnswerSeen: false,
+    sawSubagentWork: false,
+    inferredCompletionQuietMs: resolveInferredCompletionQuietMs(options.inferredCompletionQuietMs),
     pendingCollaborations: new Set(),
     activeSubagentTurns: new Set(),
     completionTimer: null,
@@ -370,27 +425,43 @@ function completeTurn(state, turn = null, options = {}) {
   state.resolveCompletion(state);
 }
 
-function scheduleInferredCompletion(state) {
-  if (state.completed || state.finalTurn || !state.finalAnswerSeen) {
-    return;
-  }
+// Inferred completion is a guarded FALLBACK (Defect A). The primary completion
+// signal is always the real main-thread turn/completed. Inference is eligible
+// ONLY when the turn actually spawned subagent/collab work that has fully
+// drained — plain recon turns never infer; they wait for turn/completed. When
+// eligible, arm a quiet timer that re-arms on every subsequent belonging
+// item/message (see scheduleInferredCompletion call sites) and fires only after
+// inferredCompletionQuietMs of genuine silence with no real turn/completed.
+function inferenceEligible(state) {
+  return (
+    !state.completed &&
+    !state.finalTurn &&
+    state.sawSubagentWork &&
+    state.pendingCollaborations.size === 0 &&
+    state.activeSubagentTurns.size === 0
+  );
+}
 
-  if (state.pendingCollaborations.size > 0 || state.activeSubagentTurns.size > 0) {
+function scheduleInferredCompletion(state) {
+  if (!inferenceEligible(state)) {
     return;
   }
 
   clearCompletionTimer(state);
   state.completionTimer = setTimeout(() => {
     state.completionTimer = null;
-    if (state.completed || state.finalTurn || !state.finalAnswerSeen) {
-      return;
-    }
-    if (state.pendingCollaborations.size > 0 || state.activeSubagentTurns.size > 0) {
+    if (!inferenceEligible(state)) {
       return;
     }
     completeTurn(state, null, { inferred: true });
-  }, 250);
+  }, state.inferredCompletionQuietMs);
   state.completionTimer.unref?.();
+}
+
+function maybeRearmInferredCompletion(state) {
+  if (state.completionTimer && inferenceEligible(state)) {
+    scheduleInferredCompletion(state);
+  }
 }
 
 function belongsToTurn(state, message) {
@@ -407,6 +478,7 @@ function recordItem(state, item, lifecycle, threadId = null) {
   if (item.type === "collabAgentToolCall") {
     if (!threadId || threadId === state.threadId) {
       if (lifecycle === "started" || item.status === "inProgress") {
+        state.sawSubagentWork = true;
         state.pendingCollaborations.add(item.id);
       } else if (lifecycle === "completed") {
         state.pendingCollaborations.delete(item.id);
@@ -428,8 +500,14 @@ function recordItem(state, item, lifecycle, threadId = null) {
       if (!threadId || threadId === state.threadId) {
         state.lastAgentMessage = item.text;
         if (lifecycle === "completed" && item.phase === "final_answer") {
+          // Bookkeeping only; finalAnswerSeen is no longer part of the inference
+          // gate (Defect A) — a readiness cue must not complete a plain turn.
           state.finalAnswerSeen = true;
-          scheduleInferredCompletion(state);
+          // Do NOT infer from a readiness cue on a plain turn. Only re-arm the
+          // quiet fallback when subagent work has already happened and drained.
+          if (inferenceEligible(state)) {
+            scheduleInferredCompletion(state);
+          }
         }
       }
       if (lifecycle === "completed") {
@@ -506,6 +584,7 @@ function applyTurnNotification(state, message) {
       registerThread(state, message.params.threadId);
       state.threadTurnIds.set(message.params.threadId, message.params.turn.id);
       if ((message.params.threadId ?? null) !== state.threadId) {
+        state.sawSubagentWork = true;
         state.activeSubagentTurns.add(message.params.threadId);
       }
       emitProgress(
@@ -526,6 +605,7 @@ function applyTurnNotification(state, message) {
         const update = describeStartedItem(state, message.params.item);
         emitProgress(state.onProgress, update?.message, update?.phase ?? null);
       }
+      maybeRearmInferredCompletion(state);
       break;
     case "item/completed":
       recordItem(state, message.params.item, "completed", message.params.threadId ?? null);
@@ -533,6 +613,7 @@ function applyTurnNotification(state, message) {
         const update = describeCompletedItem(state, message.params.item);
         emitProgress(state.onProgress, update?.message, update?.phase ?? null);
       }
+      maybeRearmInferredCompletion(state);
       break;
     case "error":
       state.error = message.params.error;
@@ -560,29 +641,94 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
 
+  // Idle watchdog: the turn/start RPC and the completion promise only settle on
+  // a server response or a full socket close. A half-dead "Reconnecting..."
+  // link delivers neither, so without this the turn would hang forever. We
+  // reject after `idleTimeoutMs` of total silence, re-arming on every progress
+  // notification so a slow-but-active turn is never killed.
+  const idleTimeoutMs = Number.isFinite(options.turnIdleTimeoutMs) && options.turnIdleTimeoutMs > 0
+    ? options.turnIdleTimeoutMs
+    : null;
+  let idleTimer = null;
+  let idleReject = null;
+  let settled = false;
+  const idlePromise = idleTimeoutMs
+    ? new Promise((_resolve, reject) => { idleReject = reject; })
+    : null;
+  const armIdle = () => {
+    if (!idleTimeoutMs || settled) {
+      return;
+    }
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+    }
+    idleTimer = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      const seconds = Math.round(idleTimeoutMs / 1000);
+      // Best-effort interrupt so the app-server can release the turn; do NOT
+      // await it (the same dead link could make it hang too).
+      const interruptTurnId = state.turnId ?? state.pendingTurnId;
+      if (interruptTurnId) {
+        try {
+          client.request("turn/interrupt", { threadId, turnId: interruptTurnId }).catch(() => {});
+        } catch {
+          // ignore — interrupt is best-effort
+        }
+      }
+      idleReject?.(new Error(`Turn idle for ${seconds}s; aborting (upstream connection appears stalled).`));
+    }, idleTimeoutMs);
+    idleTimer.unref?.();
+  };
+  const clearIdle = () => {
+    settled = true;
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  };
+
   client.setNotificationHandler((message) => {
     if (!state.turnId) {
+      // Buffering window: the turn/start RPC reply has not set state.turnId yet.
+      // Capture the turn id from a turn/started for our thread so the idle
+      // watchdog can still interrupt (Defect C). Re-arm here — these early
+      // notifications are almost always our own.
+      armIdle();
+      if (message.method === "turn/started" && extractThreadId(message) === state.threadId) {
+        state.pendingTurnId = message.params?.turn?.id ?? state.pendingTurnId;
+      }
       state.bufferedNotifications.push(message);
       return;
     }
 
     if (message.method === "thread/started" || message.method === "thread/name/updated") {
+      // Turn-agnostic bookkeeping (thread registration / naming). Safe to re-arm.
+      armIdle();
       applyTurnNotification(state, message);
       return;
     }
 
     if (!belongsToTurn(state, message)) {
-        if (previousHandler) {
-          previousHandler(message);
-        }
-        return;
+      // Foreign turn/thread traffic must NOT re-arm our watchdog (Defect B):
+      // otherwise cross-turn chatter masks a stuck turn and it never fails fast.
+      if (previousHandler) {
+        previousHandler(message);
+      }
+      return;
     }
 
+    // Belongs to our turn: re-arm the idle watchdog, then apply.
+    armIdle();
     applyTurnNotification(state, message);
   });
 
   try {
-    const response = await startRequest();
+    armIdle();
+    const response = idlePromise
+      ? await Promise.race([startRequest(), idlePromise])
+      : await startRequest();
     options.onResponse?.(response, state);
     state.turnId = response.turn?.id ?? null;
     if (state.turnId) {
@@ -603,8 +749,11 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       completeTurn(state, response.turn);
     }
 
-    return await state.completion;
+    return idlePromise
+      ? await Promise.race([state.completion, idlePromise])
+      : await state.completion;
   } finally {
+    clearIdle();
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
   }
@@ -752,7 +901,23 @@ async function resumeThread(client, threadId, cwd, options = {}) {
 }
 
 function buildResultStatus(turnState) {
+  if (turnState.error) {
+    return 1;
+  }
   return turnState.finalTurn?.status === "completed" ? 0 : 1;
+}
+
+// A turn can complete with usable output yet still carry a stale transient
+// `error` (e.g. "Reconnecting... 1/5") that buildResultStatus turned into a
+// non-zero status. Callers that produced a usable result should report success.
+// `usableText` is the per-caller "did we get output" signal: finalMessage for
+// tasks, reviewText for native review. buildResultStatus and the runners are
+// intentionally left alone so result.status semantics stay stable for the
+// adversarial path (which has its own, stricter parsed-verdict compensation).
+export function resolveRunExitStatus(result, usableText) {
+  const recovered =
+    result.turn?.status === "completed" && Boolean(String(usableText ?? "").trim());
+  return recovered ? 0 : result.status;
 }
 
 const BUILTIN_PROVIDER_LABELS = new Map([
@@ -1098,6 +1263,12 @@ export async function runAppServerTurn(cwd, options = {}) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
   }
 
+  // Pass-through only: no implicit default. captureTurn arms no watchdog when
+  // turnIdleTimeoutMs is absent/invalid. Review callers supply the default via
+  // resolveReviewTurnIdleTimeoutMs(); task runs intentionally pass nothing.
+  const turnIdleTimeoutMs = options.turnIdleTimeoutMs;
+  const inferredCompletionQuietMs = options.inferredCompletionQuietMs;
+
   return withAppServer(cwd, async (client) => {
     let threadId;
 
@@ -1140,7 +1311,7 @@ export async function runAppServerTurn(cwd, options = {}) {
           effort: options.effort ?? null,
           outputSchema: options.outputSchema ?? null
         }),
-      { onProgress: options.onProgress }
+      { onProgress: options.onProgress, turnIdleTimeoutMs, inferredCompletionQuietMs }
     );
 
     return {
@@ -1155,6 +1326,259 @@ export async function runAppServerTurn(cwd, options = {}) {
       fileChanges: turnState.fileChanges,
       touchedFiles: collectTouchedFiles(turnState.fileChanges),
       commandExecutions: turnState.commandExecutions
+    };
+  });
+}
+
+const DEFAULT_MAX_INVESTIGATION_TURNS = 10;
+const INVESTIGATION_CONTINUATION_CUE = "Continue your investigation.";
+
+const DEFAULT_FINALIZE_EFFORT = "medium";
+const FINALIZE_EFFORT_VALUES = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
+
+// The finalize turn translates already-formed conclusions into schema JSON —
+// mechanical work that does not benefit from a reasoning-heavy effort. Read at
+// call time (not import time) so the env override always takes effect.
+function resolveFinalizeEffort(callerEffort) {
+  const raw = String(process.env.CODEX_COMPANION_FINALIZE_EFFORT ?? "").trim().toLowerCase();
+  if (raw === "inherit") {
+    return callerEffort ?? null;
+  }
+  if (FINALIZE_EFFORT_VALUES.has(raw)) {
+    return raw;
+  }
+  return DEFAULT_FINALIZE_EFFORT;
+}
+
+export async function runAppServerInvestigation(cwd, options = {}) {
+  const availability = getCodexAvailability(cwd);
+  if (!availability.available) {
+    throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
+  }
+
+  const investigatePrompt = options.investigatePrompt?.trim();
+  const finalizePrompt = options.finalizePrompt?.trim();
+  if (!investigatePrompt) {
+    throw new Error("runAppServerInvestigation requires investigatePrompt.");
+  }
+  if (!finalizePrompt) {
+    throw new Error("runAppServerInvestigation requires finalizePrompt.");
+  }
+  const maxInvestigationTurns = Number.isFinite(options.maxInvestigationTurns) && options.maxInvestigationTurns > 0
+    ? Math.floor(options.maxInvestigationTurns)
+    : DEFAULT_MAX_INVESTIGATION_TURNS;
+  // Pass-through only (see runAppServerTurn): the review caller supplies the
+  // watchdog default via resolveReviewTurnIdleTimeoutMs().
+  const turnIdleTimeoutMs = options.turnIdleTimeoutMs;
+  const inferredCompletionQuietMs = options.inferredCompletionQuietMs;
+  const sandbox = options.sandbox ?? "read-only";
+
+  return withAppServer(cwd, async (client) => {
+    emitProgress(options.onProgress, "Starting Codex investigation thread.", "starting");
+    const startResponse = await startThread(client, cwd, {
+      model: options.model,
+      sandbox,
+      ephemeral: true,
+      threadName: null
+    });
+    const threadId = startResponse.thread.id;
+    emitProgress(options.onProgress, `Thread ready (${threadId}).`, "starting", { threadId });
+
+    let turnCount = 0;
+    let truncated = false;
+    let totalCommandsRun = 0;
+    const aggregatedCommandExecutions = [];
+    const aggregatedFileChanges = [];
+
+    for (let i = 1; i <= maxInvestigationTurns; i += 1) {
+      const promptText = i === 1 ? investigatePrompt : INVESTIGATION_CONTINUATION_CUE;
+      emitProgress(options.onProgress, `Investigation turn ${i}.`, "investigating");
+
+      let turnState;
+      try {
+        turnState = await captureTurn(
+          client,
+          threadId,
+          () =>
+            client.request("turn/start", {
+              threadId,
+              input: buildTurnInput(promptText),
+              model: options.model ?? null,
+              effort: options.effort ?? null,
+              outputSchema: null
+            }),
+          { onProgress: options.onProgress, turnIdleTimeoutMs, inferredCompletionQuietMs }
+        );
+      } catch (transportError) {
+        return {
+          status: 1,
+          threadId,
+          turnId: null,
+          finalMessage: "",
+          reasoningSummary: [],
+          turn: null,
+          error: { message: transportError?.message ?? String(transportError) },
+          stderr: cleanCodexStderr(client.stderr),
+          fileChanges: aggregatedFileChanges,
+          touchedFiles: collectTouchedFiles(aggregatedFileChanges),
+          commandExecutions: aggregatedCommandExecutions,
+          investigation: { turnCount, truncated: false }
+        };
+      }
+
+      turnCount = i;
+      const turnCommandCount = turnState.commandExecutions.length;
+      totalCommandsRun += turnCommandCount;
+      for (const cmd of turnState.commandExecutions) {
+        aggregatedCommandExecutions.push(cmd);
+      }
+      for (const change of turnState.fileChanges) {
+        aggregatedFileChanges.push(change);
+      }
+
+      // The app-server multiplexes transient retry notices (e.g.
+      // "Reconnecting... 1/5") onto the same `error` notification channel as
+      // fatal turn failures, and the capture state records the last one seen
+      // without clearing it. A reconnect that recovers still drives the turn
+      // to turn/completed with an agent message, so treating any `error` as a
+      // hard abort would skip the schema-enforced finalize turn and hand the
+      // raw investigation prose to the JSON parser. Only abort when the turn
+      // produced no usable output — i.e. it did not recover.
+      const turnHadAgentMessage = Boolean(turnState.lastAgentMessage);
+      const turnRecovered = turnHadAgentMessage && turnState.finalTurn?.status === "completed";
+
+      if (turnState.error && !turnRecovered) {
+        return {
+          status: buildResultStatus(turnState),
+          threadId,
+          turnId: turnState.turnId,
+          finalMessage: turnState.lastAgentMessage,
+          reasoningSummary: turnState.reasoningSummary,
+          turn: turnState.finalTurn,
+          error: turnState.error,
+          stderr: cleanCodexStderr(client.stderr),
+          fileChanges: aggregatedFileChanges,
+          touchedFiles: collectTouchedFiles(aggregatedFileChanges),
+          commandExecutions: aggregatedCommandExecutions,
+          investigation: { turnCount, truncated: false }
+        };
+      }
+
+      // Convergence: a turn that produces no commands and emits an agent
+      // message is the contract the investigate prompt teaches the model
+      // ("a summary message with no further command calls signals readiness").
+      // The legacy check required `phase: "final_answer"`, but recon turns
+      // run with outputSchema=null so the app-server does not always tag
+      // messages with that phase — leading to runaway turns where the model
+      // keeps insisting it has converged but the loop refuses to listen.
+      const converged = turnCommandCount === 0 && turnHadAgentMessage;
+      if (converged) {
+        break;
+      }
+
+      if (i === maxInvestigationTurns) {
+        truncated = true;
+      }
+    }
+
+    if (totalCommandsRun === 0) {
+      truncated = true;
+    }
+
+    emitProgress(options.onProgress, "Investigation complete; finalizing structured output.", "finalizing");
+
+    // The finalize turn is supposed to emit only the structured JSON. In
+    // practice the model sometimes emits a tool-call stub instead (e.g.
+    // {"cmd": "wc -l ..."}) — if any commands ran during finalize, treat
+    // that as a contract violation and retry once with a sharper prompt.
+    const STRICT_FINALIZE_REMINDER =
+      "STRICT FINALIZE: do not run any shell commands. Output ONLY the JSON " +
+      "matching the schema, with no prose, no tool calls, and nothing else.\n\n";
+    let finalizeState;
+    let finalizeAttempts = 0;
+    const MAX_FINALIZE_ATTEMPTS = 2;
+    while (finalizeAttempts < MAX_FINALIZE_ATTEMPTS) {
+      finalizeAttempts += 1;
+      const promptText = finalizeAttempts === 1
+        ? finalizePrompt
+        : STRICT_FINALIZE_REMINDER + finalizePrompt;
+      try {
+        finalizeState = await captureTurn(
+          client,
+          threadId,
+          () =>
+            client.request("turn/start", {
+              threadId,
+              input: buildTurnInput(promptText),
+              model: options.model ?? null,
+              effort: resolveFinalizeEffort(options.effort ?? null),
+              outputSchema: options.outputSchema ?? null
+            }),
+          { onProgress: options.onProgress, turnIdleTimeoutMs, inferredCompletionQuietMs }
+        );
+      } catch (transportError) {
+        return {
+          status: 1,
+          threadId,
+          turnId: null,
+          finalMessage: "",
+          reasoningSummary: [],
+          turn: null,
+          error: { message: transportError?.message ?? String(transportError) },
+          stderr: cleanCodexStderr(client.stderr),
+          fileChanges: aggregatedFileChanges,
+          touchedFiles: collectTouchedFiles(aggregatedFileChanges),
+          commandExecutions: aggregatedCommandExecutions,
+          investigation: { turnCount, truncated }
+        };
+      }
+
+      // If the finalize turn ran commands, the model violated the contract.
+      // Retry once with a stricter prompt; if it still fails, accept the
+      // (likely-malformed) output and let the parser surface the error.
+      if (finalizeState.commandExecutions.length === 0) {
+        break;
+      }
+      if (finalizeAttempts < MAX_FINALIZE_ATTEMPTS) {
+        emitProgress(
+          options.onProgress,
+          "Finalize turn ran commands; retrying with stricter prompt.",
+          "finalizing"
+        );
+        // Aggregate the wasted commands from this (about-to-be-superseded)
+        // attempt so the caller still sees what happened. The final attempt's
+        // executions are aggregated once after the loop, so only fold in
+        // attempts we are leaving behind here — otherwise the last attempt
+        // would be counted twice.
+        for (const cmd of finalizeState.commandExecutions) {
+          aggregatedCommandExecutions.push(cmd);
+        }
+        for (const change of finalizeState.fileChanges) {
+          aggregatedFileChanges.push(change);
+        }
+      }
+    }
+
+    for (const cmd of finalizeState.commandExecutions) {
+      aggregatedCommandExecutions.push(cmd);
+    }
+    for (const change of finalizeState.fileChanges) {
+      aggregatedFileChanges.push(change);
+    }
+
+    return {
+      status: buildResultStatus(finalizeState),
+      threadId,
+      turnId: finalizeState.turnId,
+      finalMessage: finalizeState.lastAgentMessage,
+      reasoningSummary: finalizeState.reasoningSummary,
+      turn: finalizeState.finalTurn,
+      error: finalizeState.error,
+      stderr: cleanCodexStderr(client.stderr),
+      fileChanges: aggregatedFileChanges,
+      touchedFiles: collectTouchedFiles(aggregatedFileChanges),
+      commandExecutions: aggregatedCommandExecutions,
+      investigation: { turnCount, truncated }
     };
   });
 }

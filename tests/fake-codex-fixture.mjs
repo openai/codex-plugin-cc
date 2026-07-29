@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
-import { writeExecutable } from "./helpers.mjs";
+import { makeTempDir, writeExecutable } from "./helpers.mjs";
 
 export function installFakeCodex(binDir, behavior = "review-ok") {
   const statePath = path.join(binDir, "fake-codex-state.json");
@@ -16,6 +16,7 @@ const readline = require("node:readline");
 	const STATE_PATH = ${JSON.stringify(statePath)};
 	const BEHAVIOR = ${JSON.stringify(behavior)};
 	const interruptibleTurns = new Map();
+	let serializedBusyThread = null;
 
 	function loadState() {
 	  if (!fs.existsSync(STATE_PATH)) {
@@ -234,7 +235,7 @@ function structuredReviewPayload(prompt) {
 
 function taskPayload(prompt, resume) {
   if (prompt.includes("<task>") && prompt.includes("Only review the work from the previous Claude turn.")) {
-    if (BEHAVIOR === "adversarial-clean") {
+    if (BEHAVIOR === "adversarial-clean" || BEHAVIOR === "gate-recovered") {
       return "ALLOW: No blocking issues found in the previous turn.";
     }
     return "BLOCK: Missing empty-state guard in src/app.js:4-6.";
@@ -413,31 +414,176 @@ rl.on("line", (line) => {
         }
         const turnId = nextTurnId(state);
         send({ id: message.id, result: { turn: buildTurn(turnId), reviewThreadId: reviewThread.id } });
-        emitTurnCompleted(reviewThread.id, turnId, [
-          {
-            started: { type: "enteredReviewMode", id: turnId, review: "current changes" }
-          },
-          ...(BEHAVIOR === "with-reasoning"
-            ? [
-                {
-                  completed: {
-                    type: "reasoning",
-                    id: "reasoning_" + turnId,
-                    summary: [{ text: "Reviewed the changed files and checked the likely regression paths." }],
-                    content: []
-                  }
-                }
-              ]
-            : []),
-          {
-            completed: { type: "exitedReviewMode", id: turnId, review: nativeReviewText(message.params.target) }
-          }
-        ]);
+
+        // Queue-driven mode lets a test script the review text and inject a
+        // transient (recovered) error to exercise the recovered-status path.
+        const reviewEntry =
+          BEHAVIOR === "queue-driven" && state.queue && state.queue.length > 0
+            ? state.queue.shift()
+            : null;
+        if (reviewEntry) {
+          saveState(state);
+        }
+        const reviewText = reviewEntry && typeof reviewEntry.reviewText === "string"
+          ? reviewEntry.reviewText
+          : nativeReviewText(message.params.target);
+
+        send({ method: "turn/started", params: { threadId: reviewThread.id, turn: buildTurn(turnId) } });
+        send({
+          method: "item/started",
+          params: { threadId: reviewThread.id, turnId, item: { type: "enteredReviewMode", id: turnId, review: "current changes" } }
+        });
+        if (BEHAVIOR === "with-reasoning") {
+          send({
+            method: "item/completed",
+            params: {
+              threadId: reviewThread.id,
+              turnId,
+              item: {
+                type: "reasoning",
+                id: "reasoning_" + turnId,
+                summary: [{ text: "Reviewed the changed files and checked the likely regression paths." }],
+                content: []
+              }
+            }
+          });
+        }
+        send({
+          method: "item/completed",
+          params: { threadId: reviewThread.id, turnId, item: { type: "exitedReviewMode", id: turnId, review: reviewText } }
+        });
+        if (reviewEntry && reviewEntry.turnError) {
+          send({ method: "error", params: { threadId: reviewThread.id, turnId, error: { message: reviewEntry.turnError.message } } });
+        }
+        send({ method: "turn/completed", params: { threadId: reviewThread.id, turn: buildTurn(turnId, "completed") } });
         break;
       }
 
 	      case "turn/start": {
 	        const thread = ensureThread(state, message.params.threadId);
+
+        if (BEHAVIOR === "queue-driven") {
+          if (!state.requests) { state.requests = []; }
+          state.requests.push({ method: "turn/start", params: message.params });
+
+          if (state.serialize) {
+            if (serializedBusyThread === thread.id) {
+              // A turn is already open on this thread. The real app-server queues
+              // this turn/start and (in the bug) never opens it: no result, no
+              // turn/started, no turn/completed. Persist the recorded request,
+              // then hang.
+              saveState(state);
+              break;
+            }
+            // Only the normal completion paths below (delayCompletedMs / the
+            // synchronous turn/completed) clear serializedBusyThread. Do NOT
+            // combine serialize with hang/error entries (cueThenHang,
+            // hangNoResponse, hangAfterStarted, foreignChatterThenHang,
+            // rpcError) when a SUBSEQUENT queued turn is expected to open — those
+            // branches break early and leave the thread marked busy on purpose.
+            serializedBusyThread = thread.id;
+          }
+
+          const turnId = nextTurnId(state);
+          thread.updatedAt = now();
+
+          const entry = (state.queue && state.queue.length > 0) ? state.queue.shift() : null;
+          saveState(state);
+
+          if (entry && entry.rpcError) {
+            send({ id: message.id, error: { code: -32000, message: entry.rpcError.message } });
+            break;
+          }
+
+          if (entry && entry.hangNoResponse) {
+            // Model a half-dead upstream: the request is received but the
+            // server never replies (no result, no turn/started, no
+            // turn/completed). The client-side turn/start promise stays
+            // pending forever -- this is the real "stuck at turn N" signature.
+            break;
+          }
+
+          if (entry && entry.hangAfterStarted) {
+            // Announce the turn so the client buffers a turn/started carrying the
+            // id (populating pendingTurnId), but never send the turn/start RPC
+            // result and never complete the turn. Models a delayed RPC reply on a
+            // half-dead link, exercising Defect C.
+            send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+            break;
+          }
+
+          send({ id: message.id, result: { turn: buildTurn(turnId) } });
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+
+          if (entry && entry.foreignChatterThenHang) {
+            const { count = 5, everyMs = 50 } = entry.foreignChatterThenHang;
+            const foreignThreadId = thread.id + "-foreign";
+            const foreignTurnId = turnId + "-foreign";
+            // Foreign-thread traffic: must NOT re-arm our turn's watchdog.
+            for (let n = 0; n < count; n += 1) {
+              setTimeout(() => {
+                send({
+                  method: "item/completed",
+                  params: {
+                    threadId: foreignThreadId,
+                    turnId: foreignTurnId,
+                    item: { type: "agentMessage", id: "foreign_" + n, text: "noise", phase: "analysis" }
+                  }
+                });
+              }, everyMs * (n + 1));
+            }
+            // Never emit turn/completed for OUR turn -> the watchdog must fire.
+            break;
+          }
+
+          const commands = (entry && entry.commands) || [];
+          let cmdCounter = 0;
+          for (const cmd of commands) {
+            const itemId = "cmd_" + turnId + "_" + (cmdCounter++);
+            send({ method: "item/started", params: { threadId: thread.id, turnId, item: { type: "commandExecution", id: itemId, command: cmd.command, status: "in_progress" } } });
+            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "commandExecution", id: itemId, command: cmd.command, exitCode: cmd.exitCode ?? 0, status: "completed" } } });
+          }
+
+          if (entry && entry.finalAnswer) {
+            const phase = entry.finalAnswer.phase ?? "final_answer";
+            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "msg_" + turnId, text: entry.finalAnswer.text, phase } } });
+          }
+
+          if (entry && entry.lateFinalAnswer) {
+            const lateTurnId = turnId;
+            setTimeout(() => {
+              send({ method: "item/completed", params: { threadId: thread.id, turnId: lateTurnId, item: { type: "agentMessage", id: "late_" + lateTurnId, text: entry.lateFinalAnswer.text, phase: "final_answer" } } });
+            }, entry.lateFinalAnswer.afterMs ?? 100);
+          }
+
+          if (entry && entry.cueThenHang) {
+            // Emit only the readiness cue (already sent above); never send a real
+            // turn/completed. Exercises the Defect A gate: a plain turn must not
+            // infer completion from the cue.
+            break;
+          }
+
+          if (entry && entry.turnError) {
+            send({ method: "error", params: { threadId: thread.id, turnId, error: { message: entry.turnError.message } } });
+          }
+
+          if (!entry) {
+            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "msg_" + turnId, text: "", phase: "agent_message" } } });
+          }
+
+          if (entry && entry.delayCompletedMs) {
+            const completedTurnId = turnId;
+            setTimeout(() => {
+              if (state.serialize) { serializedBusyThread = null; }
+              send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(completedTurnId, "completed") } });
+            }, entry.delayCompletedMs);
+          } else {
+            if (state.serialize) { serializedBusyThread = null; }
+            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+          }
+          break;
+        }
+
 	        const prompt = (message.params.input || [])
           .filter((item) => item.type === "text")
           .map((item) => item.text)
@@ -602,6 +748,19 @@ rl.on("line", (line) => {
 	          interruptibleTurns.set(turnId, { threadId: thread.id, timer });
 	        } else if (BEHAVIOR === "slow-task") {
 	          emitTurnCompletedLater(thread.id, turnId, items, 400);
+	        } else if (BEHAVIOR === "gate-recovered") {
+	          // Recovered transient: emit the agent message, then a stale "error"
+	          // notice, then turn/completed. The turn still has usable output, so the
+	          // companion must exit 0 (resolveRunExitStatus) and the gate must parse
+	          // the ALLOW answer rather than block on a phantom failure.
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          for (const entry of items) {
+	            if (entry && entry.completed) {
+	              send({ method: "item/completed", params: { threadId: thread.id, turnId, item: entry.completed } });
+	            }
+	          }
+	          send({ method: "error", params: { threadId: thread.id, turnId, error: { message: "Reconnecting... 1/5" } } });
+	          send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
 	        } else {
 	          emitTurnCompleted(thread.id, turnId, items);
 	        }
@@ -654,5 +813,93 @@ export function buildEnv(binDir) {
   return {
     ...process.env,
     PATH: `${binDir}${sep}${process.env.PATH}`
+  };
+}
+
+/**
+ * Sets up a queue-driven fake Codex harness for multi-turn tests.
+ * Returns a handle with helpers for scripting turn responses and
+ * inspecting captured requests.
+ */
+export function setupFakeCodex({ cwd } = {}) {
+  const binDir = makeTempDir("codex-queue-driven-");
+  installFakeCodex(binDir, "queue-driven");
+
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  const initialState = {
+    nextThreadId: 1,
+    nextTurnId: 1,
+    appServerStarts: 0,
+    threads: [],
+    capabilities: null,
+    lastInterrupt: null,
+    queue: [],
+    requests: [],
+    serialize: false
+  };
+  fs.writeFileSync(statePath, JSON.stringify(initialState, null, 2));
+
+  const sep = process.platform === "win32" ? ";" : ":";
+  process.env.PATH = `${binDir}${sep}${process.env.PATH}`;
+
+  const env = buildEnv(binDir);
+  const resolvedCwd = cwd || process.cwd();
+
+  function readState() {
+    return JSON.parse(fs.readFileSync(statePath, "utf8"));
+  }
+
+  function writeState(state) {
+    fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+  }
+
+  return {
+    cwd: resolvedCwd,
+    env,
+    binDir,
+    queueTurnResponse(entry) {
+      const state = readState();
+      if (!state.queue) { state.queue = []; }
+      state.queue.push(entry);
+      writeState(state);
+    },
+    queueTurnRpcError({ message }) {
+      const state = readState();
+      if (!state.queue) { state.queue = []; }
+      state.queue.push({ rpcError: { message } });
+      writeState(state);
+    },
+    queueTurnHang() {
+      // The server receives the turn/start but never responds, modelling a
+      // half-dead upstream connection. Used to exercise the idle timeout.
+      const state = readState();
+      if (!state.queue) { state.queue = []; }
+      state.queue.push({ hangNoResponse: true });
+      writeState(state);
+    },
+    queueTurnHangAfterStarted() {
+      const state = readState();
+      if (!state.queue) { state.queue = []; }
+      state.queue.push({ hangAfterStarted: true });
+      writeState(state);
+    },
+    enableSerialization() {
+      const state = readState();
+      state.serialize = true;
+      writeState(state);
+    },
+    // `requests` re-reads the state file each access; assign to a local variable for repeated use.
+    get requests() {
+      const state = readState();
+      return state.requests ?? [];
+    },
+    close() {
+      const sep = process.platform === "win32" ? ";" : ":";
+      process.env.PATH = (process.env.PATH ?? "")
+        .split(sep)
+        .filter((entry) => entry !== binDir)
+        .join(sep);
+      fs.rmSync(binDir, { recursive: true, force: true });
+    }
   };
 }

@@ -1,0 +1,203 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import { setupFakeCodex } from "./fake-codex-fixture.mjs";
+import { resolveReviewTurnIdleTimeoutMs, resolveRunExitStatus, runAppServerTurn } from "../plugins/codex/scripts/lib/codex.mjs";
+import { makeTempDir } from "./helpers.mjs";
+
+test("resolveReviewTurnIdleTimeoutMs defaults the review watchdog and honors explicit values", () => {
+  // The idle watchdog is a REVIEW concern (a stalled review should not hang
+  // forever). It must NOT be baked into the shared runAppServerTurn default,
+  // because /codex:task also calls runAppServerTurn and a long-thinking task
+  // would then be aborted at this threshold with no task-level knob. The default
+  // lives in this review-only helper instead.
+  assert.equal(resolveReviewTurnIdleTimeoutMs(undefined), 1_200_000, "review default is 1200s");
+  assert.equal(resolveReviewTurnIdleTimeoutMs(null), 1_200_000, "null falls back to the review default");
+  assert.equal(resolveReviewTurnIdleTimeoutMs(300), 300, "explicit ms passes through");
+  assert.equal(resolveReviewTurnIdleTimeoutMs(0), 1_200_000, "zero/invalid falls back to the review default");
+});
+
+test("runAppServerTurn passes through an absent idle timeout (task path arms no watchdog)", async () => {
+  // Regression guard for the task path: executeTaskRun calls runAppServerTurn
+  // without turnIdleTimeoutMs. runAppServerTurn must NOT inject the review
+  // default — it passes the absent value straight to captureTurn, which arms no
+  // watchdog for undefined. A normal turn therefore completes cleanly with no
+  // idle-timeout error. (The review default lives in resolveReviewTurnIdleTimeoutMs;
+  // the explicit-timeout abort is covered by the inline-review hang test below.)
+  const cwd = makeTempDir("codex-queue-test-");
+  const handle = setupFakeCodex({ cwd });
+  try {
+    handle.queueTurnResponse({ commands: [], finalAnswer: { text: "task done" } });
+
+    const result = await runAppServerTurn(cwd, { prompt: "long-running task, no watchdog" });
+
+    assert.equal(result.finalMessage, "task done", "task turn should complete normally with no timeout");
+    assert.equal(result.error ?? null, null, "no idle-timeout error when no watchdog is configured");
+  } finally {
+    handle.close();
+  }
+});
+
+test("queue-driven fake: final answer is returned via runAppServerTurn", async () => {
+  const cwd = makeTempDir("codex-queue-test-");
+  const handle = setupFakeCodex({ cwd });
+  try {
+    handle.queueTurnResponse({ finalAnswer: { text: "hi" } });
+
+    const result = await runAppServerTurn(cwd, {
+      prompt: "say hi"
+    });
+
+    assert.equal(result.finalMessage, "hi");
+    assert.equal(result.status, 0);
+  } finally {
+    handle.close();
+  }
+});
+
+test("queue-driven fake: requests are captured with params", async () => {
+  const cwd = makeTempDir("codex-queue-test-");
+  const handle = setupFakeCodex({ cwd });
+  try {
+    handle.queueTurnResponse({ finalAnswer: { text: "captured" } });
+
+    await runAppServerTurn(cwd, {
+      prompt: "check capture"
+    });
+
+    const turnStarts = handle.requests.filter((r) => r.method === "turn/start");
+    assert.equal(turnStarts.length, 1);
+    // Verify the captured params include the input text
+    const inputTexts = turnStarts[0].params.input
+      .filter((item) => item.type === "text")
+      .map((item) => item.text);
+    assert.ok(inputTexts.some((text) => text.includes("check capture")));
+  } finally {
+    handle.close();
+  }
+});
+
+test("queue-driven fake: commandExecution items are emitted and captured", async () => {
+  const cwd = makeTempDir("codex-queue-test-");
+  const handle = setupFakeCodex({ cwd });
+  try {
+    handle.queueTurnResponse({
+      commands: [{ command: "git diff", exitCode: 0 }],
+      finalAnswer: { text: "done" }
+    });
+
+    const result = await runAppServerTurn(cwd, {
+      prompt: "run commands"
+    });
+
+    assert.equal(result.finalMessage, "done");
+    assert.equal(result.commandExecutions.length, 1);
+    assert.equal(result.commandExecutions[0].command, "git diff");
+    assert.equal(result.commandExecutions[0].exitCode, 0);
+  } finally {
+    handle.close();
+  }
+});
+
+test("queue-driven fake: RPC error causes runAppServerTurn to reject", async () => {
+  const cwd = makeTempDir("codex-queue-test-");
+  const handle = setupFakeCodex({ cwd });
+  try {
+    handle.queueTurnRpcError({ message: "boom" });
+
+    await assert.rejects(
+      runAppServerTurn(cwd, { prompt: "should fail" }),
+      (error) => {
+        assert.ok(error.message.includes("boom"));
+        return true;
+      }
+    );
+  } finally {
+    handle.close();
+  }
+});
+
+test("queue-driven fake: inline turn that never responds is aborted by the idle timeout", async () => {
+  // The inline (single-turn) review path runs through runAppServerTurn. A
+  // half-dead upstream that accepts turn/start but never responds would hang
+  // the RPC forever without a watchdog. The advertised --turn-idle-timeout must
+  // apply here too, not only on the self-collect path.
+  const cwd = makeTempDir("codex-queue-test-");
+  const handle = setupFakeCodex({ cwd });
+  try {
+    handle.queueTurnHang();
+
+    const start = Date.now();
+    await assert.rejects(
+      runAppServerTurn(cwd, { prompt: "should time out", turnIdleTimeoutMs: 300 }),
+      (error) => {
+        assert.match(error.message, /idle|timed out|timeout/i, "error should explain the idle timeout");
+        return true;
+      }
+    );
+    const elapsed = Date.now() - start;
+    assert.ok(elapsed < 15000, `must abort promptly, not hang (took ${elapsed}ms)`);
+  } finally {
+    handle.close();
+  }
+});
+
+test("queue-driven fake: soft error (turnError) is captured", async () => {
+  const cwd = makeTempDir("codex-queue-test-");
+  const handle = setupFakeCodex({ cwd });
+  try {
+    handle.queueTurnResponse({
+      finalAnswer: { text: "partial" },
+      turnError: { message: "soft failure" }
+    });
+
+    const result = await runAppServerTurn(cwd, {
+      prompt: "trigger soft error"
+    });
+
+    // The turn still completes, but state.error is set
+    assert.equal(result.finalMessage, "partial");
+    assert.ok(result.error);
+    assert.equal(result.error.message, "soft failure");
+  } finally {
+    handle.close();
+  }
+});
+
+test("resolveRunExitStatus treats a completed turn with usable text as success despite a stale error", () => {
+  // Recovered transient: turn completed, has usable text, but result.status is 1
+  // (buildResultStatus saw the stale `error`). Must resolve to 0.
+  assert.equal(
+    resolveRunExitStatus({ turn: { status: "completed" }, status: 1 }, "ALLOW: looks fine"),
+    0,
+    "completed turn with usable text overrides the stale non-zero status"
+  );
+
+  // Genuine failure: no usable text => keep the raw status.
+  assert.equal(
+    resolveRunExitStatus({ turn: { status: "completed" }, status: 1 }, "   "),
+    1,
+    "completed turn with no usable text keeps the failure status"
+  );
+
+  // Genuine failure: turn did not complete => keep the raw status even with text.
+  assert.equal(
+    resolveRunExitStatus({ turn: { status: "failed" }, status: 1 }, "some text"),
+    1,
+    "non-completed turn keeps the failure status"
+  );
+
+  // Clean success: status already 0 => stays 0.
+  assert.equal(
+    resolveRunExitStatus({ turn: { status: "completed" }, status: 0 }, "done"),
+    0,
+    "a clean success stays 0"
+  );
+
+  // Missing turn => not recovered => raw status.
+  assert.equal(
+    resolveRunExitStatus({ turn: null, status: 1 }, "text"),
+    1,
+    "absent turn cannot be recovered; keep the raw status"
+  );
+});
