@@ -116,13 +116,14 @@ function send(message) {
   process.stdout.write(JSON.stringify(message) + "\\n");
 }
 
-function nextThread(state, cwd, ephemeral) {
+function nextThread(state, cwd, ephemeral, threadSource = null) {
   const thread = {
     id: "thr_" + state.nextThreadId++,
     cwd: cwd || process.cwd(),
     name: null,
     preview: "",
     ephemeral: Boolean(ephemeral),
+    threadSource,
     createdAt: now(),
     updatedAt: now()
   };
@@ -312,7 +313,7 @@ rl.on("line", (line) => {
         if (requiresExperimental("persistExtendedHistory", message, state) || requiresExperimental("persistFullHistory", message, state)) {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
-        const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
+        const thread = nextThread(state, message.params.cwd, message.params.ephemeral, message.params.threadSource ?? null);
         send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
         break;

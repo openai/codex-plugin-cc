@@ -155,6 +155,8 @@ test("review renders a no-findings result from app-server review/start", () => {
   assert.equal(result.status, 0);
   assert.match(result.stdout, /Reviewed uncommitted changes/);
   assert.match(result.stdout, /No material issues found/);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.threads[0].threadSource, null);
 });
 
 test("task runs when the active provider does not require OpenAI login", () => {
@@ -173,6 +175,8 @@ test("task runs when the active provider does not require OpenAI login", () => {
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Handled the requested task/);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.threads[0].threadSource, "user");
 });
 
 test("task runs without auth preflight so Codex can refresh an expired session", () => {
@@ -384,6 +388,8 @@ test("adversarial review renders structured findings over app-server turn/start"
 
   assert.equal(result.status, 0);
   assert.match(result.stdout, /Missing empty-state guard/);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.threads[0].threadSource, null);
 });
 
 test("adversarial review accepts the same base-branch targeting as review", () => {
@@ -1967,6 +1973,8 @@ test("stop hook runs a stop-time review task and blocks on findings when the rev
   assert.match(fakeState.lastTurnStart.prompt, /<compact_output_contract>/i);
   assert.match(fakeState.lastTurnStart.prompt, /Only review the work from the previous Claude turn/i);
   assert.match(fakeState.lastTurnStart.prompt, /I completed the refactor and updated the retry logic\./);
+  assert.equal(fakeState.threads[0].threadSource, null);
+  assert.equal(fakeState.threads[1].threadSource, "user");
 
   const status = run("node", [SCRIPT, "status"], {
     cwd: repo,
