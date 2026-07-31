@@ -17,6 +17,8 @@ const STOP_REVIEW_TIMEOUT_MS = 15 * 60 * 1000;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
+const STOP_GATE_MANUAL_OR_BYPASS_HINT =
+  "Run /codex:review --wait manually or bypass the gate by running /codex:setup --disable-review-gate.";
 
 function readHookInput() {
   const raw = fs.readFileSync(0, "utf8").trim();
@@ -66,13 +68,12 @@ function buildSetupNote(cwd) {
   return `Codex is not set up for the review gate.${detail} Run /codex:setup.`;
 }
 
-function parseStopReviewOutput(rawOutput) {
+export function parseStopReviewOutput(rawOutput) {
   const text = String(rawOutput ?? "").trim();
   if (!text) {
     return {
       ok: false,
-      reason:
-        "The stop-time Codex review task returned no final output. Run /codex:review --wait manually or bypass the gate."
+      reason: `The stop-time Codex review task returned no final output. ${STOP_GATE_MANUAL_OR_BYPASS_HINT}`
     };
   }
 
@@ -90,8 +91,7 @@ function parseStopReviewOutput(rawOutput) {
 
   return {
     ok: false,
-    reason:
-      "The stop-time Codex review task returned an unexpected answer. Run /codex:review --wait manually or bypass the gate."
+    reason: `The stop-time Codex review task returned an unexpected answer. ${STOP_GATE_MANUAL_OR_BYPASS_HINT}`
   };
 }
 
@@ -112,8 +112,7 @@ function runStopReview(cwd, input = {}) {
   if (result.error?.code === "ETIMEDOUT") {
     return {
       ok: false,
-      reason:
-        "The stop-time Codex review task timed out after 15 minutes. Run /codex:review --wait manually or bypass the gate."
+      reason: `The stop-time Codex review task timed out after 15 minutes. ${STOP_GATE_MANUAL_OR_BYPASS_HINT}`
     };
   }
 
@@ -122,8 +121,8 @@ function runStopReview(cwd, input = {}) {
     return {
       ok: false,
       reason: detail
-        ? `The stop-time Codex review task failed: ${detail}`
-        : "The stop-time Codex review task failed. Run /codex:review --wait manually or bypass the gate."
+        ? `The stop-time Codex review task failed: ${detail} ${STOP_GATE_MANUAL_OR_BYPASS_HINT}`
+        : `The stop-time Codex review task failed. ${STOP_GATE_MANUAL_OR_BYPASS_HINT}`
     };
   }
 
@@ -133,8 +132,7 @@ function runStopReview(cwd, input = {}) {
   } catch {
     return {
       ok: false,
-      reason:
-        "The stop-time Codex review task returned invalid JSON. Run /codex:review --wait manually or bypass the gate."
+      reason: `The stop-time Codex review task returned invalid JSON. ${STOP_GATE_MANUAL_OR_BYPASS_HINT}`
     };
   }
 }
@@ -175,10 +173,34 @@ function main() {
   logNote(runningTaskNote);
 }
 
-try {
-  main();
-} catch (error) {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${message}\n`);
-  process.exitCode = 1;
+export function resolveCanonicalPath(filePath) {
+  try {
+    return fs.realpathSync.native(filePath);
+  } catch {
+    try {
+      return fs.realpathSync(filePath);
+    } catch {
+      return path.resolve(filePath);
+    }
+  }
+}
+
+export function isCliEntry(argv = process.argv, moduleUrl = import.meta.url) {
+  const invoked = argv[1];
+  if (!invoked) {
+    return false;
+  }
+  return (
+    resolveCanonicalPath(invoked) === resolveCanonicalPath(fileURLToPath(moduleUrl))
+  );
+}
+
+if (isCliEntry()) {
+  try {
+    main();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${message}\n`);
+    process.exitCode = 1;
+  }
 }
