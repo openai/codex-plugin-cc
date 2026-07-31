@@ -449,6 +449,7 @@ rl.on("line", (line) => {
 	          turnId,
 	          model: message.params.model ?? null,
 	          effort: message.params.effort ?? null,
+	          sandboxPolicy: message.params.sandboxPolicy ?? null,
 	          prompt
 	        };
 	        saveState(state);

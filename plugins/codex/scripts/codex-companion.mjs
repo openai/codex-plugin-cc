@@ -78,8 +78,8 @@ function printUsage() {
       "Usage:",
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--external-sandbox] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--external-sandbox] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -412,6 +412,9 @@ async function executeReviewRun(request) {
     prompt,
     model: request.model,
     sandbox: "read-only",
+    sandboxPolicy: request.externalSandbox
+      ? { type: "externalSandbox", networkAccess: "enabled" }
+      : undefined,
     outputSchema: readOutputSchema(REVIEW_SCHEMA),
     onProgress: request.onProgress
   });
@@ -489,6 +492,9 @@ async function executeTaskRun(request) {
     model: request.model,
     effort: request.effort,
     sandbox: request.write ? "workspace-write" : "read-only",
+    sandboxPolicy: request.externalSandbox
+      ? { type: "externalSandbox", networkAccess: "enabled" }
+      : undefined,
     onProgress: request.onProgress,
     persistThread: true,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
@@ -601,13 +607,14 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, externalSandbox, resumeLast, jobId }) {
   return {
     cwd,
     model,
     effort,
     prompt,
     write,
+    externalSandbox,
     resumeLast,
     jobId
   };
@@ -712,7 +719,7 @@ function enqueueBackgroundTask(cwd, job, request) {
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["base", "scope", "model", "cwd"],
-    booleanOptions: ["json", "background", "wait"],
+    booleanOptions: ["json", "background", "wait", "external-sandbox"],
     aliasMap: {
       m: "model"
     }
@@ -721,6 +728,9 @@ async function handleReviewCommand(argv, config) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const focusText = positionals.join(" ").trim();
+  if (options["external-sandbox"] && config.reviewName === "Review") {
+    throw new Error("--external-sandbox is supported by adversarial-review, not the built-in review command.");
+  }
   const target = resolveReviewTarget(cwd, {
     base: options.base,
     scope: options.scope
@@ -744,6 +754,7 @@ async function handleReviewCommand(argv, config) {
         base: options.base,
         scope: options.scope,
         model: options.model,
+        externalSandbox: Boolean(options["external-sandbox"]),
         focusText,
         reviewName: config.reviewName,
         onProgress: progress
@@ -762,7 +773,7 @@ async function handleReview(argv) {
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    booleanOptions: ["json", "write", "external-sandbox", "resume-last", "resume", "fresh", "background"],
     aliasMap: {
       m: "model"
     }
@@ -780,6 +791,7 @@ async function handleTask(argv) {
     throw new Error("Choose either --resume/--resume-last or --fresh.");
   }
   const write = Boolean(options.write);
+  const externalSandbox = Boolean(options["external-sandbox"]);
   const taskMetadata = buildTaskRunMetadata({
     prompt,
     resumeLast
@@ -796,6 +808,7 @@ async function handleTask(argv) {
       effort,
       prompt,
       write,
+      externalSandbox,
       resumeLast,
       jobId: job.id
     });
@@ -814,6 +827,7 @@ async function handleTask(argv) {
         effort,
         prompt,
         write,
+        externalSandbox,
         resumeLast,
         jobId: job.id,
         onProgress: progress

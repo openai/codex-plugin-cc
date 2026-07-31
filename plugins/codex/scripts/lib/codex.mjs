@@ -1138,7 +1138,8 @@ export async function runAppServerTurn(cwd, options = {}) {
           input: buildTurnInput(prompt),
           model: options.model ?? null,
           effort: options.effort ?? null,
-          outputSchema: options.outputSchema ?? null
+          outputSchema: options.outputSchema ?? null,
+          ...(options.sandboxPolicy ? { sandboxPolicy: options.sandboxPolicy } : {})
         }),
       { onProgress: options.onProgress }
     );
