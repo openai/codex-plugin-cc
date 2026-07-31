@@ -763,6 +763,29 @@ test("task --fresh is treated as routing control and does not leak into the prom
   assert.equal(fakeState.lastTurnStart.prompt, "diagnose the flaky test");
 });
 
+test("task does not treat prompt fragments as --model when passed as one raw argument", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const prompt =
+    '--write review the conflict_scan.cli module and run -m pytest to verify';
+  const result = run("node", [SCRIPT, "task", prompt], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.notEqual(fakeState.lastTurnStart.model, "pytest");
+  assert.match(fakeState.lastTurnStart.prompt, /-m pytest/);
+});
+
 test("task forwards model selection and reasoning effort to app-server turn/start", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

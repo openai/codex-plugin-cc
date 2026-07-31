@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
 import process from "node:process";
 
 export function runCommand(command, args = [], options = {}) {
@@ -36,7 +37,12 @@ export function runCommandChecked(command, args = [], options = {}) {
 }
 
 export function binaryAvailable(command, versionArgs = ["--version"], options = {}) {
-  const result = runCommand(command, versionArgs, options);
+  const probeOptions = { ...options };
+  if (probeOptions.cwd && !fs.existsSync(probeOptions.cwd)) {
+    delete probeOptions.cwd;
+  }
+
+  const result = runCommand(command, versionArgs, probeOptions);
   if (result.error && /** @type {NodeJS.ErrnoException} */ (result.error).code === "ENOENT") {
     return { available: false, detail: "not found" };
   }

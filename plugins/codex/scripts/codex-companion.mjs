@@ -763,6 +763,7 @@ async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "cwd", "prompt-file"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    stopAtFirstPositional: true,
     aliasMap: {
       m: "model"
     }

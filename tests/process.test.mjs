@@ -1,7 +1,25 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import process from "node:process";
+
+import { binaryAvailable, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+
+test("binaryAvailable ignores a missing cwd for version probes", () => {
+  const status = binaryAvailable(process.execPath, ["--version"], {
+    cwd: "/does/not/exist"
+  });
+
+  assert.equal(status.available, true);
+});
+
+test("binaryAvailable still reports a missing binary when cwd is invalid", () => {
+  const status = binaryAvailable("definitely-not-a-real-binary-xyz", ["--version"], {
+    cwd: "/does/not/exist"
+  });
+
+  assert.equal(status.available, false);
+});
 
 test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;

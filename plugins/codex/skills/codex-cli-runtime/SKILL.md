@@ -9,7 +9,7 @@ user-invocable: false
 Use this skill only inside the `codex:codex-rescue` subagent.
 
 Primary helper:
-- `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task "<raw arguments>"`
+- `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task [routing flags] -- "<prompt>"`
 
 Execution rules:
 - The rescue subagent is a forwarder, not an orchestrator. Its only job is to invoke `task` once and return that stdout unchanged.
@@ -38,6 +38,8 @@ Command selection:
 Safety rules:
 - Default to write-capable Codex work in `codex:codex-rescue` unless the user explicitly asks for read-only behavior.
 - Preserve the user's task text as-is apart from stripping routing flags.
+- Always insert `--` immediately before the natural-language prompt. Put task routing flags (`--write`, `--resume-last`, `--model`, `--effort`, `--cwd`, etc.) before `--` and never include prompt text before `--`.
+- Never place `--background` or `--wait` before `--`; those are Claude-side only and must already have been stripped.
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own.
 - Return the stdout of the `task` command exactly as-is.
 - If the Bash call fails or Codex cannot be invoked, return nothing.

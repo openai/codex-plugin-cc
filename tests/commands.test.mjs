@@ -130,6 +130,14 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /prefer foreground for a small, clearly bounded rescue request/i);
   assert.match(agent, /If the user did not explicitly choose `--background` or `--wait` and the task looks complicated, open-ended, multi-step, or likely to keep Codex running for a long time, prefer background execution/i);
   assert.match(agent, /Use exactly one `Bash` call/i);
+  assert.match(agent, /task \[routing flags\] -- "<prompt>"/);
+  assert.match(agent, /Never put prompt text before `--`/i);
+  assert.match(agent, /`--background` and `--wait` are Claude-side execution control only/i);
+  assert.match(agent, /never place them among the flags before `--`/i);
+  assert.doesNotMatch(
+    agent,
+    /Place (?:task )?routing flags \(`--write`[^)]*`--background`/
+  );
   assert.match(agent, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
   assert.match(agent, /Do not call `review`, `adversarial-review`, `status`, `result`, or `cancel`/i);
   assert.match(agent, /Leave `--effort` unset unless the user explicitly requests a specific reasoning effort/i);
@@ -192,7 +200,9 @@ test("internal docs use task terminology for rescue runs", () => {
   const promptingSkill = read("skills/gpt-5-4-prompting/SKILL.md");
   const promptRecipes = read("skills/gpt-5-4-prompting/references/codex-prompt-recipes.md");
 
-  assert.match(runtimeSkill, /codex-companion\.mjs" task "<raw arguments>"/);
+  assert.match(runtimeSkill, /codex-companion\.mjs" task \[routing flags\] -- "<prompt>"/);
+  assert.match(runtimeSkill, /Never include prompt text before `--`/i);
+  assert.match(runtimeSkill, /Never place `--background` or `--wait` before `--`/i);
   assert.match(runtimeSkill, /Use `task` for every rescue request/i);
   assert.match(runtimeSkill, /task --resume-last/i);
   assert.match(promptingSkill, /Use `task` when the task is diagnosis/i);

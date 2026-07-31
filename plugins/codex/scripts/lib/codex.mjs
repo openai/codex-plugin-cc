@@ -535,8 +535,20 @@ function applyTurnNotification(state, message) {
       }
       break;
     case "error":
+      if (message.params?.willRetry) {
+        emitProgress(
+          state.onProgress,
+          `Codex error (retrying): ${message.params.error?.message ?? "unknown error"}`,
+          resolveErrorProgressPhase(message.params)
+        );
+        break;
+      }
       state.error = message.params.error;
-      emitProgress(state.onProgress, `Codex error: ${message.params.error.message}`, "failed");
+      emitProgress(
+        state.onProgress,
+        `Codex error: ${message.params.error.message}`,
+        resolveErrorProgressPhase(message.params)
+      );
       break;
     case "turn/completed":
       if ((message.params.threadId ?? null) !== state.threadId) {
@@ -550,6 +562,9 @@ function applyTurnNotification(state, message) {
         "finalizing"
       );
       completeTurn(state, message.params.turn);
+      if (message.params.turn.status === "completed") {
+        state.error = null;
+      }
       break;
     default:
       break;
@@ -751,7 +766,18 @@ async function resumeThread(client, threadId, cwd, options = {}) {
   return client.request("thread/resume", buildResumeParams(threadId, cwd, options));
 }
 
-function buildResultStatus(turnState) {
+export function shouldStoreTurnError(params = {}) {
+  return Boolean(params.error) && params.willRetry !== true;
+}
+
+export function resolveErrorProgressPhase(params = {}) {
+  return params.willRetry === true ? "retrying" : "failed";
+}
+
+export function buildResultStatus(turnState) {
+  if (turnState.error) {
+    return 1;
+  }
   return turnState.finalTurn?.status === "completed" ? 0 : 1;
 }
 

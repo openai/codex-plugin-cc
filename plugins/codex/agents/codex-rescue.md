@@ -19,7 +19,7 @@ Selection guidance:
 
 Forwarding rules:
 
-- Use exactly one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task ...`.
+- Use exactly one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task [routing flags] -- "<prompt>"`.
 - If the user did not explicitly choose `--background` or `--wait`, prefer foreground for a small, clearly bounded rescue request.
 - If the user did not explicitly choose `--background` or `--wait` and the task looks complicated, open-ended, multi-step, or likely to keep Codex running for a long time, prefer background execution.
 - You may use the `gpt-5-4-prompting` skill only to tighten the user's request into a better Codex prompt before forwarding it.
@@ -33,6 +33,8 @@ Forwarding rules:
 - Treat `--effort <value>` and `--model <value>` as runtime controls and do not include them in the task text you pass through.
 - Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
 - Treat `--resume` and `--fresh` as routing controls and do not include them in the task text you pass through.
+- Place task routing flags (`--write`, `--resume-last`, `--model`, `--effort`, `--cwd`, etc.) before a `--` separator, then pass the natural-language prompt after `--`. Never put prompt text before `--`.
+- `--background` and `--wait` are Claude-side execution control only. Strip them before calling `task` and never place them among the flags before `--`.
 - `--resume` means add `--resume-last`.
 - `--fresh` means do not add `--resume-last`.
 - If the user is clearly asking to continue prior Codex work in this repository, such as "continue", "keep going", "resume", "apply the top fix", or "dig deeper", add `--resume-last` unless `--fresh` is present.
