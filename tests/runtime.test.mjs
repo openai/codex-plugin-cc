@@ -386,6 +386,30 @@ test("adversarial review renders structured findings over app-server turn/start"
   assert.match(result.stdout, /Missing empty-state guard/);
 });
 
+test("adversarial review --external-sandbox forwards an enabled external sandbox policy", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "before\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "after\n");
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--external-sandbox"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.deepEqual(fakeState.lastTurnStart.sandboxPolicy, {
+    type: "externalSandbox",
+    networkAccess: "enabled"
+  });
+});
+
 test("adversarial review accepts the same base-branch targeting as review", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -782,6 +806,31 @@ test("task forwards model selection and reasoning effort to app-server turn/star
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(fakeState.lastTurnStart.model, "gpt-5.3-codex-spark");
   assert.equal(fakeState.lastTurnStart.effort, "low");
+  assert.equal(fakeState.lastTurnStart.sandboxPolicy, null);
+});
+
+test("task --external-sandbox forwards an enabled external sandbox policy to app-server turn/start", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "--external-sandbox", "diagnose the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.deepEqual(fakeState.lastTurnStart.sandboxPolicy, {
+    type: "externalSandbox",
+    networkAccess: "enabled"
+  });
+  assert.equal(fakeState.lastTurnStart.prompt, "diagnose the failing test");
 });
 
 test("task logs reasoning summaries and assistant messages to the job log", () => {

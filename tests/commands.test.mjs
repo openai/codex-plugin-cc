@@ -105,6 +105,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /--resume\|--fresh/);
   assert.match(rescue, /--model <model\|spark>/);
   assert.match(rescue, /--effort <none\|minimal\|low\|medium\|high\|xhigh>/);
+  assert.match(rescue, /--external-sandbox/);
   assert.match(rescue, /task-resume-candidate --json/);
   assert.match(rescue, /AskUserQuestion/);
   assert.match(rescue, /Continue current Codex thread/);
@@ -112,7 +113,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /run the `codex:codex-rescue` subagent in the background/i);
   assert.match(rescue, /default to foreground/i);
   assert.match(rescue, /Do not forward them to `task`/i);
-  assert.match(rescue, /`--model` and `--effort` are runtime-selection flags/i);
+  assert.match(rescue, /`--model`, `--effort`, and `--external-sandbox` are runtime-selection flags/i);
   assert.match(rescue, /Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort/i);
   assert.match(rescue, /If they ask for `spark`, map it to `gpt-5\.3-codex-spark`/i);
   assert.match(rescue, /If the request includes `--resume`, do not ask whether to continue/i);
@@ -136,6 +137,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /Leave model unset by default/i);
   assert.match(agent, /If the user asks for `spark`, map that to `--model gpt-5\.3-codex-spark`/i);
   assert.match(agent, /If the user asks for a concrete model name such as `gpt-5\.4-mini`, pass it through with `--model`/i);
+  assert.match(agent, /`--external-sandbox` as runtime controls/i);
   assert.match(agent, /Return the stdout of the `codex-companion` command exactly as-is/i);
   assert.match(agent, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
   assert.match(agent, /gpt-5-4-prompting/);
@@ -148,6 +150,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /Leave `--effort` unset unless the user explicitly requests a specific effort/i);
   assert.match(runtimeSkill, /Leave model unset by default/i);
   assert.match(runtimeSkill, /Map `spark` to `--model gpt-5\.3-codex-spark`/i);
+  assert.match(runtimeSkill, /includes `--external-sandbox`, pass it through to `task`/i);
   assert.match(runtimeSkill, /If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only/i);
   assert.match(runtimeSkill, /Strip it before calling `task`/i);
   assert.match(runtimeSkill, /`--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`/i);
