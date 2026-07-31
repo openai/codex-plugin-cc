@@ -51,6 +51,38 @@ const DEFAULT_CONTINUE_PROMPT =
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
 const EXTERNAL_AGENT_IMPORT_TIMEOUT_MS = 2 * 60 * 1000;
 
+export const EXPERT_DEFAULT_SELECTION = Object.freeze({
+  model: "gpt-5.6-sol",
+  effort: "high"
+});
+
+export const EXPERT_MODEL_OPTIONS = Object.freeze([
+  Object.freeze({ id: "gpt-5.6-sol", label: "Sol", description: "Highest-capability expert" }),
+  Object.freeze({ id: "gpt-5.6-terra", label: "Terra", description: "Balanced expert" }),
+  Object.freeze({ id: "gpt-5.6-luna", label: "Luna", description: "Fast, lower-cost expert" })
+]);
+
+export const EXPERT_EFFORT_OPTIONS = Object.freeze(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+export function buildExpertSelectionOffer(options = {}) {
+  return {
+    status: "selection_required",
+    reason: "user_selection_required",
+    message: "Choose the expert model and reasoning effort before starting the handoff.",
+    defaultSelection: { ...EXPERT_DEFAULT_SELECTION },
+    modelOptions: EXPERT_MODEL_OPTIONS.map((option) => ({ ...option })),
+    effortOptions: [...EXPERT_EFFORT_OPTIONS],
+    selected: {
+      model: options.model ?? null,
+      effort: options.effort ?? null
+    },
+    request: {
+      expertName: options.expertName ?? "Expert",
+      handoff: options.prompt ?? ""
+    }
+  };
+}
+
 function cleanCodexStderr(stderr) {
   return stderr
     .split(/\r?\n/)
@@ -1155,6 +1187,68 @@ export async function runAppServerTurn(cwd, options = {}) {
       fileChanges: turnState.fileChanges,
       touchedFiles: collectTouchedFiles(turnState.fileChanges),
       commandExecutions: turnState.commandExecutions
+    };
+  });
+}
+
+export async function runExpertHandoff(cwd, options = {}) {
+  const expertName = String(options.expertName ?? "Expert").trim();
+  const prompt = String(options.prompt ?? "").trim();
+  const model = String(options.model ?? "").trim();
+  const effort = String(options.effort ?? "").trim().toLowerCase();
+
+  if (!expertName) {
+    throw new Error("An expert name is required.");
+  }
+  if (!prompt) {
+    throw new Error("A compact handoff prompt is required.");
+  }
+  if (!model || !effort) {
+    throw new Error("An expert model and reasoning effort must be selected before starting the handoff.");
+  }
+  if (!EXPERT_EFFORT_OPTIONS.includes(effort)) {
+    throw new Error(`Unsupported expert reasoning effort \"${effort}\". Use one of: ${EXPERT_EFFORT_OPTIONS.join(", ")}.`);
+  }
+
+  return withDirectAppServer(cwd, async (client) => {
+    emitProgress(options.onProgress, `Starting named expert thread \"${expertName}\".`, "starting");
+    const threadResponse = await startThread(client, cwd, {
+      model,
+      sandbox: options.sandbox ?? "read-only",
+      ephemeral: false,
+      threadName: expertName
+    });
+    const threadId = threadResponse.thread.id;
+    emitProgress(options.onProgress, `Expert thread ready (${threadId}).`, "starting", {
+      threadId
+    });
+
+    const turnState = await captureTurn(
+      client,
+      threadId,
+      () =>
+        client.request("turn/start", {
+          threadId,
+          input: buildTurnInput(prompt),
+          model,
+          effort,
+          outputSchema: options.outputSchema ?? null
+        }),
+      { onProgress: options.onProgress }
+    );
+
+    return {
+      status: buildResultStatus(turnState),
+      expertName,
+      model,
+      effort,
+      threadId,
+      turnId: turnState.turnId,
+      finalMessage: turnState.lastAgentMessage,
+      reasoningSummary: turnState.reasoningSummary,
+      turn: turnState.finalTurn,
+      error: turnState.error,
+      stderr: cleanCodexStderr(client.stderr)
     };
   });
 }

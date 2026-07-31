@@ -322,6 +322,45 @@ export function renderTaskResult(parsedResult, meta) {
   return `${message}\n`;
 }
 
+export function renderExpertSelectionOffer(offer) {
+  const defaultSelection = offer.defaultSelection ?? {};
+  const lines = [
+    "# Codex Expert Handoff",
+    "",
+    offer.message ?? "Choose the expert model and reasoning effort before starting the handoff.",
+    "",
+    `Default: ${defaultSelection.model ?? "unknown"} + ${defaultSelection.effort ?? "unknown"}`,
+    "",
+    "Model options:",
+    ...(offer.modelOptions ?? []).map((option) => `- ${option.label} (${option.id}): ${option.description}`),
+    "",
+    `Effort options: ${(offer.effortOptions ?? []).join(", ")}`
+  ];
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+export function renderExpertResult(result) {
+  const lines = [
+    "# Codex Expert Handoff",
+    "",
+    `Expert: ${result.expert?.name ?? "Expert"}`,
+    `Model: ${result.expert?.model ?? "unknown"}`,
+    `Effort: ${result.expert?.effort ?? "unknown"}`,
+    `Codex session ID: ${result.expert?.threadId ?? "unknown"}`,
+    ""
+  ];
+
+  if (result.finalMessage) {
+    lines.push(result.finalMessage);
+  } else if (result.error) {
+    lines.push(`Expert handoff failed: ${result.error}`);
+  } else {
+    lines.push("The expert did not return a final message.");
+  }
+
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
 export function renderStatusReport(report) {
   const lines = [
     "# Codex Status",

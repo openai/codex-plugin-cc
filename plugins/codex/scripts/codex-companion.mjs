@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import {
+    buildExpertSelectionOffer,
     buildPersistentTaskThreadName,
     DEFAULT_CONTINUE_PROMPT,
     findLatestTaskThread,
@@ -19,6 +20,7 @@ import {
     parseStructuredOutput,
     readOutputSchema,
     runAppServerReview,
+    runExpertHandoff,
     runAppServerTurn
   } from "./lib/codex.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
@@ -58,6 +60,8 @@ import {
   renderReviewResult,
   renderStoredJobResult,
   renderCancelReport,
+  renderExpertResult,
+  renderExpertSelectionOffer,
   renderJobStatusReport,
   renderSetupReport,
   renderStatusReport,
@@ -68,7 +72,9 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
-const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
+const DEFAULT_TASK_MODEL = "gpt-5.6-luna";
+const DEFAULT_TASK_EFFORT = "max";
+const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
@@ -79,7 +85,8 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh|max>] [prompt]",
+      "  node scripts/codex-companion.mjs expert [--name <name>] [--write] [--model <model>] [--effort <none|minimal|low|medium|high|xhigh|max>] [handoff]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -121,21 +128,37 @@ function normalizeReasoningEffort(effort) {
   }
   if (!VALID_REASONING_EFFORTS.has(normalized)) {
     throw new Error(
-      `Unsupported reasoning effort "${effort}". Use one of: none, minimal, low, medium, high, xhigh.`
+      `Unsupported reasoning effort "${effort}". Use one of: none, minimal, low, medium, high, xhigh, max.`
     );
   }
   return normalized;
 }
 
-function normalizeArgv(argv) {
-  if (argv.length === 1) {
-    const [raw] = argv;
-    if (!raw || !raw.trim()) {
-      return [];
-    }
-    return splitRawArgumentString(raw);
+function resolveTaskRouting(options, resumeLast) {
+  const model = normalizeRequestedModel(options.model);
+  const effort = normalizeReasoningEffort(options.effort);
+
+  if (resumeLast) {
+    return { model, effort };
   }
-  return argv;
+
+  return {
+    model: model ?? DEFAULT_TASK_MODEL,
+    effort: effort ?? DEFAULT_TASK_EFFORT
+  };
+}
+
+function normalizeArgv(argv) {
+  if (argv.length === 0) {
+    return [];
+  }
+
+  const [first, ...rest] = argv;
+  if (!first || !first.trim()) {
+    return rest;
+  }
+
+  return [...splitRawArgumentString(first), ...rest];
 }
 
 function parseCommandInput(argv, config = {}) {
@@ -146,6 +169,60 @@ function parseCommandInput(argv, config = {}) {
       ...(config.aliasMap ?? {})
     }
   });
+}
+
+function parseExpertRawHandoff(rawHandoff) {
+  const tokens = splitRawArgumentString(rawHandoff);
+  const options = {};
+  let index = 0;
+
+  while (index < tokens.length) {
+    const token = tokens[index];
+    if (token === "--json" || token === "--write") {
+      options[token.slice(2)] = true;
+      index += 1;
+      continue;
+    }
+    if (token === "--name" || token.startsWith("--name=")) {
+      const value = token.startsWith("--name=") ? token.slice("--name=".length) : tokens[index + 1];
+      if (value === undefined) {
+        throw new Error("Missing value for --name");
+      }
+      options.name = value;
+      index += token === "--name" ? 2 : 1;
+      continue;
+    }
+    if (token === "--model" || token === "--effort" || token.startsWith("--model=") || token.startsWith("--effort=")) {
+      if (!token.includes("=") && tokens[index + 1] === undefined) {
+        throw new Error(`Missing value for ${token}`);
+      }
+      index += token.includes("=") ? 1 : 2;
+      continue;
+    }
+    break;
+  }
+
+  return { options, positionals: tokens.slice(index) };
+}
+
+function parseExpertInput(argv, config = {}) {
+  const [rawHandoff = "", ...selectedRouting] = argv;
+  if (argv.length > 1 && rawHandoff.startsWith("-") && !/\s/.test(rawHandoff)) {
+    return parseCommandInput(argv, config);
+  }
+
+  const raw = parseExpertRawHandoff(rawHandoff);
+  const selected = parseCommandInput(selectedRouting, config);
+
+  return {
+    options: {
+      ...raw.options,
+      ...selected.options,
+      model: selected.options.model,
+      effort: selected.options.effort
+    },
+    positionals: [...raw.positionals, ...selected.positionals]
+  };
 }
 
 function resolveCommandCwd(options = {}) {
@@ -759,6 +836,64 @@ async function handleReview(argv) {
   });
 }
 
+async function handleExpert(argv) {
+  const { options, positionals } = parseExpertInput(argv, {
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "name"],
+    booleanOptions: ["json", "write"],
+    aliasMap: {
+      m: "model"
+    }
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const prompt = readTaskPrompt(cwd, options, positionals);
+  requireTaskRequest(prompt, false);
+
+  const model = normalizeRequestedModel(options.model);
+  const effort = normalizeReasoningEffort(options.effort);
+  const expertName = options.name === undefined ? "Expert" : String(options.name).trim();
+  if (!expertName) {
+    throw new Error("Provide a non-empty expert name with --name.");
+  }
+
+  if (!model || !effort) {
+    const offer = buildExpertSelectionOffer({
+      expertName,
+      model,
+      effort,
+      prompt
+    });
+    outputCommandResult(offer, renderExpertSelectionOffer(offer), options.json);
+    return;
+  }
+
+  ensureCodexAvailable(cwd);
+  const result = await runExpertHandoff(cwd, {
+    expertName,
+    model,
+    effort,
+    prompt,
+    sandbox: options.write ? "workspace-write" : "read-only"
+  });
+  const payload = {
+    status: result.status === 0 ? "completed" : "failed",
+    expert: {
+      name: result.expertName,
+      model: result.model,
+      effort: result.effort,
+      threadId: result.threadId,
+      turnId: result.turnId
+    },
+    finalMessage: result.finalMessage,
+    reasoningSummary: result.reasoningSummary,
+    error: result.error?.message ?? result.error ?? result.stderr ?? null
+  };
+  outputCommandResult(payload, renderExpertResult(payload), options.json);
+  if (result.status !== 0) {
+    process.exitCode = result.status;
+  }
+}
+
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "cwd", "prompt-file"],
@@ -770,8 +905,6 @@ async function handleTask(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const model = normalizeRequestedModel(options.model);
-  const effort = normalizeReasoningEffort(options.effort);
   const prompt = readTaskPrompt(cwd, options, positionals);
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
@@ -779,6 +912,7 @@ async function handleTask(argv) {
   if (resumeLast && fresh) {
     throw new Error("Choose either --resume/--resume-last or --fresh.");
   }
+  const { model, effort } = resolveTaskRouting(options, resumeLast);
   const write = Boolean(options.write);
   const taskMetadata = buildTaskRunMetadata({
     prompt,
@@ -1042,6 +1176,9 @@ async function main() {
       break;
     case "task":
       await handleTask(argv);
+      break;
+    case "expert":
+      await handleExpert(argv);
       break;
     case "transfer":
       await handleTransfer(argv);

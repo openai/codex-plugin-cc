@@ -11,7 +11,7 @@ they already have.
 
 - `/codex:review` for a normal read-only Codex review
 - `/codex:adversarial-review` for a steerable challenge review
-- `/codex:rescue`, `/codex:transfer`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work, hand off sessions, and manage background jobs
+- `/codex:rescue`, `/codex:expert`, `/codex:transfer`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work, request a user-approved expert pass, hand off sessions, and manage background jobs
 
 ## Requirements
 
@@ -158,9 +158,15 @@ Ask Codex to redesign the database connection to be more resilient.
 
 **Notes:**
 
-- if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
+- for a fresh rescue task, if you do not pass `--model` or `--effort`, the companion explicitly starts `gpt-5.6-luna` at `max` effort; resumed tasks preserve their existing thread routing.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
+
+### `/codex:expert`
+
+The active model can invoke this command when it needs a stronger bounded pass, reaches the Luna Max effort ceiling, or encounters an ambiguous/high-risk decision. The command always asks the user to choose the expert model and reasoning effort before it starts anything; the default is Sol at High effort.
+
+The selected expert runs in a separate persistent, named Codex thread. Its final answer and session ID are returned to the active conversation so the model can continue with the expert's evidence.
 
 ### `/codex:transfer`
 
