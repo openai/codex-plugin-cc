@@ -387,10 +387,32 @@ export function renderJobStatusReport(job) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-export function renderStoredJobResult(job, storedJob) {
+// Whitespace is not output: a stored "\n" would otherwise count as a result and
+// suppress the transcript recovery that has the real answer. Every place that decides
+// "this job has output" -- storedJobHasOutput and each early return in
+// renderStoredJobResult -- must agree on that, or one of them suppresses the recovery
+// and the other discards it.
+function hasText(value) {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+export function storedJobHasOutput(storedJob) {
+  if (isStructuredReviewStoredResult(storedJob) && hasText(storedJob?.rendered)) {
+    return true;
+  }
+  if (hasText(storedJob?.result?.rawOutput)) {
+    return true;
+  }
+  if (hasText(storedJob?.result?.codex?.stdout)) {
+    return true;
+  }
+  return hasText(storedJob?.rendered);
+}
+
+export function renderStoredJobResult(job, storedJob, recovered = null) {
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
   const resumeCommand = threadId ? `codex resume ${threadId}` : null;
-  if (isStructuredReviewStoredResult(storedJob) && storedJob?.rendered) {
+  if (isStructuredReviewStoredResult(storedJob) && hasText(storedJob?.rendered)) {
     const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
     if (!threadId) {
       return output;
@@ -399,8 +421,8 @@ export function renderStoredJobResult(job, storedJob) {
   }
 
   const rawOutput =
-    (typeof storedJob?.result?.rawOutput === "string" && storedJob.result.rawOutput) ||
-    (typeof storedJob?.result?.codex?.stdout === "string" && storedJob.result.codex.stdout) ||
+    (hasText(storedJob?.result?.rawOutput) && storedJob.result.rawOutput) ||
+    (hasText(storedJob?.result?.codex?.stdout) && storedJob.result.codex.stdout) ||
     "";
   if (rawOutput) {
     const output = rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
@@ -410,7 +432,7 @@ export function renderStoredJobResult(job, storedJob) {
     return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
   }
 
-  if (storedJob?.rendered) {
+  if (hasText(storedJob?.rendered)) {
     const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
     if (!threadId) {
       return output;
@@ -438,8 +460,28 @@ export function renderStoredJobResult(job, storedJob) {
     lines.push("", job.errorMessage);
   } else if (storedJob?.errorMessage) {
     lines.push("", storedJob.errorMessage);
-  } else {
+  } else if (!recovered) {
     lines.push("", "No captured result payload was stored for this job.");
+  }
+
+  if (recovered) {
+    // The transcript says whether the turn reached its own `task_complete`. Only the
+    // cut-short case is a lead rather than a verdict, so only it is labelled partial.
+    lines.push(
+      "",
+      recovered.complete
+        ? "## Recovered from the Codex transcript"
+        : "## Recovered from the Codex transcript (PARTIAL)",
+      "",
+      recovered.complete
+        ? "No result was stored for this job, but the turn did finish -- this is the"
+        : "No result was stored for this job, so this is the last assistant message",
+      recovered.complete
+        ? `final message codex recorded. Source: ${recovered.file}`
+        : `codex recorded. The turn may not have finished. Source: ${recovered.file}`,
+      "",
+      recovered.text.trimEnd()
+    );
   }
 
   return `${lines.join("\n").trimEnd()}\n`;
