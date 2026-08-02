@@ -983,7 +983,17 @@ async function handleCancel(argv) {
     );
   }
 
-  terminateProcessTree(job.pid ?? Number.NaN);
+  const termination = terminateProcessTree(job.pid ?? Number.NaN);
+  if (termination.attempted && !termination.treeConfirmed) {
+    // The job's own process is gone, but the kill could not account for what was under
+    // it. Say so rather than reporting a clean cancellation: a surviving codex or broker
+    // child keeps running, and nothing else makes a second pass at it.
+    appendLogLine(
+      job.logFile,
+      `Cancelled, but the process tree under pid ${job.pid} could not be fully confirmed stopped. ` +
+        "Check for leftover codex processes if the workspace behaves oddly."
+    );
+  }
   appendLogLine(job.logFile, "Cancelled by user.");
 
   const completedAt = nowIso();
