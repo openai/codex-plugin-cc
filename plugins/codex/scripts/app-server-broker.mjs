@@ -8,6 +8,7 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
+import { BROKER_IDLE_MS_ENV, clearBrokerSession, loadBrokerSession } from "./lib/broker-lifecycle.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 
@@ -115,8 +116,52 @@ async function main() {
 
   appClient.setNotificationHandler(routeNotification);
 
+  // Until now a broker exited only on `broker/shutdown` or a signal, so anything that
+  // lost track of one -- a hard-killed parent, a replaced-but-not-killed stale session,
+  // a test run with no teardown -- stranded it and the ~9-process codex stack under it,
+  // forever. An idle broker holds no state worth keeping: a turn keeps its socket open
+  // for its whole duration, so zero sockets means nothing is in flight, and the thread
+  // itself lives in $CODEX_HOME/sessions and is resumable. The next caller respawns one.
+  // The env override exists so a test can watch a real broker exit on its own; 30
+  // minutes is the shipped value.
+  const IDLE_TIMEOUT_MS = Number(process.env[BROKER_IDLE_MS_ENV]) || 30 * 60 * 1000;
+  let idleTimer = null;
+
+  function cancelIdleTimer() {
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  }
+
+  function restartIdleTimer(server) {
+    cancelIdleTimer();
+    if (sockets.size > 0) {
+      return;
+    }
+    idleTimer = setTimeout(() => {
+      // Drop our own `broker.json` first. `ensureBrokerSession` would probe and repair
+      // it, but the `reuseExistingBroker` callers -- auth status and turn interrupt --
+      // read the stored endpoint without probing, so a record left pointing at this
+      // dead socket turns into an app-server failure for them instead of the direct
+      // spawn they fall back to when there is no record at all.
+      // Match on the endpoint, not the pid: a replacement broker may already own this
+      // cwd, and pids get recycled.
+      try {
+        if (loadBrokerSession(cwd)?.endpoint === endpoint) {
+          clearBrokerSession(cwd);
+        }
+      } catch {
+        // A racing writer must not turn the idle exit into a crash.
+      }
+      shutdown(server).finally(() => process.exit(0));
+    }, IDLE_TIMEOUT_MS);
+    idleTimer.unref(); // never hold the process open just to wait for its own exit
+  }
+
   const server = net.createServer((socket) => {
     sockets.add(socket);
+    cancelIdleTimer();
     socket.setEncoding("utf8");
     let buffer = "";
 
@@ -225,11 +270,13 @@ async function main() {
     socket.on("close", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      restartIdleTimer(server);
     });
 
     socket.on("error", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      restartIdleTimer(server);
     });
   });
 
@@ -243,7 +290,8 @@ async function main() {
     process.exit(0);
   });
 
-  server.listen(listenTarget.path);
+  // Start it now too: a broker nobody ever connects to is exactly the stranded case.
+  server.listen(listenTarget.path, () => restartIdleTimer(server));
 }
 
 main().catch((error) => {

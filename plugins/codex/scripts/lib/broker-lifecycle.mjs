@@ -6,11 +6,16 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
+import { runCommand, terminateProcessTree } from "./process.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
+// Test-facing override for the broker's idle timeout; the shipped value is in
+// app-server-broker.mjs. It lives here because importing that script runs it.
+export const BROKER_IDLE_MS_ENV = "CODEX_COMPANION_BROKER_IDLE_MS";
 const BROKER_STATE_FILE = "broker.json";
+const PROCESS_START_TIME_TIMEOUT_MS = 2000;
 
 export function createBrokerSessionDir(prefix = "cxc-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -73,6 +78,71 @@ function resolveBrokerStateFile(cwd) {
   return path.join(resolveStateDir(cwd), BROKER_STATE_FILE);
 }
 
+export function readProcessStartTime(pid, options = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return null;
+  }
+
+  const platform = options.platform ?? process.platform;
+  try {
+    if (platform === "linux") {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const fieldsAfterCommand = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+      return fieldsAfterCommand[19] ?? null;
+    }
+
+    const runCommandImpl = options.runCommandImpl ?? runCommand;
+    const commandOptions = {
+      env: options.env,
+      shell: false,
+      timeout: PROCESS_START_TIME_TIMEOUT_MS
+    };
+    const result =
+      platform === "win32"
+        ? runCommandImpl(
+            "powershell.exe",
+            [
+              "-NoProfile",
+              "-NonInteractive",
+              "-Command",
+              `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks`
+            ],
+            commandOptions
+          )
+        : runCommandImpl(
+            // macOS has no finer-grained portable ps start-time field. `lstart` is
+            // second-resolution, so PID reuse within the same second remains possible.
+            "ps",
+            ["-p", String(pid), "-o", "lstart="],
+            commandOptions
+          );
+    if (result.error || result.status !== 0) {
+      return null;
+    }
+    return result.stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+export function brokerProcessMatchesRecordedStart(existing, options = {}) {
+  if (typeof existing.processStartTime !== "string") {
+    return false;
+  }
+  const readProcessStartTimeImpl = options.readProcessStartTime ?? readProcessStartTime;
+  try {
+    return (
+      readProcessStartTimeImpl(existing.pid, {
+        env: options.env,
+        platform: options.platform,
+        runCommandImpl: options.runCommandImpl
+      }) === existing.processStartTime
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function loadBrokerSession(cwd) {
   const stateFile = resolveBrokerStateFile(cwd);
   if (!fs.existsSync(stateFile)) {
@@ -99,31 +169,45 @@ export function clearBrokerSession(cwd) {
   }
 }
 
+// A healthy broker answers the first probe immediately, so the second, longer one
+// only costs time when the broker is already in trouble. Without it a merely busy
+// broker on a loaded host misses 150 ms, gets replaced, and its process is stranded.
 async function isBrokerEndpointReady(endpoint) {
   if (!endpoint) {
     return false;
   }
-  try {
-    return await waitForBrokerEndpoint(endpoint, 150);
-  } catch {
-    return false;
+  for (const timeoutMs of [150, 1000]) {
+    try {
+      if (await waitForBrokerEndpoint(endpoint, timeoutMs)) {
+        return true;
+      }
+    } catch {
+      return false;
+    }
   }
+  return false;
 }
 
 export async function ensureBrokerSession(cwd, options = {}) {
+  const terminateBrokerProcess =
+    options.killProcess ?? options.terminateProcessTreeImpl ?? terminateProcessTree;
   const existing = loadBrokerSession(cwd);
   if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
     return existing;
   }
 
   if (existing) {
+    const brokerPidVerified = brokerProcessMatchesRecordedStart(existing, options);
     teardownBrokerSession({
       endpoint: existing.endpoint ?? null,
       pidFile: existing.pidFile ?? null,
       logFile: existing.logFile ?? null,
       sessionDir: existing.sessionDir ?? null,
       pid: existing.pid ?? null,
-      killProcess: options.killProcess ?? null
+      // A pid is safe to target only while its immutable process start time still
+      // matches the value recorded when this broker was spawned. Missing, unreadable
+      // or mismatched identity skips the kill, but teardown still clears stale files.
+      killProcess: brokerPidVerified ? terminateBrokerProcess : null
     });
     clearBrokerSession(cwd);
   }
@@ -145,16 +229,26 @@ export async function ensureBrokerSession(cwd, options = {}) {
     logFile,
     env: options.env ?? process.env
   });
+  const readProcessStartTimeImpl = options.readProcessStartTime ?? readProcessStartTime;
+  const processStartTime = readProcessStartTimeImpl(child.pid, {
+    env: options.env,
+    runCommandImpl: options.runCommandImpl
+  });
 
   const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
   if (!ready) {
+    // We spawned this one, but the endpoint wait runs out its full timeout even when the
+    // child died immediately -- `codex app-server` failing at startup does exactly that --
+    // and node reaps the child, so by now the pid can belong to somebody else. A child
+    // node still holds open is the one case where the pid is unambiguously ours.
+    const childStillRunning = child.exitCode === null && child.signalCode === null;
     teardownBrokerSession({
       endpoint,
       pidFile,
       logFile,
       sessionDir,
       pid: child.pid ?? null,
-      killProcess: options.killProcess ?? null
+      killProcess: childStillRunning ? terminateBrokerProcess : null
     });
     return null;
   }
@@ -164,7 +258,8 @@ export async function ensureBrokerSession(cwd, options = {}) {
     pidFile,
     logFile,
     sessionDir,
-    pid: child.pid ?? null
+    pid: child.pid ?? null,
+    processStartTime
   };
   saveBrokerSession(cwd, session);
   return session;

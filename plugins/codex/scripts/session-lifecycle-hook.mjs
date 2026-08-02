@@ -2,10 +2,12 @@
 
 import fs from "node:fs";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 
 import { terminateProcessTree } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
+  brokerProcessMatchesRecordedStart,
   clearBrokerSession,
   LOG_FILE_ENV,
   loadBrokerSession,
@@ -80,7 +82,7 @@ function handleSessionStart(input) {
   appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
 }
 
-async function handleSessionEnd(input) {
+export async function handleSessionEnd(input, options = {}) {
   const cwd = input.cwd || process.cwd();
   const brokerSession =
     loadBrokerSession(cwd) ??
@@ -96,6 +98,16 @@ async function handleSessionEnd(input) {
   const logFile = brokerSession?.logFile ?? null;
   const sessionDir = brokerSession?.sessionDir ?? null;
   const pid = brokerSession?.pid ?? null;
+  const brokerPidVerified = brokerSession
+    ? brokerProcessMatchesRecordedStart(brokerSession, options)
+    : false;
+  const terminateBrokerProcess = (targetPid) =>
+    terminateProcessTree(targetPid, {
+      platform: options.platform,
+      runCommandImpl: options.runCommandImpl,
+      killImpl: options.killImpl,
+      killWaitMs: options.killWaitMs
+    });
 
   if (brokerEndpoint) {
     await sendBrokerShutdown(brokerEndpoint);
@@ -108,7 +120,7 @@ async function handleSessionEnd(input) {
     logFile,
     sessionDir,
     pid,
-    killProcess: terminateProcessTree
+    killProcess: brokerPidVerified ? terminateBrokerProcess : null
   });
   clearBrokerSession(cwd);
 }
@@ -127,7 +139,22 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-  process.exit(1);
-});
+// `process.argv[1]` is resolved to an absolute path but never through symlinks, while
+// `import.meta.url` always is. A plugin root reached through a symlink -- what a locally
+// linked install looks like -- makes the two differ, and comparing them literally would
+// skip `main()` and turn SessionStart/SessionEnd into a silent no-op. Compare what the
+// two paths actually point at, and fall back to the literal check if either is unreadable.
+function invokedAsEntryPoint() {
+  try {
+    return fs.realpathSync(process.argv[1] ?? "") === fs.realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return process.argv[1] === fileURLToPath(import.meta.url);
+  }
+}
+
+if (invokedAsEntryPoint()) {
+  main().catch((error) => {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exit(1);
+  });
+}
