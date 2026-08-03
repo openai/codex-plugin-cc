@@ -47,14 +47,22 @@ A finding should answer:
 
 <structured_output_contract>
 Return only valid JSON matching the provided schema.
+The top-level object must contain exactly these four keys:
+- `verdict`: either `approve` or `needs-attention`
+- `summary`: a non-empty string
+- `findings`: an array, empty when there is nothing to report
+- `next_steps`: an array of strings, empty when there is nothing to do
 Keep the output compact and specific.
 Use `needs-attention` if there is any material risk worth blocking on.
 Use `approve` only if you cannot support any substantive adversarial finding from the provided context.
-Every finding must include:
-- the affected file
-- `line_start` and `line_end`
-- a confidence score from 0 to 1
-- a concrete recommendation
+Every finding object must contain exactly these eight keys:
+- `severity`: one of `low`, `medium`, `high`
+- `title`: a short one-line label
+- `body`: the explanation, including any inference it depends on
+- `file`: the affected file
+- `line_start` and `line_end`: integers
+- `confidence`: a number from 0 to 1
+- `recommendation`: a concrete change
 Write the summary like a terse ship/no-ship assessment, not a neutral recap.
 </structured_output_contract>
 
