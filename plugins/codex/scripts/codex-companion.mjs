@@ -24,8 +24,24 @@ import {
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
-import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import { binaryAvailable, isPidAlive, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
+import {
+  applyReduceOutcome,
+  assignFindingIds,
+  buildReducePrompt,
+  buildShardDiff,
+  buildShardPrompt,
+  bySeverityThenConfidence,
+  collectChangedFiles,
+  DEFAULT_MAX_SHARDS,
+  extractJsonPayload,
+  extractSeamHints,
+  mergeFindings,
+  normalizeShardFinding,
+  planShards,
+  renderParallelReviewResult
+} from "./lib/parallel-review.mjs";
 import {
   generateJobId,
   getConfig,
@@ -66,6 +82,17 @@ import {
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
+const PARALLEL_REDUCE_SCHEMA = path.join(ROOT_DIR, "schemas", "parallel-reduce-output.schema.json");
+const PARALLEL_SPAWN_STAGGER_MS = 3000;
+const PARALLEL_POLL_INTERVAL_MS = 15000;
+const PARALLEL_STALL_TIMEOUT_MS = 6 * 60_000;
+const PARALLEL_PENDING_GRACE_MS = 90_000;
+const PARALLEL_MAX_RETRIES_PER_SHARD = 1;
+const DEFAULT_PARALLEL_TIMEOUT_MIN = 45;
+const PARALLEL_RESUME_PROMPT =
+  "Your previous review turn was interrupted before you produced the final answer. " +
+  "Do not start over. Finish the adversarial review of your shard and return only the " +
+  "final JSON object required by the structured output contract you were given earlier.";
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
@@ -79,6 +106,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
+      "  node scripts/codex-companion.mjs parallel-review [--base <ref>] [--scope <auto|working-tree|branch>] [--max-shards 4] [--invariants-file <path>] [--reduce-effort low] [--timeout-min 45] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
@@ -467,8 +495,11 @@ async function executeTaskRun(request) {
     resumeLast: request.resumeLast
   });
 
-  let resumeThreadId = null;
-  if (request.resumeLast) {
+  // An explicit thread id (e.g. from the parallel-review supervisor resuming a
+  // dead shard) wins over the session-scoped latest-thread lookup, which is
+  // ambiguous when several tasks are in flight.
+  let resumeThreadId = request.resumeThreadId ?? null;
+  if (!resumeThreadId && request.resumeLast) {
     const latestThread = await resolveLatestTrackedTaskThread(workspaceRoot, {
       excludeJobId: request.jobId
     });
@@ -489,6 +520,7 @@ async function executeTaskRun(request) {
     model: request.model,
     effort: request.effort,
     sandbox: request.write ? "workspace-write" : "read-only",
+    ...(request.outputSchema ? { outputSchema: request.outputSchema } : {}),
     onProgress: request.onProgress,
     persistThread: true,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
@@ -560,6 +592,9 @@ function renderQueuedTaskLaunch(payload) {
 function getJobKindLabel(kind, jobClass) {
   if (kind === "adversarial-review") {
     return "adversarial-review";
+  }
+  if (kind === "parallel-review") {
+    return "parallel-review";
   }
   return jobClass === "review" ? "review" : "rescue";
 }
@@ -880,6 +915,432 @@ async function handleTaskWorker(argv) {
   );
 }
 
+function isTerminalJobStatus(status) {
+  return status === "completed" || status === "failed" || status === "cancelled";
+}
+
+async function recoverParallelChild({ cwd, workspaceRoot, child, record, reason, onProgress }) {
+  if (child.retries >= PARALLEL_MAX_RETRIES_PER_SHARD) {
+    child.terminal = true;
+    child.finalStatus = `unrecovered (${reason})`;
+    onProgress?.({ message: `${child.label}: ${reason}; retry budget exhausted.` });
+    return;
+  }
+  child.retries += 1;
+  onProgress?.({ message: `${child.label}: ${reason}; recovering (attempt ${child.retries}/${PARALLEL_MAX_RETRIES_PER_SHARD}).` });
+
+  const storedJob = record ?? readStoredJob(workspaceRoot, child.jobId);
+  if (storedJob) {
+    try {
+      await cancelJobRecord(cwd, workspaceRoot, storedJob, "Cancelled by the parallel-review supervisor after the worker stopped responding.");
+    } catch {
+      // The worker may already be gone; respawning below is what matters.
+    }
+  }
+
+  // A persisted thread id means the Codex thread still holds the original
+  // prompt and any analysis done before the crash — resume it instead of
+  // paying for a fresh start.
+  const threadId = storedJob?.threadId ?? null;
+  const job = buildTaskJob(workspaceRoot, { title: child.title, summary: child.summary }, false);
+  const request = buildTaskRequest({
+    cwd,
+    model: child.model,
+    effort: child.effort,
+    prompt: threadId ? PARALLEL_RESUME_PROMPT : child.prompt,
+    write: false,
+    resumeLast: false,
+    jobId: job.id
+  });
+  if (threadId) {
+    request.resumeThreadId = threadId;
+  }
+  request.outputSchema = child.outputSchema;
+  enqueueBackgroundTask(cwd, job, request);
+  child.jobId = job.id;
+  child.jobIds.push(job.id);
+  child.lastSpawnAt = Date.now();
+  onProgress?.({ message: `${child.label}: ${threadId ? "resumed its thread" : "respawned fresh"} as ${job.id}.` });
+}
+
+async function superviseParallelJobs({ cwd, workspaceRoot, children, deadline, onProgress }) {
+  for (;;) {
+    let active = 0;
+    for (const child of children) {
+      if (child.terminal) {
+        continue;
+      }
+      const record = readStoredJob(workspaceRoot, child.jobId);
+
+      if (!record) {
+        // Right after enqueueing, the detached worker may not have written its
+        // job file yet; that is pending, not dead.
+        if (Date.now() - child.lastSpawnAt < PARALLEL_PENDING_GRACE_MS) {
+          active += 1;
+        } else {
+          await recoverParallelChild({ cwd, workspaceRoot, child, record: null, reason: "its job record disappeared", onProgress });
+          if (!child.terminal) {
+            active += 1;
+          }
+        }
+        continue;
+      }
+
+      if (isTerminalJobStatus(record.status)) {
+        child.terminal = true;
+        child.finalStatus = record.status;
+        child.record = record;
+        const completedAt = record.completedAt ? Date.parse(record.completedAt) : Date.now();
+        child.wallSec = Math.max(0, Math.round((completedAt - child.firstSpawnAt) / 1000));
+        onProgress?.({ message: `${child.label}: ${record.status} after ${child.wallSec}s.` });
+        continue;
+      }
+
+      // The job record can say "running" long after the worker died; trust the
+      // OS over the record, and treat a silent log as a hung turn.
+      const pidDead = record.pid != null && !isPidAlive(record.pid);
+      let stalled = false;
+      if (!pidDead && record.status === "running" && record.logFile && fs.existsSync(record.logFile)) {
+        stalled = Date.now() - fs.statSync(record.logFile).mtimeMs > PARALLEL_STALL_TIMEOUT_MS;
+      }
+      if (pidDead || stalled) {
+        await recoverParallelChild({
+          cwd,
+          workspaceRoot,
+          child,
+          record,
+          reason: pidDead ? "its worker process is dead while the job still reports running" : "it has made no log progress",
+          onProgress
+        });
+        if (!child.terminal) {
+          active += 1;
+        }
+        continue;
+      }
+
+      active += 1;
+    }
+
+    if (active === 0) {
+      return;
+    }
+    if (Date.now() > deadline) {
+      throw new Error(
+        "Parallel review timed out with jobs still active; they are being cancelled. Rerun with a longer --timeout-min or fewer shards."
+      );
+    }
+    await sleep(PARALLEL_POLL_INTERVAL_MS);
+  }
+}
+
+async function executeParallelReviewRun(request) {
+  const { cwd, workspaceRoot, target, plan, focusText, invariantsText, model, effort, reduceEffort, timeoutMs, onProgress } = request;
+  const runLabel = request.jobId ? `parallel-review ${request.jobId}` : "parallel-review";
+  const seams = extractSeamHints({
+    files: plan.files,
+    shards: plan.shards,
+    readFileContent: (relativePath) => {
+      try {
+        return fs.readFileSync(path.join(cwd, relativePath), "utf8");
+      } catch {
+        return null;
+      }
+    }
+  });
+  const shardSchema = readOutputSchema(REVIEW_SCHEMA);
+  const reduceSchema = readOutputSchema(PARALLEL_REDUCE_SCHEMA);
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
+  const children = [];
+
+  onProgress?.({
+    message: `Sharding ${plan.fileCount} files (~${plan.totalLines} changed lines) into ${plan.shards.length} concurrent reviews.`,
+    phase: "starting"
+  });
+
+  try {
+    for (const shard of plan.shards) {
+      const diff = buildShardDiff(cwd, target, shard);
+      const prompt = buildShardPrompt(ROOT_DIR, {
+        runLabel,
+        shard,
+        shardCount: plan.shards.length,
+        targetLabel: target.label,
+        invariantsText,
+        focusText,
+        diff
+      });
+      const title = `Codex Parallel Shard ${shard.id}`;
+      const summary = `Shard ${shard.id}: ${shard.files.length} files of ${target.label}`;
+      const job = buildTaskJob(workspaceRoot, { title, summary }, false);
+      const taskRequest = buildTaskRequest({ cwd, model, effort, prompt, write: false, resumeLast: false, jobId: job.id });
+      taskRequest.outputSchema = shardSchema;
+      enqueueBackgroundTask(cwd, job, taskRequest);
+      children.push({
+        kind: "shard",
+        shard,
+        label: `Shard ${shard.id}`,
+        title,
+        summary,
+        jobId: job.id,
+        jobIds: [job.id],
+        prompt,
+        outputSchema: shardSchema,
+        model,
+        effort,
+        firstSpawnAt: Date.now(),
+        lastSpawnAt: Date.now(),
+        retries: 0,
+        terminal: false,
+        finalStatus: null,
+        record: null
+      });
+      onProgress?.({ message: `Spawned shard ${shard.id} (${shard.files.length} files, ~${shard.weight} lines) as ${job.id}.` });
+      if (shard !== plan.shards[plan.shards.length - 1]) {
+        // Concurrent job-state writers race; give each enqueue a head start.
+        await sleep(PARALLEL_SPAWN_STAGGER_MS);
+      }
+    }
+
+    await superviseParallelJobs({ cwd, workspaceRoot, children, deadline, onProgress });
+
+    const rawFindings = [];
+    const unparsed = [];
+    const shardReports = [];
+    for (const child of children) {
+      const record = child.record ?? readStoredJob(workspaceRoot, child.jobId);
+      const report = {
+        shard: child.shard.id,
+        jobId: child.jobId,
+        status: child.finalStatus ?? "unknown",
+        wallSec: child.wallSec ?? null,
+        retries: child.retries,
+        verdict: null,
+        summary: null,
+        findingCount: 0
+      };
+      shardReports.push(report);
+      const extraction = extractJsonPayload(record?.result?.rawOutput ?? "", (parsed) => Array.isArray(parsed.findings));
+      if (!extraction.payload) {
+        unparsed.push({ shard: child.shard.id, jobId: child.jobId, error: extraction.error });
+        continue;
+      }
+      report.verdict = extraction.payload.verdict ?? null;
+      report.summary = extraction.payload.summary ?? null;
+      report.findingCount = extraction.payload.findings.length;
+      for (const raw of extraction.payload.findings) {
+        rawFindings.push(normalizeShardFinding(raw, child.shard.id));
+      }
+    }
+    const findings = assignFindingIds(mergeFindings(rawFindings));
+
+    // The reduce pass is mandatory even when every shard approved: a defect
+    // whose cause is in one shard and whose victim is in another is invisible
+    // to both, and only this pass reads across the boundary.
+    onProgress?.({ message: `Merged ${findings.length} findings; starting the cross-shard integration pass.`, phase: "reviewing" });
+    const reducePrompt = buildReducePrompt(ROOT_DIR, {
+      runLabel,
+      targetLabel: target.label,
+      shards: plan.shards,
+      findings,
+      seams,
+      unparsedCount: unparsed.length
+    });
+    const reduceJob = buildTaskJob(
+      workspaceRoot,
+      { title: "Codex Parallel Reduce", summary: `Integration pass over ${findings.length} findings` },
+      false
+    );
+    const reduceRequest = buildTaskRequest({
+      cwd,
+      model,
+      effort: reduceEffort,
+      prompt: reducePrompt,
+      write: false,
+      resumeLast: false,
+      jobId: reduceJob.id
+    });
+    reduceRequest.outputSchema = reduceSchema;
+    enqueueBackgroundTask(cwd, reduceJob, reduceRequest);
+    const reduceChild = {
+      kind: "reduce",
+      shard: { id: "reduce", files: [] },
+      label: "Reduce",
+      title: "Codex Parallel Reduce",
+      summary: `Integration pass over ${findings.length} findings`,
+      jobId: reduceJob.id,
+      jobIds: [reduceJob.id],
+      prompt: reducePrompt,
+      outputSchema: reduceSchema,
+      model,
+      effort: reduceEffort,
+      firstSpawnAt: Date.now(),
+      lastSpawnAt: Date.now(),
+      retries: 0,
+      terminal: false,
+      finalStatus: null,
+      record: null
+    };
+    children.push(reduceChild);
+    await superviseParallelJobs({ cwd, workspaceRoot, children, deadline, onProgress });
+
+    const reduceRecord = reduceChild.record ?? readStoredJob(workspaceRoot, reduceChild.jobId);
+    const reduceReport = {
+      jobId: reduceChild.jobId,
+      status: reduceChild.finalStatus ?? "unknown",
+      wallSec: reduceChild.wallSec ?? null,
+      summary: null,
+      assessed: 0,
+      seamFindingCount: 0
+    };
+    let seamFindings = [];
+    const reduceExtraction = extractJsonPayload(
+      reduceRecord?.result?.rawOutput ?? "",
+      (parsed) => Array.isArray(parsed.assessments) || Array.isArray(parsed.seam_findings)
+    );
+    if (reduceExtraction.payload) {
+      const outcome = applyReduceOutcome(findings, reduceExtraction.payload);
+      seamFindings = outcome.seamFindings;
+      reduceReport.summary = reduceExtraction.payload.summary ?? null;
+      reduceReport.assessed = outcome.assessed;
+      reduceReport.seamFindingCount = seamFindings.length;
+    } else {
+      reduceReport.error = reduceExtraction.error;
+    }
+
+    const payload = {
+      review: "Parallel Review",
+      target,
+      shards: shardReports,
+      reduce: reduceReport,
+      findings: [...findings, ...seamFindings].sort(bySeverityThenConfidence),
+      unparsed,
+      seams,
+      totals: { wallSec: Math.round((Date.now() - startedAt) / 1000), shardCount: plan.shards.length }
+    };
+    const degraded = shardReports.some((report) => report.status !== "completed") || Boolean(reduceReport.error);
+
+    return {
+      exitStatus: degraded ? 1 : 0,
+      payload,
+      rendered: renderParallelReviewResult(payload),
+      summary: reduceReport.summary ?? `Parallel review finished with ${payload.findings.length} findings.`,
+      jobTitle: "Codex Parallel Review",
+      jobClass: "review",
+      targetLabel: target.label
+    };
+  } finally {
+    // Never exit with children still queued or running, whatever went wrong.
+    for (const child of children) {
+      if (child.terminal) {
+        continue;
+      }
+      const record = readStoredJob(workspaceRoot, child.jobId);
+      if (record && !isTerminalJobStatus(record.status)) {
+        try {
+          await cancelJobRecord(cwd, workspaceRoot, record, "Cancelled because the parallel-review orchestrator exited.");
+        } catch {
+          // Best-effort teardown.
+        }
+      }
+    }
+  }
+}
+
+async function handleParallelReview(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["base", "scope", "model", "effort", "reduce-effort", "max-shards", "invariants-file", "timeout-min", "cwd"],
+    booleanOptions: ["json"],
+    aliasMap: {
+      m: "model"
+    }
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveCommandWorkspace(options);
+  ensureCodexAvailable(cwd);
+  ensureGitRepository(cwd);
+
+  const model = normalizeRequestedModel(options.model);
+  const effort = normalizeReasoningEffort(options.effort);
+  const reduceEffort = normalizeReasoningEffort(options["reduce-effort"]) ?? "low";
+  const maxShards = Math.max(2, Number.parseInt(options["max-shards"] ?? `${DEFAULT_MAX_SHARDS}`, 10) || DEFAULT_MAX_SHARDS);
+  const timeoutMs =
+    Math.max(1, Number.parseInt(options["timeout-min"] ?? `${DEFAULT_PARALLEL_TIMEOUT_MIN}`, 10) || DEFAULT_PARALLEL_TIMEOUT_MIN) * 60_000;
+  const focusText = positionals.join(" ").trim();
+  const invariantsText = options["invariants-file"]
+    ? fs.readFileSync(path.resolve(cwd, options["invariants-file"]), "utf8")
+    : "";
+
+  const target = resolveReviewTarget(cwd, {
+    base: options.base,
+    scope: options.scope
+  });
+  const files = collectChangedFiles(cwd, target);
+  if (files.length === 0) {
+    throw new Error(`No changes found for ${target.label}.`);
+  }
+  const plan = planShards(files, maxShards);
+
+  if (plan.mode === "single") {
+    // Below the gate a sharded run costs ~k× tokens with no wall-time win;
+    // run the existing single adversarial review instead.
+    const metadata = buildReviewJobMetadata("Adversarial Review", target);
+    const job = createCompanionJob({
+      prefix: "review",
+      kind: metadata.kind,
+      title: metadata.title,
+      workspaceRoot,
+      jobClass: "review",
+      summary: metadata.summary
+    });
+    await runForegroundCommand(
+      job,
+      (progress) =>
+        executeReviewRun({
+          cwd,
+          base: options.base,
+          scope: options.scope,
+          model,
+          focusText,
+          reviewName: "Adversarial Review",
+          onProgress: progress
+        }),
+      { json: options.json }
+    );
+    return;
+  }
+
+  plan.files = files;
+  const job = createCompanionJob({
+    prefix: "review",
+    kind: "parallel-review",
+    title: "Codex Parallel Review",
+    workspaceRoot,
+    jobClass: "review",
+    summary: `Parallel review ${target.label} (${plan.shards.length} shards)`
+  });
+  await runForegroundCommand(
+    job,
+    (progress) =>
+      executeParallelReviewRun({
+        cwd,
+        workspaceRoot,
+        target,
+        plan,
+        focusText,
+        invariantsText,
+        model,
+        effort,
+        reduceEffort,
+        timeoutMs,
+        jobId: job.id,
+        onProgress: progress
+      }),
+    { json: options.json }
+  );
+}
+
 async function handleStatus(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
@@ -960,31 +1421,24 @@ function handleTaskResumeCandidate(argv) {
   outputCommandResult(payload, rendered, options.json);
 }
 
-async function handleCancel(argv) {
-  const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
-    booleanOptions: ["json"]
-  });
-
-  const cwd = resolveCommandCwd(options);
-  const reference = positionals[0] ?? "";
-  const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
+async function cancelJobRecord(cwd, workspaceRoot, job, reason = "Cancelled by user.") {
   const existing = readStoredJob(workspaceRoot, job.id) ?? {};
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
+  const logFile = job.logFile ?? existing.logFile ?? null;
 
   const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
   if (interrupt.attempted) {
     appendLogLine(
-      job.logFile,
+      logFile,
       interrupt.interrupted
         ? `Requested Codex turn interrupt for ${turnId} on ${threadId}.`
         : `Codex turn interrupt failed${interrupt.detail ? `: ${interrupt.detail}` : "."}`
     );
   }
 
-  terminateProcessTree(job.pid ?? Number.NaN);
-  appendLogLine(job.logFile, "Cancelled by user.");
+  terminateProcessTree(job.pid ?? existing.pid ?? Number.NaN);
+  appendLogLine(logFile, reason);
 
   const completedAt = nowIso();
   const nextJob = {
@@ -993,7 +1447,7 @@ async function handleCancel(argv) {
     phase: "cancelled",
     pid: null,
     completedAt,
-    errorMessage: "Cancelled by user."
+    errorMessage: reason
   };
 
   writeJobFile(workspaceRoot, job.id, {
@@ -1006,9 +1460,23 @@ async function handleCancel(argv) {
     status: "cancelled",
     phase: "cancelled",
     pid: null,
-    errorMessage: "Cancelled by user.",
+    errorMessage: reason,
     completedAt
   });
+
+  return { nextJob, interrupt };
+}
+
+async function handleCancel(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const reference = positionals[0] ?? "";
+  const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
+  const { nextJob, interrupt } = await cancelJobRecord(cwd, workspaceRoot, job);
 
   const payload = {
     jobId: job.id,
@@ -1039,6 +1507,9 @@ async function main() {
       await handleReviewCommand(argv, {
         reviewName: "Adversarial Review"
       });
+      break;
+    case "parallel-review":
+      await handleParallelReview(argv);
       break;
     case "task":
       await handleTask(argv);
