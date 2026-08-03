@@ -919,10 +919,25 @@ function isTerminalJobStatus(status) {
   return status === "completed" || status === "failed" || status === "cancelled";
 }
 
-async function recoverParallelChild({ cwd, workspaceRoot, child, record, reason, onProgress }) {
+async function recoverParallelChild({ cwd, workspaceRoot, child, record, reason, onChildrenChanged, onProgress }) {
   if (child.retries >= PARALLEL_MAX_RETRIES_PER_SHARD) {
     child.terminal = true;
     child.finalStatus = `unrecovered (${reason})`;
+    // A stalled worker can still be alive; stop it now instead of letting it
+    // burn tokens until the orchestrator exits.
+    const abandonedJob = record ?? readStoredJob(workspaceRoot, child.jobId);
+    if (abandonedJob && !isTerminalJobStatus(abandonedJob.status)) {
+      try {
+        await cancelJobRecord(
+          cwd,
+          workspaceRoot,
+          abandonedJob,
+          "Cancelled by the parallel-review supervisor after its retry budget was exhausted."
+        );
+      } catch {
+        // Best-effort; the exit teardown sweeps every attempt again.
+      }
+    }
     onProgress?.({ message: `${child.label}: ${reason}; retry budget exhausted.` });
     return;
   }
@@ -956,14 +971,16 @@ async function recoverParallelChild({ cwd, workspaceRoot, child, record, reason,
     request.resumeThreadId = threadId;
   }
   request.outputSchema = child.outputSchema;
-  enqueueBackgroundTask(cwd, job, request);
   child.jobId = job.id;
   child.jobIds.push(job.id);
   child.lastSpawnAt = Date.now();
+  // Persist before the spawn so a cancel can never race it.
+  onChildrenChanged?.();
+  enqueueBackgroundTask(cwd, job, request);
   onProgress?.({ message: `${child.label}: ${threadId ? "resumed its thread" : "respawned fresh"} as ${job.id}.` });
 }
 
-async function superviseParallelJobs({ cwd, workspaceRoot, children, deadline, onProgress }) {
+async function superviseParallelJobs({ cwd, workspaceRoot, children, deadline, onChildrenChanged, onProgress }) {
   for (;;) {
     let active = 0;
     for (const child of children) {
@@ -978,7 +995,15 @@ async function superviseParallelJobs({ cwd, workspaceRoot, children, deadline, o
         if (Date.now() - child.lastSpawnAt < PARALLEL_PENDING_GRACE_MS) {
           active += 1;
         } else {
-          await recoverParallelChild({ cwd, workspaceRoot, child, record: null, reason: "its job record disappeared", onProgress });
+          await recoverParallelChild({
+            cwd,
+            workspaceRoot,
+            child,
+            record: null,
+            reason: "its job record disappeared",
+            onChildrenChanged,
+            onProgress
+          });
           if (!child.terminal) {
             active += 1;
           }
@@ -997,10 +1022,18 @@ async function superviseParallelJobs({ cwd, workspaceRoot, children, deadline, o
       }
 
       // The job record can say "running" long after the worker died; trust the
-      // OS over the record, and treat a silent log as a hung turn.
+      // OS over the record, and treat a silent log as a hung turn. "queued" is
+      // normally a sub-second window before the worker flips to "running", so a
+      // queued record whose log has been silent this long is a wedged startup
+      // (or a lost status write) and gets the same recovery.
       const pidDead = record.pid != null && !isPidAlive(record.pid);
       let stalled = false;
-      if (!pidDead && record.status === "running" && record.logFile && fs.existsSync(record.logFile)) {
+      if (
+        !pidDead &&
+        (record.status === "running" || record.status === "queued") &&
+        record.logFile &&
+        fs.existsSync(record.logFile)
+      ) {
         stalled = Date.now() - fs.statSync(record.logFile).mtimeMs > PARALLEL_STALL_TIMEOUT_MS;
       }
       if (pidDead || stalled) {
@@ -1010,6 +1043,7 @@ async function superviseParallelJobs({ cwd, workspaceRoot, children, deadline, o
           child,
           record,
           reason: pidDead ? "its worker process is dead while the job still reports running" : "it has made no log progress",
+          onChildrenChanged,
           onProgress
         });
         if (!child.terminal) {
@@ -1053,6 +1087,23 @@ async function executeParallelReviewRun(request) {
   const deadline = startedAt + timeoutMs;
   const children = [];
 
+  // /codex:cancel on the orchestrator kills this process before the finally
+  // teardown can run; the persisted list lets cancelJobRecord cascade to the
+  // detached shard/reduce workers instead of orphaning them.
+  const persistChildJobIds = () => {
+    if (!request.jobId) {
+      return;
+    }
+    const stored = readStoredJob(workspaceRoot, request.jobId);
+    if (!stored) {
+      return;
+    }
+    writeJobFile(workspaceRoot, request.jobId, {
+      ...stored,
+      childJobIds: children.flatMap((child) => child.jobIds)
+    });
+  };
+
   onProgress?.({
     message: `Sharding ${plan.fileCount} files (~${plan.totalLines} changed lines) into ${plan.shards.length} concurrent reviews.`,
     phase: "starting"
@@ -1075,7 +1126,6 @@ async function executeParallelReviewRun(request) {
       const job = buildTaskJob(workspaceRoot, { title, summary }, false);
       const taskRequest = buildTaskRequest({ cwd, model, effort, prompt, write: false, resumeLast: false, jobId: job.id });
       taskRequest.outputSchema = shardSchema;
-      enqueueBackgroundTask(cwd, job, taskRequest);
       children.push({
         kind: "shard",
         shard,
@@ -1095,6 +1145,10 @@ async function executeParallelReviewRun(request) {
         finalStatus: null,
         record: null
       });
+      // Persist before the spawn so a cancel can never race it; an id whose
+      // spawn failed has no record and the cascade skips it.
+      persistChildJobIds();
+      enqueueBackgroundTask(cwd, job, taskRequest);
       onProgress?.({ message: `Spawned shard ${shard.id} (${shard.files.length} files, ~${shard.weight} lines) as ${job.id}.` });
       if (shard !== plan.shards[plan.shards.length - 1]) {
         // Concurrent job-state writers race; give each enqueue a head start.
@@ -1102,7 +1156,7 @@ async function executeParallelReviewRun(request) {
       }
     }
 
-    await superviseParallelJobs({ cwd, workspaceRoot, children, deadline, onProgress });
+    await superviseParallelJobs({ cwd, workspaceRoot, children, deadline, onChildrenChanged: persistChildJobIds, onProgress });
 
     const rawFindings = [];
     const unparsed = [];
@@ -1161,7 +1215,6 @@ async function executeParallelReviewRun(request) {
       jobId: reduceJob.id
     });
     reduceRequest.outputSchema = reduceSchema;
-    enqueueBackgroundTask(cwd, reduceJob, reduceRequest);
     const reduceChild = {
       kind: "reduce",
       shard: { id: "reduce", files: [] },
@@ -1182,7 +1235,9 @@ async function executeParallelReviewRun(request) {
       record: null
     };
     children.push(reduceChild);
-    await superviseParallelJobs({ cwd, workspaceRoot, children, deadline, onProgress });
+    persistChildJobIds();
+    enqueueBackgroundTask(cwd, reduceJob, reduceRequest);
+    await superviseParallelJobs({ cwd, workspaceRoot, children, deadline, onChildrenChanged: persistChildJobIds, onProgress });
 
     const reduceRecord = reduceChild.record ?? readStoredJob(workspaceRoot, reduceChild.jobId);
     const reduceReport = {
@@ -1231,16 +1286,18 @@ async function executeParallelReviewRun(request) {
     };
   } finally {
     // Never exit with children still queued or running, whatever went wrong.
+    // Sweep every attempt (child.jobIds), not just the latest: a recovery whose
+    // cancel failed, or a child marked terminal while its worker is still
+    // alive, would otherwise escape teardown.
     for (const child of children) {
-      if (child.terminal) {
-        continue;
-      }
-      const record = readStoredJob(workspaceRoot, child.jobId);
-      if (record && !isTerminalJobStatus(record.status)) {
-        try {
-          await cancelJobRecord(cwd, workspaceRoot, record, "Cancelled because the parallel-review orchestrator exited.");
-        } catch {
-          // Best-effort teardown.
+      for (const attemptJobId of child.jobIds) {
+        const record = readStoredJob(workspaceRoot, attemptJobId);
+        if (record && !isTerminalJobStatus(record.status)) {
+          try {
+            await cancelJobRecord(cwd, workspaceRoot, record, "Cancelled because the parallel-review orchestrator exited.");
+          } catch {
+            // Best-effort teardown.
+          }
         }
       }
     }
@@ -1421,7 +1478,8 @@ function handleTaskResumeCandidate(argv) {
   outputCommandResult(payload, rendered, options.json);
 }
 
-async function cancelJobRecord(cwd, workspaceRoot, job, reason = "Cancelled by user.") {
+async function cancelJobRecord(cwd, workspaceRoot, job, reason = "Cancelled by user.", cancelledIds = new Set()) {
+  cancelledIds.add(job.id);
   const existing = readStoredJob(workspaceRoot, job.id) ?? {};
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
@@ -1440,6 +1498,10 @@ async function cancelJobRecord(cwd, workspaceRoot, job, reason = "Cancelled by u
   terminateProcessTree(job.pid ?? existing.pid ?? Number.NaN);
   appendLogLine(logFile, reason);
 
+  // Re-read after the terminate: a parallel-review orchestrator may have
+  // persisted more child job ids between the first read and its death.
+  const latest = readStoredJob(workspaceRoot, job.id) ?? existing;
+
   const completedAt = nowIso();
   const nextJob = {
     ...job,
@@ -1451,7 +1513,7 @@ async function cancelJobRecord(cwd, workspaceRoot, job, reason = "Cancelled by u
   };
 
   writeJobFile(workspaceRoot, job.id, {
-    ...existing,
+    ...latest,
     ...nextJob,
     cancelledAt: completedAt
   });
@@ -1463,6 +1525,24 @@ async function cancelJobRecord(cwd, workspaceRoot, job, reason = "Cancelled by u
     errorMessage: reason,
     completedAt
   });
+
+  // A cancelled parallel-review orchestrator dies before its own teardown can
+  // run, and its shard/reduce workers are detached processes that survive the
+  // tree kill above — cancel them from the persisted child list.
+  const childJobIds = Array.isArray(latest.childJobIds) ? latest.childJobIds : [];
+  for (const childJobId of childJobIds) {
+    if (cancelledIds.has(childJobId)) {
+      continue;
+    }
+    const childRecord = readStoredJob(workspaceRoot, childJobId);
+    if (childRecord && !isTerminalJobStatus(childRecord.status)) {
+      try {
+        await cancelJobRecord(cwd, workspaceRoot, childRecord, "Cancelled with its parallel-review parent.", cancelledIds);
+      } catch {
+        // Best-effort cascade; remaining children stay visible in status.
+      }
+    }
+  }
 
   return { nextJob, interrupt };
 }

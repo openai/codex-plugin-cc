@@ -19,8 +19,9 @@ const SOURCE_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
 const STYLE_EXTENSIONS = new Set([".css", ".scss"]);
 const IMPORT_RESOLVE_SUFFIXES = ["", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".css", "/index.ts", "/index.tsx", "/index.js"];
 
+// Git is directly executable on Windows. Repository-derived arguments must never pass through a shell.
 function runGit(cwd, args) {
-  return runCommandChecked("git", args, { cwd }).stdout;
+  return runCommandChecked("git", args, { cwd, shell: false }).stdout;
 }
 
 function diffRangeArgs(target) {
