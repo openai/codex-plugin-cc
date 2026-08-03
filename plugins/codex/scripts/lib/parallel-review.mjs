@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { isProbablyText } from "./fs.mjs";
 import { runCommandChecked } from "./process.mjs";
 import { interpolateTemplate, loadPromptTemplate } from "./prompts.mjs";
 
@@ -13,6 +14,9 @@ const TARGET_LINES_PER_SHARD = 400;
 const OVERSIZE_UNIT_RATIO = 1.25;
 const BINARY_FILE_WEIGHT = 20;
 const MAX_SHARD_DIFF_BYTES = 150_000;
+// Same bound lib/git.mjs uses for untracked content: stat before reading so a
+// giant generated artifact can never stall or OOM the orchestrator.
+const MAX_UNTRACKED_READ_BYTES = 24 * 1024;
 const MAX_SEAM_HINTS = 100;
 const SEVERITY_RANK = { critical: 4, high: 3, medium: 2, low: 1 };
 const SOURCE_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".css", ".scss"]);
@@ -103,12 +107,21 @@ export function collectChangedFiles(cwd, target) {
         continue;
       }
       let weight = BINARY_FILE_WEIGHT;
+      let binary = false;
       try {
-        weight = fs.readFileSync(path.join(cwd, filePath), "utf8").split("\n").length;
+        const absolute = path.join(cwd, filePath);
+        if (fs.statSync(absolute).size <= MAX_UNTRACKED_READ_BYTES) {
+          const content = fs.readFileSync(absolute);
+          if (isProbablyText(content)) {
+            weight = content.toString("utf8").split("\n").length;
+          } else {
+            binary = true;
+          }
+        }
       } catch {
-        // Unreadable or binary; keep the default weight.
+        // Unreadable; keep the default weight.
       }
-      files.push({ path: filePath, weight, binary: false, status: "A", oldPath: null });
+      files.push({ path: filePath, weight, binary, status: "A", oldPath: null });
     }
   }
 
@@ -301,8 +314,17 @@ export function buildShardDiff(cwd, target, shard) {
     }
     if (!text.trim() && file.status === "A") {
       try {
-        const content = fs.readFileSync(path.join(cwd, file.path), "utf8");
-        text = `--- new file: ${file.path} ---\n${content}\n`;
+        const absolute = path.join(cwd, file.path);
+        const stat = fs.statSync(absolute);
+        if (stat.size <= MAX_UNTRACKED_READ_BYTES) {
+          const content = fs.readFileSync(absolute);
+          if (isProbablyText(content)) {
+            text = `--- new file: ${file.path} ---\n${content.toString("utf8")}\n`;
+          }
+        }
+        if (!text) {
+          text = `--- new file: ${file.path} (${stat.size} bytes, content omitted) ---\n`;
+        }
       } catch {
         text = "";
       }

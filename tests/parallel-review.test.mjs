@@ -268,3 +268,27 @@ test("applyReduceOutcome does not count assessments for unknown ids", () => {
   assert.equal(findings[0].verification, "CONFIRMED");
   assert.equal(findings[1].verification, "SUSPECTED");
 });
+
+test("collectChangedFiles caps untracked reads and flags binary content", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "base.txt"), "base\n", "utf8");
+  run("git", ["add", "."], { cwd: repo });
+  run("git", ["commit", "-m", "base"], { cwd: repo });
+
+  fs.writeFileSync(path.join(repo, "small.txt"), "one\ntwo\nthree\n", "utf8");
+  fs.writeFileSync(path.join(repo, "blob.bin"), Buffer.from([0, 1, 2, 0, 3]));
+  fs.writeFileSync(path.join(repo, "huge.txt"), "x".repeat(30 * 1024), "utf8");
+
+  const target = { mode: "working-tree", label: "working tree" };
+  const files = collectChangedFiles(repo, target);
+  const byPath = new Map(files.map((file) => [file.path, file]));
+
+  assert.equal(byPath.get("small.txt").weight, 4);
+  assert.equal(byPath.get("blob.bin").binary, true);
+  // Oversized content is never read; the default weight stands in.
+  assert.equal(byPath.get("huge.txt").weight, byPath.get("blob.bin").weight);
+
+  const diff = buildShardDiff(repo, target, { id: "A", files: [byPath.get("huge.txt")] });
+  assert.match(diff.text, /content omitted/);
+});

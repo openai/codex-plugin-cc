@@ -1102,7 +1102,13 @@ async function executeParallelReviewRun(request) {
     shards: plan.shards,
     readFileContent: (relativePath) => {
       try {
-        return fs.readFileSync(path.join(cwd, relativePath), "utf8");
+        const absolute = path.join(cwd, relativePath);
+        // Seam scanning is a heuristic; skip pathological files (generated
+        // bundles) rather than loading them whole.
+        if (fs.statSync(absolute).size > 1_000_000) {
+          return null;
+        }
+        return fs.readFileSync(absolute, "utf8");
       } catch {
         return null;
       }
@@ -1213,7 +1219,16 @@ async function executeParallelReviewRun(request) {
         outOfScope: 0
       };
       shardReports.push(report);
-      const extraction = extractJsonPayload(record?.result?.rawOutput ?? "", (parsed) => Array.isArray(parsed.findings));
+      // Mirror the review schema's required contract: a truncated object that
+      // parses but lacks required fields is a dropped shard, not a clean one.
+      const extraction = extractJsonPayload(
+        record?.result?.rawOutput ?? "",
+        (parsed) =>
+          typeof parsed.verdict === "string" &&
+          typeof parsed.summary === "string" &&
+          Array.isArray(parsed.findings) &&
+          Array.isArray(parsed.next_steps)
+      );
       if (!extraction.payload) {
         unparsed.push({ shard: child.shard.id, jobId: child.jobId, error: extraction.error });
         continue;
@@ -1299,9 +1314,12 @@ async function executeParallelReviewRun(request) {
       seamFindingCount: 0
     };
     let seamFindings = [];
+    // The reduce contract requires all three fields; an explicit (possibly
+    // empty) seam_findings array is the evidence the seam hunt actually ran.
     const reduceExtraction = extractJsonPayload(
       reduceRecord?.result?.rawOutput ?? "",
-      (parsed) => Array.isArray(parsed.assessments) || Array.isArray(parsed.seam_findings)
+      (parsed) =>
+        typeof parsed.summary === "string" && Array.isArray(parsed.assessments) && Array.isArray(parsed.seam_findings)
     );
     if (reduceExtraction.payload) {
       const outcome = applyReduceOutcome(findings, reduceExtraction.payload);
