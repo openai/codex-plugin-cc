@@ -77,9 +77,19 @@ export function loadState(cwd) {
   }
 }
 
+// Status, cancel, and the parallel-review supervisor all depend on the job
+// files of in-flight jobs; rank active jobs ahead of recency so retention
+// pruning cannot delete a running job's record mid-flight.
 function pruneJobs(jobs) {
+  const isActive = (job) => job.status === "queued" || job.status === "running";
   return [...jobs]
-    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")))
+    .sort((left, right) => {
+      const activeDelta = Number(isActive(right)) - Number(isActive(left));
+      if (activeDelta !== 0) {
+        return activeDelta;
+      }
+      return String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? ""));
+    })
     .slice(0, MAX_JOBS);
 }
 

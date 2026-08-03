@@ -7,8 +7,9 @@ allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 
 Run a sharded adversarial Codex review through the shared plugin runtime.
 
-The companion splits the diff into up to `--max-shards` balanced shards by
-directory/file ownership, reviews them as concurrent background tasks, then
+The companion splits the diff into up to `--max-shards` balanced shards
+(capped at 8) by directory/file ownership, reviews them as concurrent
+background tasks, then
 runs one mandatory cross-shard integration pass that verifies every finding
 (CONFIRMED / SUSPECTED / REJECTED) and hunts defects that span two shards —
 the class a single shard can never see whole. Small diffs (under ~300 changed

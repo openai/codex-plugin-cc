@@ -85,6 +85,7 @@ const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json"
 const PARALLEL_REDUCE_SCHEMA = path.join(ROOT_DIR, "schemas", "parallel-reduce-output.schema.json");
 const PARALLEL_SPAWN_STAGGER_MS = 3000;
 const PARALLEL_POLL_INTERVAL_MS = 15000;
+const PARALLEL_MAX_SHARDS_LIMIT = 8;
 const PARALLEL_STALL_TIMEOUT_MS = 6 * 60_000;
 // Delta notifications are opted out at initialize, so a live turn can
 // legitimately go minutes without log activity while the model reasons;
@@ -1312,7 +1313,10 @@ async function executeParallelReviewRun(request) {
       seams,
       totals: { wallSec: Math.round((Date.now() - startedAt) / 1000), shardCount: plan.shards.length }
     };
-    const degraded = shardReports.some((report) => report.status !== "completed") || Boolean(reduceReport.error);
+    // A shard that completed but produced non-schema output contributed no
+    // findings — that run is incomplete, not successful.
+    const degraded =
+      shardReports.some((report) => report.status !== "completed") || unparsed.length > 0 || Boolean(reduceReport.error);
 
     return {
       exitStatus: degraded ? 1 : 0,
@@ -1363,7 +1367,13 @@ async function handleParallelReview(argv) {
   const model = normalizeRequestedModel(options.model);
   const effort = normalizeReasoningEffort(options.effort);
   const reduceEffort = normalizeReasoningEffort(options["reduce-effort"]) ?? "low";
-  const maxShards = Math.max(2, Number.parseInt(options["max-shards"] ?? `${DEFAULT_MAX_SHARDS}`, 10) || DEFAULT_MAX_SHARDS);
+  // Every shard costs jobs (two attempts each, plus the reduce and the parent
+  // record) against the workspace's 50-slot retention cap; the clamp keeps a
+  // worst-case run well inside it.
+  const maxShards = Math.min(
+    PARALLEL_MAX_SHARDS_LIMIT,
+    Math.max(2, Number.parseInt(options["max-shards"] ?? `${DEFAULT_MAX_SHARDS}`, 10) || DEFAULT_MAX_SHARDS)
+  );
   const timeoutMs =
     Math.max(1, Number.parseInt(options["timeout-min"] ?? `${DEFAULT_PARALLEL_TIMEOUT_MIN}`, 10) || DEFAULT_PARALLEL_TIMEOUT_MIN) * 60_000;
   const focusText = positionals.join(" ").trim();
