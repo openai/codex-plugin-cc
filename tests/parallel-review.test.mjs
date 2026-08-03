@@ -1,9 +1,13 @@
+import fs from "node:fs";
+import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
   applyReduceOutcome,
   assignFindingIds,
+  buildShardDiff,
+  collectChangedFiles,
   extractJsonPayload,
   extractSeamHints,
   mergeFindings,
@@ -13,6 +17,7 @@ import {
   renderParallelReviewResult
 } from "../plugins/codex/scripts/lib/parallel-review.mjs";
 import { isPidAlive } from "../plugins/codex/scripts/lib/process.mjs";
+import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 
 function makeFile(filePath, weight, overrides = {}) {
   return { path: filePath, weight, binary: false, status: "M", oldPath: null, ...overrides };
@@ -218,4 +223,48 @@ test("isPidAlive distinguishes the current process from a dead pid", () => {
   assert.equal(isPidAlive(2 ** 30), false);
   assert.equal(isPidAlive(Number.NaN), false);
   assert.equal(isPidAlive(-1), false);
+});
+
+test("working-tree collection sees staged edits a worktree revert hides", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const filePath = path.join(repo, "src", "a.txt");
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, "original\n", "utf8");
+  run("git", ["add", "."], { cwd: repo });
+  run("git", ["commit", "-m", "base"], { cwd: repo });
+
+  // Stage an edit, then revert the worktree copy: `git diff HEAD` is empty
+  // for this path, but committing now would still land the staged edit.
+  fs.writeFileSync(filePath, "staged edit\n", "utf8");
+  run("git", ["add", "src/a.txt"], { cwd: repo });
+  fs.writeFileSync(filePath, "original\n", "utf8");
+
+  const target = { mode: "working-tree", label: "working tree" };
+  const files = collectChangedFiles(repo, target);
+  const entry = files.find((file) => file.path === "src/a.txt");
+  assert.ok(entry, "expected the staged-but-reverted file to be collected");
+
+  const diff = buildShardDiff(repo, target, { id: "A", files: [entry] });
+  assert.match(diff.text, /staged edit/);
+});
+
+test("applyReduceOutcome does not count assessments for unknown ids", () => {
+  const findings = assignFindingIds(
+    mergeFindings([
+      normalizeShardFinding({ severity: "high", title: "A", file: "a.ts", line_start: 1, line_end: 1, confidence: 0.9, body: "a", recommendation: "r" }, "s1"),
+      normalizeShardFinding({ severity: "low", title: "B", file: "b.ts", line_start: 5, line_end: 5, confidence: 0.5, body: "b", recommendation: "r" }, "s2")
+    ])
+  );
+  const { assessed } = applyReduceOutcome(findings, {
+    assessments: [
+      { id: "f1", verdict: "CONFIRMED", note: "checked" },
+      { id: "f9", verdict: "REJECTED", note: "hallucinated id" }
+    ],
+    seam_findings: []
+  });
+
+  assert.equal(assessed, 1);
+  assert.equal(findings[0].verification, "CONFIRMED");
+  assert.equal(findings[1].verification, "SUSPECTED");
 });

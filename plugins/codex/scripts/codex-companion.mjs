@@ -1209,7 +1209,8 @@ async function executeParallelReviewRun(request) {
         retries: child.retries,
         verdict: null,
         summary: null,
-        findingCount: 0
+        findingCount: 0,
+        outOfScope: 0
       };
       shardReports.push(report);
       const extraction = extractJsonPayload(record?.result?.rawOutput ?? "", (parsed) => Array.isArray(parsed.findings));
@@ -1219,9 +1220,18 @@ async function executeParallelReviewRun(request) {
       }
       report.verdict = extraction.payload.verdict ?? null;
       report.summary = extraction.payload.summary ?? null;
-      report.findingCount = extraction.payload.findings.length;
+      // The shard prompt promises findings outside the shard's file list are
+      // discarded; enforce that here so out-of-lane guesses cannot seed
+      // duplicates — cross-file defects are the reduce pass's job.
+      const ownedPaths = new Set(child.shard.files.map((file) => file.path));
       for (const raw of extraction.payload.findings) {
-        rawFindings.push(normalizeShardFinding(raw, child.shard.id));
+        const finding = normalizeShardFinding(raw, child.shard.id);
+        if (!ownedPaths.has(finding.file.replace(/^\.\//, ""))) {
+          report.outOfScope += 1;
+          continue;
+        }
+        report.findingCount += 1;
+        rawFindings.push(finding);
       }
     }
     const findings = assignFindingIds(mergeFindings(rawFindings));
@@ -1314,13 +1324,14 @@ async function executeParallelReviewRun(request) {
       totals: { wallSec: Math.round((Date.now() - startedAt) / 1000), shardCount: plan.shards.length }
     };
     // A shard that completed but produced non-schema output contributed no
-    // findings, and a reduce turn that failed can still leave parseable
-    // partial output behind — either way the run is incomplete, not
-    // successful.
+    // findings, a failed reduce turn can still leave parseable partial output
+    // behind, and a truncated reduce can parse yet skip finding ids — every
+    // one of those runs is incomplete, not successful.
     const degraded =
       shardReports.some((report) => report.status !== "completed") ||
       unparsed.length > 0 ||
       reduceReport.status !== "completed" ||
+      reduceReport.assessed < findings.length ||
       Boolean(reduceReport.error);
 
     return {

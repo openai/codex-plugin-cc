@@ -24,8 +24,11 @@ function runGit(cwd, args) {
   return runCommandChecked("git", args, { cwd, shell: false }).stdout;
 }
 
-function diffRangeArgs(target) {
-  return target.mode === "branch" ? [`${target.baseRef}...HEAD`] : ["HEAD"];
+// Working-tree reviews must read HEAD→index (staged) and index→worktree
+// (unstaged) as separate legs: a staged edit whose worktree copy reverts it
+// is invisible to a single `git diff HEAD`.
+function diffArgSets(target) {
+  return target.mode === "branch" ? [[`${target.baseRef}...HEAD`]] : [["--cached"], []];
 }
 
 // `--numstat -M` renders renames as either `old => new` or `pre{old => new}post`.
@@ -43,36 +46,52 @@ export function normalizeRenamePath(rawPath) {
 }
 
 export function collectChangedFiles(cwd, target) {
-  const rangeArgs = diffRangeArgs(target);
+  const argSets = diffArgSets(target);
 
+  // The staged leg runs first, so a path staged as a rename/add keeps that
+  // status even when an unstaged edit also touches it.
   const statusByPath = new Map();
-  for (const line of runGit(cwd, ["diff", "--name-status", "-M", ...rangeArgs]).split("\n")) {
-    if (!line.trim()) {
-      continue;
+  for (const argSet of argSets) {
+    for (const line of runGit(cwd, ["diff", "--name-status", "-M", ...argSet]).split("\n")) {
+      if (!line.trim()) {
+        continue;
+      }
+      const parts = line.split("\t");
+      const code = parts[0];
+      const filePath = code.startsWith("R") || code.startsWith("C") ? parts[2] : parts[1];
+      if (!statusByPath.has(filePath)) {
+        statusByPath.set(filePath, {
+          code: code[0],
+          oldPath: code.startsWith("R") || code.startsWith("C") ? parts[1] : null
+        });
+      }
     }
-    const parts = line.split("\t");
-    const code = parts[0];
-    if (code.startsWith("R") || code.startsWith("C")) {
-      statusByPath.set(parts[2], { code: code[0], oldPath: parts[1] });
-    } else {
-      statusByPath.set(parts[1], { code: code[0], oldPath: null });
+  }
+
+  const churnByPath = new Map();
+  for (const argSet of argSets) {
+    for (const line of runGit(cwd, ["diff", "--numstat", "-M", ...argSet]).split("\n")) {
+      if (!line.trim()) {
+        continue;
+      }
+      const [added, deleted, ...rest] = line.split("\t");
+      const filePath = normalizeRenamePath(rest.join("\t"));
+      const binary = added === "-" || deleted === "-";
+      const legWeight = binary ? BINARY_FILE_WEIGHT : Number.parseInt(added, 10) + Number.parseInt(deleted, 10);
+      const entry = churnByPath.get(filePath) ?? { weight: 0, binary: false };
+      entry.weight += Number.isFinite(legWeight) ? legWeight : BINARY_FILE_WEIGHT;
+      entry.binary = entry.binary || binary;
+      churnByPath.set(filePath, entry);
     }
   }
 
   const files = [];
-  for (const line of runGit(cwd, ["diff", "--numstat", "-M", ...rangeArgs]).split("\n")) {
-    if (!line.trim()) {
-      continue;
-    }
-    const [added, deleted, ...rest] = line.split("\t");
-    const filePath = normalizeRenamePath(rest.join("\t"));
-    const binary = added === "-" || deleted === "-";
-    const weight = binary ? BINARY_FILE_WEIGHT : Number.parseInt(added, 10) + Number.parseInt(deleted, 10);
+  for (const [filePath, churn] of churnByPath) {
     const status = statusByPath.get(filePath) ?? { code: "M", oldPath: null };
     files.push({
       path: filePath,
-      weight: Number.isFinite(weight) ? weight : BINARY_FILE_WEIGHT,
-      binary,
+      weight: churn.weight,
+      binary: churn.binary,
       status: status.code,
       oldPath: status.oldPath
     });
@@ -269,14 +288,16 @@ export function extractSeamHints({ files, shards, readFileContent }) {
 }
 
 export function buildShardDiff(cwd, target, shard) {
-  const rangeArgs = diffRangeArgs(target);
+  const argSets = diffArgSets(target);
   const perFile = shard.files.map((file) => {
     const pathspec = file.oldPath ? [file.oldPath, file.path] : [file.path];
     let text = "";
-    try {
-      text = runGit(cwd, ["diff", "-M", ...rangeArgs, "--", ...pathspec]);
-    } catch {
-      // An untracked file has no diff against HEAD; embed its content instead.
+    for (const argSet of argSets) {
+      try {
+        text += runGit(cwd, ["diff", "-M", ...argSet, "--", ...pathspec]);
+      } catch {
+        // An untracked file has no diff to show; embed its content below.
+      }
     }
     if (!text.trim() && file.status === "A") {
       try {
@@ -497,8 +518,14 @@ export function applyReduceOutcome(findings, reducePayload) {
   const byId = new Map(
     (reducePayload.assessments ?? []).map((assessment) => [String(assessment.id), assessment])
   );
+  // Count only assessments that matched one of our findings: an id the
+  // reducer invented must not compensate for an id it skipped.
+  let assessed = 0;
   for (const finding of findings) {
     const assessment = byId.get(finding.id);
+    if (assessment) {
+      assessed += 1;
+    }
     finding.verification = REDUCE_VERDICTS.has(assessment?.verdict) ? assessment.verdict : "SUSPECTED";
     finding.reduceNote = assessment?.note ?? null;
   }
@@ -512,7 +539,7 @@ export function applyReduceOutcome(findings, reducePayload) {
     return normalized;
   });
 
-  return { seamFindings, assessed: byId.size };
+  return { seamFindings, assessed };
 }
 
 function formatFindingLine(finding) {
