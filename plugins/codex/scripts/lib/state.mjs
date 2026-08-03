@@ -114,10 +114,29 @@ function writeFileAtomic(targetPath, content) {
   }
 }
 
-export function saveState(cwd, state) {
+export function saveState(cwd, state, options = {}) {
   const previousJobs = loadState(cwd).jobs;
   ensureStateDir(cwd);
-  const nextJobs = pruneJobs(state.jobs ?? []);
+
+  let jobs = state.jobs ?? [];
+  if (options.reconcile) {
+    // Concurrent detached workers each load/mutate/save this shared file. Rebase
+    // only the jobs this mutation actually changed onto the authoritative
+    // previousJobs read (the very read the delete loop below uses), so a
+    // concurrent writer's added or completed job is neither reverted to a stale
+    // status nor deleted. updateState's mutators (upsertJob, setConfig) only add
+    // or update the single job they target, so every other job is taken fresh
+    // from disk. `baseById` holds each job's pre-mutation JSON.
+    const baseById = options.baseById ?? new Map();
+    const changed = jobs.filter((job) => baseById.get(job.id) !== JSON.stringify(job));
+    const merged = new Map(previousJobs.map((job) => [job.id, job]));
+    for (const job of changed) {
+      merged.set(job.id, job);
+    }
+    jobs = [...merged.values()];
+  }
+
+  const nextJobs = pruneJobs(jobs);
   const nextState = {
     version: STATE_VERSION,
     config: {
@@ -142,23 +161,13 @@ export function saveState(cwd, state) {
 
 export function updateState(cwd, mutate) {
   const state = loadState(cwd);
+  // Snapshot each job before mutating so saveState can tell which jobs this
+  // mutation changed and rebase just those onto the latest on-disk state,
+  // instead of overwriting a concurrent writer's changes. Direct saveState
+  // callers that intend to remove jobs (session teardown) skip reconciliation.
+  const baseById = new Map(state.jobs.map((job) => [job.id, JSON.stringify(job)]));
   mutate(state);
-
-  // Concurrent detached workers each run load/mutate/save on this file, so a
-  // stale snapshot at save time could drop — and then saveState could delete
-  // the files of — a live job another worker added after our load. The
-  // mutators routed through updateState (upsertJob, setConfig) only add or
-  // update, never remove, so any job still active on disk that is missing from
-  // our result was added concurrently: merge it back. Direct saveState callers
-  // that intend to remove active jobs (session teardown) are unaffected.
-  const resultIds = new Set(state.jobs.map((job) => job.id));
-  for (const job of loadState(cwd).jobs) {
-    if (!resultIds.has(job.id) && (job.status === "queued" || job.status === "running")) {
-      state.jobs.push(job);
-    }
-  }
-
-  return saveState(cwd, state);
+  return saveState(cwd, state, { reconcile: true, baseById });
 }
 
 export function generateJobId(prefix = "job") {
