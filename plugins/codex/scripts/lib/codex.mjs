@@ -1185,6 +1185,19 @@ export function buildPersistentTaskThreadName(prompt) {
   return buildTaskThreadName(prompt);
 }
 
+// A model asked for JSON often wraps the reply in a markdown fence, which a
+// bare JSON.parse rejects — discarding a well-formed review in favour of the
+// raw-text fallback. Only a fence enclosing the WHOLE message is stripped, so
+// JSON carrying backticks inside string values is untouched and genuinely
+// malformed output still fails.
+const FENCED_MESSAGE = /^```[A-Za-z0-9_+-]*[ \t]*\r?\n([\s\S]*?)\r?\n?```[ \t]*$/;
+
+function unfenceStructuredOutput(rawOutput) {
+  const trimmed = String(rawOutput).trim();
+  const fenced = FENCED_MESSAGE.exec(trimmed);
+  return fenced ? fenced[1] : trimmed;
+}
+
 export function parseStructuredOutput(rawOutput, fallback = {}) {
   if (!rawOutput) {
     return {
@@ -1197,7 +1210,7 @@ export function parseStructuredOutput(rawOutput, fallback = {}) {
 
   try {
     return {
-      parsed: JSON.parse(rawOutput),
+      parsed: JSON.parse(unfenceStructuredOutput(rawOutput)),
       parseError: null,
       rawOutput,
       ...fallback
