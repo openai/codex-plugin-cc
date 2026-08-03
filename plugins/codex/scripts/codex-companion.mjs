@@ -86,6 +86,10 @@ const PARALLEL_REDUCE_SCHEMA = path.join(ROOT_DIR, "schemas", "parallel-reduce-o
 const PARALLEL_SPAWN_STAGGER_MS = 3000;
 const PARALLEL_POLL_INTERVAL_MS = 15000;
 const PARALLEL_STALL_TIMEOUT_MS = 6 * 60_000;
+// Delta notifications are opted out at initialize, so a live turn can
+// legitimately go minutes without log activity while the model reasons;
+// only a much longer silence marks a live-pid worker as hung.
+const PARALLEL_LIVE_STALL_TIMEOUT_MS = 15 * 60_000;
 const PARALLEL_PENDING_GRACE_MS = 90_000;
 const PARALLEL_MAX_RETRIES_PER_SHARD = 1;
 const DEFAULT_PARALLEL_TIMEOUT_MIN = 45;
@@ -336,6 +340,7 @@ function findLatestResumableTaskJob(jobs) {
     jobs.find(
       (job) =>
         job.jobClass === "task" &&
+        job.resumable !== false &&
         job.threadId &&
         job.status !== "queued" &&
         job.status !== "running"
@@ -366,7 +371,9 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const sessionId = getCurrentClaudeSessionId();
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
   const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
-  const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
+  const activeTask = visibleJobs.find(
+    (job) => job.jobClass === "task" && job.resumable !== false && (job.status === "queued" || job.status === "running")
+  );
   if (activeTask) {
     throw new Error(`Task ${activeTask.id} is still running. Use /codex:status before continuing it.`);
   }
@@ -523,7 +530,9 @@ async function executeTaskRun(request) {
     ...(request.outputSchema ? { outputSchema: request.outputSchema } : {}),
     onProgress: request.onProgress,
     persistThread: true,
-    threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
+    // Internal jobs (parallel shards/reduce) override the name so the
+    // TASK_THREAD_PREFIX search in findLatestTaskThread never matches them.
+    threadName: resumeThreadId ? null : (request.threadName ?? buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT))
   });
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
@@ -599,7 +608,7 @@ function getJobKindLabel(kind, jobClass) {
   return jobClass === "review" ? "review" : "rescue";
 }
 
-function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false }) {
+function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false, resumable = true }) {
   return createJobRecord({
     id: generateJobId(prefix),
     kind,
@@ -608,7 +617,8 @@ function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summ
     workspaceRoot,
     jobClass,
     summary,
-    write
+    write,
+    ...(resumable ? {} : { resumable: false })
   });
 }
 
@@ -624,7 +634,7 @@ function createTrackedProgress(job, options = {}) {
   };
 }
 
-function buildTaskJob(workspaceRoot, taskMetadata, write) {
+function buildTaskJob(workspaceRoot, taskMetadata, write, options = {}) {
   return createCompanionJob({
     prefix: "task",
     kind: "task",
@@ -632,11 +642,12 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
     workspaceRoot,
     jobClass: "task",
     summary: taskMetadata.summary,
-    write
+    write,
+    resumable: options.resumable ?? true
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId, threadName }) {
   return {
     cwd,
     model,
@@ -644,7 +655,8 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId
     prompt,
     write,
     resumeLast,
-    jobId
+    jobId,
+    ...(threadName ? { threadName } : {})
   };
 }
 
@@ -957,7 +969,7 @@ async function recoverParallelChild({ cwd, workspaceRoot, child, record, reason,
   // prompt and any analysis done before the crash — resume it instead of
   // paying for a fresh start.
   const threadId = storedJob?.threadId ?? null;
-  const job = buildTaskJob(workspaceRoot, { title: child.title, summary: child.summary }, false);
+  const job = buildTaskJob(workspaceRoot, { title: child.title, summary: child.summary }, false, { resumable: false });
   const request = buildTaskRequest({
     cwd,
     model: child.model,
@@ -965,7 +977,8 @@ async function recoverParallelChild({ cwd, workspaceRoot, child, record, reason,
     prompt: threadId ? PARALLEL_RESUME_PROMPT : child.prompt,
     write: false,
     resumeLast: false,
-    jobId: job.id
+    jobId: job.id,
+    threadName: child.title
   });
   if (threadId) {
     request.resumeThreadId = threadId;
@@ -1022,10 +1035,11 @@ async function superviseParallelJobs({ cwd, workspaceRoot, children, deadline, o
       }
 
       // The job record can say "running" long after the worker died; trust the
-      // OS over the record, and treat a silent log as a hung turn. "queued" is
-      // normally a sub-second window before the worker flips to "running", so a
-      // queued record whose log has been silent this long is a wedged startup
-      // (or a lost status write) and gets the same recovery.
+      // OS over the record. A silent log marks a hung turn, but a live "running"
+      // worker gets the long threshold — reasoning stretches emit no events.
+      // "queued" is normally a sub-second window before the worker flips to
+      // "running", so a queued record silent past the short threshold is a
+      // wedged startup (or a lost status write) and gets recovered sooner.
       const pidDead = record.pid != null && !isPidAlive(record.pid);
       let stalled = false;
       if (
@@ -1034,7 +1048,19 @@ async function superviseParallelJobs({ cwd, workspaceRoot, children, deadline, o
         record.logFile &&
         fs.existsSync(record.logFile)
       ) {
-        stalled = Date.now() - fs.statSync(record.logFile).mtimeMs > PARALLEL_STALL_TIMEOUT_MS;
+        const silentMs = Date.now() - fs.statSync(record.logFile).mtimeMs;
+        const stallLimitMs = record.status === "queued" ? PARALLEL_STALL_TIMEOUT_MS : PARALLEL_LIVE_STALL_TIMEOUT_MS;
+        stalled = silentMs > stallLimitMs;
+        if (!stalled && record.status === "running" && silentMs > PARALLEL_STALL_TIMEOUT_MS) {
+          if (!child.stallWarned) {
+            child.stallWarned = true;
+            onProgress?.({
+              message: `${child.label}: no log progress for ${Math.round(silentMs / 60_000)}m; worker is still alive — recovering only after ${Math.round(PARALLEL_LIVE_STALL_TIMEOUT_MS / 60_000)}m of silence.`
+            });
+          }
+        } else if (silentMs <= PARALLEL_STALL_TIMEOUT_MS) {
+          child.stallWarned = false;
+        }
       }
       if (pidDead || stalled) {
         await recoverParallelChild({
@@ -1123,8 +1149,19 @@ async function executeParallelReviewRun(request) {
       });
       const title = `Codex Parallel Shard ${shard.id}`;
       const summary = `Shard ${shard.id}: ${shard.files.length} files of ${target.label}`;
-      const job = buildTaskJob(workspaceRoot, { title, summary }, false);
-      const taskRequest = buildTaskRequest({ cwd, model, effort, prompt, write: false, resumeLast: false, jobId: job.id });
+      // Shard and reduce jobs are internal to this run; they must never win
+      // the task --resume-last lookup or block it as an active user task.
+      const job = buildTaskJob(workspaceRoot, { title, summary }, false, { resumable: false });
+      const taskRequest = buildTaskRequest({
+        cwd,
+        model,
+        effort,
+        prompt,
+        write: false,
+        resumeLast: false,
+        jobId: job.id,
+        threadName: title
+      });
       taskRequest.outputSchema = shardSchema;
       children.push({
         kind: "shard",
@@ -1203,7 +1240,8 @@ async function executeParallelReviewRun(request) {
     const reduceJob = buildTaskJob(
       workspaceRoot,
       { title: "Codex Parallel Reduce", summary: `Integration pass over ${findings.length} findings` },
-      false
+      false,
+      { resumable: false }
     );
     const reduceRequest = buildTaskRequest({
       cwd,
@@ -1212,7 +1250,8 @@ async function executeParallelReviewRun(request) {
       prompt: reducePrompt,
       write: false,
       resumeLast: false,
-      jobId: reduceJob.id
+      jobId: reduceJob.id,
+      threadName: "Codex Parallel Reduce"
     });
     reduceRequest.outputSchema = reduceSchema;
     const reduceChild = {
