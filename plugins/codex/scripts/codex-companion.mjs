@@ -1314,9 +1314,14 @@ async function executeParallelReviewRun(request) {
       totals: { wallSec: Math.round((Date.now() - startedAt) / 1000), shardCount: plan.shards.length }
     };
     // A shard that completed but produced non-schema output contributed no
-    // findings — that run is incomplete, not successful.
+    // findings, and a reduce turn that failed can still leave parseable
+    // partial output behind — either way the run is incomplete, not
+    // successful.
     const degraded =
-      shardReports.some((report) => report.status !== "completed") || unparsed.length > 0 || Boolean(reduceReport.error);
+      shardReports.some((report) => report.status !== "completed") ||
+      unparsed.length > 0 ||
+      reduceReport.status !== "completed" ||
+      Boolean(reduceReport.error);
 
     return {
       exitStatus: degraded ? 1 : 0,

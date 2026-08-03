@@ -26,9 +26,12 @@ Core constraint:
 Execution rules:
 - A parallel review runs several concurrent Codex turns and costs roughly
   shard-count × the tokens of a single review. Before launching, check the
-  scope with `git diff --shortstat <base>...HEAD` (or `git diff --shortstat`
-  for working-tree scope) and confirm with the user once if they have not
-  already accepted the cost in this conversation.
+  scope and confirm with the user once if they have not already accepted the
+  cost in this conversation:
+  - For base-branch scope, use `git diff --shortstat <base>...HEAD`.
+  - For working-tree scope, inspect both `git diff --shortstat --cached` and
+    `git diff --shortstat` — staged changes are part of the review, and treat
+    untracked files as reviewable work even when both are empty.
 - Always run the command in a Claude background task; a full run takes
   several minutes end-to-end:
   `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" parallel-review <arguments>`
