@@ -98,6 +98,11 @@ const PARALLEL_RESUME_PROMPT =
   "Your previous review turn was interrupted before you produced the final answer. " +
   "Do not start over. Finish the adversarial review of your shard and return only the " +
   "final JSON object required by the structured output contract you were given earlier.";
+const PARALLEL_REDUCE_RESUME_PROMPT =
+  "Your previous integration turn was interrupted before you produced the final answer. " +
+  "Do not start over. Finish the cross-shard integration pass — assess every finding and " +
+  "hunt seam defects that span shards — and return only the final JSON object required by " +
+  "the structured output contract you were given earlier.";
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
@@ -970,12 +975,16 @@ async function recoverParallelChild({ cwd, workspaceRoot, child, record, reason,
   // prompt and any analysis done before the crash — resume it instead of
   // paying for a fresh start.
   const threadId = storedJob?.threadId ?? null;
+  // The reduce pass and shard reviews have different jobs to finish; resuming
+  // a reduce thread with the shard prompt would tell it to review "your shard"
+  // and abandon the integration pass.
+  const resumePrompt = child.kind === "reduce" ? PARALLEL_REDUCE_RESUME_PROMPT : PARALLEL_RESUME_PROMPT;
   const job = buildTaskJob(workspaceRoot, { title: child.title, summary: child.summary }, false, { resumable: false });
   const request = buildTaskRequest({
     cwd,
     model: child.model,
     effort: child.effort,
-    prompt: threadId ? PARALLEL_RESUME_PROMPT : child.prompt,
+    prompt: threadId ? resumePrompt : child.prompt,
     write: false,
     resumeLast: false,
     jobId: job.id,

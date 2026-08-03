@@ -143,6 +143,21 @@ export function saveState(cwd, state) {
 export function updateState(cwd, mutate) {
   const state = loadState(cwd);
   mutate(state);
+
+  // Concurrent detached workers each run load/mutate/save on this file, so a
+  // stale snapshot at save time could drop — and then saveState could delete
+  // the files of — a live job another worker added after our load. The
+  // mutators routed through updateState (upsertJob, setConfig) only add or
+  // update, never remove, so any job still active on disk that is missing from
+  // our result was added concurrently: merge it back. Direct saveState callers
+  // that intend to remove active jobs (session teardown) are unaffected.
+  const resultIds = new Set(state.jobs.map((job) => job.id));
+  for (const job of loadState(cwd).jobs) {
+    if (!resultIds.has(job.id) && (job.status === "queued" || job.status === "running")) {
+      state.jobs.push(job);
+    }
+  }
+
   return saveState(cwd, state);
 }
 

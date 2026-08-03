@@ -5,7 +5,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
-import { readJobFile, resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
+import { readJobFile, resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState, updateState, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -114,4 +114,46 @@ test("writeJobFile writes atomically and leaves no temp files behind", () => {
 
   const leftovers = fs.readdirSync(path.dirname(jobFile)).filter((name) => name.includes(".tmp-"));
   assert.deepEqual(leftovers, [], "no temp files should survive an atomic write");
+});
+
+test("updateState re-adds an active job missing from a stale mutation, but a direct saveState can still remove it", () => {
+  const workspace = makeTempDir();
+
+  // Seed two active jobs on disk with files + logs.
+  const liveIds = ["job-live-a", "job-live-b"];
+  for (const id of liveIds) {
+    writeJobFile(workspace, id, { id, status: "running" });
+    fs.writeFileSync(resolveJobLogFile(workspace, id), `log ${id}\n`, "utf8");
+  }
+  saveState(workspace, {
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: liveIds.map((id) => ({ id, status: "running", logFile: resolveJobLogFile(workspace, id) }))
+  });
+
+  // A mutation that drops an active job (standing in for a stale snapshot from
+  // a concurrent worker) must not lose it: updateState re-adds it and its files
+  // survive.
+  updateState(workspace, (state) => {
+    state.jobs = state.jobs.filter((job) => job.id !== "job-live-b");
+  });
+  assert.equal(fs.existsSync(resolveJobFile(workspace, "job-live-b")), true, "dropped live job file must not be deleted");
+  assert.equal(fs.existsSync(resolveJobLogFile(workspace, "job-live-b")), true, "dropped live job log must not be deleted");
+  assert.ok(
+    JSON.parse(fs.readFileSync(resolveStateFile(workspace), "utf8")).jobs.some((job) => job.id === "job-live-b"),
+    "dropped live job must be merged back into the index"
+  );
+
+  // A direct saveState (session teardown) that intends to remove an active job
+  // must still succeed — the reconciliation only guards updateState mutators.
+  saveState(workspace, {
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [{ id: "job-live-a", status: "running", logFile: resolveJobLogFile(workspace, "job-live-a") }]
+  });
+  assert.equal(fs.existsSync(resolveJobFile(workspace, "job-live-b")), false, "direct saveState removal must delete the job file");
+  assert.ok(
+    !JSON.parse(fs.readFileSync(resolveStateFile(workspace), "utf8")).jobs.some((job) => job.id === "job-live-b"),
+    "direct saveState removal must drop the job from the index"
+  );
 });
