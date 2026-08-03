@@ -1316,7 +1316,10 @@ async function handleParallelReview(argv) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   ensureCodexAvailable(cwd);
-  ensureGitRepository(cwd);
+  // Git prints root-relative paths, and shard pathspecs plus seam reads
+  // resolve against the run directory — anchor the whole run at the repo root
+  // so invoking from a subdirectory cannot produce empty shard diffs.
+  const repoRoot = ensureGitRepository(cwd);
 
   const model = normalizeRequestedModel(options.model);
   const effort = normalizeReasoningEffort(options.effort);
@@ -1329,11 +1332,11 @@ async function handleParallelReview(argv) {
     ? fs.readFileSync(path.resolve(cwd, options["invariants-file"]), "utf8")
     : "";
 
-  const target = resolveReviewTarget(cwd, {
+  const target = resolveReviewTarget(repoRoot, {
     base: options.base,
     scope: options.scope
   });
-  const files = collectChangedFiles(cwd, target);
+  const files = collectChangedFiles(repoRoot, target);
   if (files.length === 0) {
     throw new Error(`No changes found for ${target.label}.`);
   }
@@ -1355,11 +1358,17 @@ async function handleParallelReview(argv) {
       job,
       (progress) =>
         executeReviewRun({
-          cwd,
+          cwd: repoRoot,
           base: options.base,
           scope: options.scope,
           model,
-          focusText,
+          // The single fallback must still honor the shared invariant list the
+          // sharded path would have given every shard.
+          focusText: invariantsText
+            ? [focusText, `Shared invariants that must hold for this change:\n${invariantsText.trim()}`]
+                .filter(Boolean)
+                .join("\n\n")
+            : focusText,
           reviewName: "Adversarial Review",
           onProgress: progress
         }),
@@ -1381,7 +1390,7 @@ async function handleParallelReview(argv) {
     job,
     (progress) =>
       executeParallelReviewRun({
-        cwd,
+        cwd: repoRoot,
         workspaceRoot,
         target,
         plan,
