@@ -99,6 +99,21 @@ function removeFileIfExists(filePath) {
   }
 }
 
+// Concurrent detached workers read these files while others rewrite them; a
+// plain writeFileSync truncates in place, so a reader can catch a half-written
+// file. Write to a sibling temp file and rename (atomic on the same
+// filesystem) so every reader sees a complete old or new file.
+function writeFileAtomic(targetPath, content) {
+  const tempPath = `${targetPath}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    fs.writeFileSync(tempPath, content, "utf8");
+    fs.renameSync(tempPath, targetPath);
+  } catch (error) {
+    removeFileIfExists(tempPath);
+    throw error;
+  }
+}
+
 export function saveState(cwd, state) {
   const previousJobs = loadState(cwd).jobs;
   ensureStateDir(cwd);
@@ -121,7 +136,7 @@ export function saveState(cwd, state) {
     removeFileIfExists(job.logFile);
   }
 
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  writeFileAtomic(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`);
   return nextState;
 }
 
@@ -176,7 +191,7 @@ export function getConfig(cwd) {
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  writeFileAtomic(jobFile, `${JSON.stringify(payload, null, 2)}\n`);
   return jobFile;
 }
 

@@ -5,7 +5,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
-import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import { readJobFile, resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -102,4 +102,16 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
       .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
       .sort()
   );
+});
+
+test("writeJobFile writes atomically and leaves no temp files behind", () => {
+  const workspace = makeTempDir();
+  const jobId = "job-atomic";
+  writeJobFile(workspace, jobId, { id: jobId, status: "running", note: "payload" });
+
+  const jobFile = resolveJobFile(workspace, jobId);
+  assert.deepEqual(readJobFile(jobFile), { id: jobId, status: "running", note: "payload" });
+
+  const leftovers = fs.readdirSync(path.dirname(jobFile)).filter((name) => name.includes(".tmp-"));
+  assert.deepEqual(leftovers, [], "no temp files should survive an atomic write");
 });

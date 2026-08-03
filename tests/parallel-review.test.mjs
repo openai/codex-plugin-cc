@@ -292,3 +292,24 @@ test("collectChangedFiles caps untracked reads and flags binary content", () => 
   const diff = buildShardDiff(repo, target, { id: "A", files: [byPath.get("huge.txt")] });
   assert.match(diff.text, /content omitted/);
 });
+
+test("buildShardDiff omits an oversized single-file diff instead of dropping it silently", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const filePath = path.join(repo, "big.txt");
+  // A committed file whose full rewrite produces a diff well over the shard
+  // inline budget (~150KB): ~6000 lines each replaced.
+  const original = Array.from({ length: 6000 }, (_, i) => `original line ${i} ${"x".repeat(20)}`).join("\n");
+  fs.writeFileSync(filePath, `${original}\n`, "utf8");
+  run("git", ["add", "."], { cwd: repo });
+  run("git", ["commit", "-m", "base"], { cwd: repo });
+  const rewritten = Array.from({ length: 6000 }, (_, i) => `changed line ${i} ${"y".repeat(20)}`).join("\n");
+  fs.writeFileSync(filePath, `${rewritten}\n`, "utf8");
+
+  const target = { mode: "working-tree", label: "working tree" };
+  const file = { path: "big.txt", weight: 12000, binary: false, status: "M", oldPath: null };
+  const diff = buildShardDiff(repo, target, { id: "A", files: [file] });
+
+  assert.deepEqual(diff.omitted, ["big.txt"]);
+  assert.equal(diff.text.includes("changed line"), false, "oversized diff must not be inlined");
+});

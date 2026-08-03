@@ -23,9 +23,18 @@ const SOURCE_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
 const STYLE_EXTENSIONS = new Set([".css", ".scss"]);
 const IMPORT_RESOLVE_SUFFIXES = ["", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".css", "/index.ts", "/index.tsx", "/index.js"];
 
+// Metadata reads (numstat/name-status) can be large on a big diff, so lift the
+// default buffer well above spawnSync's 1MB; per-file diff reads pass a tight
+// bound so an oversized single-file diff is caught instead of read whole.
+const GIT_OUTPUT_MAX_BUFFER = 64 * 1024 * 1024;
+
 // Git is directly executable on Windows. Repository-derived arguments must never pass through a shell.
-function runGit(cwd, args) {
-  return runCommandChecked("git", args, { cwd, shell: false }).stdout;
+function runGit(cwd, args, options = {}) {
+  return runCommandChecked("git", args, {
+    cwd,
+    shell: false,
+    maxBuffer: options.maxBuffer ?? GIT_OUTPUT_MAX_BUFFER
+  }).stdout;
 }
 
 // Working-tree reviews must read HEAD→index (staged) and index→worktree
@@ -305,12 +314,22 @@ export function buildShardDiff(cwd, target, shard) {
   const perFile = shard.files.map((file) => {
     const pathspec = file.oldPath ? [file.oldPath, file.path] : [file.path];
     let text = "";
+    let oversized = false;
     for (const argSet of argSets) {
       try {
-        text += runGit(cwd, ["diff", "-M", ...argSet, "--", ...pathspec]);
-      } catch {
-        // An untracked file has no diff to show; embed its content below.
+        text += runGit(cwd, ["diff", "-M", ...argSet, "--", ...pathspec], { maxBuffer: MAX_SHARD_DIFF_BYTES + 1 });
+      } catch (error) {
+        // A single-file diff larger than a shard can inline overflows the
+        // buffer; route that file to the reviewer to read directly rather than
+        // dropping it silently. Other errors (e.g. an untracked path with no
+        // diff) fall through to the embed handling below.
+        if (error?.code === "ENOBUFS" || /ENOBUFS|maxBuffer/i.test(error?.message ?? "")) {
+          oversized = true;
+        }
       }
+    }
+    if (oversized) {
+      return { file, text: "", bytes: 0, omit: true };
     }
     if (!text.trim() && file.status === "A") {
       try {
@@ -329,17 +348,20 @@ export function buildShardDiff(cwd, target, shard) {
         text = "";
       }
     }
-    return { file, text, bytes: Buffer.byteLength(text, "utf8") };
+    return { file, text, bytes: Buffer.byteLength(text, "utf8"), omit: false };
   });
 
-  const totalBytes = perFile.reduce((sum, entry) => sum + entry.bytes, 0);
+  const forcedOmitted = perFile.filter((entry) => entry.omit).map((entry) => entry.file.path);
+  const inlineable = perFile.filter((entry) => !entry.omit);
+
+  const totalBytes = inlineable.reduce((sum, entry) => sum + entry.bytes, 0);
   if (totalBytes <= MAX_SHARD_DIFF_BYTES) {
-    return { text: perFile.map((entry) => entry.text).join(""), omitted: [] };
+    return { text: inlineable.map((entry) => entry.text).join(""), omitted: forcedOmitted };
   }
 
   // Over budget: keep the heaviest-churn files inline; the reviewer has
   // read-only repository access and can inspect the rest itself.
-  const sorted = [...perFile].sort((a, b) => b.file.weight - a.file.weight);
+  const sorted = [...inlineable].sort((a, b) => b.file.weight - a.file.weight);
   let budget = MAX_SHARD_DIFF_BYTES;
   const keep = new Set();
   for (const entry of sorted) {
@@ -349,8 +371,11 @@ export function buildShardDiff(cwd, target, shard) {
     }
   }
   return {
-    text: perFile.filter((entry) => keep.has(entry.file.path)).map((entry) => entry.text).join(""),
-    omitted: perFile.filter((entry) => !keep.has(entry.file.path)).map((entry) => entry.file.path)
+    text: inlineable.filter((entry) => keep.has(entry.file.path)).map((entry) => entry.text).join(""),
+    omitted: [
+      ...inlineable.filter((entry) => !keep.has(entry.file.path)).map((entry) => entry.file.path),
+      ...forcedOmitted
+    ]
   };
 }
 
@@ -612,6 +637,16 @@ export function renderParallelReviewResult(payload) {
     lines.push(`Warning: ${payload.unparsed.length} shard output(s) could not be parsed; their findings are missing:`);
     for (const entry of payload.unparsed) {
       lines.push(`- ${entry.shard} (${entry.jobId}): ${entry.error}`);
+    }
+  }
+
+  const outOfScope = payload.shards.filter((shard) => shard.outOfScope > 0);
+  if (outOfScope.length > 0) {
+    const total = outOfScope.reduce((sum, shard) => sum + shard.outOfScope, 0);
+    lines.push("");
+    lines.push(`Note: ${total} finding(s) were dropped for citing files outside their shard's ownership:`);
+    for (const shard of outOfScope) {
+      lines.push(`- ${shard.shard}: ${shard.outOfScope} out-of-scope`);
     }
   }
 
