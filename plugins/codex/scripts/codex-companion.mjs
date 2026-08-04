@@ -67,6 +67,12 @@ import {
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
+// Foreground tasks always execute in a detached worker; this budget bounds only how long the CLI
+// process WAITS for the result before handing back the job id. It sits deliberately below Claude
+// Code's 600s Bash ceiling so the id is printed by this process rather than a harness timeout —
+// a harness-side kill loses stdout, and the id the harness substitutes belongs to its own
+// background-command namespace, which status/result cannot resolve.
+const DEFAULT_TASK_WAIT_BUDGET_MS = 540000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
@@ -557,6 +563,65 @@ function renderQueuedTaskLaunch(payload) {
   return `${payload.title} started in the background as ${payload.jobId}. Check /codex:status ${payload.jobId} for progress.\n`;
 }
 
+function renderTaskStillRunning(payload, timeoutMs) {
+  const minutes = Math.max(1, Math.round(timeoutMs / 60000));
+  return (
+    `${payload.title} is still running as ${payload.jobId} after ${minutes} minute(s); it keeps ` +
+    `running in the background. Fetch the outcome with /codex:result ${payload.jobId} ` +
+    `(or /codex:status ${payload.jobId} for progress).\n`
+  );
+}
+
+// Waits for a detached task worker to finish, mirroring the old in-process foreground UX by
+// tailing the worker's log file to stderr while polling the job record.
+async function waitForTaskCompletion(cwd, jobId, { timeoutMs, logFile, stderr }) {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  let logOffset = 0;
+  const logSize = () => {
+    try {
+      return logFile ? fs.statSync(logFile).size : 0;
+    } catch {
+      return 0;
+    }
+  };
+  const tail = () => {
+    if (!stderr || !logFile) {
+      return;
+    }
+    try {
+      const stat = fs.statSync(logFile);
+      if (stat.size > logOffset) {
+        const stream = fs.readFileSync(logFile, "utf8").slice(logOffset);
+        logOffset = stat.size;
+        process.stderr.write(stream);
+      }
+    } catch {
+      // The worker may not have created the file yet.
+    }
+  };
+
+  let snapshot = buildSingleJobSnapshot(cwd, jobId);
+  while (isActiveJobStatus(snapshot.job.status) && Date.now() < deadline) {
+    tail();
+    await sleep(Math.min(DEFAULT_STATUS_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())));
+    snapshot = buildSingleJobSnapshot(cwd, jobId);
+  }
+  if (!isActiveJobStatus(snapshot.job.status)) {
+    // The worker flips the job status and then flushes its final log block; give the file a
+    // moment to settle so the tail carries the run's closing lines (the failure text lives there).
+    for (let settle = 0; settle < 20; settle += 1) {
+      const before = logSize();
+      await sleep(100);
+      tail();
+      if (logSize() === before && settle > 1) {
+        break;
+      }
+    }
+  }
+  tail();
+  return { ...snapshot, waitTimedOut: isActiveJobStatus(snapshot.job.status) };
+}
+
 function getJobKindLabel(kind, jobClass) {
   if (kind === "adversarial-review") {
     return "adversarial-review";
@@ -761,7 +826,7 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "wait-budget-ms"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
     aliasMap: {
       m: "model"
@@ -804,22 +869,71 @@ async function handleTask(argv) {
     return;
   }
 
+  ensureCodexAvailable(cwd);
+  requireTaskRequest(prompt, resumeLast);
+
+  // Detached-worker-first: the run itself always executes in a detached worker, so an interrupted
+  // or timed-out CLI invocation can never lose it. This process only WAITS — inside a budget below
+  // Claude Code's 600s Bash ceiling — and on timeout prints the REAL task id, which /codex:status
+  // and /codex:result resolve; the previous in-process run left a harness timeout to report an id
+  // from the wrong namespace.
   const job = buildTaskJob(workspaceRoot, taskMetadata, write);
-  await runForegroundCommand(
-    job,
-    (progress) =>
-      executeTaskRun({
-        cwd,
-        model,
-        effort,
-        prompt,
-        write,
-        resumeLast,
-        jobId: job.id,
-        onProgress: progress
-      }),
-    { json: options.json }
-  );
+  if (resumeLast) {
+    // Fail fast in THIS process, exactly as the in-process path did: an unresolvable resume (no
+    // prior thread, or another task still running in this session) must error before a worker is
+    // spawned, or the caller only learns from a failed background job.
+    const latestThread = await resolveLatestTrackedTaskThread(workspaceRoot, {
+      excludeJobId: job.id
+    });
+    if (!latestThread) {
+      throw new Error("No previous Codex task thread was found for this repository.");
+    }
+  }
+  const request = buildTaskRequest({
+    cwd,
+    model,
+    effort,
+    prompt,
+    write,
+    resumeLast,
+    jobId: job.id
+  });
+  const { payload } = enqueueBackgroundTask(cwd, job, request);
+  const waitBudgetMs = Math.max(0, Number(options["wait-budget-ms"]) || DEFAULT_TASK_WAIT_BUDGET_MS);
+  const snapshot = await waitForTaskCompletion(cwd, job.id, {
+    timeoutMs: waitBudgetMs,
+    logFile: payload.logFile ?? null,
+    stderr: !options.json
+  });
+
+  if (snapshot.waitTimedOut) {
+    outputCommandResult(
+      { ...payload, waitTimedOut: true },
+      renderTaskStillRunning(payload, waitBudgetMs),
+      options.json
+    );
+    return;
+  }
+
+  // Emit exactly what the old in-process foreground path emitted: the worker persisted the run's
+  // payload and rendered text on the job record, so completion output (and the exit status) stays
+  // byte-compatible for callers scripted against it.
+  const storedJob = readStoredJob(workspaceRoot, job.id);
+  // A THROWN worker error (auth rejection, missing prompt) stores errorMessage with no rendered
+  // output; rethrow it here so the CLI fails exactly as the in-process path did — message on
+  // stderr, non-zero exit.
+  const errorMessage = storedJob?.errorMessage ?? snapshot.job.errorMessage ?? null;
+  if (snapshot.job.status === "failed" && !storedJob?.rendered && errorMessage) {
+    throw new Error(errorMessage);
+  }
+  const payloadOut = storedJob?.result ?? { status: snapshot.job.status === "completed" ? 0 : 1 };
+  const renderedOut =
+    storedJob?.rendered ?? renderStoredJobResult(snapshot.job, storedJob ?? snapshot.job);
+  outputResult(options.json ? payloadOut : renderedOut, options.json);
+  const exitStatus = Number(payloadOut?.status ?? 0);
+  if (exitStatus !== 0) {
+    process.exitCode = exitStatus;
+  }
 }
 
 async function handleTransfer(argv) {
