@@ -25,7 +25,8 @@ Execution rules:
 
 Command selection:
 - Use exactly one `task` invocation per rescue handoff.
-- If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Strip it before calling `task`, and do not treat it as part of the natural-language task text.
+- If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Always strip it before calling `task` — never forward either flag to `task` — and do not treat it as part of the natural-language task text.
+- If the forwarded request includes `--cwd <path>`, treat that as a routing control: strip it from the task text and pass it through to `task` as `--cwd <path>`. It targets the Codex run at a specific working tree (typically an isolated git worktree) so parallel rescue runs never collide; the companion's job state and `--resume-last` threads are scoped per `--cwd` repository root.
 - If the forwarded request includes `--model`, normalize `spark` to `gpt-5.3-codex-spark` and pass it through to `task`.
 - If the forwarded request includes `--effort`, pass it through to `task`.
 - If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
