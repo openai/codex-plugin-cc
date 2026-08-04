@@ -50,6 +50,22 @@ export function binaryAvailable(command, versionArgs = ["--version"], options = 
   return { available: true, detail: result.stdout.trim() || result.stderr.trim() || "ok" };
 }
 
+// A job record can say "running" long after its worker died (host timeouts,
+// broker teardown, SIGKILL); signal 0 asks the OS whether the pid still exists.
+export function isPidAlive(pid, options = {}) {
+  if (!Number.isFinite(pid) || pid <= 0) {
+    return false;
+  }
+  const killImpl = options.killImpl ?? process.kill.bind(process);
+  try {
+    killImpl(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means the process exists but belongs to another user.
+    return error.code === "EPERM";
+  }
+}
+
 function looksLikeMissingProcessMessage(text) {
   return /not found|no running instance|cannot find|does not exist|no such process/i.test(text);
 }

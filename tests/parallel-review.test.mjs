@@ -1,0 +1,477 @@
+import fs from "node:fs";
+import path from "node:path";
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import {
+  applyReduceOutcome,
+  assignFindingIds,
+  buildShardDiff,
+  collectChangedFiles,
+  readReviewedFileContent,
+  extractJsonPayload,
+  extractSeamHints,
+  mergeFindings,
+  normalizeShardFinding,
+  parseNameStatusZ,
+  parseNumstatZ,
+  planShards,
+  renderParallelReviewResult,
+  resolveOwnedFindingPath
+} from "../plugins/codex/scripts/lib/parallel-review.mjs";
+import { isPidAlive } from "../plugins/codex/scripts/lib/process.mjs";
+import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+
+function makeFile(filePath, weight, overrides = {}) {
+  return { path: filePath, weight, binary: false, status: "M", oldPath: null, ...overrides };
+}
+
+test("planShards gates small diffs to a single review", () => {
+  const files = [makeFile("src/a.ts", 120), makeFile("src/b.ts", 90)];
+  const plan = planShards(files, 4);
+
+  assert.equal(plan.mode, "single");
+  assert.match(plan.reason, /parallel gate/i);
+});
+
+test("planShards keeps directory units together and balances shard weight", () => {
+  const files = [
+    makeFile("client/one.ts", 100),
+    makeFile("client/two.ts", 100),
+    makeFile("server/one.ts", 100),
+    makeFile("server/two.ts", 100),
+    makeFile("styles/app.css", 100),
+    makeFile("routes/index.ts", 100),
+    makeFile("lib/util.ts", 100),
+    makeFile("tests/app.test.ts", 100)
+  ];
+  const plan = planShards(files, 4);
+
+  assert.equal(plan.mode, "parallel");
+  assert.equal(plan.shards.length, 2);
+  const weights = plan.shards.map((shard) => shard.weight);
+  assert.equal(Math.max(...weights) - Math.min(...weights), 0);
+  for (const shard of plan.shards) {
+    const dirs = new Set(shard.files.map((file) => file.path.split("/")[0]));
+    for (const dir of dirs) {
+      const dirFiles = files.filter((file) => file.path.startsWith(`${dir}/`));
+      const inShard = shard.files.filter((file) => file.path.startsWith(`${dir}/`));
+      assert.equal(inShard.length, dirFiles.length, `directory ${dir} must not be split across shards`);
+    }
+  }
+});
+
+test("planShards splits an oversized directory so it cannot become the bottleneck", () => {
+  const files = [
+    ...Array.from({ length: 10 }, (_, index) => makeFile(`big/file-${index}.ts`, 140)),
+    makeFile("small/a.ts", 60),
+    makeFile("small/b.ts", 60),
+    makeFile("other/c.ts", 60)
+  ];
+  const plan = planShards(files, 4);
+
+  assert.equal(plan.mode, "parallel");
+  assert.equal(plan.shards.length, 4);
+  const heaviest = Math.max(...plan.shards.map((shard) => shard.weight));
+  const total = files.reduce((sum, file) => sum + file.weight, 0);
+  assert.ok(heaviest < total * 0.5, `oversized dir must be split (heaviest shard ${heaviest} of ${total})`);
+});
+
+test("parseNameStatusZ reads statuses and rename old/new paths verbatim", () => {
+  // A\0added\0 M\0mod\0 D\0gone\0 R100\0old\0new\0 — with a literal ' => ' in a name.
+  const output = "A\x00added.txt\x00M\x00weird => name.txt\x00D\x00gone.txt\x00R100\x00old.ts\x00new.ts\x00";
+  const byPath = parseNameStatusZ(output);
+
+  assert.equal(byPath.get("added.txt").code, "A");
+  assert.equal(byPath.get("weird => name.txt").code, "M");
+  assert.equal(byPath.get("gone.txt").code, "D");
+  assert.deepEqual(byPath.get("new.ts"), { code: "R", oldPath: "old.ts" });
+  assert.equal(byPath.has("old.ts"), false, "the old rename path is not a changed file");
+});
+
+test("parseNumstatZ reads churn and does not mistake ' => ' in a name for a rename", () => {
+  const output = "1\t2\tweird => name.txt\x00-\t-\tbin.dat\x000\t0\t\x00old.ts\x00new.ts\x00";
+  const entries = parseNumstatZ(output);
+
+  assert.deepEqual(entries[0], { added: "1", deleted: "2", path: "weird => name.txt" });
+  assert.deepEqual(entries[1], { added: "-", deleted: "-", path: "bin.dat" });
+  assert.deepEqual(entries[2], { added: "0", deleted: "0", path: "new.ts" });
+});
+
+test("collectChangedFiles keeps a literal ' => ' filename intact", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const literalName = "weird => name.txt";
+  fs.writeFileSync(path.join(repo, literalName), "original\n", "utf8");
+  run("git", ["add", "-A"], { cwd: repo });
+  run("git", ["commit", "-m", "base"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, literalName), "changed\n", "utf8");
+
+  const target = { mode: "working-tree", label: "working tree" };
+  const files = collectChangedFiles(repo, target);
+  const entry = files.find((file) => file.path === literalName);
+  assert.ok(entry, "a modified file whose name contains ' => ' must be recorded under its real name");
+  assert.equal(entry.status, "M");
+
+  const diff = buildShardDiff(repo, target, { id: "A", files: [entry] });
+  assert.match(diff.text, /changed/, "the shard diff must contain the real file's change");
+});
+
+test("extractSeamHints reports imports, css tokens, and global styles crossing shards", () => {
+  const files = [
+    makeFile("src/styles/app.css", 50),
+    makeFile("src/ui/button.tsx", 50),
+    makeFile("src/lib/util.ts", 50)
+  ];
+  const shards = [
+    { id: "s1", files: [files[0]] },
+    { id: "s2", files: [files[1], files[2]] }
+  ];
+  const contents = {
+    "src/styles/app.css": ":root {\n  --color-accent: oklch(60% 0.1 200 / 0.5);\n}\n",
+    "src/ui/button.tsx": "import { helper } from \"../lib/util\";\nconst style = { color: \"var(--color-accent)\" };\n",
+    "src/lib/util.ts": "export function helper() {}\n"
+  };
+  const seams = extractSeamHints({ files, shards, readFileContent: (p) => contents[p] ?? null });
+
+  const kinds = seams.map((seam) => seam.kind).sort();
+  assert.deepEqual([...new Set(kinds)], ["css-token", "global-style"]);
+  const token = seams.find((seam) => seam.kind === "css-token");
+  assert.equal(token.token, "color-accent");
+  assert.equal(token.definedShard, "s1");
+  assert.equal(token.usedShard, "s2");
+  // button.tsx imports util.ts, but both live in s2 — no seam.
+  assert.equal(seams.some((seam) => seam.kind === "import"), false);
+});
+
+test("extractSeamHints resolves relative imports that cross shards", () => {
+  const files = [makeFile("src/ui/button.tsx", 50), makeFile("src/lib/util.ts", 50)];
+  const shards = [
+    { id: "s1", files: [files[0]] },
+    { id: "s2", files: [files[1]] }
+  ];
+  const contents = {
+    "src/ui/button.tsx": "import { helper } from \"../lib/util\";\n",
+    "src/lib/util.ts": "export function helper() {}\n"
+  };
+  const seams = extractSeamHints({ files, shards, readFileContent: (p) => contents[p] ?? null });
+
+  assert.equal(seams.length, 1);
+  assert.equal(seams[0].kind, "import");
+  assert.equal(seams[0].from, "src/ui/button.tsx");
+  assert.equal(seams[0].to, "src/lib/util.ts");
+});
+
+test("mergeFindings dedupes overlapping findings and keeps the worst severity", () => {
+  const findings = [
+    normalizeShardFinding(
+      { severity: "medium", title: "Token alpha stacks with modifier", file: "app.css", line_start: 10, line_end: 14, confidence: 0.7, body: "short", recommendation: "fix" },
+      "s1"
+    ),
+    normalizeShardFinding(
+      { severity: "high", title: "Alpha token stacks with opacity modifier", file: "app.css", line_start: 12, line_end: 16, confidence: 0.9, body: "a longer explanation of the same defect", recommendation: "fix it properly" },
+      "s2"
+    ),
+    normalizeShardFinding(
+      { severity: "low", title: "Unrelated finding", file: "other.ts", line_start: 1, line_end: 2, confidence: 0.5, body: "x", recommendation: "y" },
+      "s1"
+    )
+  ];
+  const merged = assignFindingIds(mergeFindings(findings));
+
+  assert.equal(merged.length, 2);
+  assert.equal(merged[0].severity, "high");
+  assert.equal(merged[0].confidence, 0.9);
+  assert.deepEqual([...merged[0].shards].sort(), ["s1", "s2"]);
+  assert.equal(merged[0].id, "f1");
+  assert.equal(merged[0].sources.length, 2);
+});
+
+test("applyReduceOutcome joins verdicts by id and defaults unassessed findings to SUSPECTED", () => {
+  const findings = assignFindingIds(
+    mergeFindings([
+      normalizeShardFinding({ severity: "high", title: "A", file: "a.ts", line_start: 1, line_end: 1, confidence: 0.9, body: "a", recommendation: "r" }, "s1"),
+      normalizeShardFinding({ severity: "low", title: "B", file: "b.ts", line_start: 1, line_end: 1, confidence: 0.5, body: "b", recommendation: "r" }, "s2")
+    ])
+  );
+  const { seamFindings, assessed } = applyReduceOutcome(findings, {
+    summary: "verdict",
+    assessments: [{ id: "f1", verdict: "REJECTED", note: "disproven" }],
+    seam_findings: [
+      { severity: "high", title: "Cross-shard defect", body: "spans two shards", file: "a.ts", line_start: 5, line_end: 6, confidence: 0.8, recommendation: "fix", related_files: ["b.ts"] }
+    ]
+  });
+
+  assert.equal(assessed, 1);
+  assert.equal(findings[0].verification, "REJECTED");
+  assert.equal(findings[0].reduceNote, "disproven");
+  assert.equal(findings[1].verification, "SUSPECTED");
+  assert.equal(seamFindings.length, 1);
+  assert.equal(seamFindings[0].id, "sf1");
+  assert.equal(seamFindings[0].origin, "reduce");
+  assert.deepEqual(seamFindings[0].relatedFiles, ["b.ts"]);
+});
+
+test("extractJsonPayload tolerates fences and surrounding prose", () => {
+  const valid = (parsed) => Array.isArray(parsed.findings);
+  const object = { verdict: "approve", summary: "ok", findings: [], next_steps: [] };
+
+  assert.deepEqual(extractJsonPayload(JSON.stringify(object), valid).payload, object);
+  assert.deepEqual(extractJsonPayload("```json\n" + JSON.stringify(object) + "\n```", valid).payload, object);
+  assert.deepEqual(extractJsonPayload("Here is my verdict:\n" + JSON.stringify(object) + "\nDone.", valid).payload, object);
+  assert.match(extractJsonPayload("no json here", valid).error, /no schema-shaped/i);
+  assert.match(extractJsonPayload("", valid).error, /empty/i);
+});
+
+test("renderParallelReviewResult separates active and rejected findings", () => {
+  const findings = assignFindingIds(
+    mergeFindings([
+      normalizeShardFinding({ severity: "high", title: "Real defect", file: "a.ts", line_start: 1, line_end: 1, confidence: 0.9, body: "explanation", recommendation: "fix" }, "s1"),
+      normalizeShardFinding({ severity: "low", title: "False alarm", file: "b.ts", line_start: 2, line_end: 2, confidence: 0.4, body: "meh", recommendation: "" }, "s2")
+    ])
+  );
+  applyReduceOutcome(findings, {
+    summary: "one real issue",
+    assessments: [
+      { id: "f1", verdict: "CONFIRMED", note: "verified" },
+      { id: "f2", verdict: "REJECTED", note: "not reachable" }
+    ],
+    seam_findings: []
+  });
+  const rendered = renderParallelReviewResult({
+    target: { label: "base main...HEAD" },
+    shards: [{ shard: "s1", status: "completed", wallSec: 100, retries: 0 }],
+    reduce: { status: "completed", wallSec: 40, summary: "one real issue" },
+    findings,
+    unparsed: [],
+    totals: { wallSec: 150, shardCount: 1 }
+  });
+
+  assert.match(rendered, /Real defect/);
+  assert.match(rendered, /\[CONFIRMED\]/);
+  assert.match(rendered, /Disproven by the integration pass \(1\)/);
+  assert.match(rendered, /not reachable/);
+  assert.match(rendered, /total: 150s end-to-end/);
+});
+
+test("isPidAlive distinguishes the current process from a dead pid", () => {
+  assert.equal(isPidAlive(process.pid), true);
+  assert.equal(isPidAlive(2 ** 30), false);
+  assert.equal(isPidAlive(Number.NaN), false);
+  assert.equal(isPidAlive(-1), false);
+});
+
+test("working-tree collection sees staged edits a worktree revert hides", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const filePath = path.join(repo, "src", "a.txt");
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, "original\n", "utf8");
+  run("git", ["add", "."], { cwd: repo });
+  run("git", ["commit", "-m", "base"], { cwd: repo });
+
+  // Stage an edit, then revert the worktree copy: `git diff HEAD` is empty
+  // for this path, but committing now would still land the staged edit.
+  fs.writeFileSync(filePath, "staged edit\n", "utf8");
+  run("git", ["add", "src/a.txt"], { cwd: repo });
+  fs.writeFileSync(filePath, "original\n", "utf8");
+
+  const target = { mode: "working-tree", label: "working tree" };
+  const files = collectChangedFiles(repo, target);
+  const entry = files.find((file) => file.path === "src/a.txt");
+  assert.ok(entry, "expected the staged-but-reverted file to be collected");
+
+  const diff = buildShardDiff(repo, target, { id: "A", files: [entry] });
+  assert.match(diff.text, /staged edit/);
+});
+
+test("applyReduceOutcome does not count assessments for unknown ids", () => {
+  const findings = assignFindingIds(
+    mergeFindings([
+      normalizeShardFinding({ severity: "high", title: "A", file: "a.ts", line_start: 1, line_end: 1, confidence: 0.9, body: "a", recommendation: "r" }, "s1"),
+      normalizeShardFinding({ severity: "low", title: "B", file: "b.ts", line_start: 5, line_end: 5, confidence: 0.5, body: "b", recommendation: "r" }, "s2")
+    ])
+  );
+  const { assessed } = applyReduceOutcome(findings, {
+    assessments: [
+      { id: "f1", verdict: "CONFIRMED", note: "checked" },
+      { id: "f9", verdict: "REJECTED", note: "hallucinated id" }
+    ],
+    seam_findings: []
+  });
+
+  assert.equal(assessed, 1);
+  assert.equal(findings[0].verification, "CONFIRMED");
+  assert.equal(findings[1].verification, "SUSPECTED");
+});
+
+test("collectChangedFiles caps untracked reads and flags binary content", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "base.txt"), "base\n", "utf8");
+  run("git", ["add", "."], { cwd: repo });
+  run("git", ["commit", "-m", "base"], { cwd: repo });
+
+  fs.writeFileSync(path.join(repo, "small.txt"), "one\ntwo\nthree\n", "utf8");
+  fs.writeFileSync(path.join(repo, "blob.bin"), Buffer.from([0, 1, 2, 0, 3]));
+  fs.writeFileSync(path.join(repo, "huge.txt"), "x".repeat(30 * 1024), "utf8");
+
+  const target = { mode: "working-tree", label: "working tree" };
+  const files = collectChangedFiles(repo, target);
+  const byPath = new Map(files.map((file) => [file.path, file]));
+
+  assert.equal(byPath.get("small.txt").weight, 4);
+  assert.equal(byPath.get("blob.bin").binary, true);
+  // Oversized content is never read; the default weight stands in.
+  assert.equal(byPath.get("huge.txt").weight, byPath.get("blob.bin").weight);
+
+  const diff = buildShardDiff(repo, target, { id: "A", files: [byPath.get("huge.txt")] });
+  assert.match(diff.text, /content omitted/);
+});
+
+test("buildShardDiff omits an oversized single-file diff instead of dropping it silently", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const filePath = path.join(repo, "big.txt");
+  // A committed file whose full rewrite produces a diff well over the shard
+  // inline budget (~150KB): ~6000 lines each replaced.
+  const original = Array.from({ length: 6000 }, (_, i) => `original line ${i} ${"x".repeat(20)}`).join("\n");
+  fs.writeFileSync(filePath, `${original}\n`, "utf8");
+  run("git", ["add", "."], { cwd: repo });
+  run("git", ["commit", "-m", "base"], { cwd: repo });
+  const rewritten = Array.from({ length: 6000 }, (_, i) => `changed line ${i} ${"y".repeat(20)}`).join("\n");
+  fs.writeFileSync(filePath, `${rewritten}\n`, "utf8");
+
+  const target = { mode: "working-tree", label: "working tree" };
+  const file = { path: "big.txt", weight: 12000, binary: false, status: "M", oldPath: null };
+  const diff = buildShardDiff(repo, target, { id: "A", files: [file] });
+
+  assert.deepEqual(diff.omitted, ["big.txt"]);
+  assert.equal(diff.text.includes("changed line"), false, "oversized diff must not be inlined");
+});
+
+test("readReviewedFileContent reads the reviewed snapshot, not a dirty worktree or a reverted stage", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const rel = "src/mod.ts";
+  fs.mkdirSync(path.join(repo, "src"), { recursive: true });
+  fs.writeFileSync(path.join(repo, rel), "export const committed = 1;\n", "utf8");
+  run("git", ["add", "."], { cwd: repo });
+  run("git", ["commit", "-m", "base"], { cwd: repo });
+
+  // Branch review: the reviewed content is HEAD, even with an unrelated dirty
+  // worktree edit on top.
+  fs.writeFileSync(path.join(repo, rel), "export const dirtyWorktree = 2;\n", "utf8");
+  const branchContent = readReviewedFileContent(repo, { mode: "branch", baseRef: "main" }, rel);
+  assert.match(branchContent, /committed/);
+  assert.equal(/dirtyWorktree/.test(branchContent), false, "branch review must not read uncommitted worktree edits");
+
+  // Working-tree review: a staged change whose worktree copy was reverted must
+  // still be visible (scanned from the index), so its seams are not missed.
+  fs.writeFileSync(path.join(repo, rel), "import { token } from './staged';\n", "utf8");
+  run("git", ["add", rel], { cwd: repo });
+  fs.writeFileSync(path.join(repo, rel), "export const committed = 1;\n", "utf8");
+  const wtContent = readReviewedFileContent(repo, { mode: "working-tree", label: "working tree" }, rel);
+  assert.match(wtContent, /token/, "working-tree review must scan staged content even when the worktree reverted it");
+});
+
+test("resolveOwnedFindingPath rescues diff-prefixed and ./-prefixed shard paths", () => {
+  const owned = new Set(["src/foo.ts", "a/real.ts"]);
+
+  // Plain, ./, and / prefixes resolve to the owned path.
+  assert.equal(resolveOwnedFindingPath(owned, "src/foo.ts"), "src/foo.ts");
+  assert.equal(resolveOwnedFindingPath(owned, "./src/foo.ts"), "src/foo.ts");
+  assert.equal(resolveOwnedFindingPath(owned, "/src/foo.ts"), "src/foo.ts");
+
+  // Git diff header prefixes (b/ for the new side, a/ for deletions) resolve.
+  assert.equal(resolveOwnedFindingPath(owned, "b/src/foo.ts"), "src/foo.ts");
+  assert.equal(resolveOwnedFindingPath(owned, "a/src/foo.ts"), "src/foo.ts");
+
+  // A real top-level a/-named file matches literally and is not mis-stripped.
+  assert.equal(resolveOwnedFindingPath(owned, "a/real.ts"), "a/real.ts");
+
+  // A genuinely out-of-scope path stays unresolved.
+  assert.equal(resolveOwnedFindingPath(owned, "other/bar.ts"), null);
+  assert.equal(resolveOwnedFindingPath(owned, "b/other/bar.ts"), null);
+});
+
+test("applyReduceOutcome does not count an assessment that lacks a valid verdict", () => {
+  const findings = assignFindingIds(
+    mergeFindings([
+      normalizeShardFinding({ severity: "high", title: "A", file: "a.ts", line_start: 1, line_end: 1, confidence: 0.9, body: "a", recommendation: "r" }, "s1"),
+      normalizeShardFinding({ severity: "low", title: "B", file: "b.ts", line_start: 2, line_end: 2, confidence: 0.5, body: "b", recommendation: "r" }, "s2")
+    ])
+  );
+  const { assessed } = applyReduceOutcome(findings, {
+    assessments: [
+      { id: "f1", verdict: "CONFIRMED" },
+      { id: "f2" } // present for every id but missing its verdict
+    ],
+    seam_findings: []
+  });
+
+  assert.equal(assessed, 1, "an assessment missing a valid verdict must not count toward completion");
+  assert.equal(findings[0].verification, "CONFIRMED");
+  assert.equal(findings[1].verification, "SUSPECTED");
+});
+
+test("collectChangedFiles reconciles a staged delete recreated in the worktree into one embedded entry", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "f.txt"), "original\n", "utf8");
+  run("git", ["add", "."], { cwd: repo });
+  run("git", ["commit", "-m", "base"], { cwd: repo });
+  run("git", ["rm", "f.txt"], { cwd: repo }); // stage the deletion, remove the worktree copy
+  fs.writeFileSync(path.join(repo, "f.txt"), "recreated content\n", "utf8"); // recreate (now untracked)
+
+  const target = { mode: "working-tree", label: "working tree" };
+  const entries = collectChangedFiles(repo, target).filter((file) => file.path === "f.txt");
+  assert.equal(entries.length, 1, "a staged delete recreated in the worktree must be one entry, not two");
+  assert.equal(entries[0].recreated, true);
+
+  const diff = buildShardDiff(repo, target, { id: "A", files: entries });
+  assert.match(diff.text, /recreated after staged delete/);
+  assert.match(diff.text, /recreated content/, "the recreated worktree content must be embedded");
+});
+
+test("buildShardDiff treats a shard path with glob characters as a literal file", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "sub"), { recursive: true });
+  fs.writeFileSync(path.join(repo, "sub", "data.txt"), "data original\n", "utf8");
+  fs.writeFileSync(path.join(repo, "sub", "*.txt"), "star original\n", "utf8"); // a file literally named *.txt
+  run("git", ["add", "-A"], { cwd: repo });
+  run("git", ["commit", "-m", "base"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "sub", "data.txt"), "DATA_LEAK_MARKER\n", "utf8");
+  fs.writeFileSync(path.join(repo, "sub", "*.txt"), "STAR_LITERAL_MARKER\n", "utf8");
+
+  const target = { mode: "working-tree", label: "working tree" };
+  // The shard owns only the literal "sub/*.txt"; without literal pathspecs its
+  // name would glob and pull in sub/data.txt too.
+  const file = { path: "sub/*.txt", weight: 1, binary: false, status: "M", oldPath: null };
+  const diff = buildShardDiff(repo, target, { id: "A", files: [file] });
+
+  assert.match(diff.text, /STAR_LITERAL_MARKER/);
+  assert.equal(/DATA_LEAK_MARKER/.test(diff.text), false, "a glob-like filename must not pull in other files");
+});
+
+test("buildShardDiff renders an untracked symlink as its target, not the linked file's contents", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "base.txt"), "base\n", "utf8");
+  run("git", ["add", "-A"], { cwd: repo });
+  run("git", ["commit", "-m", "base"], { cwd: repo });
+
+  // A file the symlink points at; its contents must never be embedded.
+  fs.writeFileSync(path.join(repo, "secret.txt"), "TOP_SECRET_CONTENTS\n", "utf8");
+  fs.symlinkSync("secret.txt", path.join(repo, "link.txt")); // untracked symlink
+
+  const target = { mode: "working-tree", label: "working tree" };
+  const linkEntry = collectChangedFiles(repo, target).find((file) => file.path === "link.txt");
+  assert.ok(linkEntry, "the untracked symlink should be collected");
+  assert.equal(linkEntry.binary, false);
+
+  const diff = buildShardDiff(repo, target, { id: "A", files: [linkEntry] });
+  assert.match(diff.text, /symlink.*secret\.txt/);
+  assert.equal(/TOP_SECRET_CONTENTS/.test(diff.text), false, "must not dereference the symlink into the target's contents");
+});

@@ -77,9 +77,19 @@ export function loadState(cwd) {
   }
 }
 
+// Status, cancel, and the parallel-review supervisor all depend on the job
+// files of in-flight jobs; rank active jobs ahead of recency so retention
+// pruning cannot delete a running job's record mid-flight.
 function pruneJobs(jobs) {
+  const isActive = (job) => job.status === "queued" || job.status === "running";
   return [...jobs]
-    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")))
+    .sort((left, right) => {
+      const activeDelta = Number(isActive(right)) - Number(isActive(left));
+      if (activeDelta !== 0) {
+        return activeDelta;
+      }
+      return String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? ""));
+    })
     .slice(0, MAX_JOBS);
 }
 
@@ -89,10 +99,44 @@ function removeFileIfExists(filePath) {
   }
 }
 
-export function saveState(cwd, state) {
+// Concurrent detached workers read these files while others rewrite them; a
+// plain writeFileSync truncates in place, so a reader can catch a half-written
+// file. Write to a sibling temp file and rename (atomic on the same
+// filesystem) so every reader sees a complete old or new file.
+function writeFileAtomic(targetPath, content) {
+  const tempPath = `${targetPath}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    fs.writeFileSync(tempPath, content, "utf8");
+    fs.renameSync(tempPath, targetPath);
+  } catch (error) {
+    removeFileIfExists(tempPath);
+    throw error;
+  }
+}
+
+export function saveState(cwd, state, options = {}) {
   const previousJobs = loadState(cwd).jobs;
   ensureStateDir(cwd);
-  const nextJobs = pruneJobs(state.jobs ?? []);
+
+  let jobs = state.jobs ?? [];
+  if (options.reconcile) {
+    // Concurrent detached workers each load/mutate/save this shared file. Rebase
+    // only the jobs this mutation actually changed onto the authoritative
+    // previousJobs read (the very read the delete loop below uses), so a
+    // concurrent writer's added or completed job is neither reverted to a stale
+    // status nor deleted. updateState's mutators (upsertJob, setConfig) only add
+    // or update the single job they target, so every other job is taken fresh
+    // from disk. `baseById` holds each job's pre-mutation JSON.
+    const baseById = options.baseById ?? new Map();
+    const changed = jobs.filter((job) => baseById.get(job.id) !== JSON.stringify(job));
+    const merged = new Map(previousJobs.map((job) => [job.id, job]));
+    for (const job of changed) {
+      merged.set(job.id, job);
+    }
+    jobs = [...merged.values()];
+  }
+
+  const nextJobs = pruneJobs(jobs);
   const nextState = {
     version: STATE_VERSION,
     config: {
@@ -111,14 +155,19 @@ export function saveState(cwd, state) {
     removeFileIfExists(job.logFile);
   }
 
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  writeFileAtomic(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`);
   return nextState;
 }
 
 export function updateState(cwd, mutate) {
   const state = loadState(cwd);
+  // Snapshot each job before mutating so saveState can tell which jobs this
+  // mutation changed and rebase just those onto the latest on-disk state,
+  // instead of overwriting a concurrent writer's changes. Direct saveState
+  // callers that intend to remove jobs (session teardown) skip reconciliation.
+  const baseById = new Map(state.jobs.map((job) => [job.id, JSON.stringify(job)]));
   mutate(state);
-  return saveState(cwd, state);
+  return saveState(cwd, state, { reconcile: true, baseById });
 }
 
 export function generateJobId(prefix = "job") {
@@ -166,7 +215,7 @@ export function getConfig(cwd) {
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  writeFileAtomic(jobFile, `${JSON.stringify(payload, null, 2)}\n`);
   return jobFile;
 }
 
