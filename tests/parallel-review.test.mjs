@@ -360,3 +360,42 @@ test("resolveOwnedFindingPath rescues diff-prefixed and ./-prefixed shard paths"
   assert.equal(resolveOwnedFindingPath(owned, "other/bar.ts"), null);
   assert.equal(resolveOwnedFindingPath(owned, "b/other/bar.ts"), null);
 });
+
+test("applyReduceOutcome does not count an assessment that lacks a valid verdict", () => {
+  const findings = assignFindingIds(
+    mergeFindings([
+      normalizeShardFinding({ severity: "high", title: "A", file: "a.ts", line_start: 1, line_end: 1, confidence: 0.9, body: "a", recommendation: "r" }, "s1"),
+      normalizeShardFinding({ severity: "low", title: "B", file: "b.ts", line_start: 2, line_end: 2, confidence: 0.5, body: "b", recommendation: "r" }, "s2")
+    ])
+  );
+  const { assessed } = applyReduceOutcome(findings, {
+    assessments: [
+      { id: "f1", verdict: "CONFIRMED" },
+      { id: "f2" } // present for every id but missing its verdict
+    ],
+    seam_findings: []
+  });
+
+  assert.equal(assessed, 1, "an assessment missing a valid verdict must not count toward completion");
+  assert.equal(findings[0].verification, "CONFIRMED");
+  assert.equal(findings[1].verification, "SUSPECTED");
+});
+
+test("collectChangedFiles reconciles a staged delete recreated in the worktree into one embedded entry", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "f.txt"), "original\n", "utf8");
+  run("git", ["add", "."], { cwd: repo });
+  run("git", ["commit", "-m", "base"], { cwd: repo });
+  run("git", ["rm", "f.txt"], { cwd: repo }); // stage the deletion, remove the worktree copy
+  fs.writeFileSync(path.join(repo, "f.txt"), "recreated content\n", "utf8"); // recreate (now untracked)
+
+  const target = { mode: "working-tree", label: "working tree" };
+  const entries = collectChangedFiles(repo, target).filter((file) => file.path === "f.txt");
+  assert.equal(entries.length, 1, "a staged delete recreated in the worktree must be one entry, not two");
+  assert.equal(entries[0].recreated, true);
+
+  const diff = buildShardDiff(repo, target, { id: "A", files: entries });
+  assert.match(diff.text, /recreated after staged delete/);
+  assert.match(diff.text, /recreated content/, "the recreated worktree content must be embedded");
+});

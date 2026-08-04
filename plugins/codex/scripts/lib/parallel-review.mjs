@@ -149,6 +149,7 @@ export function collectChangedFiles(cwd, target) {
   }
 
   if (target.mode !== "branch") {
+    const existingByPath = new Map(files.map((file) => [file.path, file]));
     for (const filePath of runGit(cwd, ["ls-files", "--others", "--exclude-standard"]).split("\n")) {
       if (!filePath.trim()) {
         continue;
@@ -168,7 +169,20 @@ export function collectChangedFiles(cwd, target) {
       } catch {
         // Unreadable; keep the default weight.
       }
-      files.push({ path: filePath, weight, binary, status: "A", oldPath: null });
+      const existing = existingByPath.get(filePath);
+      if (existing) {
+        // The path is both staged (e.g. a staged `git rm`) and present as an
+        // untracked file — it was deleted in the index and recreated in the
+        // worktree. Keep the single diff entry but flag it so buildShardDiff
+        // also embeds the recreated content instead of showing only the delete.
+        existing.recreated = true;
+        existing.binary = existing.binary || binary;
+        existing.weight += weight;
+        continue;
+      }
+      const entry = { path: filePath, weight, binary, status: "A", oldPath: null };
+      files.push(entry);
+      existingByPath.set(filePath, entry);
     }
   }
 
@@ -347,6 +361,26 @@ export function extractSeamHints({ files, shards, readFileContent }) {
     .slice(0, MAX_SEAM_HINTS);
 }
 
+// Render a worktree file as an inline block (capped, binary-aware) for cases a
+// git diff can't show: a brand-new untracked file, or one recreated after a
+// staged delete. Returns "" when the file is unreadable.
+function embedWorktreeFile(cwd, relativePath, label) {
+  try {
+    const absolute = path.join(cwd, relativePath);
+    const stat = fs.statSync(absolute);
+    if (stat.size <= MAX_UNTRACKED_READ_BYTES) {
+      const content = fs.readFileSync(absolute);
+      if (isProbablyText(content)) {
+        return `--- ${label}: ${relativePath} ---\n${content.toString("utf8")}\n`;
+      }
+      return `--- ${label}: ${relativePath} (binary, content omitted) ---\n`;
+    }
+    return `--- ${label}: ${relativePath} (${stat.size} bytes, content omitted) ---\n`;
+  } catch {
+    return "";
+  }
+}
+
 export function buildShardDiff(cwd, target, shard) {
   const argSets = diffArgSets(target);
   const perFile = shard.files.map((file) => {
@@ -370,20 +404,14 @@ export function buildShardDiff(cwd, target, shard) {
       return { file, text: "", bytes: 0, omit: true };
     }
     if (!text.trim() && file.status === "A") {
-      try {
-        const absolute = path.join(cwd, file.path);
-        const stat = fs.statSync(absolute);
-        if (stat.size <= MAX_UNTRACKED_READ_BYTES) {
-          const content = fs.readFileSync(absolute);
-          if (isProbablyText(content)) {
-            text = `--- new file: ${file.path} ---\n${content.toString("utf8")}\n`;
-          }
-        }
-        if (!text) {
-          text = `--- new file: ${file.path} (${stat.size} bytes, content omitted) ---\n`;
-        }
-      } catch {
-        text = "";
+      text = embedWorktreeFile(cwd, file.path, "new file");
+    }
+    if (file.recreated) {
+      // Staged delete + worktree recreate: the diff legs show only the delete,
+      // so append the recreated content the reviewer would otherwise never see.
+      const recreated = embedWorktreeFile(cwd, file.path, "recreated after staged delete");
+      if (recreated) {
+        text += (text.endsWith("\n") || text === "" ? "" : "\n") + recreated;
       }
     }
     return { file, text, bytes: Buffer.byteLength(text, "utf8"), omit: false };
@@ -620,15 +648,18 @@ export function applyReduceOutcome(findings, reducePayload) {
   const byId = new Map(
     (reducePayload.assessments ?? []).map((assessment) => [String(assessment.id), assessment])
   );
-  // Count only assessments that matched one of our findings: an id the
-  // reducer invented must not compensate for an id it skipped.
+  // Count only assessments that matched one of our findings AND carry a valid
+  // verdict: an id the reducer invented must not compensate for a skipped one,
+  // and an object missing/corrupting its verdict is not a real assessment (the
+  // degraded check compares this count against the finding total).
   let assessed = 0;
   for (const finding of findings) {
     const assessment = byId.get(finding.id);
-    if (assessment) {
+    const validVerdict = REDUCE_VERDICTS.has(assessment?.verdict);
+    if (assessment && validVerdict) {
       assessed += 1;
     }
-    finding.verification = REDUCE_VERDICTS.has(assessment?.verdict) ? assessment.verdict : "SUSPECTED";
+    finding.verification = validVerdict ? assessment.verdict : "SUSPECTED";
     finding.reduceNote = assessment?.note ?? null;
   }
 
