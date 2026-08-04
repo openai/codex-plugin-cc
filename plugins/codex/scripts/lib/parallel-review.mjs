@@ -76,7 +76,10 @@ export function readReviewedFileContent(cwd, target, relativePath) {
   }
   try {
     const absolute = path.join(cwd, relativePath);
-    if (fs.statSync(absolute).size <= MAX_SEAM_READ_BYTES) {
+    // lstat, never stat: a symlink has no imports/tokens to scan and following
+    // it could read a file outside the repo into the seam inputs.
+    const stat = fs.lstatSync(absolute);
+    if (!stat.isSymbolicLink() && stat.isFile() && stat.size <= MAX_SEAM_READ_BYTES) {
       parts.push(fs.readFileSync(absolute, "utf8"));
     }
   } catch {
@@ -204,7 +207,10 @@ export function collectChangedFiles(cwd, target) {
       let binary = false;
       try {
         const absolute = path.join(cwd, filePath);
-        if (fs.statSync(absolute).size <= MAX_UNTRACKED_READ_BYTES) {
+        const stat = fs.lstatSync(absolute); // no-follow: don't dereference symlinks
+        if (stat.isSymbolicLink()) {
+          weight = 1; // a symlink's content is just its short target path
+        } else if (stat.isFile() && stat.size <= MAX_UNTRACKED_READ_BYTES) {
           const content = fs.readFileSync(absolute);
           if (isProbablyText(content)) {
             weight = content.toString("utf8").split("\n").length;
@@ -413,7 +419,15 @@ export function extractSeamHints({ files, shards, readFileContent }) {
 function embedWorktreeFile(cwd, relativePath, label) {
   try {
     const absolute = path.join(cwd, relativePath);
-    const stat = fs.statSync(absolute);
+    // lstat, never stat: a symlink's reviewable content is its target path (git
+    // stores exactly that), and following it could embed a file outside the repo.
+    const stat = fs.lstatSync(absolute);
+    if (stat.isSymbolicLink()) {
+      return `--- ${label} (symlink): ${relativePath} -> ${fs.readlinkSync(absolute)} ---\n`;
+    }
+    if (!stat.isFile()) {
+      return "";
+    }
     if (stat.size <= MAX_UNTRACKED_READ_BYTES) {
       const content = fs.readFileSync(absolute);
       if (isProbablyText(content)) {

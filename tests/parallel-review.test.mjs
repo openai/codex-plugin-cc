@@ -454,3 +454,24 @@ test("buildShardDiff treats a shard path with glob characters as a literal file"
   assert.match(diff.text, /STAR_LITERAL_MARKER/);
   assert.equal(/DATA_LEAK_MARKER/.test(diff.text), false, "a glob-like filename must not pull in other files");
 });
+
+test("buildShardDiff renders an untracked symlink as its target, not the linked file's contents", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "base.txt"), "base\n", "utf8");
+  run("git", ["add", "-A"], { cwd: repo });
+  run("git", ["commit", "-m", "base"], { cwd: repo });
+
+  // A file the symlink points at; its contents must never be embedded.
+  fs.writeFileSync(path.join(repo, "secret.txt"), "TOP_SECRET_CONTENTS\n", "utf8");
+  fs.symlinkSync("secret.txt", path.join(repo, "link.txt")); // untracked symlink
+
+  const target = { mode: "working-tree", label: "working tree" };
+  const linkEntry = collectChangedFiles(repo, target).find((file) => file.path === "link.txt");
+  assert.ok(linkEntry, "the untracked symlink should be collected");
+  assert.equal(linkEntry.binary, false);
+
+  const diff = buildShardDiff(repo, target, { id: "A", files: [linkEntry] });
+  assert.match(diff.text, /symlink.*secret\.txt/);
+  assert.equal(/TOP_SECRET_CONTENTS/.test(diff.text), false, "must not dereference the symlink into the target's contents");
+});
