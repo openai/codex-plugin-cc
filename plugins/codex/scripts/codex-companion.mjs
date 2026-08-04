@@ -41,7 +41,8 @@ import {
   normalizeShardFinding,
   planShards,
   readReviewedFileContent,
-  renderParallelReviewResult
+  renderParallelReviewResult,
+  resolveOwnedFindingPath
 } from "./lib/parallel-review.mjs";
 import {
   generateJobId,
@@ -1241,10 +1242,14 @@ async function executeParallelReviewRun(request) {
       const ownedPaths = new Set(child.shard.files.map((file) => file.path));
       for (const raw of extraction.payload.findings) {
         const finding = normalizeShardFinding(raw, child.shard.id);
-        if (!ownedPaths.has(finding.file.replace(/^\.\//, ""))) {
+        const ownedPath = resolveOwnedFindingPath(ownedPaths, finding.file);
+        if (!ownedPath) {
           report.outOfScope += 1;
           continue;
         }
+        // Normalize any diff-prefixed citation back to the owned path so dedupe
+        // and the reduce pass see a consistent path.
+        finding.file = ownedPath;
         report.findingCount += 1;
         rawFindings.push(finding);
       }

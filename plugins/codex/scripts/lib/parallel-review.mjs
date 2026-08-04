@@ -467,6 +467,23 @@ export function buildReducePrompt(rootDir, { runLabel, targetLabel, shards, find
   });
 }
 
+// A shard may cite a path the way the git diff header shows it (`a/…` for the
+// old side, `b/…` for the new) or with a `./` or `/` prefix. Resolve it back to
+// the shard's owned path so a valid in-shard finding is not dropped as
+// out-of-scope. The literal path is tried first so a real top-level `a/`- or
+// `b/`-named file is never mis-stripped; returns null when it is truly outside.
+export function resolveOwnedFindingPath(ownedPaths, rawPath) {
+  const stripped = String(rawPath ?? "").replace(/^\.?\//, "");
+  if (ownedPaths.has(stripped)) {
+    return stripped;
+  }
+  const deprefixed = stripped.replace(/^[ab]\//, "");
+  if (deprefixed !== stripped && ownedPaths.has(deprefixed)) {
+    return deprefixed;
+  }
+  return null;
+}
+
 export function normalizeShardFinding(raw, shardId) {
   const title = String(raw.title ?? "(untitled)");
   const lineStart = Number.isFinite(raw.line_start) ? raw.line_start : 1;

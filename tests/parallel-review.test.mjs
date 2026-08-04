@@ -15,7 +15,8 @@ import {
   normalizeRenamePath,
   normalizeShardFinding,
   planShards,
-  renderParallelReviewResult
+  renderParallelReviewResult,
+  resolveOwnedFindingPath
 } from "../plugins/codex/scripts/lib/parallel-review.mjs";
 import { isPidAlive } from "../plugins/codex/scripts/lib/process.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
@@ -338,4 +339,24 @@ test("readReviewedFileContent reads the reviewed snapshot, not a dirty worktree 
   fs.writeFileSync(path.join(repo, rel), "export const committed = 1;\n", "utf8");
   const wtContent = readReviewedFileContent(repo, { mode: "working-tree", label: "working tree" }, rel);
   assert.match(wtContent, /token/, "working-tree review must scan staged content even when the worktree reverted it");
+});
+
+test("resolveOwnedFindingPath rescues diff-prefixed and ./-prefixed shard paths", () => {
+  const owned = new Set(["src/foo.ts", "a/real.ts"]);
+
+  // Plain, ./, and / prefixes resolve to the owned path.
+  assert.equal(resolveOwnedFindingPath(owned, "src/foo.ts"), "src/foo.ts");
+  assert.equal(resolveOwnedFindingPath(owned, "./src/foo.ts"), "src/foo.ts");
+  assert.equal(resolveOwnedFindingPath(owned, "/src/foo.ts"), "src/foo.ts");
+
+  // Git diff header prefixes (b/ for the new side, a/ for deletions) resolve.
+  assert.equal(resolveOwnedFindingPath(owned, "b/src/foo.ts"), "src/foo.ts");
+  assert.equal(resolveOwnedFindingPath(owned, "a/src/foo.ts"), "src/foo.ts");
+
+  // A real top-level a/-named file matches literally and is not mis-stripped.
+  assert.equal(resolveOwnedFindingPath(owned, "a/real.ts"), "a/real.ts");
+
+  // A genuinely out-of-scope path stays unresolved.
+  assert.equal(resolveOwnedFindingPath(owned, "other/bar.ts"), null);
+  assert.equal(resolveOwnedFindingPath(owned, "b/other/bar.ts"), null);
 });
