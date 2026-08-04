@@ -85,18 +85,75 @@ export function readReviewedFileContent(cwd, target, relativePath) {
   return parts.length > 0 ? parts.join("\n") : null;
 }
 
-// `--numstat -M` renders renames as either `old => new` or `pre{old => new}post`.
-export function normalizeRenamePath(rawPath) {
-  if (rawPath.includes("{")) {
-    return rawPath
-      .replace(/\{([^{}]*) => ([^{}]*)\}/g, (_, _from, to) => to)
-      .replace(/\/{2,}/g, "/")
-      .replace(/^\.\//, "");
+// NUL-terminated parsers. `-z` prints pathnames verbatim (no quoting, no
+// `old => new` rewriting), so a filename containing ` => `, tabs, quotes, or
+// non-ASCII bytes is handled correctly instead of being mis-parsed as a rename.
+
+// `--name-status -M -z`: `<status>\0<path>\0`, or `R<score>\0<old>\0<new>\0`.
+export function parseNameStatusZ(output) {
+  const tokens = output.split("\0");
+  const byPath = new Map();
+  let i = 0;
+  while (i < tokens.length) {
+    const status = tokens[i];
+    if (!status) {
+      i += 1;
+      continue;
+    }
+    const code = status[0];
+    if (code === "R" || code === "C") {
+      const oldPath = tokens[i + 1] ?? null;
+      const newPath = tokens[i + 2];
+      i += 3;
+      if (newPath && !byPath.has(newPath)) {
+        byPath.set(newPath, { code, oldPath });
+      }
+    } else {
+      const filePath = tokens[i + 1];
+      i += 2;
+      if (filePath && !byPath.has(filePath)) {
+        byPath.set(filePath, { code, oldPath: null });
+      }
+    }
   }
-  if (rawPath.includes(" => ")) {
-    return rawPath.split(" => ").pop();
+  return byPath;
+}
+
+// `--numstat -M -z`: `<added>\t<deleted>\t<path>\0`, or for a rename
+// `<added>\t<deleted>\t\0<old>\0<new>\0` (empty path field, then old + new).
+export function parseNumstatZ(output) {
+  const tokens = output.split("\0");
+  const entries = [];
+  let i = 0;
+  while (i < tokens.length) {
+    const head = tokens[i];
+    if (!head) {
+      i += 1;
+      continue;
+    }
+    const firstTab = head.indexOf("\t");
+    const secondTab = head.indexOf("\t", firstTab + 1);
+    if (firstTab === -1 || secondTab === -1) {
+      i += 1;
+      continue;
+    }
+    const added = head.slice(0, firstTab);
+    const deleted = head.slice(firstTab + 1, secondTab);
+    const pathField = head.slice(secondTab + 1);
+    let filePath;
+    if (pathField === "") {
+      // Rename/copy: the new path is the second following token.
+      filePath = tokens[i + 2];
+      i += 3;
+    } else {
+      filePath = pathField;
+      i += 1;
+    }
+    if (filePath) {
+      entries.push({ added, deleted, path: filePath });
+    }
   }
-  return rawPath;
+  return entries;
 }
 
 export function collectChangedFiles(cwd, target) {
@@ -106,30 +163,16 @@ export function collectChangedFiles(cwd, target) {
   // status even when an unstaged edit also touches it.
   const statusByPath = new Map();
   for (const argSet of argSets) {
-    for (const line of runGit(cwd, ["diff", "--name-status", "-M", ...argSet]).split("\n")) {
-      if (!line.trim()) {
-        continue;
-      }
-      const parts = line.split("\t");
-      const code = parts[0];
-      const filePath = code.startsWith("R") || code.startsWith("C") ? parts[2] : parts[1];
+    for (const [filePath, info] of parseNameStatusZ(runGit(cwd, ["diff", "--name-status", "-M", "-z", ...argSet]))) {
       if (!statusByPath.has(filePath)) {
-        statusByPath.set(filePath, {
-          code: code[0],
-          oldPath: code.startsWith("R") || code.startsWith("C") ? parts[1] : null
-        });
+        statusByPath.set(filePath, info);
       }
     }
   }
 
   const churnByPath = new Map();
   for (const argSet of argSets) {
-    for (const line of runGit(cwd, ["diff", "--numstat", "-M", ...argSet]).split("\n")) {
-      if (!line.trim()) {
-        continue;
-      }
-      const [added, deleted, ...rest] = line.split("\t");
-      const filePath = normalizeRenamePath(rest.join("\t"));
+    for (const { added, deleted, path: filePath } of parseNumstatZ(runGit(cwd, ["diff", "--numstat", "-M", "-z", ...argSet]))) {
       const binary = added === "-" || deleted === "-";
       const legWeight = binary ? BINARY_FILE_WEIGHT : Number.parseInt(added, 10) + Number.parseInt(deleted, 10);
       const entry = churnByPath.get(filePath) ?? { weight: 0, binary: false };
@@ -153,8 +196,8 @@ export function collectChangedFiles(cwd, target) {
 
   if (target.mode !== "branch") {
     const existingByPath = new Map(files.map((file) => [file.path, file]));
-    for (const filePath of runGit(cwd, ["ls-files", "--others", "--exclude-standard"]).split("\n")) {
-      if (!filePath.trim()) {
+    for (const filePath of runGit(cwd, ["ls-files", "--others", "--exclude-standard", "-z"]).split("\0")) {
+      if (!filePath) {
         continue;
       }
       let weight = BINARY_FILE_WEIGHT;

@@ -12,8 +12,9 @@ import {
   extractJsonPayload,
   extractSeamHints,
   mergeFindings,
-  normalizeRenamePath,
   normalizeShardFinding,
+  parseNameStatusZ,
+  parseNumstatZ,
   planShards,
   renderParallelReviewResult,
   resolveOwnedFindingPath
@@ -76,11 +77,44 @@ test("planShards splits an oversized directory so it cannot become the bottlenec
   assert.ok(heaviest < total * 0.5, `oversized dir must be split (heaviest shard ${heaviest} of ${total})`);
 });
 
-test("normalizeRenamePath handles both numstat rename spellings", () => {
-  assert.equal(normalizeRenamePath("src/{old.ts => new.ts}"), "src/new.ts");
-  assert.equal(normalizeRenamePath("a/{b => c}/d.ts"), "a/c/d.ts");
-  assert.equal(normalizeRenamePath("old.ts => new.ts"), "new.ts");
-  assert.equal(normalizeRenamePath("plain/path.ts"), "plain/path.ts");
+test("parseNameStatusZ reads statuses and rename old/new paths verbatim", () => {
+  // A\0added\0 M\0mod\0 D\0gone\0 R100\0old\0new\0 — with a literal ' => ' in a name.
+  const output = "A\x00added.txt\x00M\x00weird => name.txt\x00D\x00gone.txt\x00R100\x00old.ts\x00new.ts\x00";
+  const byPath = parseNameStatusZ(output);
+
+  assert.equal(byPath.get("added.txt").code, "A");
+  assert.equal(byPath.get("weird => name.txt").code, "M");
+  assert.equal(byPath.get("gone.txt").code, "D");
+  assert.deepEqual(byPath.get("new.ts"), { code: "R", oldPath: "old.ts" });
+  assert.equal(byPath.has("old.ts"), false, "the old rename path is not a changed file");
+});
+
+test("parseNumstatZ reads churn and does not mistake ' => ' in a name for a rename", () => {
+  const output = "1\t2\tweird => name.txt\x00-\t-\tbin.dat\x000\t0\t\x00old.ts\x00new.ts\x00";
+  const entries = parseNumstatZ(output);
+
+  assert.deepEqual(entries[0], { added: "1", deleted: "2", path: "weird => name.txt" });
+  assert.deepEqual(entries[1], { added: "-", deleted: "-", path: "bin.dat" });
+  assert.deepEqual(entries[2], { added: "0", deleted: "0", path: "new.ts" });
+});
+
+test("collectChangedFiles keeps a literal ' => ' filename intact", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const literalName = "weird => name.txt";
+  fs.writeFileSync(path.join(repo, literalName), "original\n", "utf8");
+  run("git", ["add", "-A"], { cwd: repo });
+  run("git", ["commit", "-m", "base"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, literalName), "changed\n", "utf8");
+
+  const target = { mode: "working-tree", label: "working tree" };
+  const files = collectChangedFiles(repo, target);
+  const entry = files.find((file) => file.path === literalName);
+  assert.ok(entry, "a modified file whose name contains ' => ' must be recorded under its real name");
+  assert.equal(entry.status, "M");
+
+  const diff = buildShardDiff(repo, target, { id: "A", files: [entry] });
+  assert.match(diff.text, /changed/, "the shard diff must contain the real file's change");
 });
 
 test("extractSeamHints reports imports, css tokens, and global styles crossing shards", () => {
