@@ -1,0 +1,8 @@
+{
+  "name": "claudian",
+  "version": "1.0.0",
+  "description": "Obsidian integration for Claude Code. Auto-saves conversation notes and decisions to your Obsidian vault.",
+  "author": {
+    "name": "YUICHIRO TANAKA"
+  }
+}
