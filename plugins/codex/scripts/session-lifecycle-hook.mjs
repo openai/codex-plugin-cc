@@ -68,10 +68,14 @@ function cleanupSessionJobs(cwd, sessionId) {
     }
   }
 
-  saveState(workspaceRoot, {
-    ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
-  });
+  saveState(
+    workspaceRoot,
+    {
+      ...state,
+      jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
+    },
+    { removedJobIds: removedJobs.map((job) => job.id) }
+  );
 }
 
 function handleSessionStart(input) {

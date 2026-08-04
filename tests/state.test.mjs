@@ -5,7 +5,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
-import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import {
+  loadState,
+  resolveJobFile,
+  resolveJobLogFile,
+  resolveStateDir,
+  resolveStateFile,
+  saveState,
+  upsertJob,
+  writeJobFile
+} from "../plugins/codex/scripts/lib/state.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -102,4 +111,66 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
       .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
       .sort()
   );
+});
+
+test("saveState with a stale snapshot does not destroy a concurrently written job", () => {
+  const workspace = makeTempDir();
+
+  // Process A: seed job-A and load a snapshot that only knows about it.
+  upsertJob(workspace, {
+    id: "job-A",
+    status: "completed",
+    logFile: resolveJobLogFile(workspace, "job-A")
+  });
+  const staleSnapshot = loadState(workspace);
+
+  // Process B: record job-B along with its result and log files.
+  const jobBLogFile = resolveJobLogFile(workspace, "job-B");
+  fs.writeFileSync(jobBLogFile, "log job-B\n", "utf8");
+  writeJobFile(workspace, "job-B", { id: "job-B", status: "completed" });
+  upsertJob(workspace, {
+    id: "job-B",
+    status: "completed",
+    logFile: jobBLogFile
+  });
+
+  // Process A saves its stale snapshot; job-B must survive untouched.
+  saveState(workspace, staleSnapshot);
+
+  const savedState = JSON.parse(fs.readFileSync(resolveStateFile(workspace), "utf8"));
+  assert.deepEqual(savedState.jobs.map((job) => job.id).sort(), ["job-A", "job-B"]);
+  assert.equal(fs.existsSync(resolveJobFile(workspace, "job-B")), true);
+  assert.equal(fs.existsSync(jobBLogFile), true);
+});
+
+test("saveState removes ledger entries and artifacts for explicitly removed jobs", () => {
+  const workspace = makeTempDir();
+
+  for (const jobId of ["job-keep", "job-drop"]) {
+    const logFile = resolveJobLogFile(workspace, jobId);
+    fs.writeFileSync(logFile, `log ${jobId}\n`, "utf8");
+    writeJobFile(workspace, jobId, { id: jobId, status: "completed" });
+    upsertJob(workspace, {
+      id: jobId,
+      status: "completed",
+      logFile
+    });
+  }
+
+  const state = loadState(workspace);
+  saveState(
+    workspace,
+    {
+      ...state,
+      jobs: state.jobs.filter((job) => job.id !== "job-drop")
+    },
+    { removedJobIds: ["job-drop"] }
+  );
+
+  const savedState = JSON.parse(fs.readFileSync(resolveStateFile(workspace), "utf8"));
+  assert.deepEqual(savedState.jobs.map((job) => job.id), ["job-keep"]);
+  assert.equal(fs.existsSync(resolveJobFile(workspace, "job-drop")), false);
+  assert.equal(fs.existsSync(resolveJobLogFile(workspace, "job-drop")), false);
+  assert.equal(fs.existsSync(resolveJobFile(workspace, "job-keep")), true);
+  assert.equal(fs.existsSync(resolveJobLogFile(workspace, "job-keep")), true);
 });

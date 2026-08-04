@@ -89,10 +89,36 @@ function removeFileIfExists(filePath) {
   }
 }
 
-export function saveState(cwd, state) {
+function isNewerJob(candidate, incumbent) {
+  return String(candidate.updatedAt ?? "").localeCompare(String(incumbent.updatedAt ?? "")) > 0;
+}
+
+export function saveState(cwd, state, options = {}) {
   const previousJobs = loadState(cwd).jobs;
   ensureStateDir(cwd);
-  const nextJobs = pruneJobs(state.jobs ?? []);
+
+  // Merge with the current on-disk jobs so a stale snapshot never destroys
+  // records written by a concurrent process. A job disappears only when the
+  // caller removed it explicitly (removedJobIds) or the prune cap drops it.
+  const removedJobIds = new Set(options.removedJobIds ?? []);
+  const mergedById = new Map((state.jobs ?? []).map((job) => [job.id, job]));
+  for (const job of previousJobs) {
+    const snapshotJob = mergedById.get(job.id);
+    if (!snapshotJob || isNewerJob(job, snapshotJob)) {
+      mergedById.set(job.id, job);
+    }
+  }
+
+  const droppedById = new Map();
+  for (const jobId of removedJobIds) {
+    const job = mergedById.get(jobId);
+    if (job) {
+      droppedById.set(jobId, job);
+      mergedById.delete(jobId);
+    }
+  }
+
+  const nextJobs = pruneJobs([...mergedById.values()]);
   const nextState = {
     version: STATE_VERSION,
     config: {
@@ -103,10 +129,12 @@ export function saveState(cwd, state) {
   };
 
   const retainedIds = new Set(nextJobs.map((job) => job.id));
-  for (const job of previousJobs) {
-    if (retainedIds.has(job.id)) {
-      continue;
+  for (const job of mergedById.values()) {
+    if (!retainedIds.has(job.id)) {
+      droppedById.set(job.id, job);
     }
+  }
+  for (const job of droppedById.values()) {
     removeJobFile(resolveJobFile(cwd, job.id));
     removeFileIfExists(job.logFile);
   }
@@ -115,10 +143,10 @@ export function saveState(cwd, state) {
   return nextState;
 }
 
-export function updateState(cwd, mutate) {
+export function updateState(cwd, mutate, options = {}) {
   const state = loadState(cwd);
   mutate(state);
-  return saveState(cwd, state);
+  return saveState(cwd, state, options);
 }
 
 export function generateJobId(prefix = "job") {
