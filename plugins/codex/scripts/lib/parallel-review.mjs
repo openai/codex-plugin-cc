@@ -30,8 +30,11 @@ const IMPORT_RESOLVE_SUFFIXES = ["", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".css
 const GIT_OUTPUT_MAX_BUFFER = 64 * 1024 * 1024;
 
 // Git is directly executable on Windows. Repository-derived arguments must never pass through a shell.
+// --literal-pathspecs: shard file paths are literal repo paths, so a filename
+// carrying pathspec magic (`:(glob)`, a leading `:`, etc.) must never be globbed
+// into matching other files the shard does not own.
 function runGit(cwd, args, options = {}) {
-  return runCommandChecked("git", args, {
+  return runCommandChecked("git", ["--literal-pathspecs", ...args], {
     cwd,
     shell: false,
     maxBuffer: options.maxBuffer ?? GIT_OUTPUT_MAX_BUFFER

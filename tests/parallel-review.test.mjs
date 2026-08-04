@@ -399,3 +399,24 @@ test("collectChangedFiles reconciles a staged delete recreated in the worktree i
   assert.match(diff.text, /recreated after staged delete/);
   assert.match(diff.text, /recreated content/, "the recreated worktree content must be embedded");
 });
+
+test("buildShardDiff treats a shard path with glob characters as a literal file", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "sub"), { recursive: true });
+  fs.writeFileSync(path.join(repo, "sub", "data.txt"), "data original\n", "utf8");
+  fs.writeFileSync(path.join(repo, "sub", "*.txt"), "star original\n", "utf8"); // a file literally named *.txt
+  run("git", ["add", "-A"], { cwd: repo });
+  run("git", ["commit", "-m", "base"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "sub", "data.txt"), "DATA_LEAK_MARKER\n", "utf8");
+  fs.writeFileSync(path.join(repo, "sub", "*.txt"), "STAR_LITERAL_MARKER\n", "utf8");
+
+  const target = { mode: "working-tree", label: "working tree" };
+  // The shard owns only the literal "sub/*.txt"; without literal pathspecs its
+  // name would glob and pull in sub/data.txt too.
+  const file = { path: "sub/*.txt", weight: 1, binary: false, status: "M", oldPath: null };
+  const diff = buildShardDiff(repo, target, { id: "A", files: [file] });
+
+  assert.match(diff.text, /STAR_LITERAL_MARKER/);
+  assert.equal(/DATA_LEAK_MARKER/.test(diff.text), false, "a glob-like filename must not pull in other files");
+});
