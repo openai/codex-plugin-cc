@@ -8,6 +8,7 @@ import {
   assignFindingIds,
   buildShardDiff,
   collectChangedFiles,
+  readReviewedFileContent,
   extractJsonPayload,
   extractSeamHints,
   mergeFindings,
@@ -312,4 +313,29 @@ test("buildShardDiff omits an oversized single-file diff instead of dropping it 
 
   assert.deepEqual(diff.omitted, ["big.txt"]);
   assert.equal(diff.text.includes("changed line"), false, "oversized diff must not be inlined");
+});
+
+test("readReviewedFileContent reads the reviewed snapshot, not a dirty worktree or a reverted stage", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const rel = "src/mod.ts";
+  fs.mkdirSync(path.join(repo, "src"), { recursive: true });
+  fs.writeFileSync(path.join(repo, rel), "export const committed = 1;\n", "utf8");
+  run("git", ["add", "."], { cwd: repo });
+  run("git", ["commit", "-m", "base"], { cwd: repo });
+
+  // Branch review: the reviewed content is HEAD, even with an unrelated dirty
+  // worktree edit on top.
+  fs.writeFileSync(path.join(repo, rel), "export const dirtyWorktree = 2;\n", "utf8");
+  const branchContent = readReviewedFileContent(repo, { mode: "branch", baseRef: "main" }, rel);
+  assert.match(branchContent, /committed/);
+  assert.equal(/dirtyWorktree/.test(branchContent), false, "branch review must not read uncommitted worktree edits");
+
+  // Working-tree review: a staged change whose worktree copy was reverted must
+  // still be visible (scanned from the index), so its seams are not missed.
+  fs.writeFileSync(path.join(repo, rel), "import { token } from './staged';\n", "utf8");
+  run("git", ["add", rel], { cwd: repo });
+  fs.writeFileSync(path.join(repo, rel), "export const committed = 1;\n", "utf8");
+  const wtContent = readReviewedFileContent(repo, { mode: "working-tree", label: "working tree" }, rel);
+  assert.match(wtContent, /token/, "working-tree review must scan staged content even when the worktree reverted it");
 });

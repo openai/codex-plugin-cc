@@ -40,6 +40,7 @@ import {
   mergeFindings,
   normalizeShardFinding,
   planShards,
+  readReviewedFileContent,
   renderParallelReviewResult
 } from "./lib/parallel-review.mjs";
 import {
@@ -1109,19 +1110,9 @@ async function executeParallelReviewRun(request) {
   const seams = extractSeamHints({
     files: plan.files,
     shards: plan.shards,
-    readFileContent: (relativePath) => {
-      try {
-        const absolute = path.join(cwd, relativePath);
-        // Seam scanning is a heuristic; skip pathological files (generated
-        // bundles) rather than loading them whole.
-        if (fs.statSync(absolute).size > 1_000_000) {
-          return null;
-        }
-        return fs.readFileSync(absolute, "utf8");
-      } catch {
-        return null;
-      }
-    }
+    // Read seam inputs from the reviewed snapshot (HEAD for a branch review,
+    // staged + worktree for a working-tree review), matching the shard diffs.
+    readFileContent: (relativePath) => readReviewedFileContent(cwd, target, relativePath)
   });
   const shardSchema = readOutputSchema(REVIEW_SCHEMA);
   const reduceSchema = readOutputSchema(PARALLEL_REDUCE_SCHEMA);

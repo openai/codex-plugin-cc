@@ -18,6 +18,7 @@ const MAX_SHARD_DIFF_BYTES = 150_000;
 // giant generated artifact can never stall or OOM the orchestrator.
 const MAX_UNTRACKED_READ_BYTES = 24 * 1024;
 const MAX_SEAM_HINTS = 100;
+const MAX_SEAM_READ_BYTES = 1_000_000;
 const SEVERITY_RANK = { critical: 4, high: 3, medium: 2, low: 1 };
 const SOURCE_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".css", ".scss"]);
 const STYLE_EXTENSIONS = new Set([".css", ".scss"]);
@@ -42,6 +43,43 @@ function runGit(cwd, args, options = {}) {
 // is invisible to a single `git diff HEAD`.
 function diffArgSets(target) {
   return target.mode === "branch" ? [[`${target.baseRef}...HEAD`]] : [["--cached"], []];
+}
+
+function gitShowOrNull(cwd, ref) {
+  try {
+    return runGit(cwd, ["show", ref], { maxBuffer: MAX_SEAM_READ_BYTES + 1 });
+  } catch {
+    // The path is absent from that snapshot (untracked, unstaged-only, deleted)
+    // or larger than the seam-scan bound; the caller falls back or skips it.
+    return null;
+  }
+}
+
+// Seam hints must reflect the snapshot under review, not whatever the worktree
+// happens to hold. A branch review is HEAD (the worktree may carry unrelated
+// uncommitted edits); a working-tree review covers both the staged and unstaged
+// legs, so scan the staged blob and the worktree file together — a seam
+// introduced in either leg (including a staged change whose worktree copy was
+// reverted) is then still seen. Returns null when nothing readable exists.
+export function readReviewedFileContent(cwd, target, relativePath) {
+  if (target.mode === "branch") {
+    return gitShowOrNull(cwd, `HEAD:${relativePath}`);
+  }
+
+  const parts = [];
+  const staged = gitShowOrNull(cwd, `:${relativePath}`);
+  if (staged != null) {
+    parts.push(staged);
+  }
+  try {
+    const absolute = path.join(cwd, relativePath);
+    if (fs.statSync(absolute).size <= MAX_SEAM_READ_BYTES) {
+      parts.push(fs.readFileSync(absolute, "utf8"));
+    }
+  } catch {
+    // Untracked or deleted in the worktree; a staged copy (if any) still scanned.
+  }
+  return parts.length > 0 ? parts.join("\n") : null;
 }
 
 // `--numstat -M` renders renames as either `old => new` or `pre{old => new}post`.
