@@ -345,6 +345,145 @@ test("task reports the actual Codex auth error when the run is rejected", () => 
   assert.match(result.stderr, /authentication expired; run codex login/);
 });
 
+test("task --wait --json emits a single structured task result", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run(
+    "node",
+    [SCRIPT, "task", "--wait", "--json", "--model", "spark", "--effort", "low", "summarize the repo"],
+    {
+      cwd: repo,
+      env: buildEnv(binDir)
+    }
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.kind, "task");
+  assert.equal(payload.status, "completed");
+  assert.equal(fs.realpathSync(payload.cwd), fs.realpathSync(repo));
+  assert.equal(payload.model, "gpt-5.3-codex-spark");
+  assert.equal(payload.effort, "low");
+  assert.match(payload.jobId, /^task-/);
+  assert.match(payload.threadId, /^thr_/);
+  assert.equal(payload.finalMessage, "Handled the requested task.\nTask prompt accepted.");
+  assert.deepEqual(payload.touchedFiles, []);
+  assert.equal("error" in payload, false);
+});
+
+test("task --json emits a structured error when the Codex run fails", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "auth-run-fails");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "--json", "check failed auth"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.notEqual(result.status, 0);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.kind, "task");
+  assert.equal(payload.status, "failed");
+  assert.match(payload.error.message, /authentication expired; run codex login/);
+  assert.match(result.stderr, /authentication expired; run codex login/);
+});
+
+test("review --json emits a single structured review result", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 1;\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 2;\n");
+
+  const result = run("node", [SCRIPT, "review", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.kind, "review");
+  assert.equal(payload.status, "completed");
+  assert.equal(fs.realpathSync(payload.cwd), fs.realpathSync(repo));
+  assert.match(payload.jobId, /^review-/);
+  assert.match(payload.threadId, /^thr_/);
+  assert.match(payload.finalMessage, /Reviewed uncommitted changes/);
+  assert.match(payload.finalMessage, /No material issues found/);
+  assert.equal("findings" in payload, false);
+  assert.equal("error" in payload, false);
+});
+
+test("review --json emits a structured error when the Codex run fails", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "auth-run-fails");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  const result = run("node", [SCRIPT, "review", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.notEqual(result.status, 0);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.kind, "review");
+  assert.equal(payload.status, "failed");
+  assert.match(payload.error.message, /authentication expired; run codex login/);
+});
+
+test("adversarial-review --json emits schema-conforming findings", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0];\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0].id;\n");
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.kind, "review");
+  assert.equal(payload.status, "completed");
+  assert.match(payload.jobId, /^review-/);
+  assert.match(payload.threadId, /^thr_/);
+  assert.match(payload.finalMessage, /needs-attention/);
+  assert.equal(payload.findings.length, 1);
+  const finding = payload.findings[0];
+  assert.equal(finding.severity, "high");
+  assert.equal(finding.title, "Missing empty-state guard");
+  assert.equal(finding.file, "src/app.js");
+  assert.equal(finding.line_start, 4);
+  assert.equal(finding.line_end, 6);
+  assert.equal(finding.confidence, 0.87);
+  assert.equal(finding.recommendation, "Handle empty collections before indexing.");
+});
+
 test("review accepts the quoted raw argument style for built-in base-branch review", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -936,12 +1075,13 @@ test("task --background enqueues a detached worker and exposes per-job status", 
 
   assert.equal(launched.status, 0, launched.stderr);
   const launchPayload = JSON.parse(launched.stdout);
-  assert.equal(launchPayload.status, "queued");
-  assert.match(launchPayload.jobId, /^task-/);
+  assert.equal(launchPayload.job.status, "queued");
+  assert.match(launchPayload.job.id, /^task-/);
+  const launchedJobId = launchPayload.job.id;
 
   const waitedStatus = run(
     "node",
-    [SCRIPT, "status", launchPayload.jobId, "--wait", "--timeout-ms", "15000", "--json"],
+    [SCRIPT, "status", launchedJobId, "--wait", "--timeout-ms", "15000", "--json"],
     {
       cwd: repo,
       env: buildEnv(binDir)
@@ -950,11 +1090,11 @@ test("task --background enqueues a detached worker and exposes per-job status", 
 
   assert.equal(waitedStatus.status, 0, waitedStatus.stderr);
   const waitedPayload = JSON.parse(waitedStatus.stdout);
-  assert.equal(waitedPayload.job.id, launchPayload.jobId);
+  assert.equal(waitedPayload.job.id, launchedJobId);
   assert.equal(waitedPayload.job.status, "completed");
 
   const resultPayload = await waitFor(() => {
-    const result = run("node", [SCRIPT, "result", launchPayload.jobId, "--json"], {
+    const result = run("node", [SCRIPT, "result", launchedJobId, "--json"], {
       cwd: repo,
       env: buildEnv(binDir)
     });
@@ -964,7 +1104,7 @@ test("task --background enqueues a detached worker and exposes per-job status", 
     return JSON.parse(result.stdout);
   });
 
-  assert.equal(resultPayload.job.id, launchPayload.jobId);
+  assert.equal(resultPayload.job.id, launchedJobId);
   assert.equal(resultPayload.job.status, "completed");
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
 });
@@ -1048,8 +1188,9 @@ test("review accepts --background while still running as a tracked review job", 
 
   assert.equal(launched.status, 0, launched.stderr);
   const launchPayload = JSON.parse(launched.stdout);
-  assert.equal(launchPayload.review, "Review");
-  assert.match(launchPayload.codex.stdout, /No material issues found/);
+  assert.equal(launchPayload.kind, "review");
+  assert.equal(launchPayload.status, "completed");
+  assert.match(launchPayload.finalMessage, /No material issues found/);
 
   const status = run("node", [SCRIPT, "status"], {
     cwd: repo,
@@ -1755,7 +1896,7 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
 
   assert.equal(launched.status, 0, launched.stderr);
   const launchPayload = JSON.parse(launched.stdout);
-  const jobId = launchPayload.jobId;
+  const jobId = launchPayload.job.id;
   assert.ok(jobId);
 
   const stateDir = resolveStateDir(repo);

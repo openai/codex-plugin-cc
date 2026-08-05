@@ -129,7 +129,7 @@ function runStopReview(cwd, input = {}) {
 
   try {
     const payload = JSON.parse(result.stdout);
-    return parseStopReviewOutput(payload?.rawOutput);
+    return parseStopReviewOutput(payload?.finalMessage ?? payload?.rawOutput);
   } catch {
     return {
       ok: false,

@@ -70,6 +70,41 @@ function normalizeReviewResultData(data) {
   };
 }
 
+export function extractReviewFindings(parsed) {
+  if (!parsed || validateReviewResultShape(parsed)) {
+    return null;
+  }
+  return parsed.findings;
+}
+
+export function buildStructuredRunResult(kind, result, meta = {}) {
+  const failed = (result.exitStatus ?? 1) !== 0;
+  const structured = {
+    kind,
+    status: failed ? "failed" : "completed",
+    cwd: meta.cwd ?? null,
+    model: meta.model ?? null,
+    effort: meta.effort ?? null,
+    jobId: meta.jobId ?? null,
+    threadId: result.threadId ?? null,
+    finalMessage: typeof result.finalMessage === "string" ? result.finalMessage : ""
+  };
+
+  if (Array.isArray(result.findings)) {
+    structured.findings = result.findings;
+  }
+  if (Array.isArray(result.touchedFiles)) {
+    structured.touchedFiles = result.touchedFiles;
+  }
+  if (failed) {
+    structured.error = {
+      message: String(result.failureMessage ?? "").trim() || `Codex ${kind} failed.`
+    };
+  }
+
+  return structured;
+}
+
 function isStructuredReviewStoredResult(storedJob) {
   const result = storedJob?.result;
   if (!result || typeof result !== "object" || Array.isArray(result)) {
