@@ -13,7 +13,10 @@ export function createBrokerEndpoint(sessionDir, platform = process.platform) {
     return `pipe:\\\\.\\pipe\\${pipeName}`;
   }
 
-  return `unix:${path.join(sessionDir, "broker.sock")}`;
+  // path.posix, not the host path module: the win32 pipe branch above already
+  // uses path.win32 explicitly, and this branch must honor the injected
+  // platform the same way instead of inheriting the host's separators.
+  return `unix:${path.posix.join(sessionDir, "broker.sock")}`;
 }
 
 export function parseBrokerEndpoint(endpoint) {
