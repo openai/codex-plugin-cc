@@ -64,9 +64,14 @@ export function terminateProcessTree(pid, options = {}) {
   const killImpl = options.killImpl ?? process.kill.bind(process);
 
   if (platform === "win32") {
+    // shell: false — runCommand's win32 default runs through the user's shell
+    // when SHELL is set (the norm under Git Bash), and MSYS argument conversion
+    // rewrites /PID into a filesystem path (e.g. "C:/Program Files/Git/PID"),
+    // making taskkill fail with "ERROR: Invalid argument".
     const result = runCommandImpl("taskkill", ["/PID", String(pid), "/T", "/F"], {
       cwd: options.cwd,
-      env: options.env
+      env: options.env,
+      shell: false
     });
 
     if (!result.error && result.status === 0) {
