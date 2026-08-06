@@ -51,6 +51,22 @@ this plugin**. Put the new structure in `.claudian.json` at the root of
   same reorganisation as soon as the vault syncs. A per-machine `folders`
   block in `~/.claudian/config.json` also works, but the vault's file wins.
 
+Nothing to type by hand: run the scan **on the Mac that holds the vault** and it
+reads the real structure and drafts the file for you.
+
+```bash
+# 1. 下書きを表示するだけ（何も書き込まない）
+node plugins/claudian/scripts/obsidian-save.mjs --scan-folders
+
+# 2. 内容を確認してから保管庫に保存
+node plugins/claudian/scripts/obsidian-save.mjs --scan-folders --write
+```
+
+The scan keeps aliases that still point at a surviving folder, gives new
+folders an alias derived from their name (`20_進行中` → `進行中`,
+`03_PUBLIC` → `public`), and sets `null` for aliases whose folder is gone.
+`--write` preserves any other keys already in `.claudian.json`.
+
 Check what is live at any moment:
 
 ```bash
@@ -120,6 +136,8 @@ node plugins/claudian/scripts/obsidian-save.mjs \
 | `--folder <alias>` | Save under a registered alias (default `inbox`). |
 | `--dir <相対パス>` | Save under a literal vault subdirectory, ignoring aliases. |
 | `--list-folders` | Print the live alias → directory mapping and its sources. |
+| `--scan-folders` | Read the vault and print a draft `.claudian.json` for its current structure. |
+| `--write` | With `--scan-folders`, save that draft into the vault. |
 | `--vault <path>` | Use this vault for one run. |
 | `--create-vault` | Create the vault directory if it is missing. |
 

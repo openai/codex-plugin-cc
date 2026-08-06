@@ -25,7 +25,7 @@
  * and bypasses the mapping entirely.
  */
 
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import process from "node:process";
@@ -202,7 +202,9 @@ export function parseArgs(args) {
     dir: null,
     vault: null,
     createVault: false,
-    listFolders: false
+    listFolders: false,
+    scanFolders: false,
+    write: false
   };
 
   for (let i = 0; i < args.length; i += 1) {
@@ -226,6 +228,10 @@ export function parseArgs(args) {
       result.createVault = true;
     } else if (arg === "--list-folders") {
       result.listFolders = true;
+    } else if (arg === "--scan-folders") {
+      result.scanFolders = true;
+    } else if (arg === "--write") {
+      result.write = true;
     } else {
       throw new Error(`不明なオプションです: ${arg}`);
     }
@@ -301,6 +307,77 @@ export function listFolders(argv, { env = process.env, home = homedir() } = {}) 
   return { vaultRoot: resolved.root, source: resolved.source, folders, sources };
 }
 
+/**
+ * Turns a directory name into a short alias: "20_進行中" → "進行中",
+ * "03_PUBLIC" → "public".
+ */
+export function deriveAlias(directoryName) {
+  const withoutPrefix = directoryName.replace(/^[0-9]+[ _-]*/, "").trim() || directoryName;
+  return /^[\x20-\x7E]+$/.test(withoutPrefix) ? withoutPrefix.toLowerCase().replace(/\s+/g, "-") : withoutPrefix;
+}
+
+/**
+ * Reads the vault as it actually is and proposes a folders block for it, so a
+ * reorganisation can be captured without typing the new structure by hand.
+ */
+export function scanFolders(argv, { env = process.env, home = homedir() } = {}) {
+  const { vault, createVault, write } = parseArgs(argv);
+  const resolved = requireVault({ explicit: vault, createVault, env, home });
+  const { folders: live } = resolveFolders({ vaultRoot: resolved.root, env, home });
+
+  const directories = readdirSync(resolved.root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+    .map((entry) => entry.name)
+    .sort((a, b) => a.localeCompare(b, "ja"));
+
+  const proposed = {};
+  const covered = new Set();
+  const stale = [];
+
+  for (const [alias, directory] of Object.entries(live)) {
+    if (isDirectory(join(resolved.root, directory))) {
+      proposed[alias] = directory;
+      covered.add(directory.split("/")[0]);
+    } else {
+      // Keep the alias listed but disabled: a folder the reorganisation
+      // removed must stop being a save target, not be recreated on next save.
+      proposed[alias] = null;
+      stale.push(alias);
+    }
+  }
+
+  const added = [];
+  for (const directory of directories) {
+    if (covered.has(directory)) {
+      continue;
+    }
+    let alias = deriveAlias(directory);
+    if (Object.hasOwn(proposed, alias)) {
+      alias = directory;
+    }
+    proposed[alias] = directory;
+    covered.add(directory);
+    added.push(alias);
+  }
+
+  const configPath = join(resolved.root, VAULT_CONFIG_FILENAME);
+  if (write) {
+    const existing = readJsonFile(configPath) ?? {};
+    writeFileSync(configPath, `${JSON.stringify({ ...existing, folders: proposed }, null, 2)}\n`, "utf8");
+  }
+
+  return {
+    vaultRoot: resolved.root,
+    source: resolved.source,
+    configPath,
+    directories,
+    proposed,
+    added,
+    stale,
+    written: write
+  };
+}
+
 export function saveNote(argv, { env = process.env, home = homedir(), now = new Date() } = {}) {
   const { title, content, folder, tags, dir, vault, createVault } = parseArgs(argv);
 
@@ -337,17 +414,49 @@ export function saveNote(argv, { env = process.env, home = homedir(), now = new 
   return { filePath, vaultRoot: resolved.root, source: resolved.source, folder: relativeDir };
 }
 
+const WIDE_CHARACTER = /[ᄀ-ᅟ⺀-꓏가-힣豈-﫿︰-﹯＀-｠￠-￦]/;
+
+function displayWidth(text) {
+  let width = 0;
+  for (const character of text) {
+    width += WIDE_CHARACTER.test(character) ? 2 : 1;
+  }
+  return width;
+}
+
 function main() {
   try {
     const argv = process.argv.slice(2);
+
+    if (argv.includes("--scan-folders")) {
+      const scan = scanFolders(argv);
+      console.log(`保管庫: ${scan.vaultRoot} (${scan.source})`);
+      console.log(`検出したフォルダ (${scan.directories.length}):`);
+      for (const directory of scan.directories) {
+        console.log(`  ${directory}`);
+      }
+      console.log("");
+      console.log(JSON.stringify({ folders: scan.proposed }, null, 2));
+      console.log("");
+      if (scan.added.length > 0) {
+        console.log(`新しく別名を付けた: ${scan.added.join(" / ")}`);
+      }
+      if (scan.stale.length > 0) {
+        console.log(`フォルダが無い別名 (null で無効化): ${scan.stale.join(" / ")}`);
+      }
+      console.log(
+        scan.written ? `書き込みました: ${scan.configPath}` : `--write を付けると ${scan.configPath} に保存します。`
+      );
+      return;
+    }
 
     if (argv.includes("--list-folders")) {
       const { vaultRoot, source, folders, sources } = listFolders(argv);
       console.log(`保管庫: ${vaultRoot} (${source})`);
       console.log(`フォルダ定義: ${sources.join(" → ")}`);
-      const width = Math.max(0, ...Object.keys(folders).map((alias) => alias.length));
+      const width = Math.max(0, ...Object.keys(folders).map(displayWidth));
       for (const [alias, directory] of Object.entries(folders)) {
-        console.log(`  ${alias.padEnd(width)} → ${directory}`);
+        console.log(`  ${alias}${" ".repeat(width - displayWidth(alias))} → ${directory}`);
       }
       return;
     }

@@ -9,6 +9,7 @@ import {
   DEFAULT_FOLDERS,
   DEFAULT_VAULT_NAME,
   VAULT_CONFIG_FILENAME,
+  deriveAlias,
   listFolders,
   lookupFolder,
   normalizeFolderPath,
@@ -17,6 +18,7 @@ import {
   resolveFolders,
   resolveVaultRoot,
   saveNote,
+  scanFolders,
   today,
   uniqueFilePath
 } from "../plugins/claudian/scripts/obsidian-save.mjs";
@@ -319,6 +321,80 @@ test("listFolders reports the mapping and where it came from", () => {
   assert.equal(listed.vaultRoot, root);
   assert.equal(listed.folders.inbox, "10_受信");
   assert.deepEqual(listed.sources, ["デフォルト", path.join(root, VAULT_CONFIG_FILENAME)]);
+});
+
+test("deriveAlias drops the numeric prefix and normalises ASCII names", () => {
+  assert.equal(deriveAlias("03_PUBLIC"), "public");
+  assert.equal(deriveAlias("20_進行中"), "進行中");
+  assert.equal(deriveAlias("10 Reading List"), "reading-list");
+  assert.equal(deriveAlias("2026"), "2026");
+});
+
+test("scanFolders reads the reorganised vault and proposes a mapping for it", () => {
+  const { home, root } = makeVault();
+  for (const directory of ["10_受信", "20_進行中", "02_KEEP", ".obsidian"]) {
+    fs.mkdirSync(path.join(root, directory), { recursive: true });
+  }
+
+  const scan = scanFolders(["--scan-folders"], { env: {}, home });
+
+  assert.deepEqual(scan.directories, ["02_KEEP", "10_受信", "20_進行中"]);
+  assert.deepEqual(scan.proposed, {
+    inbox: null,
+    keep: "02_KEEP",
+    public: null,
+    archive: null,
+    受信: "10_受信",
+    進行中: "20_進行中"
+  });
+  assert.deepEqual(scan.added, ["受信", "進行中"]);
+  assert.deepEqual(scan.stale, ["inbox", "public", "archive"]);
+  assert.equal(scan.written, false);
+  assert.equal(fs.existsSync(scan.configPath), false);
+});
+
+test("scanFolders keeps aliases that already point at a surviving folder", () => {
+  const { home, root } = makeVault();
+  fs.mkdirSync(path.join(root, "20_進行中", "2026"), { recursive: true });
+  writeConfig(path.join(root, VAULT_CONFIG_FILENAME), { folders: { project: "20_進行中/2026" } });
+
+  const scan = scanFolders(["--scan-folders"], { env: {}, home });
+
+  assert.equal(scan.proposed.project, "20_進行中/2026");
+  assert.equal(scan.added.includes("進行中"), false);
+});
+
+test("scanFolders --write saves the mapping into the vault and keeps other keys", () => {
+  const { home, root } = makeVault();
+  fs.mkdirSync(path.join(root, "10_受信"), { recursive: true });
+  writeConfig(path.join(root, VAULT_CONFIG_FILENAME), { note: "手書きのメモ", folders: { inbox: "古い" } });
+
+  const scan = scanFolders(["--scan-folders", "--write"], { env: {}, home });
+  const saved = JSON.parse(fs.readFileSync(scan.configPath, "utf8"));
+
+  assert.equal(scan.written, true);
+  assert.equal(saved.note, "手書きのメモ");
+  assert.equal(saved.folders.受信, "10_受信");
+  assert.equal(saved.folders.inbox, null);
+
+  // The written file is what the next save reads back.
+  const { folders } = resolveFolders({ vaultRoot: root, env: {}, home });
+  assert.equal(folders.受信, "10_受信");
+  assert.equal(Object.hasOwn(folders, "inbox"), false);
+});
+
+test("the CLI prints a draft .claudian.json for --scan-folders", () => {
+  const { home, root } = makeVault();
+  fs.mkdirSync(path.join(root, "10_受信"), { recursive: true });
+
+  const result = run(process.execPath, [SCRIPT, "--scan-folders"], {
+    env: { ...process.env, HOME: home, CLAUDIAN_VAULT_ROOT: root, CLAUDIAN_CONFIG: path.join(home, "absent.json") }
+  });
+
+  assert.equal(result.status, 0);
+  assert.match(result.stdout, /"受信": "10_受信"/);
+  assert.match(result.stdout, /--write を付けると/);
+  assert.equal(fs.existsSync(path.join(root, VAULT_CONFIG_FILENAME)), false);
 });
 
 test("the CLI prints the resolved mapping for --list-folders", () => {

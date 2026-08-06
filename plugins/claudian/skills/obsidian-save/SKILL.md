@@ -96,5 +96,9 @@ The script exits non-zero and prints what to fix. Do not retry blindly:
   `CLAUDIAN_VAULT_ROOT` (or `~/.claudian/config.json`) on that machine.
 - `--folder に未登録の名前が指定されました` — the alias was renamed or removed by
   the reorganisation. Run `--list-folders` and retry with a live alias.
+- If the mapping is clearly behind the vault (several aliases point at folders
+  that no longer exist), run `--scan-folders` to show the user a draft of the
+  current structure. It only prints; adding `--write` changes the vault's
+  `.claudian.json`, so ask before running that.
 - Never invent a path or pass `--create-vault` on your own; an empty vault
   created in the wrong place looks like a successful save.
