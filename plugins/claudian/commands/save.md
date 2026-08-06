@@ -24,7 +24,12 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/obsidian-save.mjs" \
   --tags "<タグ1,タグ2>"
 ```
 
+The vault (`田中雄一郎OS保管庫`) is resolved per machine by the script itself —
+never pass `--vault` unless the user gives an explicit path.
+
 Report the result as: `保存しました：<filename>`
+
+If the command exits non-zero, report its error message as-is instead.
 
 Raw user request:
 $ARGUMENTS

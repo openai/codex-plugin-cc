@@ -50,7 +50,17 @@ Nothing else — no elaboration.
 
 ## Vault path
 
-`/Users/nesty/TANAKA-BRAIN/田中雄一郎OS保管庫/`
+Save destination: `田中雄一郎OS保管庫`
+
+The script resolves the vault per machine, so the same command works on the
+MacBook Air M1 and the MacBook Air M5 even when the vault sits in a different
+place. Resolution order:
+
+1. `--vault <path>`
+2. `CLAUDIAN_VAULT_ROOT`
+3. `vaultRoot` in `~/.claudian/config.json`
+4. Auto-detection of `田中雄一郎OS保管庫` under `~/TANAKA-BRAIN`, `~`,
+   `~/Documents`, the Obsidian/iCloud Drive folders, `~/Dropbox`, `~/Google Drive`
 
 | folder value | directory |
 |---|---|
@@ -58,3 +68,13 @@ Nothing else — no elaboration.
 | keep | 02_KEEP |
 | public | 03_PUBLIC |
 | archive | 99_ARCHIVE |
+
+## When the save fails
+
+The script exits non-zero and prints what to fix. Do not retry blindly:
+
+- `保管庫が見つかりません` / `保管庫のパスが存在しません` — the vault is not where
+  the script looked. Report the message and tell the user to set
+  `CLAUDIAN_VAULT_ROOT` (or `~/.claudian/config.json`) on that machine.
+- Never invent a path or pass `--create-vault` on your own; an empty vault
+  created in the wrong place looks like a successful save.
