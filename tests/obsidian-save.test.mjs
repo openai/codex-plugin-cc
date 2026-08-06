@@ -6,9 +6,15 @@ import assert from "node:assert/strict";
 
 import { makeTempDir, run } from "./helpers.mjs";
 import {
+  DEFAULT_FOLDERS,
   DEFAULT_VAULT_NAME,
+  VAULT_CONFIG_FILENAME,
+  listFolders,
+  lookupFolder,
+  normalizeFolderPath,
   parseArgs,
   renderNote,
+  resolveFolders,
   resolveVaultRoot,
   saveNote,
   today,
@@ -80,7 +86,7 @@ test("saveNote rejects missing arguments and unknown folders", () => {
   assert.throws(() => saveNote(["--title", "メモ"], { env: {}, home }), /--title と --content は必須です/);
   assert.throws(
     () => saveNote(["--title", "メモ", "--content", "本文", "--folder", "keeps"], { env: {}, home }),
-    /--folder は/
+    /--folder に未登録の名前が指定されました: keeps[\s\S]*inbox \/ keep \/ public \/ archive/
   );
 });
 
@@ -186,6 +192,146 @@ test("uniqueFilePath keeps counting past an existing suffix", () => {
   fs.writeFileSync(path.join(dir, "note_2.md"), "", "utf8");
 
   assert.equal(uniqueFilePath(dir, "note"), path.join(dir, "note_3.md"));
+});
+
+function writeConfig(filePath, data) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, JSON.stringify(data), "utf8");
+}
+
+test("resolveFolders starts from the built-in mapping", () => {
+  const { home, root } = makeVault();
+
+  const { folders, sources } = resolveFolders({ vaultRoot: root, env: {}, home });
+
+  assert.deepEqual(folders, DEFAULT_FOLDERS);
+  assert.deepEqual(sources, ["デフォルト"]);
+});
+
+test("a reorganised vault carries its own folder mapping", () => {
+  const { home, root } = makeVault();
+  writeConfig(path.join(root, VAULT_CONFIG_FILENAME), {
+    folders: { inbox: "10_受信", project: "20_進行中/2026", archive: null }
+  });
+
+  const { folders, sources } = resolveFolders({ vaultRoot: root, env: {}, home });
+
+  assert.deepEqual(folders, { inbox: "10_受信", keep: "02_KEEP", public: "03_PUBLIC", project: "20_進行中/2026" });
+  assert.deepEqual(sources, ["デフォルト", path.join(root, VAULT_CONFIG_FILENAME)]);
+});
+
+test("the vault mapping wins over the per-machine one", () => {
+  const { home, root } = makeVault();
+  writeConfig(path.join(home, ".claudian", "config.json"), { folders: { inbox: "99_ローカル", note: "50_NOTE" } });
+  writeConfig(path.join(root, VAULT_CONFIG_FILENAME), { folders: { inbox: "10_受信" } });
+
+  const { folders } = resolveFolders({ vaultRoot: root, env: {}, home });
+
+  assert.equal(folders.inbox, "10_受信");
+  assert.equal(folders.note, "50_NOTE");
+});
+
+test("saveNote follows the reorganised mapping, including new aliases", () => {
+  const { home, root } = makeVault();
+  writeConfig(path.join(root, VAULT_CONFIG_FILENAME), { folders: { project: "20_進行中/2026" } });
+  const options = { env: {}, home, now: new Date(2026, 7, 6, 12, 0, 0) };
+
+  const result = saveNote(["--title", "進行メモ", "--content", "本文", "--folder", "project"], options);
+
+  assert.equal(result.folder, "20_進行中/2026");
+  assert.equal(fs.existsSync(path.join(root, "20_進行中", "2026", "2026-08-06_進行メモ.md")), true);
+});
+
+test("saveNote rejects an alias the reorganisation removed", () => {
+  const { home, root } = makeVault();
+  writeConfig(path.join(root, VAULT_CONFIG_FILENAME), { folders: { archive: null } });
+
+  assert.throws(
+    () => saveNote(["--title", "メモ", "--content", "本文", "--folder", "archive"], { env: {}, home }),
+    /--folder に未登録の名前が指定されました: archive/
+  );
+  assert.equal(fs.existsSync(path.join(root, "99_ARCHIVE")), false);
+});
+
+test("folder aliases are matched case-insensitively", () => {
+  const { home } = makeVault();
+
+  const result = saveNote(["--title", "メモ", "--content", "本文", "--folder", "KEEP"], { env: {}, home });
+
+  assert.equal(result.folder, "02_KEEP");
+  assert.equal(lookupFolder(DEFAULT_FOLDERS, " Public "), "03_PUBLIC");
+  assert.equal(lookupFolder(DEFAULT_FOLDERS, "missing"), null);
+});
+
+test("--dir writes to a literal vault subdirectory, bypassing the mapping", () => {
+  const { home, root } = makeVault();
+
+  const result = saveNote(["--title", "メモ", "--content", "本文", "--dir", "30_再編中/下書き"], {
+    env: {},
+    home,
+    now: new Date(2026, 7, 6, 12, 0, 0)
+  });
+
+  assert.equal(result.folder, "30_再編中/下書き");
+  assert.equal(fs.existsSync(path.join(root, "30_再編中", "下書き", "2026-08-06_メモ.md")), true);
+});
+
+test("folder paths cannot escape the vault", () => {
+  const { home, root } = makeVault();
+
+  assert.throws(
+    () => saveNote(["--title", "メモ", "--content", "本文", "--dir", "../外"], { env: {}, home }),
+    /--dir は保管庫内の相対パスにしてください/
+  );
+  assert.throws(
+    () => saveNote(["--title", "メモ", "--content", "本文", "--dir", "/tmp/外"], { env: {}, home }),
+    /--dir は保管庫内の相対パスにしてください/
+  );
+  assert.equal(fs.existsSync(path.join(path.dirname(root), "外")), false);
+
+  assert.throws(
+    () => normalizeFolderPath("a/../b", { label: "folders.x", source: "config" }),
+    /folders\.x は保管庫内の相対パスにしてください/
+  );
+  assert.equal(normalizeFolderPath("./01_A/", { label: "folders.x", source: "config" }), "01_A");
+});
+
+test("a malformed folders block is reported with its file", () => {
+  const { home, root } = makeVault();
+  const vaultConfig = path.join(root, VAULT_CONFIG_FILENAME);
+
+  writeConfig(vaultConfig, { folders: ["00_INBOX"] });
+  assert.throws(
+    () => resolveFolders({ vaultRoot: root, env: {}, home }),
+    new RegExp(`${vaultConfig.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")} の folders はオブジェクトで指定してください`)
+  );
+
+  writeConfig(vaultConfig, { folders: { keep: 7 } });
+  assert.throws(() => resolveFolders({ vaultRoot: root, env: {}, home }), /folders\.keep は空でない文字列にしてください/);
+});
+
+test("listFolders reports the mapping and where it came from", () => {
+  const { home, root } = makeVault();
+  writeConfig(path.join(root, VAULT_CONFIG_FILENAME), { folders: { inbox: "10_受信" } });
+
+  const listed = listFolders(["--list-folders"], { env: {}, home });
+
+  assert.equal(listed.vaultRoot, root);
+  assert.equal(listed.folders.inbox, "10_受信");
+  assert.deepEqual(listed.sources, ["デフォルト", path.join(root, VAULT_CONFIG_FILENAME)]);
+});
+
+test("the CLI prints the resolved mapping for --list-folders", () => {
+  const { home, root } = makeVault();
+  writeConfig(path.join(root, VAULT_CONFIG_FILENAME), { folders: { inbox: "10_受信" } });
+
+  const result = run(process.execPath, [SCRIPT, "--list-folders"], {
+    env: { ...process.env, HOME: home, CLAUDIAN_VAULT_ROOT: root, CLAUDIAN_CONFIG: path.join(home, "absent.json") }
+  });
+
+  assert.equal(result.status, 0);
+  assert.match(result.stdout, /inbox\s+→ 10_受信/);
+  assert.match(result.stdout, /keep\s+→ 02_KEEP/);
 });
 
 test("the CLI prints the filename on stdout and the vault on stderr", () => {

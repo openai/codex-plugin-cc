@@ -17,12 +17,52 @@ the user says「保存して」「これでいい」.
 
 ## Vault layout
 
+Default aliases:
+
 | folder value | directory |
 |---|---|
 | inbox (default) | `00_INBOX` |
 | keep | `02_KEEP` |
 | public | `03_PUBLIC` |
 | archive | `99_ARCHIVE` |
+
+### 保管庫を再編したとき
+
+The mapping is data, not code — **reorganising the vault needs no change to
+this plugin**. Put the new structure in `.claudian.json` at the root of
+`田中雄一郎OS保管庫`:
+
+```json
+{
+  "folders": {
+    "inbox": "10_受信",
+    "project": "20_進行中/2026",
+    "archive": null
+  }
+}
+```
+
+- Only the aliases you list change; the rest keep their defaults.
+- `null` removes an alias, so a folder that no longer exists stops being a
+  valid save target instead of being silently recreated.
+- Values are vault-relative paths (nesting allowed). Absolute paths and `..`
+  are rejected.
+- Because the file lives **inside the vault**, the M1 and the M5 pick up the
+  same reorganisation as soon as the vault syncs. A per-machine `folders`
+  block in `~/.claudian/config.json` also works, but the vault's file wins.
+
+Check what is live at any moment:
+
+```bash
+node plugins/claudian/scripts/obsidian-save.mjs --list-folders
+```
+
+While the structure is still in flux, save straight to a directory without
+registering an alias:
+
+```bash
+node plugins/claudian/scripts/obsidian-save.mjs --title "…" --content "…" --dir "30_再編中/下書き"
+```
 
 Notes are written as `YYYY-MM-DD_タイトル.md` (local date) with `date` and
 `tags` frontmatter. A same-day note with the same title never overwrites the
@@ -74,6 +114,14 @@ node plugins/claudian/scripts/obsidian-save.mjs \
   --folder keep \
   --tags "設計,決定"
 ```
+
+| flag | meaning |
+|---|---|
+| `--folder <alias>` | Save under a registered alias (default `inbox`). |
+| `--dir <相対パス>` | Save under a literal vault subdirectory, ignoring aliases. |
+| `--list-folders` | Print the live alias → directory mapping and its sources. |
+| `--vault <path>` | Use this vault for one run. |
+| `--create-vault` | Create the vault directory if it is missing. |
 
 The saved filename is printed to stdout; the resolved vault directory and how
 it was resolved go to stderr.

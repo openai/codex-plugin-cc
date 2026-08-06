@@ -5,7 +5,8 @@
  * Usage:
  *   node obsidian-save.mjs --title "タイトル" --content "内容"
  *     [--folder inbox|keep|public|archive] [--tags "タグ1,タグ2"]
- *     [--vault /path/to/保管庫] [--create-vault]
+ *     [--dir 01_PROJECT/進行中] [--vault /path/to/保管庫] [--create-vault]
+ *   node obsidian-save.mjs --list-folders
  *
  * The vault location is resolved per machine so the same plugin works on every
  * Mac without editing this file. Resolution order:
@@ -14,6 +15,14 @@
  *   3. vaultRoot in ~/.claudian/config.json (override with CLAUDIAN_CONFIG)
  *   4. auto-detection of CLAUDIAN_VAULT_NAME (default 田中雄一郎OS保管庫)
  *      under the usual parents (~/TANAKA-BRAIN, ~, ~/Documents, iCloud, ...)
+ *
+ * The folder mapping is data, not code, so reorganising the vault needs no
+ * change here. Layers merge in this order (later wins, per alias):
+ *   1. the built-in defaults below
+ *   2. "folders" in ~/.claudian/config.json          (per machine)
+ *   3. "folders" in <vault>/.claudian.json           (travels with the vault)
+ * A null value removes an alias. --dir writes to a literal vault subdirectory
+ * and bypasses the mapping entirely.
  */
 
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
@@ -24,12 +33,14 @@ import { pathToFileURL } from "node:url";
 
 export const DEFAULT_VAULT_NAME = "田中雄一郎OS保管庫";
 
-export const FOLDERS = {
+export const DEFAULT_FOLDERS = {
   inbox: "00_INBOX",
   keep: "02_KEEP",
   public: "03_PUBLIC",
   archive: "99_ARCHIVE"
 };
+
+export const VAULT_CONFIG_FILENAME = ".claudian.json";
 
 export function today(now = new Date()) {
   const pad = (value) => String(value).padStart(2, "0");
@@ -74,57 +85,125 @@ function isDirectory(candidate) {
   }
 }
 
-function readConfiguredRoot(env, home) {
-  const filePath = configFilePath(env, home);
+function readJsonFile(filePath) {
   if (!existsSync(filePath)) {
     return null;
   }
-
-  let parsed;
   try {
-    parsed = JSON.parse(readFileSync(filePath, "utf8"));
+    return JSON.parse(readFileSync(filePath, "utf8"));
   } catch (error) {
-    throw new Error(`設定ファイルを読めませんでした: ${filePath}\n${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(
+      `設定ファイルを読めませんでした: ${filePath}\n${error instanceof Error ? error.message : String(error)}`
+    );
   }
-
-  const vaultRoot = parsed?.vaultRoot;
-  if (vaultRoot == null || vaultRoot === "") {
-    return null;
-  }
-  if (typeof vaultRoot !== "string") {
-    throw new Error(`${filePath} の vaultRoot は文字列で指定してください。`);
-  }
-  return { root: expandHome(vaultRoot, home), source: filePath };
 }
 
 export function resolveVaultRoot({ explicit = null, env = process.env, home = homedir() } = {}) {
   const vaultName = env.CLAUDIAN_VAULT_NAME?.trim() || DEFAULT_VAULT_NAME;
 
   if (explicit) {
-    return { root: expandHome(explicit, home), source: "--vault", vaultName, detected: false };
+    return { root: expandHome(explicit, home), source: "--vault", vaultName };
   }
 
   const fromEnv = env.CLAUDIAN_VAULT_ROOT?.trim();
   if (fromEnv) {
-    return { root: expandHome(fromEnv, home), source: "CLAUDIAN_VAULT_ROOT", vaultName, detected: false };
+    return { root: expandHome(fromEnv, home), source: "CLAUDIAN_VAULT_ROOT", vaultName };
   }
 
-  const fromConfig = readConfiguredRoot(env, home);
-  if (fromConfig) {
-    return { root: fromConfig.root, source: fromConfig.source, vaultName, detected: false };
+  const userConfigPath = configFilePath(env, home);
+  const userConfig = readJsonFile(userConfigPath);
+  const vaultRoot = userConfig?.vaultRoot;
+  if (vaultRoot != null && vaultRoot !== "") {
+    if (typeof vaultRoot !== "string") {
+      throw new Error(`${userConfigPath} の vaultRoot は文字列で指定してください。`);
+    }
+    return { root: expandHome(vaultRoot, home), source: userConfigPath, vaultName };
   }
 
   const candidates = vaultCandidates(vaultName, home);
   const found = candidates.find(isDirectory);
   if (found) {
-    return { root: found, source: "自動検出", vaultName, detected: true };
+    return { root: found, source: "自動検出", vaultName };
   }
 
-  return { root: null, source: null, vaultName, detected: true, candidates };
+  return { root: null, source: null, vaultName, candidates };
+}
+
+export function normalizeFolderPath(value, { label, source }) {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error(`${source} の ${label} は空でない文字列にしてください。`);
+  }
+
+  const normalized = value.trim().replace(/^\.\//, "").replace(/\/+$/, "");
+  const segments = normalized.split("/");
+
+  if (isAbsolute(normalized) || segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+    throw new Error(`${source} の ${label} は保管庫内の相対パスにしてください: ${value}`);
+  }
+
+  return normalized;
+}
+
+/**
+ * Merges the folder-alias layers. Vault-local config wins so a reorganisation
+ * of 田中雄一郎OS保管庫 reaches every machine through the vault itself.
+ */
+export function resolveFolders({ vaultRoot = null, env = process.env, home = homedir() } = {}) {
+  const folders = { ...DEFAULT_FOLDERS };
+  const sources = ["デフォルト"];
+
+  const layers = [];
+  const userConfigPath = configFilePath(env, home);
+  layers.push({ path: userConfigPath, data: readJsonFile(userConfigPath) });
+  if (vaultRoot) {
+    const vaultConfigPath = join(vaultRoot, VAULT_CONFIG_FILENAME);
+    layers.push({ path: vaultConfigPath, data: readJsonFile(vaultConfigPath) });
+  }
+
+  for (const layer of layers) {
+    const overrides = layer.data?.folders;
+    if (overrides == null) {
+      continue;
+    }
+    if (typeof overrides !== "object" || Array.isArray(overrides)) {
+      throw new Error(`${layer.path} の folders はオブジェクトで指定してください。`);
+    }
+
+    for (const [alias, value] of Object.entries(overrides)) {
+      const key = alias.trim();
+      if (key === "") {
+        throw new Error(`${layer.path} の folders に空のキーがあります。`);
+      }
+      if (value === null) {
+        delete folders[key];
+        continue;
+      }
+      folders[key] = normalizeFolderPath(value, { label: `folders.${key}`, source: layer.path });
+    }
+
+    sources.push(layer.path);
+  }
+
+  return { folders, sources };
+}
+
+export function lookupFolder(folders, alias) {
+  const wanted = String(alias ?? "").trim().toLowerCase();
+  const match = Object.entries(folders).find(([key]) => key.toLowerCase() === wanted);
+  return match ? match[1] : null;
 }
 
 export function parseArgs(args) {
-  const result = { title: "", content: "", folder: "inbox", tags: [], vault: null, createVault: false };
+  const result = {
+    title: "",
+    content: "",
+    folder: "inbox",
+    tags: [],
+    dir: null,
+    vault: null,
+    createVault: false,
+    listFolders: false
+  };
 
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
@@ -134,6 +213,8 @@ export function parseArgs(args) {
       result.content = args[++i] ?? "";
     } else if (arg === "--folder") {
       result.folder = args[++i] ?? "inbox";
+    } else if (arg === "--dir") {
+      result.dir = args[++i] ?? "";
     } else if (arg === "--tags") {
       result.tags = (args[++i] ?? "")
         .split(",")
@@ -143,6 +224,8 @@ export function parseArgs(args) {
       result.vault = args[++i] ?? "";
     } else if (arg === "--create-vault") {
       result.createVault = true;
+    } else if (arg === "--list-folders") {
+      result.listFolders = true;
     } else {
       throw new Error(`不明なオプションです: ${arg}`);
     }
@@ -188,18 +271,8 @@ function missingVaultMessage({ vaultName, candidates }) {
   ].join("\n");
 }
 
-export function saveNote(argv, { env = process.env, home = homedir(), now = new Date() } = {}) {
-  const { title, content, folder, tags, vault, createVault } = parseArgs(argv);
-
-  if (!title || !content) {
-    throw new Error("--title と --content は必須です。");
-  }
-
-  if (!Object.hasOwn(FOLDERS, folder)) {
-    throw new Error(`--folder は ${Object.keys(FOLDERS).join(" / ")} のいずれかを指定してください: ${folder}`);
-  }
-
-  const resolved = resolveVaultRoot({ explicit: vault, env, home });
+function requireVault({ explicit, createVault, env, home }) {
+  const resolved = resolveVaultRoot({ explicit, env, home });
   if (!resolved.root) {
     throw new Error(missingVaultMessage({ vaultName: resolved.vaultName, candidates: resolved.candidates }));
   }
@@ -217,19 +290,69 @@ export function saveNote(argv, { env = process.env, home = homedir(), now = new 
     mkdirSync(resolved.root, { recursive: true });
   }
 
-  const dirPath = join(resolved.root, FOLDERS[folder]);
+  return resolved;
+}
+
+export function listFolders(argv, { env = process.env, home = homedir() } = {}) {
+  const { vault, createVault } = parseArgs(argv);
+  const resolved = requireVault({ explicit: vault, createVault, env, home });
+  const { folders, sources } = resolveFolders({ vaultRoot: resolved.root, env, home });
+
+  return { vaultRoot: resolved.root, source: resolved.source, folders, sources };
+}
+
+export function saveNote(argv, { env = process.env, home = homedir(), now = new Date() } = {}) {
+  const { title, content, folder, tags, dir, vault, createVault } = parseArgs(argv);
+
+  if (!title || !content) {
+    throw new Error("--title と --content は必須です。");
+  }
+
+  const resolved = requireVault({ explicit: vault, createVault, env, home });
+  const { folders } = resolveFolders({ vaultRoot: resolved.root, env, home });
+
+  let relativeDir;
+  if (dir != null) {
+    relativeDir = normalizeFolderPath(dir, { label: "--dir", source: "コマンドライン" });
+  } else {
+    relativeDir = lookupFolder(folders, folder);
+    if (!relativeDir) {
+      throw new Error(
+        [
+          `--folder に未登録の名前が指定されました: ${folder}`,
+          `使える名前: ${Object.keys(folders).join(" / ") || "(なし)"}`,
+          "保管庫内の任意のフォルダに保存する場合は --dir を使ってください。"
+        ].join("\n")
+      );
+    }
+  }
+
+  const dirPath = join(resolved.root, relativeDir);
   mkdirSync(dirPath, { recursive: true });
 
   const date = today(now);
   const filePath = uniqueFilePath(dirPath, `${date}_${sanitizeTitle(title)}`);
   writeFileSync(filePath, renderNote({ title, content, tags, date }), "utf8");
 
-  return { filePath, vaultRoot: resolved.root, source: resolved.source, folder: FOLDERS[folder] };
+  return { filePath, vaultRoot: resolved.root, source: resolved.source, folder: relativeDir };
 }
 
 function main() {
   try {
-    const { filePath, vaultRoot, source, folder } = saveNote(process.argv.slice(2));
+    const argv = process.argv.slice(2);
+
+    if (argv.includes("--list-folders")) {
+      const { vaultRoot, source, folders, sources } = listFolders(argv);
+      console.log(`保管庫: ${vaultRoot} (${source})`);
+      console.log(`フォルダ定義: ${sources.join(" → ")}`);
+      const width = Math.max(0, ...Object.keys(folders).map((alias) => alias.length));
+      for (const [alias, directory] of Object.entries(folders)) {
+        console.log(`  ${alias.padEnd(width)} → ${directory}`);
+      }
+      return;
+    }
+
+    const { filePath, vaultRoot, source, folder } = saveNote(argv);
     console.error(`保管庫: ${vaultRoot}/${folder} (${source})`);
     console.log(basename(filePath));
   } catch (error) {

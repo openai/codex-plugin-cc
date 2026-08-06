@@ -35,12 +35,28 @@ Nothing else — no elaboration.
 
 ## Folder selection
 
+The vault is being reorganised, so the alias list is **data, not code**: it
+lives in `<vault>/.claudian.json` and can gain, rename, or drop entries at any
+time. Never assume the table below is current.
+
 | User keyword | --folder value |
 |---|---|
 | (default / none) | inbox |
 | KEEP / 設計原本 | keep |
 | 公開用 | public |
 | アーカイブ | archive |
+
+Check the live mapping whenever the user names a folder that is not in that
+table, or when a save fails with `--folder に未登録の名前が指定されました`:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/obsidian-save.mjs" --list-folders
+```
+
+Then re-run the save with an alias that actually exists. To write to a folder
+that has no alias yet, pass a literal vault-relative path instead:
+`--dir "20_進行中/2026"`. Prefer aliases; use `--dir` only when the user named a
+specific folder or the reorganisation has not settled.
 
 ## Title and tags
 
@@ -62,6 +78,8 @@ place. Resolution order:
 4. Auto-detection of `田中雄一郎OS保管庫` under `~/TANAKA-BRAIN`, `~`,
    `~/Documents`, the Obsidian/iCloud Drive folders, `~/Dropbox`, `~/Google Drive`
 
+Default folder mapping (overridden by `<vault>/.claudian.json`):
+
 | folder value | directory |
 |---|---|
 | inbox | 00_INBOX |
@@ -76,5 +94,7 @@ The script exits non-zero and prints what to fix. Do not retry blindly:
 - `保管庫が見つかりません` / `保管庫のパスが存在しません` — the vault is not where
   the script looked. Report the message and tell the user to set
   `CLAUDIAN_VAULT_ROOT` (or `~/.claudian/config.json`) on that machine.
+- `--folder に未登録の名前が指定されました` — the alias was renamed or removed by
+  the reorganisation. Run `--list-folders` and retry with a live alias.
 - Never invent a path or pass `--create-vault` on your own; an empty vault
   created in the wrong place looks like a successful save.
