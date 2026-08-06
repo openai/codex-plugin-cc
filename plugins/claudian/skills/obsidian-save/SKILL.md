@@ -35,12 +35,28 @@ Nothing else — no elaboration.
 
 ## Folder selection
 
+The vault is being reorganised, so the alias list is **data, not code**: it
+lives in `<vault>/.claudian.json` and can gain, rename, or drop entries at any
+time. Never assume the table below is current.
+
 | User keyword | --folder value |
 |---|---|
 | (default / none) | inbox |
 | KEEP / 設計原本 | keep |
 | 公開用 | public |
 | アーカイブ | archive |
+
+Check the live mapping whenever the user names a folder that is not in that
+table, or when a save fails with `--folder に未登録の名前が指定されました`:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/obsidian-save.mjs" --list-folders
+```
+
+Then re-run the save with an alias that actually exists. To write to a folder
+that has no alias yet, pass a literal vault-relative path instead:
+`--dir "20_進行中/2026"`. Prefer aliases; use `--dir` only when the user named a
+specific folder or the reorganisation has not settled.
 
 ## Title and tags
 
@@ -50,7 +66,19 @@ Nothing else — no elaboration.
 
 ## Vault path
 
-`/Users/nesty/TANAKA-BRAIN/田中雄一郎OS保管庫/`
+Save destination: `田中雄一郎OS保管庫`
+
+The script resolves the vault per machine, so the same command works on the
+MacBook Air M1 and the MacBook Air M5 even when the vault sits in a different
+place. Resolution order:
+
+1. `--vault <path>`
+2. `CLAUDIAN_VAULT_ROOT`
+3. `vaultRoot` in `~/.claudian/config.json`
+4. Auto-detection of `田中雄一郎OS保管庫` under `~/TANAKA-BRAIN`, `~`,
+   `~/Documents`, the Obsidian/iCloud Drive folders, `~/Dropbox`, `~/Google Drive`
+
+Default folder mapping (overridden by `<vault>/.claudian.json`):
 
 | folder value | directory |
 |---|---|
@@ -58,3 +86,19 @@ Nothing else — no elaboration.
 | keep | 02_KEEP |
 | public | 03_PUBLIC |
 | archive | 99_ARCHIVE |
+
+## When the save fails
+
+The script exits non-zero and prints what to fix. Do not retry blindly:
+
+- `保管庫が見つかりません` / `保管庫のパスが存在しません` — the vault is not where
+  the script looked. Report the message and tell the user to set
+  `CLAUDIAN_VAULT_ROOT` (or `~/.claudian/config.json`) on that machine.
+- `--folder に未登録の名前が指定されました` — the alias was renamed or removed by
+  the reorganisation. Run `--list-folders` and retry with a live alias.
+- If the mapping is clearly behind the vault (several aliases point at folders
+  that no longer exist), run `--scan-folders` to show the user a draft of the
+  current structure. It only prints; adding `--write` changes the vault's
+  `.claudian.json`, so ask before running that.
+- Never invent a path or pass `--create-vault` on your own; an empty vault
+  created in the wrong place looks like a successful save.
