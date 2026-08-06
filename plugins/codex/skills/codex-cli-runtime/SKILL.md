@@ -25,6 +25,8 @@ Execution rules:
 
 Command selection:
 - Use exactly one `task` invocation per rescue handoff.
+- Always run that Bash call in the foreground. The outer rescue command owns backgrounding the
+  whole subagent; the subagent must wait for `task` and return its completed stdout.
 - If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Strip it before calling `task`, and do not treat it as part of the natural-language task text.
 - If the forwarded request includes `--model`, normalize `spark` to `gpt-5.3-codex-spark` and pass it through to `task`.
 - If the forwarded request includes `--effort`, pass it through to `task`.
