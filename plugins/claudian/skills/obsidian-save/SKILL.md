@@ -75,8 +75,13 @@ place. Resolution order:
 1. `--vault <path>`
 2. `CLAUDIAN_VAULT_ROOT`
 3. `vaultRoot` in `~/.claudian/config.json`
-4. Auto-detection of `田中雄一郎OS保管庫` under `~/TANAKA-BRAIN`, `~`,
+4. Auto-detection of `田中雄一郎OS保管庫` under `~` (the real layout:
+   `/Users/nesty/田中雄一郎OS保管庫`), then `~/TANAKA-BRAIN` (old layout),
    `~/Documents`, the Obsidian/iCloud Drive folders, `~/Dropbox`, `~/Google Drive`
+
+If several candidates exist, the script uses the first and prints the others on
+stderr. Pass that warning on to the user — it usually means a backup or a copy
+restored from the Trash is sitting next to the real vault.
 
 Default folder mapping (overridden by `<vault>/.claudian.json`):
 

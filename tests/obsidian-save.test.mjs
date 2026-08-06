@@ -143,6 +143,53 @@ test("resolveVaultRoot honours --vault, the env var, the config file, then auto-
   assert.equal(detected.source, "自動検出");
 });
 
+test("resolveVaultRoot finds the vault directly under the home folder", () => {
+  const home = makeTempDir("claudian-home-");
+  const vault = path.join(home, DEFAULT_VAULT_NAME);
+  fs.mkdirSync(vault, { recursive: true });
+
+  const resolved = resolveVaultRoot({ env: {}, home });
+
+  assert.equal(resolved.root, vault);
+  assert.equal(resolved.source, "自動検出");
+  assert.deepEqual(resolved.alternatives, []);
+});
+
+test("the home-folder vault outranks an old copy restored under TANAKA-BRAIN", () => {
+  const home = makeTempDir("claudian-home-");
+  const vault = path.join(home, DEFAULT_VAULT_NAME);
+  const legacy = path.join(home, "TANAKA-BRAIN", DEFAULT_VAULT_NAME);
+  fs.mkdirSync(vault, { recursive: true });
+  fs.mkdirSync(legacy, { recursive: true });
+
+  const resolved = resolveVaultRoot({ env: {}, home });
+
+  assert.equal(resolved.root, vault);
+  assert.deepEqual(resolved.alternatives, [legacy]);
+
+  // The losing candidate is reported so a duplicate cannot swallow notes unnoticed.
+  const saved = saveNote(["--title", "メモ", "--content", "本文"], { env: {}, home });
+  assert.equal(saved.vaultRoot, vault);
+  assert.deepEqual(saved.alternatives, [legacy]);
+});
+
+test("the CLI warns when more than one vault candidate exists", () => {
+  const home = makeTempDir("claudian-home-");
+  const vault = path.join(home, DEFAULT_VAULT_NAME);
+  const legacy = path.join(home, "TANAKA-BRAIN", DEFAULT_VAULT_NAME);
+  fs.mkdirSync(vault, { recursive: true });
+  fs.mkdirSync(legacy, { recursive: true });
+
+  const result = run(process.execPath, [SCRIPT, "--title", "メモ", "--content", "本文"], {
+    env: { ...process.env, HOME: home, CLAUDIAN_VAULT_ROOT: "", CLAUDIAN_CONFIG: path.join(home, "absent.json") }
+  });
+
+  assert.equal(result.status, 0);
+  assert.match(result.stderr, /保管庫の候補が 2 件見つかりました/);
+  assert.match(result.stderr, new RegExp(legacy.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.equal(fs.existsSync(path.join(vault, "00_INBOX", result.stdout.trim())), true);
+});
+
 test("resolveVaultRoot expands ~ and honours CLAUDIAN_VAULT_NAME", () => {
   const home = makeTempDir("claudian-home-");
   const named = path.join(home, "Documents", "別の保管庫");

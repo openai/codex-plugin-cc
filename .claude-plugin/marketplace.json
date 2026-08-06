@@ -20,7 +20,7 @@
     {
       "name": "claudian",
       "description": "Obsidian integration for Claude Code. Auto-saves conversation notes and decisions to your Obsidian vault (田中雄一郎OS保管庫).",
-      "version": "1.3.0",
+      "version": "1.4.0",
       "author": {
         "name": "YUICHIRO TANAKA"
       },

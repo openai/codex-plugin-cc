@@ -93,11 +93,17 @@ order:
 1. `--vault <path>` on the command line
 2. `CLAUDIAN_VAULT_ROOT` environment variable
 3. `vaultRoot` in `~/.claudian/config.json` (path overridable with `CLAUDIAN_CONFIG`)
-4. Auto-detection of a directory named `田中雄一郎OS保管庫` under:
-   `~/TANAKA-BRAIN`, `~`, `~/Documents`,
+4. Auto-detection of a directory named `田中雄一郎OS保管庫` under, in order:
+   `~` (the current layout — `/Users/nesty/田中雄一郎OS保管庫`),
+   `~/TANAKA-BRAIN` (the old layout), `~/Documents`,
    `~/Library/Mobile Documents/iCloud~md~obsidian/Documents`,
    `~/Library/Mobile Documents/com~apple~CloudDocs`, `~/Dropbox`,
    `~/Google Drive`, `~/obsidian`
+
+The home folder is checked first on purpose: a backup or an old copy restored
+from the Trash must not outrank the live vault. When more than one candidate
+exists the script uses the first and prints the rest on stderr, so a duplicate
+never swallows notes unnoticed.
 
 If the vault lives in one of those places, nothing to configure. Otherwise pin
 it once per machine:
