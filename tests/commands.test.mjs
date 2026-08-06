@@ -70,6 +70,24 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /can still take extra focus text after the flags/i);
 });
 
+test("verified review command exposes the two-pass read-only contract", () => {
+  const source = read("commands/verified-review.md");
+  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+
+  assert.match(source, /AskUserQuestion/);
+  assert.match(source, /\bBash\(/);
+  assert.match(source, /verified-review "\$ARGUMENTS"/);
+  assert.match(source, /\[--scope auto\|working-tree\|branch\]/);
+  assert.match(source, /\[--base <ref>\]/);
+  assert.match(source, /\[--check "<command>"\]/);
+  assert.match(source, /run_in_background:\s*true/);
+  assert.match(source, /Do not fix issues/i);
+  assert.match(source, /read-only/i);
+  assert.match(source, /Return the command stdout verbatim to the user/i);
+  assert.match(readme, /### `\/codex:verified-review`/);
+  assert.match(readme, /--check/i);
+});
+
 test("continue is not exposed as a user-facing command", () => {
   const commandFiles = fs.readdirSync(path.join(PLUGIN_ROOT, "commands")).sort();
   assert.deepEqual(commandFiles, [
@@ -80,7 +98,8 @@ test("continue is not exposed as a user-facing command", () => {
     "review.md",
     "setup.md",
     "status.md",
-    "transfer.md"
+    "transfer.md",
+    "verified-review.md"
   ]);
 });
 

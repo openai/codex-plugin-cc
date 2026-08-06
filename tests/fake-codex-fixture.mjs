@@ -181,6 +181,36 @@ function emitTurnCompletedLater(threadId, turnId, item, delayMs) {
 }
 
 function nativeReviewText(target) {
+  if (BEHAVIOR === "verified-review-native-empty") {
+    return "";
+  }
+  if (BEHAVIOR === "verified-review-native-clean") {
+    return "No material issues found.";
+  }
+  if (BEHAVIOR === "verified-review-native-clean-after-heading") {
+    return "Reviewed uncommitted changes.\\nNo material issues found.";
+  }
+  if (BEHAVIOR === "verified-review-native-ambiguous") {
+    return "Looks good, but X is broken";
+  }
+  if (BEHAVIOR === "verified-review-native-none") {
+    return "- None.";
+  }
+  if (BEHAVIOR === "verified-review-native-no-findings") {
+    return "No findings.";
+  }
+  if (BEHAVIOR === "verified-review-native-no-issues") {
+    return "No issues.";
+  }
+  if (BEHAVIOR === "verified-review-native-no-problems") {
+    return "No problems.";
+  }
+  if (BEHAVIOR === "verified-review-native-clean-mixed") {
+    return "No material issues found.\\nBut src/app.js can still throw.";
+  }
+  if (BEHAVIOR.startsWith("verified-review-")) {
+    return "Reviewed uncommitted changes.\\n- [high] Missing empty-state guard (src/app.js:4)\\n- [low] Naming could be clearer (src/app.js:1)";
+  }
   if (target.type === "baseBranch") {
     return "Reviewed changes against " + target.branch + ".\\nNo material issues found.";
   }
@@ -191,6 +221,56 @@ function nativeReviewText(target) {
 }
 
 function structuredReviewPayload(prompt) {
+  if (BEHAVIOR.startsWith("verified-review-")) {
+    const emptyNativeFindings = new Set([
+      "verified-review-native-empty",
+      "verified-review-native-clean",
+      "verified-review-native-clean-after-heading",
+      "verified-review-native-none",
+      "verified-review-native-no-findings",
+      "verified-review-native-no-issues",
+      "verified-review-native-no-problems",
+      "verified-review-native-clean-mixed"
+    ]);
+    const nativeFindingIds =
+      BEHAVIOR === "verified-review-missing-finding"
+        ? ["native-1"]
+        : BEHAVIOR === "verified-review-duplicate-finding"
+          ? ["native-1", "native-1"]
+          : BEHAVIOR === "verified-review-unknown-finding"
+            ? ["native-1", "native-99"]
+            : ["native-1", "native-2"];
+    return JSON.stringify({
+      verdict: "needs-attention",
+      summary: "Every native finding was independently classified.",
+      findings: (emptyNativeFindings.has(BEHAVIOR) ? [] : [
+        {
+          native_finding_id: nativeFindingIds[0],
+          severity: "high",
+          title: "[confirmed] Missing empty-state guard",
+          body: "The unguarded index access can throw for an empty collection.",
+          file: "src/app.js",
+          line_start: 4,
+          line_end: 4,
+          confidence: 0.95,
+          recommendation: "Handle empty collections before indexing."
+        },
+        {
+          native_finding_id: nativeFindingIds[1],
+          severity: "low",
+          title: "[style-only] Naming could be clearer",
+          body: "This is readability-only and has no behavior impact.",
+          file: "src/app.js",
+          line_start: 1,
+          line_end: 1,
+          confidence: 0.8,
+          recommendation: "Rename when editing this code next."
+        }
+      ]).filter((finding) => finding.native_finding_id),
+      next_steps: ["Fix the confirmed empty-state guard."]
+    });
+  }
+
   if (prompt.includes("adversarial software review")) {
     if (BEHAVIOR === "adversarial-clean") {
       return JSON.stringify({
@@ -230,6 +310,91 @@ function structuredReviewPayload(prompt) {
     findings: [],
     next_steps: []
   });
+}
+
+function verifiedReviewCheckItems(turnId, prompt) {
+  const explicitChecksStart = prompt.indexOf("<explicit_checks>");
+  const explicitChecksEnd = prompt.indexOf("</explicit_checks>");
+  const hasRequestedCheck =
+    explicitChecksStart >= 0 &&
+    explicitChecksEnd > explicitChecksStart &&
+    prompt.slice(explicitChecksStart, explicitChecksEnd).includes("- npm test -- --runInBand");
+  if (!BEHAVIOR.startsWith("verified-review-") || !prompt.includes("Execute only these explicitly supplied commands")) {
+    return [];
+  }
+
+  const items = [
+    {
+      started: {
+        type: "commandExecution",
+        id: "command_" + turnId + "_inspection",
+        command: "git diff --stat",
+        status: "inProgress"
+      },
+      completed: {
+        type: "commandExecution",
+        id: "command_" + turnId + "_inspection",
+        command: "git diff --stat",
+        status: "completed",
+        exitCode: 0,
+        aggregatedOutput: " src/app.js | 2 + -",
+        commandActions: ["read"]
+      }
+    }
+  ];
+
+  if (BEHAVIOR === "verified-review-check-readonly-inspection") {
+    items.push({
+      started: {
+        type: "commandExecution",
+        id: "command_" + turnId + "_inspection_check",
+        command: "git diff --check",
+        status: "inProgress"
+      },
+      completed: {
+        type: "commandExecution",
+        id: "command_" + turnId + "_inspection_check",
+        command: "git diff --check",
+        status: "completed",
+        exitCode: 0,
+        aggregatedOutput: "",
+        commandActions: ["read"]
+      }
+    });
+  }
+
+  if (!hasRequestedCheck) {
+    return items;
+  }
+
+  if (BEHAVIOR === "verified-review-check-skipped") {
+    return items;
+  }
+
+  const commands =
+    BEHAVIOR === "verified-review-check-duplicate"
+      ? ["npm test -- --runInBand", "npm test -- --runInBand"]
+      : BEHAVIOR === "verified-review-unauthorized-check"
+        ? ["npm test -- --runInBand", "npm run build"]
+        : ["npm test -- --runInBand"];
+
+  return [...items, ...commands.map((command, index) => ({
+    started: {
+      type: "commandExecution",
+      id: "command_" + turnId + "_" + index,
+      command,
+      status: "inProgress"
+    },
+    completed: {
+      type: "commandExecution",
+      id: "command_" + turnId + "_" + index,
+      command,
+      status: "completed",
+      exitCode: 0,
+      aggregatedOutput: "all tests passed",
+      commandActions: command === "npm run build" ? ["execute"] : ["read"]
+    }
+  }))];
 }
 
 function taskPayload(prompt, resume) {
@@ -406,6 +571,15 @@ rl.on("line", (line) => {
 
       case "review/start": {
         const thread = ensureThread(state, message.params.threadId);
+        state.reviewStarts = [
+          ...(state.reviewStarts || []),
+          {
+            threadId: message.params.threadId,
+            delivery: message.params.delivery,
+            target: message.params.target
+          }
+        ];
+        saveState(state);
         let reviewThread = thread;
         if (message.params.delivery === "detached") {
           reviewThread = nextThread(state, thread.cwd, true);
@@ -444,13 +618,15 @@ rl.on("line", (line) => {
           .join("\\n");
         const turnId = nextTurnId(state);
         thread.updatedAt = now();
-	        state.lastTurnStart = {
+	        const turnStart = {
 	          threadId: message.params.threadId,
 	          turnId,
 	          model: message.params.model ?? null,
 	          effort: message.params.effort ?? null,
 	          prompt
 	        };
+	        state.lastTurnStart = turnStart;
+	        state.turnStarts = [...(state.turnStarts || []), turnStart];
 	        saveState(state);
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
 
@@ -567,8 +743,9 @@ rl.on("line", (line) => {
           break;
         }
 
-        const items = [
-          ...(BEHAVIOR === "with-reasoning"
+	        const items = [
+	          ...verifiedReviewCheckItems(turnId, prompt),
+	          ...(BEHAVIOR === "with-reasoning"
             ? [
                 {
                   completed: {

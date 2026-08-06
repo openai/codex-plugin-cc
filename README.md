@@ -11,6 +11,7 @@ they already have.
 
 - `/codex:review` for a normal read-only Codex review
 - `/codex:adversarial-review` for a steerable challenge review
+- `/codex:verified-review` for a native review with an independent evidence pass
 - `/codex:rescue`, `/codex:transfer`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work, hand off sessions, and manage background jobs
 
 ## Requirements
@@ -122,6 +123,20 @@ Examples:
 ```
 
 This command is read-only. It does not fix code.
+
+### `/codex:verified-review`
+
+Runs one native Codex review, then a fresh read-only Codex turn that independently verifies every finding. The final report labels each finding as `confirmed`, `false-positive`, `style-only`, or `unverified`, with evidence and any check output.
+
+It accepts the normal review target options, including `--base <ref>` and `--scope auto|working-tree|branch`. Add `--check "<command>"` repeatedly to authorize only those validation commands for the verification turn:
+
+```bash
+/codex:verified-review
+/codex:verified-review --base main --check "npm test" --check "npm run build"
+/codex:verified-review --background --check "npm test"
+```
+
+`--check` is a trust boundary: each command is passed exactly as user-supplied to Codex's local read-only verification sandbox and may invoke arbitrary local programs available there. The plugin does not infer or run default test, build, lint, or check commands. Without `--check`, verification uses only read-only repository inspection. Use [`/codex:status`](#codexstatus) and [`/codex:result`](#codexresult) for background work.
 
 ### `/codex:rescue`
 
