@@ -15,6 +15,7 @@ import {
 } from "./lib/broker-lifecycle.mjs";
 import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
+import { cleanupVerifiedReviewInputs } from "./lib/verified-review-input.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
@@ -102,6 +103,10 @@ async function handleSessionEnd(input) {
   }
 
   cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
+  cleanupVerifiedReviewInputs({
+    cwd,
+    sessionId: input.session_id || process.env[SESSION_ID_ENV]
+  });
   teardownBrokerSession({
     endpoint: brokerEndpoint,
     pidFile,

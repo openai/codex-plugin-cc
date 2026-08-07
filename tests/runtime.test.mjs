@@ -10,12 +10,18 @@ import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { readJobFile, resolveJobFile, resolveStateDir, upsertJob, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
 import { cancelTrackedJob, createJobProgressUpdater, runTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
+import {
+  captureVerifiedReviewInput,
+  cleanupVerifiedReviewInputs,
+  consumeVerifiedReviewInput
+} from "../plugins/codex/scripts/lib/verified-review-input.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
+const VERIFIED_REVIEW_INPUT_HOOK = path.join(PLUGIN_ROOT, "scripts", "verified-review-input-hook.mjs");
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   const start = Date.now();
@@ -40,6 +46,39 @@ function createVerifiedReviewRepo(behavior) {
   run("git", ["commit", "-m", "init"], { cwd: repo });
   fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0].id;\n");
   return { repo, binDir };
+}
+
+function verifiedReviewInputFiles(cwd) {
+  const directory = path.join(path.dirname(resolveStateDir(cwd)), "verified-review-inputs");
+  return fs.existsSync(directory) ? fs.readdirSync(directory).filter((name) => name.endsWith(".json")) : [];
+}
+
+function verifiedReviewInputDir(cwd) {
+  return path.join(path.dirname(resolveStateDir(cwd)), "verified-review-inputs");
+}
+
+function captureVerifiedReviewArguments({ cwd, env, sessionId, rawArguments }) {
+  const result = run("node", [VERIFIED_REVIEW_INPUT_HOOK], {
+    cwd,
+    env,
+    input: JSON.stringify({
+      hook_event_name: "UserPromptExpansion",
+      command_name: "codex:verified-review",
+      command_args: rawArguments,
+      session_id: sessionId,
+      cwd
+    })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
+  const match = /^CODEX_VERIFIED_REVIEW_CAPTURE_ID=([0-9a-f-]{36})$/i.exec(context);
+  assert.ok(match, `Missing verified-review capture ID in ${context}`);
+  return match[1];
+}
+
+function fakeCodexState(binDir) {
+  const filePath = path.join(binDir, "fake-codex-state.json");
+  return fs.existsSync(filePath) ? JSON.parse(fs.readFileSync(filePath, "utf8")) : null;
 }
 
 test("setup reports ready when fake codex is installed and authenticated", () => {
@@ -1127,6 +1166,197 @@ test("verified review runs one native pass, then one fresh read-only verificatio
   const log = fs.readFileSync(jobState.jobs[0].logFile, "utf8");
   assert.match(log, /npm test -- --runInBand/);
   assert.match(log, /exit 0/);
+});
+
+test("verified review captures slash arguments as opaque input before the shell can expand them", () => {
+  const { repo, binDir } = createVerifiedReviewRepo("verified-review-findings");
+  const sessionId = "sess-captured-input";
+  const marker = path.join(makeTempDir(), "must-not-exist");
+  const literal = `$HOME \`never-run\` $(touch ${marker}) 'single quote' "double quote" \\\\path 한국어\nembedded line`;
+  const rawArguments = `--base "${literal.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+  const env = {
+    ...buildEnv(binDir),
+    CODEX_COMPANION_SESSION_ID: sessionId
+  };
+  const captureId = captureVerifiedReviewArguments({ cwd: repo, env, sessionId, rawArguments });
+  const captureFile = path.join(verifiedReviewInputDir(repo), `${captureId}.json`);
+
+  assert.equal(JSON.parse(fs.readFileSync(captureFile, "utf8")).rawArguments, rawArguments);
+  assert.equal(fs.existsSync(marker), false);
+
+  const result = run("node", [SCRIPT, "verified-review", "--captured-input", captureId], { cwd: repo, env });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(marker), false);
+  assert.equal(fs.existsSync(captureFile), false);
+  const state = fakeCodexState(binDir);
+  assert.equal(state.reviewStarts.length, 1);
+  assert.equal(state.turnStarts.length, 1);
+  assert.equal(state.reviewStarts[0].target.branch, literal);
+});
+
+test("captured verified-review input fails closed before Codex for invalid ownership and reuse", () => {
+  const { repo, binDir } = createVerifiedReviewRepo("verified-review-findings");
+  const ownerSession = "sess-capture-owner";
+  const ownerEnv = {
+    ...buildEnv(binDir),
+    CODEX_COMPANION_SESSION_ID: ownerSession
+  };
+  const runCaptured = (captureId, env = ownerEnv, cwd = repo) =>
+    run("node", [SCRIPT, "verified-review", "--captured-input", captureId], { cwd, env });
+  const noCodexRan = () => assert.equal(fakeCodexState(binDir), null);
+
+  const malformed = runCaptured("not-a-capture-id");
+  assert.notEqual(malformed.status, 0);
+  noCodexRan();
+
+  const missing = runCaptured("00000000-0000-4000-8000-000000000000");
+  assert.notEqual(missing.status, 0);
+  noCodexRan();
+
+  const malformedId = "11111111-1111-4111-8111-111111111111";
+  const captureDir = verifiedReviewInputDir(repo);
+  fs.mkdirSync(captureDir, { recursive: true });
+  fs.writeFileSync(path.join(captureDir, `${malformedId}.json`), "not json", "utf8");
+  const malformedRecord = runCaptured(malformedId);
+  assert.notEqual(malformedRecord.status, 0);
+  noCodexRan();
+
+  const wrongSessionId = captureVerifiedReviewInput({
+    cwd: repo,
+    sessionId: ownerSession,
+    rawArguments: "--scope working-tree"
+  }).id;
+  const wrongSession = runCaptured(wrongSessionId, {
+    ...ownerEnv,
+    CODEX_COMPANION_SESSION_ID: "sess-not-owner"
+  });
+  assert.notEqual(wrongSession.status, 0);
+  noCodexRan();
+
+  const otherWorkspace = makeTempDir();
+  initGitRepo(otherWorkspace);
+  const wrongWorkspaceId = captureVerifiedReviewInput({
+    cwd: repo,
+    sessionId: ownerSession,
+    rawArguments: "--scope working-tree"
+  }).id;
+  const wrongWorkspace = runCaptured(wrongWorkspaceId, ownerEnv, otherWorkspace);
+  assert.notEqual(wrongWorkspace.status, 0);
+  noCodexRan();
+
+  const reusableId = captureVerifiedReviewInput({
+    cwd: repo,
+    sessionId: ownerSession,
+    rawArguments: "--scope working-tree"
+  }).id;
+  const firstUse = runCaptured(reusableId);
+  assert.equal(firstUse.status, 0, firstUse.stderr);
+  const secondUse = runCaptured(reusableId);
+  assert.notEqual(secondUse.status, 0);
+  assert.equal(fakeCodexState(binDir).reviewStarts.length, 1);
+  assert.equal(fakeCodexState(binDir).turnStarts.length, 1);
+});
+
+test("verified-review capture runtime failures exit 2 without emitting a capture marker", () => {
+  const repo = makeTempDir();
+  const pluginData = makeTempDir();
+  initGitRepo(repo);
+  const captureDir = path.join(pluginData, "state", "verified-review-inputs");
+  fs.mkdirSync(path.dirname(captureDir), { recursive: true });
+  fs.writeFileSync(captureDir, "not a directory", "utf8");
+  const result = run("node", [VERIFIED_REVIEW_INPUT_HOOK], {
+    cwd: repo,
+    env: { ...process.env, CLAUDE_PLUGIN_DATA: pluginData },
+    input: JSON.stringify({
+      hook_event_name: "UserPromptExpansion",
+      command_name: "verified-review",
+      command_args: "--scope branch",
+      session_id: "sess-hook-failure",
+      cwd: repo
+    })
+  });
+
+  assert.equal(result.status, 2, result.stderr);
+  assert.equal(result.stdout, "");
+  assert.doesNotMatch(result.stdout, /CODEX_VERIFIED_REVIEW_CAPTURE_ID/);
+  assert.equal(fs.readFileSync(captureDir, "utf8"), "not a directory");
+});
+
+test("captured verified-review input expires before use", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const capture = captureVerifiedReviewInput({ cwd: repo, sessionId: "sess-expired", rawArguments: "--scope branch" });
+  const captureFile = path.join(verifiedReviewInputDir(repo), `${capture.id}.json`);
+  const record = JSON.parse(fs.readFileSync(captureFile, "utf8"));
+  fs.writeFileSync(captureFile, `${JSON.stringify({ ...record, createdAt: Date.now() - 10 * 60 * 1000 - 1 })}\n`);
+
+  assert.deepEqual(consumeVerifiedReviewInput(repo, capture.id, { sessionId: "sess-expired" }), null);
+  assert.equal(fs.existsSync(captureFile), false);
+});
+
+test("verified-review capture cleanup spans workspaces, retains live claims, and prunes stale claims", () => {
+  const repo = makeTempDir();
+  const otherWorkspace = makeTempDir();
+  initGitRepo(repo);
+  initGitRepo(otherWorkspace);
+  const env = { ...process.env };
+  const first = captureVerifiedReviewInput({ cwd: repo, sessionId: "sess-cleanup", rawArguments: "--scope working-tree" });
+  const second = captureVerifiedReviewInput({
+    cwd: otherWorkspace,
+    sessionId: "sess-cleanup",
+    rawArguments: "--scope branch"
+  });
+  const otherSession = captureVerifiedReviewInput({
+    cwd: otherWorkspace,
+    sessionId: "sess-other",
+    rawArguments: "--check npm test"
+  });
+  const stale = captureVerifiedReviewInput({
+    cwd: repo,
+    sessionId: "sess-stale",
+    rawArguments: "--base main"
+  });
+  const captureDir = verifiedReviewInputDir(repo);
+  const stalePath = path.join(captureDir, `${stale.id}.json`);
+  const staleRecord = JSON.parse(fs.readFileSync(stalePath, "utf8"));
+  fs.renameSync(stalePath, path.join(captureDir, `.${stale.id}.crash.claimed`));
+  fs.writeFileSync(
+    path.join(captureDir, `.${stale.id}.crash.claimed`),
+    `${JSON.stringify({ ...staleRecord, createdAt: Date.now() - 10 * 60 * 1000 - 1 })}\n`
+  );
+  const liveClaim = captureVerifiedReviewInput({
+    cwd: repo,
+    sessionId: "sess-cleanup",
+    rawArguments: "--scope staged"
+  });
+  const liveClaimPath = path.join(captureDir, `.${liveClaim.id}.active.claimed`);
+  fs.renameSync(path.join(captureDir, `${liveClaim.id}.json`), liveClaimPath);
+  const malformedId = "22222222-2222-4222-8222-222222222222";
+  const malformedPath = path.join(captureDir, `.${malformedId}.crash.claimed`);
+  fs.writeFileSync(malformedPath, "not json", "utf8");
+  const staleAt = new Date(Date.now() - 10 * 60 * 1000 - 1);
+  fs.utimesSync(malformedPath, staleAt, staleAt);
+
+  assert.equal(verifiedReviewInputFiles(repo).length, 3);
+  assert.deepEqual(consumeVerifiedReviewInput(repo, first.id, { sessionId: "sess-cleanup" }), {
+    rawArguments: "--scope working-tree"
+  });
+  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo, session_id: "sess-cleanup" })
+  });
+  assert.equal(cleanup.status, 0, cleanup.stderr);
+  assert.equal(verifiedReviewInputFiles(repo).length, 1);
+  assert.deepEqual(consumeVerifiedReviewInput(otherWorkspace, second.id, { sessionId: "sess-cleanup" }), null);
+  assert.equal(fs.existsSync(liveClaimPath), true);
+  assert.equal(fs.existsSync(path.join(captureDir, `.${stale.id}.crash.claimed`)), false);
+  assert.equal(fs.existsSync(malformedPath), false);
+  assert.deepEqual(consumeVerifiedReviewInput(otherWorkspace, otherSession.id, { sessionId: "sess-other" }), {
+    rawArguments: "--check npm test"
+  });
+  assert.equal(cleanupVerifiedReviewInputs({ cwd: repo, sessionId: "sess-other" }), 0);
 });
 
 test("verified review rejects omitted, duplicate, and unknown native finding classifications", () => {

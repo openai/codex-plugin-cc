@@ -8,6 +8,10 @@ import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import {
+  consumeVerifiedReviewInput,
+  VERIFIED_REVIEW_CAPTURE_ID_PATTERN
+} from "./lib/verified-review-input.mjs";
+import {
     buildPersistentTaskThreadName,
     DEFAULT_CONTINUE_PROMPT,
     findLatestTaskThread,
@@ -1118,7 +1122,36 @@ function readExplicitChecks(checks) {
   return values;
 }
 
+async function resolveVerifiedReviewArgv(argv) {
+  const hasCapturedInput = argv.some(
+    (argument) => argument === "--captured-input" || argument.startsWith("--captured-input=")
+  );
+  if (!hasCapturedInput) {
+    return argv;
+  }
+
+  if (
+    argv.length !== 2 ||
+    argv[0] !== "--captured-input" ||
+    !VERIFIED_REVIEW_CAPTURE_ID_PATTERN.test(argv[1])
+  ) {
+    throw new Error("`--captured-input` must be the only verified-review option and use a valid capture ID.");
+  }
+
+  const sessionId = getCurrentClaudeSessionId();
+  if (!sessionId) {
+    throw new Error("`--captured-input` requires an active Claude session.");
+  }
+
+  const captured = await consumeVerifiedReviewInput(process.cwd(), argv[1], { sessionId });
+  if (!captured || typeof captured.rawArguments !== "string") {
+    throw new Error("Captured verified-review input is invalid.");
+  }
+  return [captured.rawArguments];
+}
+
 async function handleVerifiedReview(argv) {
+  argv = await resolveVerifiedReviewArgv(argv);
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["base", "scope", "cwd", "check"],
     repeatableValueOptions: ["check"],

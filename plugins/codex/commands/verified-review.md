@@ -10,6 +10,11 @@ Run a verified Codex review through the shared plugin runtime.
 Raw slash-command arguments:
 `$ARGUMENTS`
 
+Safe input transport:
+- Additional command context supplies `CODEX_VERIFIED_REVIEW_CAPTURE_ID=<uuid>` for these raw arguments. Treat that UUID as opaque.
+- Before any execution, find one valid `CODEX_VERIFIED_REVIEW_CAPTURE_ID` UUID marker in that context. If it is absent or invalid, fail closed: do not invoke the companion and report that the verified review cannot safely access its captured input.
+- Pass only `--captured-input "<uuid>"` to the companion. Never copy, interpolate, export, pipe, or otherwise place raw `$ARGUMENTS` in Bash, a template string, an environment variable, or stdin.
+
 Core constraint:
 - This command is review-only and read-only.
 - Do not fix issues, apply patches, or suggest that you are about to make changes.
@@ -37,14 +42,14 @@ Execution mode rules:
   - `Run in background`
 
 Argument handling:
-- Preserve `--base`, `--scope`, every `--check`, `--wait`, and `--background` exactly.
+- The captured input preserves `--base`, `--scope`, every `--check`, `--wait`, and `--background` exactly.
 - `/codex:verified-review` supports only auto, working-tree, and branch review scopes. It does not support staged-only review, unstaged-only review, or focus text.
-- The companion script parses `--wait`, `--background`, and repeated `--check`; Claude Code's `Bash(..., run_in_background: true)` is what detaches this slash-command turn.
+- The companion reads the captured input and parses `--wait`, `--background`, and repeated `--check`; Claude Code's `Bash(..., run_in_background: true)` is what detaches this slash-command turn.
 
 Foreground flow:
 - Run:
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" verified-review "$ARGUMENTS"
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" verified-review --captured-input "<uuid>"
 ```
 - Return stdout verbatim, exactly as-is.
 
@@ -52,7 +57,7 @@ Background flow:
 - Launch with `Bash` in the background:
 ```typescript
 Bash({
-  command: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" verified-review "$ARGUMENTS"`,
+  command: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" verified-review --captured-input "<uuid>"`,
   description: "Codex verified review",
   run_in_background: true
 })

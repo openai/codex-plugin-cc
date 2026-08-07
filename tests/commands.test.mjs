@@ -73,10 +73,20 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
 test("verified review command exposes the two-pass read-only contract", () => {
   const source = read("commands/verified-review.md");
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+  const executableBlocks = [...source.matchAll(/```(?:bash|typescript)\n([\s\S]*?)```/g)].map((match) => match[1]);
 
   assert.match(source, /AskUserQuestion/);
   assert.match(source, /\bBash\(/);
-  assert.match(source, /verified-review "\$ARGUMENTS"/);
+  assert.match(source, /CODEX_VERIFIED_REVIEW_CAPTURE_ID=<uuid>/);
+  assert.match(source, /fail closed/i);
+  assert.match(source, /--captured-input "<uuid>"/);
+  assert.match(source, /Never copy, interpolate, export, pipe, or otherwise place raw `\$ARGUMENTS` in Bash/i);
+  assert.equal(executableBlocks.length, 2);
+  for (const block of executableBlocks) {
+    assert.match(block, /verified-review --captured-input "<uuid>"/);
+    assert.doesNotMatch(block, /\$ARGUMENTS/);
+  }
+  assert.doesNotMatch(source, /verified-review "\$ARGUMENTS"/);
   assert.match(source, /\[--scope auto\|working-tree\|branch\]/);
   assert.match(source, /\[--base <ref>\]/);
   assert.match(source, /\[--check "<command>"\]/);
