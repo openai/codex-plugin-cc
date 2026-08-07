@@ -1485,6 +1485,19 @@ test("verified review accepts only explicit native clean sentinels", () => {
   }
 });
 
+test("verified review ignores nested and fenced list markers in native output", () => {
+  const { repo, binDir } = createVerifiedReviewRepo("verified-review-native-nested-and-fenced");
+  const result = run("node", [SCRIPT, "verified-review", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.native.findings.map((finding) => finding.id), ["native-1", "native-2"]);
+  assert.deepEqual(payload.result.findings.map((finding) => finding.native_finding_id), ["native-1", "native-2"]);
+});
+
 test("verified review preserves native target selection for auto, working-tree, branch, and --base", () => {
   const cases = [
     { args: [], targetType: "uncommittedChanges" },

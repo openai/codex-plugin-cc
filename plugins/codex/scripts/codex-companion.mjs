@@ -479,21 +479,65 @@ async function executeReviewRun(request) {
 }
 
 const VERIFIED_FINDING_PREFIX = /^\[(?:confirmed|false-positive|style-only|unverified)\]\s+/;
-const NATIVE_FINDING_ITEM = /^\s*(?:[-*+]\s+|\d+[.)]\s+|\[P\d+\]\s+)(\S.*)$/i;
+const NATIVE_FINDING_ITEM = /^(?:[-*+]\s+|\d+[.)]\s+|\[P\d+\]\s+)(\S.*)$/i;
+const NATIVE_REVIEW_FENCE = /^\s*(`{3,}|~{3,})(.*)$/;
 const NATIVE_REVIEW_HEADER = /^reviewed\b(?!.*\b(?:but|however|found|issue|finding|problem)\b).*?[.!]?$/i;
 const NATIVE_REVIEW_CLEAN = /^(?:[-*+]\s+)?(?:none|no\s+(?:material\s+)?(?:issues?|findings?|problems?)(?:\s+found)?|looks\s+good|nothing\s+to\s+report)\.?$/i;
 
 function extractNativeFindings(reviewText) {
-  const text = String(reviewText ?? "").trim();
-  if (!text) {
+  const text = String(reviewText ?? "");
+  if (!text.trim()) {
     return { findings: [], error: "Native review returned no text, so there are no findings to verify." };
   }
 
   const findings = [];
   let current = null;
-  const lines = text.split(/\r?\n/).map((line) => line.replace(/\s+/g, " ").trim()).filter(Boolean);
-  if (lines.some((line) => NATIVE_REVIEW_CLEAN.test(line))) {
-    if (lines.every((line) => NATIVE_REVIEW_HEADER.test(line) || NATIVE_REVIEW_CLEAN.test(line))) {
+  let fence = null;
+  const topLevelLines = [];
+  for (const rawLine of text.split(/\r?\n/)) {
+    const normalized = rawLine.replace(/\s+/g, " ").trim();
+    const fenceMatch = rawLine.match(NATIVE_REVIEW_FENCE);
+    const isFenceClose = fence && fenceMatch && fenceMatch[1][0] === fence.marker && fenceMatch[1].length >= fence.length && !fenceMatch[2].trim();
+    if (fence || fenceMatch) {
+      if (current && normalized) {
+        current.text += `\n${normalized}`;
+      }
+      if (isFenceClose) {
+        fence = null;
+      } else if (!fence && fenceMatch) {
+        fence = { marker: fenceMatch[1][0], length: fenceMatch[1].length };
+      }
+      continue;
+    }
+    if (!normalized) {
+      continue;
+    }
+    if (/^\s/.test(rawLine)) {
+      if (current) {
+        current.text += `\n${normalized}`;
+      }
+      continue;
+    }
+
+    topLevelLines.push(normalized);
+    const match = normalized.match(NATIVE_FINDING_ITEM);
+    if (match) {
+      current = { id: `native-${findings.length + 1}`, text: match[1] };
+      findings.push(current);
+    } else if (current) {
+      current.text += `\n${normalized}`;
+    }
+  }
+
+  if (fence) {
+    return {
+      findings: [],
+      error: "Native review contains an unterminated fenced block, so its finding set cannot be verified."
+    };
+  }
+
+  if (topLevelLines.some((line) => NATIVE_REVIEW_CLEAN.test(line))) {
+    if (topLevelLines.every((line) => NATIVE_REVIEW_HEADER.test(line) || NATIVE_REVIEW_CLEAN.test(line))) {
       return { findings: [], error: null };
     }
     return {
@@ -501,16 +545,6 @@ function extractNativeFindings(reviewText) {
       error: "Native review combines a clean sentinel with substantive text, so its finding set is ambiguous."
     };
   }
-  for (const line of lines) {
-    const match = line.match(NATIVE_FINDING_ITEM);
-    if (match) {
-      current = { id: `native-${findings.length + 1}`, text: match[1] };
-      findings.push(current);
-    } else if (current && line.trim()) {
-      current.text += `\n${line.trim()}`;
-    }
-  }
-
   if (findings.length === 0) {
     return {
       findings: [],

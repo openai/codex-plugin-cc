@@ -208,6 +208,26 @@ function nativeReviewText(target) {
   if (BEHAVIOR === "verified-review-native-clean-mixed") {
     return "No material issues found.\\nBut src/app.js can still throw.";
   }
+  if (BEHAVIOR === "verified-review-native-nested-and-fenced") {
+    return [
+      "Reviewed uncommitted changes.",
+      "- [high] Missing empty-state guard (src/app.js:4)",
+      "  - Nested explanation is not another finding.",
+      "  \`\`\`diff",
+      "  - removed code is not a finding",
+      "  + added code is not a finding",
+      "  [P1] code marker is not a finding",
+      "  \`\`\`",
+      "- [low] Naming could be clearer (src/app.js:1)",
+      "    1. Nested list item is not another finding.",
+      "~~~text",
+      "- fenced marker is not a finding",
+      "+ fenced marker is not a finding",
+      "1. fenced marker is not a finding",
+      "[P2] fenced marker is not a finding",
+      "~~~"
+    ].join("\\n");
+  }
   if (BEHAVIOR.startsWith("verified-review-")) {
     return "Reviewed uncommitted changes.\\n- [high] Missing empty-state guard (src/app.js:4)\\n- [low] Naming could be clearer (src/app.js:1)";
   }
