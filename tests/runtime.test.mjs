@@ -193,6 +193,64 @@ test("task runs without auth preflight so Codex can refresh an expired session",
   assert.match(result.stdout, /Handled the requested task/);
 });
 
+test("task threads honor sandbox workspace network access on start and resume", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "network-access-enabled");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const firstRun = run("node", [SCRIPT, "task", "--write", "initial task"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+
+  const resumedRun = run("node", [SCRIPT, "task", "--write", "--resume", "follow up"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(resumedRun.status, 0, resumedRun.stderr);
+
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.deepEqual(fakeState.threadStarts[0].config, {
+    sandbox_workspace_write: { network_access: true }
+  });
+  assert.deepEqual(fakeState.threadResumes[0].config, {
+    sandbox_workspace_write: { network_access: true }
+  });
+});
+
+test("task threads omit sandbox network config when it is disabled, absent, null, or unreadable", () => {
+  for (const behavior of [
+    "network-access-disabled",
+    "network-access-absent",
+    "network-access-null",
+    "config-read-fails"
+  ]) {
+    const repo = makeTempDir();
+    const binDir = makeTempDir();
+    const statePath = path.join(binDir, "fake-codex-state.json");
+    installFakeCodex(binDir, behavior);
+    initGitRepo(repo);
+    fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+    run("git", ["add", "README.md"], { cwd: repo });
+    run("git", ["commit", "-m", "init"], { cwd: repo });
+
+    const result = run("node", [SCRIPT, "task", "--write", "initial task"], {
+      cwd: repo,
+      env: buildEnv(binDir)
+    });
+    assert.equal(result.status, 0, `${behavior}: ${result.stderr}`);
+
+    const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.equal("config" in fakeState.threadStarts[0], false, behavior);
+  }
+});
+
 test("transfer delegates the current Claude session directly to native import", () => {
   const home = makeTempDir();
   const repo = path.join(home, "repo");

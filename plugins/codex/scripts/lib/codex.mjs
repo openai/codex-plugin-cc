@@ -6,6 +6,7 @@
  * @typedef {import("./app-server-protocol").ThreadStartParams} ThreadStartParams
  * @typedef {import("./app-server-protocol").Turn} Turn
  * @typedef {import("./app-server-protocol").UserInput} UserInput
+ * @typedef {{ sandbox_workspace_write: { network_access: true } } | null} ThreadConfigOverride
  * @typedef {((update: string | { message: string, phase: string | null, threadId?: string | null, turnId?: string | null, stderrMessage?: string | null, logTitle?: string | null, logBody?: string | null }) => void)} ProgressReporter
  * @typedef {{
  *   threadId: string,
@@ -50,6 +51,7 @@ const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
 const EXTERNAL_AGENT_IMPORT_TIMEOUT_MS = 2 * 60 * 1000;
+const threadConfigOverrides = new WeakMap();
 
 function cleanCodexStderr(stderr) {
   return stderr
@@ -59,9 +61,34 @@ function cleanCodexStderr(stderr) {
     .join("\n");
 }
 
+/** @returns {Promise<ThreadConfigOverride>} */
+function getThreadConfigOverride(client, cwd) {
+  let configPromise = threadConfigOverrides.get(client);
+  if (configPromise) {
+    return configPromise;
+  }
+
+  configPromise = Promise.resolve()
+    .then(() =>
+      client.request("config/read", {
+        includeLayers: false,
+        cwd
+      })
+    )
+    .then((response) => {
+      if (response?.config?.sandbox_workspace_write?.network_access !== true) {
+        return null;
+      }
+      return { sandbox_workspace_write: { network_access: true } };
+    })
+    .catch(() => null);
+  threadConfigOverrides.set(client, configPromise);
+  return configPromise;
+}
+
 /** @returns {ThreadStartParams} */
 function buildThreadParams(cwd, options = {}) {
-  return {
+  const params = {
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
@@ -69,17 +96,25 @@ function buildThreadParams(cwd, options = {}) {
     serviceName: SERVICE_NAME,
     ephemeral: options.ephemeral ?? true
   };
+  if (options.config) {
+    params.config = options.config;
+  }
+  return params;
 }
 
 /** @returns {ThreadResumeParams} */
 function buildResumeParams(threadId, cwd, options = {}) {
-  return {
+  const params = {
     threadId,
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
     sandbox: options.sandbox ?? "read-only"
   };
+  if (options.config) {
+    params.config = options.config;
+  }
+  return params;
 }
 
 /** @returns {UserInput[]} */
@@ -730,7 +765,8 @@ async function requestExternalAgentSessionImport(client, params) {
 }
 
 async function startThread(client, cwd, options = {}) {
-  const response = await client.request("thread/start", buildThreadParams(cwd, options));
+  const config = await getThreadConfigOverride(client, cwd);
+  const response = await client.request("thread/start", buildThreadParams(cwd, { ...options, config }));
   const threadId = response.thread.id;
   if (options.threadName) {
     try {
@@ -748,7 +784,8 @@ async function startThread(client, cwd, options = {}) {
 }
 
 async function resumeThread(client, threadId, cwd, options = {}) {
-  return client.request("thread/resume", buildResumeParams(threadId, cwd, options));
+  const config = await getThreadConfigOverride(client, cwd);
+  return client.request("thread/resume", buildResumeParams(threadId, cwd, { ...options, config }));
 }
 
 function buildResultStatus(turnState) {
