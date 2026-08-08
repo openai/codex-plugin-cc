@@ -153,7 +153,22 @@ export async function runTrackedJob(job, runner, options = {}) {
 
   try {
     const execution = await runner();
-    const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
+
+    // fleet#264: a zero exit status / "completed" turn reports app-server health, not work
+    // completion. A turn that touched no files and ran no commands exits/completes exactly like
+    // a turn that made the change (fleet#292 was this shape: REPORT claimed work, run_state said
+    // delivered, the actual diff was empty). Demote such a run to `failed` so no caller can read
+    // `completed` as evidence of work.
+    const workVerdict = execution.workVerdict ?? null;
+    const emptyRun = Boolean(workVerdict?.noWork);
+    const completionStatus = execution.exitStatus === 0 && !emptyRun ? "completed" : "failed";
+    if (emptyRun) {
+      appendLogLine(
+        options.logFile ?? job.logFile ?? null,
+        `EMPTY RUN: marking ${job.id} FAILED despite exitStatus ${execution.exitStatus}. ${(workVerdict.reasons ?? []).join(" ")}`
+      );
+    }
+
     const completedAt = nowIso();
     writeJobFile(job.workspaceRoot, job.id, {
       ...runningRecord,
@@ -164,7 +179,10 @@ export async function runTrackedJob(job, runner, options = {}) {
       phase: completionStatus === "completed" ? "done" : "failed",
       completedAt,
       result: execution.payload,
-      rendered: execution.rendered
+      rendered: execution.rendered,
+      workEvidence: workVerdict?.evidence ?? null,
+      emptyRun,
+      errorMessage: emptyRun ? (workVerdict.reasons ?? []).join(" ") : undefined
     });
     upsertJob(job.workspaceRoot, {
       id: job.id,

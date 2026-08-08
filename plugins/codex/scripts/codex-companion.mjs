@@ -22,6 +22,7 @@ import {
     runAppServerTurn
   } from "./lib/codex.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
+import { assessWorkEvidence, renderWorkEvidenceBanner } from "./lib/work-evidence.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
@@ -496,24 +497,43 @@ async function executeTaskRun(request) {
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
   const failureMessage = result.error?.message ?? result.stderr ?? "";
-  const rendered = renderTaskResult(
-    {
-      rawOutput,
-      failureMessage,
-      reasoningSummary: result.reasoningSummary
-    },
-    {
-      title: taskMetadata.title,
-      jobId: request.jobId ?? null,
-      write: Boolean(request.write)
-    }
-  );
+
+  // fleet#264: a completed turn (exitStatus 0) must not be reported as work done when the turn
+  // touched no files and ran no commands. Mirrors the grok bridge's fleet#254 fix; the codex
+  // app-server already collects fileChanges/commandExecutions per turn, so no extra telemetry
+  // extraction is needed here.
+  const workVerdict = assessWorkEvidence({
+    write: Boolean(request.write),
+    touchedFiles: result.touchedFiles,
+    commandExecutions: result.commandExecutions,
+    text: rawOutput,
+    requireWork: request.requireWork !== false
+  });
+
+  const rendered =
+    renderTaskResult(
+      {
+        rawOutput,
+        failureMessage,
+        reasoningSummary: result.reasoningSummary
+      },
+      {
+        title: taskMetadata.title,
+        jobId: request.jobId ?? null,
+        write: Boolean(request.write)
+      }
+    ) + renderWorkEvidenceBanner(workVerdict);
   const payload = {
     status: result.status,
     threadId: result.threadId,
     rawOutput,
     touchedFiles: result.touchedFiles,
-    reasoningSummary: result.reasoningSummary
+    reasoningSummary: result.reasoningSummary,
+    workEvidence: workVerdict.evidence,
+    workVerdict: {
+      noWork: workVerdict.noWork,
+      reasons: workVerdict.reasons
+    }
   };
 
   return {
@@ -522,7 +542,10 @@ async function executeTaskRun(request) {
     turnId: result.turnId,
     payload,
     rendered,
-    summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
+    workVerdict,
+    summary: workVerdict.noWork
+      ? `EMPTY RUN (no work performed): ${firstMeaningfulLine(rawOutput, taskMetadata.title)}`
+      : firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
     jobTitle: taskMetadata.title,
     jobClass: "task",
     write: Boolean(request.write)
@@ -601,7 +624,16 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({
+  cwd,
+  model,
+  effort,
+  prompt,
+  write,
+  resumeLast,
+  jobId,
+  requireWork = true
+}) {
   return {
     cwd,
     model,
@@ -609,7 +641,10 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId
     prompt,
     write,
     resumeLast,
-    jobId
+    jobId,
+    // fleet#264: persisted into the queued request so background task-worker runs enforce the
+    // same work-evidence gate as foreground runs.
+    requireWork
   };
 }
 
@@ -664,6 +699,10 @@ async function runForegroundCommand(job, runner, options = {}) {
   outputResult(options.json ? execution.payload : execution.rendered, options.json);
   if (execution.exitStatus !== 0) {
     process.exitCode = execution.exitStatus;
+  } else if (execution.workVerdict?.noWork) {
+    // fleet#264: an empty run must be visible to the shell that invoked codex-companion, not
+    // just in the job record.
+    process.exitCode = 3;
   }
   return execution;
 }
@@ -762,7 +801,16 @@ async function handleReview(argv) {
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    booleanOptions: [
+      "json",
+      "write",
+      "resume-last",
+      "resume",
+      "fresh",
+      "background",
+      // fleet#264 work-evidence gate control.
+      "allow-no-work"
+    ],
     aliasMap: {
       m: "model"
     }
@@ -780,6 +828,7 @@ async function handleTask(argv) {
     throw new Error("Choose either --resume/--resume-last or --fresh.");
   }
   const write = Boolean(options.write);
+  const requireWork = !options["allow-no-work"];
   const taskMetadata = buildTaskRunMetadata({
     prompt,
     resumeLast
@@ -797,7 +846,8 @@ async function handleTask(argv) {
       prompt,
       write,
       resumeLast,
-      jobId: job.id
+      jobId: job.id,
+      requireWork
     });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
@@ -816,6 +866,7 @@ async function handleTask(argv) {
         write,
         resumeLast,
         jobId: job.id,
+        requireWork,
         onProgress: progress
       }),
     { json: options.json }
