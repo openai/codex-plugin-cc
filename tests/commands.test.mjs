@@ -208,6 +208,8 @@ test("hooks keep session-end cleanup and stop gating enabled", () => {
   assert.match(source, /SessionEnd/);
   assert.match(source, /stop-review-gate-hook\.mjs/);
   assert.match(source, /session-lifecycle-hook\.mjs/);
+  const sessionEndTimeout = JSON.parse(source).hooks.SessionEnd[0].hooks[0].timeout;
+  assert.ok(sessionEndTimeout <= 3, "SessionEnd timeout must not exceed Codex CLI's 3s cap");
 });
 
 test("setup command can offer Codex install and still points users to codex login", () => {
