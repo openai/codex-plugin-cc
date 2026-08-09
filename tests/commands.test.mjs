@@ -81,10 +81,17 @@ test("verified review command exposes the two-pass read-only contract", () => {
   assert.match(source, /fail closed/i);
   assert.match(source, /--captured-input "<uuid>"/);
   assert.match(source, /Never copy, interpolate, export, pipe, or otherwise place raw `\$ARGUMENTS` in Bash/i);
+  assert.doesNotMatch(source, /git diff --shortstat <base>\.\.\.HEAD/);
+  assert.match(source, /If raw arguments explicitly select a branch with `--base` or `--scope branch`, never run Bash to size that branch; recommend background/i);
+  assert.match(source, /Never copy or interpolate a raw base or ref into Bash/i);
+  assert.match(source, /git status --short --untracked-files=all/);
+  assert.match(source, /git diff --shortstat --cached/);
+  assert.match(source, /If the working tree is clean, the companion will fall back to branch review, or the size is unclear, recommend background/i);
   assert.equal(executableBlocks.length, 2);
   for (const block of executableBlocks) {
     assert.match(block, /verified-review --captured-input "<uuid>"/);
     assert.doesNotMatch(block, /\$ARGUMENTS/);
+    assert.doesNotMatch(block, /<base>|<ref>/);
   }
   assert.doesNotMatch(source, /verified-review "\$ARGUMENTS"/);
   assert.match(source, /\[--scope auto\|working-tree\|branch\]/);

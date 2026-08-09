@@ -32,9 +32,11 @@ Execution mode rules:
 - If raw arguments include `--wait`, do not ask. Run in the foreground.
 - If raw arguments include `--background`, do not ask. Run in a Claude background task.
 - Otherwise, estimate review size before asking:
-  - For working-tree review, start with `git status --short --untracked-files=all` and inspect both `git diff --shortstat --cached` and `git diff --shortstat`.
-  - For base-branch review, use `git diff --shortstat <base>...HEAD`.
+  - If raw arguments explicitly select a branch with `--base` or `--scope branch`, never run Bash to size that branch; recommend background.
+  - For auto or working-tree review with no explicit branch selector, run only fixed, argument-free working-tree sizing commands: `git status --short --untracked-files=all`, `git diff --shortstat --cached`, and `git diff --shortstat`.
+  - Never copy or interpolate a raw base or ref into Bash.
   - Treat untracked files or directories as reviewable work even when `git diff --shortstat` is empty.
+  - If the working tree is clean, the companion will fall back to branch review, or the size is unclear, recommend background.
   - Recommend waiting only when the scoped review is clearly tiny, roughly 1-2 files total and no sign of a broader directory-sized change.
   - In every other case, including unclear size, recommend background.
 - Then use `AskUserQuestion` exactly once with two options, putting the recommended option first and suffixing it with `(Recommended)`:
