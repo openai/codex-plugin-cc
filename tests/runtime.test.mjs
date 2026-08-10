@@ -221,7 +221,7 @@ test("transfer delegates the current Claude session directly to native import", 
       ...buildEnv(binDir),
       HOME: home,
       CODEX_HOME: path.join(home, ".codex"),
-      CODEX_COMPANION_TRANSCRIPT_PATH: sourcePath
+      CLAUDE_CODE_SESSION_ID: sessionId
     }
   });
 
@@ -242,6 +242,79 @@ test("transfer delegates the current Claude session directly to native import", 
     fakeState.threads[0].visibleMessages.map((message) => message.text),
     ["Initial request", "Initial answer", "/codex:transfer"]
   );
+});
+
+test("transfer prefers Claude's current session id over stale companion hook state", () => {
+  const home = makeTempDir();
+  const repo = path.join(home, "repo");
+  const binDir = makeTempDir();
+  const currentSessionId = "sess-current-fork";
+  const staleSessionId = "sess-stale-parent";
+  const projectDir = path.join(home, ".claude", "projects", "-repo");
+  const currentSourcePath = path.join(projectDir, `${currentSessionId}.jsonl`);
+  const staleSourcePath = path.join(projectDir, `${staleSessionId}.jsonl`);
+  fs.mkdirSync(repo, { recursive: true });
+  fs.mkdirSync(projectDir, { recursive: true });
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  fs.writeFileSync(
+    currentSourcePath,
+    `${JSON.stringify({ type: "user", cwd: repo, message: { role: "user", content: "Current fork" } })}\n`,
+    "utf8"
+  );
+  fs.writeFileSync(
+    staleSourcePath,
+    `${JSON.stringify({ type: "user", cwd: repo, message: { role: "user", content: "Stale parent" } })}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "transfer", "--json"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      HOME: home,
+      CODEX_HOME: path.join(home, ".codex"),
+      CLAUDE_CODE_SESSION_ID: currentSessionId,
+      CODEX_COMPANION_SESSION_ID: staleSessionId,
+      CODEX_COMPANION_TRANSCRIPT_PATH: staleSourcePath
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.sessionId, currentSessionId);
+  assert.equal(payload.sourcePath, fs.realpathSync(currentSourcePath));
+});
+
+test("transfer requires an explicit source when a session id matches multiple transcripts", () => {
+  const home = makeTempDir();
+  const repo = path.join(home, "repo");
+  const binDir = makeTempDir();
+  const sessionId = "sess-ambiguous";
+  fs.mkdirSync(repo, { recursive: true });
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  for (const project of ["-repo", "-repo-worktree"]) {
+    const projectDir = path.join(home, ".claude", "projects", project);
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.writeFileSync(path.join(projectDir, `${sessionId}.jsonl`), "{}\n", "utf8");
+  }
+
+  const result = run("node", [SCRIPT, "transfer"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      HOME: home,
+      CODEX_HOME: path.join(home, ".codex"),
+      CLAUDE_CODE_SESSION_ID: sessionId
+    }
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Multiple Claude transcripts matched session sess-ambiguous/);
+  assert.match(result.stderr, /--source <path-to-claude-jsonl>/);
 });
 
 test("transfer reports an actionable upgrade error when native import is unsupported", () => {

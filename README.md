@@ -175,7 +175,7 @@ Examples:
 /codex:transfer --source ~/.claude/projects/-Users-me-repo/<session-id>.jsonl
 ```
 
-The plugin's existing `SessionStart` hook supplies the current transcript path automatically; `--source` is available as a manual override. The transfer uses Codex's external-agent session importer, so it follows the same conversion rules as importing Claude history in the Codex App and creates visible turns that can be continued in the App or TUI. The source must be under `~/.claude/projects`, and older Codex versions that do not expose session import must be upgraded before using this command.
+The plugin's existing `SessionStart` hook supplies the current transcript path automatically. If that hook state is missing or stale after Claude forks a session during compaction, transfer resolves Claude's current session ID to a unique transcript under `~/.claude/projects`. `--source` is available as a manual override and is required when multiple transcripts share the same session ID. The transfer uses Codex's external-agent session importer, so it follows the same conversion rules as importing Claude history in the Codex App and creates visible turns that can be continued in the App or TUI. The source must be under `~/.claude/projects`, and older Codex versions that do not expose session import must be upgraded before using this command.
 
 ### `/codex:status`
 
