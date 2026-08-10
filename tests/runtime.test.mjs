@@ -1378,6 +1378,19 @@ test("verified review rejects omitted, duplicate, and unknown native finding cla
   }
 });
 
+test("verified review fails closed on schema-invalid verifier output", () => {
+  const { repo, binDir } = createVerifiedReviewRepo("verified-review-invalid-shape");
+  const result = run("node", [SCRIPT, "verified-review", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.notEqual(result.status, 0);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.result, null);
+  assert.match(payload.parseError, /next_steps/);
+});
+
 test("verified review separates normal inspection from explicitly requested check executions", () => {
   const requestedCheck = "npm test -- --runInBand";
   const cases = [

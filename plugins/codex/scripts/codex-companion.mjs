@@ -66,7 +66,8 @@ import {
   renderJobStatusReport,
   renderSetupReport,
   renderStatusReport,
-  renderTaskResult
+  renderTaskResult,
+  validateReviewResultShape
 } from "./lib/render.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -563,8 +564,13 @@ function parseVerifiedReviewOutput(result, nativeFindings) {
     status: result.status,
     failureMessage: result.error?.message ?? result.stderr
   });
-  if (!parsed.parsed || !Array.isArray(parsed.parsed.findings)) {
+  if (!parsed.parsed) {
     return parsed;
+  }
+
+  const shapeError = validateReviewResultShape(parsed.parsed);
+  if (shapeError) {
+    return invalidVerifiedReview(parsed, shapeError);
   }
 
   if (!parsed.parsed.findings.every((finding) => VERIFIED_FINDING_PREFIX.test(finding?.title ?? ""))) {

@@ -241,6 +241,14 @@ function nativeReviewText(target) {
 }
 
 function structuredReviewPayload(prompt) {
+  if (BEHAVIOR === "verified-review-invalid-shape") {
+    return JSON.stringify({
+      verdict: "approve",
+      summary: "Verifier omitted a required field.",
+      findings: []
+    });
+  }
+
   if (BEHAVIOR.startsWith("verified-review-")) {
     const emptyNativeFindings = new Set([
       "verified-review-native-empty",
