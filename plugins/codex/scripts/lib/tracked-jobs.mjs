@@ -16,6 +16,7 @@ function normalizeProgressEvent(value) {
       phase: typeof value.phase === "string" && value.phase.trim() ? value.phase.trim() : null,
       threadId: typeof value.threadId === "string" && value.threadId.trim() ? value.threadId.trim() : null,
       turnId: typeof value.turnId === "string" && value.turnId.trim() ? value.turnId.trim() : null,
+      hideFromStderr: value.hideFromStderr === true,
       stderrMessage: value.stderrMessage == null ? null : String(value.stderrMessage).trim(),
       logTitle: typeof value.logTitle === "string" && value.logTitle.trim() ? value.logTitle.trim() : null,
       logBody: value.logBody == null ? null : String(value.logBody).trimEnd()
@@ -27,6 +28,7 @@ function normalizeProgressEvent(value) {
     phase: null,
     threadId: null,
     turnId: null,
+    hideFromStderr: false,
     stderrMessage: String(value ?? "").trim(),
     logTitle: null,
     logBody: null
@@ -122,7 +124,7 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
   return (eventOrMessage) => {
     const event = normalizeProgressEvent(eventOrMessage);
     const stderrMessage = event.stderrMessage ?? event.message;
-    if (stderr && stderrMessage) {
+    if (stderr && !event.hideFromStderr && stderrMessage) {
       process.stderr.write(`[codex] ${stderrMessage}\n`);
     }
     appendLogLine(logFile, event.message);
