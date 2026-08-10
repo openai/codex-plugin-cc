@@ -1979,6 +1979,40 @@ test("stop hook runs a stop-time review task and blocks on findings when the rev
   assert.match(status.stdout, /Codex Stop Gate Review/);
 });
 
+test("stop hook skips review when thumbs owns the fixer session", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(setup.status, 0, setup.stderr);
+  assert.equal(JSON.parse(setup.stdout).reviewGateEnabled, true);
+  const stateBeforeStop = fs.readFileSync(fakeStatePath, "utf8");
+
+  const skipped = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      THUMBS_ACTIVE: "1",
+      THUMBS_STAGE: "fixer"
+    },
+    input: JSON.stringify({
+      cwd: repo,
+      last_assistant_message: "I completed the requested fix."
+    })
+  });
+
+  assert.equal(skipped.status, 0, skipped.stderr);
+  assert.equal(skipped.stdout, "");
+  assert.equal(skipped.stderr, "");
+  assert.equal(fs.readFileSync(fakeStatePath, "utf8"), stateBeforeStop);
+});
+
 test("stop hook logs running tasks to stderr without blocking when the review gate is disabled", () => {
   const repo = makeTempDir();
   initGitRepo(repo);

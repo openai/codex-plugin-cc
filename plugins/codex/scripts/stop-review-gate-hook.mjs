@@ -140,6 +140,12 @@ function runStopReview(cwd, input = {}) {
 }
 
 function main() {
+  // thumbs owns its review/fix loop and marks the Claude fixer process so
+  // this interactive gate does not start a nested, untracked Codex review.
+  if (process.env.THUMBS_ACTIVE === "1") {
+    return;
+  }
+
   const input = readHookInput();
   const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const workspaceRoot = resolveWorkspaceRoot(cwd);
