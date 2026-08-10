@@ -24,7 +24,7 @@ import {
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
-import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import { binaryAvailable, isPidAlive, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
@@ -44,7 +44,11 @@ import {
 } from "./lib/job-control.mjs";
 import {
   appendLogLine,
+  claimTerminalStatus,
   createJobLogFile,
+  readTerminalClaim,
+  reassertTerminalClaim,
+  waitForTurnIdentity,
   createJobProgressUpdater,
   createJobRecord,
   createProgressReporter,
@@ -68,6 +72,8 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
+const CANCEL_TURN_INTERRUPT_TIMEOUT_MS = 5000;
+const CANCEL_TURN_IDENTITY_WAIT_MS = 3000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
@@ -677,6 +683,10 @@ function spawnDetachedTaskWorker(cwd, jobId) {
     stdio: "ignore",
     windowsHide: true
   });
+  // Spawn failures (EMFILE/EAGAIN) surface as an async 'error' event; without
+  // a listener that becomes an uncaught exception. The synchronous pid check
+  // in enqueueBackgroundTask reports the failure.
+  child.on("error", () => {});
   child.unref();
   return child;
 }
@@ -685,17 +695,46 @@ function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
+  // Persist the queued record BEFORE spawning: the job must be visible to
+  // session-end guards (and to its own worker) from the first instant —
+  // spawning first leaves a window in which the job has neither a state
+  // record nor a broker socket, so a racing SessionEnd passes every guard
+  // and tears the runtime down under the brand-new job.
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
     request
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
+
+  const child = spawnDetachedTaskWorker(cwd, job.id);
+  if (child.pid == null) {
+    // The spawn failed before the worker ever existed; a queued record with
+    // no pid would count as active forever and pin the shared broker.
+    const errorMessage = "Failed to spawn the background task worker.";
+    const failedPatch = {
+      status: "failed",
+      phase: "failed",
+      pid: null,
+      completedAt: nowIso(),
+      errorMessage
+    };
+    writeJobFile(job.workspaceRoot, job.id, { ...queuedRecord, ...failedPatch });
+    upsertJob(job.workspaceRoot, { id: job.id, ...failedPatch });
+    appendLogLine(logFile, errorMessage);
+    throw new Error(errorMessage);
+  }
+  // Record the worker pid; merge over the freshest stored record in case
+  // the worker already flipped the job to running.
+  upsertJob(job.workspaceRoot, { id: job.id, pid: child.pid });
+  const storedAfterSpawn = readStoredJob(job.workspaceRoot, job.id);
+  if (storedAfterSpawn && storedAfterSpawn.status === "queued") {
+    writeJobFile(job.workspaceRoot, job.id, { ...storedAfterSpawn, pid: child.pid });
+  }
 
   return {
     payload: {
@@ -970,22 +1009,73 @@ async function handleCancel(argv) {
   const reference = positionals[0] ?? "";
   const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
   const existing = readStoredJob(workspaceRoot, job.id) ?? {};
-  const threadId = existing.threadId ?? job.threadId ?? null;
-  const turnId = existing.turnId ?? job.turnId ?? null;
+  let threadId = existing.threadId ?? job.threadId ?? null;
+  let turnId = existing.turnId ?? job.turnId ?? null;
+  // The state snapshot can carry the queued record's pid: null while the
+  // worker has since written its real pid to the job file — and the terminal
+  // writes below null the pid field, so capture the fresher value first.
+  let workerPid = existing.pid ?? job.pid ?? Number.NaN;
 
-  const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
-  if (interrupt.attempted) {
-    appendLogLine(
-      job.logFile,
-      interrupt.interrupted
-        ? `Requested Codex turn interrupt for ${turnId} on ${threadId}.`
-        : `Codex turn interrupt failed${interrupt.detail ? `: ${interrupt.detail}` : "."}`
-    );
+  // Claim the terminal status first: if the worker finished in the meantime,
+  // its completed/failed record stands and there is nothing left to cancel.
+  // That race is benign, so report the job's terminal outcome as a normal
+  // result instead of failing the command — after a brief wait for the
+  // winner's record write to land, so the reported status is not stale.
+  let orphanAdopted = false;
+  const claimOwned = claimTerminalStatus(workspaceRoot, job.id);
+  if (!claimOwned) {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const finished = readStoredJob(workspaceRoot, job.id) ?? job;
+    const finishedStatus = finished.status ?? "unknown";
+    const claimant = readTerminalClaim(workspaceRoot, job.id);
+    const claimantAlive = claimant?.pid != null && isPidAlive(claimant.pid);
+    if (finishedStatus !== "queued" && finishedStatus !== "running") {
+      // The claimant may have died between its terminal job-file write and
+      // its state.json update; converge the index to the file's terminal
+      // outcome so the job does not stay listed as running with a dead pid.
+      reassertTerminalClaim(workspaceRoot, job.id, finished);
+      const payload = {
+        jobId: job.id,
+        status: finishedStatus,
+        title: job.title,
+        alreadyFinished: true
+      };
+      outputCommandResult(
+        payload,
+        `Job ${job.id} already finished (${finishedStatus}); nothing to cancel.\n`,
+        options.json
+      );
+      return;
+    }
+    if (claimantAlive) {
+      // The claim owner is still finalizing the job (e.g. the worker is
+      // writing its completed record); leave it to finish.
+      const payload = {
+        jobId: job.id,
+        status: finishedStatus,
+        title: job.title,
+        alreadyFinished: true
+      };
+      outputCommandResult(
+        payload,
+        `Job ${job.id} is being finalized (${finishedStatus}); nothing to cancel.\n`,
+        options.json
+      );
+      return;
+    }
+    // The claim is orphaned: its owner died before persisting a terminal
+    // record. Repair the records (the claim's recorded intent decides
+    // failed vs cancelled) and proceed with the interrupt and the worker
+    // kill below — otherwise a hung worker could never be cancelled,
+    // because every retry would lose the same claim.
+    workerPid = finished?.pid ?? workerPid;
+    reassertTerminalClaim(workspaceRoot, job.id, finished);
+    orphanAdopted = true;
   }
 
-  terminateProcessTree(job.pid ?? Number.NaN);
-  appendLogLine(job.logFile, "Cancelled by user.");
-
+  // Persist the terminal record before touching the turn or the worker: a
+  // crash partway through must never leave an interrupted turn behind with no
+  // recorded outcome.
   const completedAt = nowIso();
   const nextJob = {
     ...job,
@@ -996,29 +1086,112 @@ async function handleCancel(argv) {
     errorMessage: "Cancelled by user."
   };
 
-  writeJobFile(workspaceRoot, job.id, {
-    ...existing,
-    ...nextJob,
-    cancelledAt: completedAt
-  });
-  upsertJob(workspaceRoot, {
-    id: job.id,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    errorMessage: "Cancelled by user.",
-    completedAt
-  });
+  // An adopted orphan already carries the record the claim's intent calls
+  // for (failed for a dead worker's own claim); don't overwrite it.
+  if (!orphanAdopted) {
+    // Re-read at write time and apply only the terminal fields: the early
+    // snapshot must not erase a turn identity the worker persisted since
+    // (the updater de-duplicates ids and would never re-send them).
+    const freshStored = readStoredJob(workspaceRoot, job.id) ?? existing;
+    workerPid = freshStored?.pid ?? workerPid;
+    writeJobFile(workspaceRoot, job.id, {
+      ...freshStored,
+      status: "cancelled",
+      phase: "cancelled",
+      pid: null,
+      completedAt,
+      errorMessage: "Cancelled by user.",
+      cancelledAt: completedAt
+    });
+    upsertJob(workspaceRoot, {
+      id: job.id,
+      status: "cancelled",
+      phase: "cancelled",
+      pid: null,
+      errorMessage: "Cancelled by user.",
+      completedAt
+    });
+  }
 
+  // A cancel can land before the worker persisted the turn identity; wait
+  // for it (while the worker is alive to produce it, bounded so a wedged
+  // worker cannot stall the cancel) rather than skipping the interrupt and
+  // orphaning the turn.
+  {
+    // The wait also refreshes the worker pid: with record-before-spawn the
+    // snapshot can carry pid null, and the kill below must target the real
+    // worker, not NaN.
+    const identity = await waitForTurnIdentity(workspaceRoot, job.id, {
+      threadId,
+      turnId,
+      deadline: Date.now() + CANCEL_TURN_IDENTITY_WAIT_MS,
+      workerPid: job.pid ?? null
+    });
+    threadId = identity.threadId;
+    turnId = identity.turnId;
+    workerPid = identity.workerPid ?? workerPid;
+  }
+
+  // Bounded like the session-end path: the terminal records are already
+  // written, so a turn/interrupt that never replies must not hang the
+  // command before the worker kill below runs — that would strand a live
+  // worker behind a cancelled record it can no longer overwrite.
+  const interrupt = await interruptAppServerTurn(cwd, {
+    threadId,
+    turnId,
+    timeoutMs: CANCEL_TURN_INTERRUPT_TIMEOUT_MS
+  });
+  let workerKillError = null;
+  try {
+    terminateProcessTree(workerPid);
+  } catch (error) {
+    // The cancellation is already recorded; a failed kill (EPERM, taskkill
+    // access denied) must not turn it into a CLI crash with no payload.
+    workerKillError = error;
+  }
+
+  // Log appends are best-effort; an unwritable log must not fail the cancel.
+  try {
+    if (workerKillError) {
+      appendLogLine(
+        job.logFile,
+        `Worker termination failed: ${workerKillError instanceof Error ? workerKillError.message : String(workerKillError)}`
+      );
+    }
+    if (interrupt.attempted) {
+      appendLogLine(
+        job.logFile,
+        interrupt.interrupted
+          ? `Requested Codex turn interrupt for ${turnId} on ${threadId}.`
+          : `Codex turn interrupt failed${interrupt.detail ? `: ${interrupt.detail}` : "."}`
+      );
+    }
+    appendLogLine(job.logFile, "Cancelled by user.");
+  } catch {
+    // Ignore log write failures after the cancellation is already recorded.
+  }
+
+  // An adopted orphan keeps the status the claim's intent produced (e.g.
+  // failed for a dead worker's own claim) instead of reporting cancelled.
+  const effectiveStatus = orphanAdopted
+    ? readStoredJob(workspaceRoot, job.id)?.status ?? "cancelled"
+    : "cancelled";
   const payload = {
     jobId: job.id,
-    status: "cancelled",
+    status: effectiveStatus,
     title: job.title,
     turnInterruptAttempted: interrupt.attempted,
-    turnInterrupted: interrupt.interrupted
+    turnInterrupted: interrupt.interrupted,
+    // A failed kill leaves the worker alive even though the record is
+    // cancelled; the caller must be able to tell that from a clean cancel.
+    workerTerminated: workerKillError == null
   };
 
-  outputCommandResult(payload, renderCancelReport(nextJob), options.json);
+  outputCommandResult(
+    payload,
+    renderCancelReport({ ...nextJob, status: effectiveStatus }, { workerTerminated: workerKillError == null }),
+    options.json
+  );
 }
 
 async function main() {

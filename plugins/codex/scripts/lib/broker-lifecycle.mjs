@@ -5,7 +5,7 @@ import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
+import { BROKER_BUSY_RPC_CODE, createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
@@ -41,18 +41,57 @@ export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
 }
 
 export async function sendBrokerShutdown(endpoint) {
-  await new Promise((resolve) => {
+  const first = await sendBrokerShutdownOnce(endpoint);
+  if (!first.refused) {
+    return first;
+  }
+  // Two racing session-end hooks can refuse each other before the broker has
+  // marked either as a shutdown requester; back off briefly and retry once.
+  // If the peer's shutdown won, the retry reports unreachable and teardown
+  // proceeds; a genuinely busy broker refuses again.
+  await new Promise((resolve) => setTimeout(resolve, 150 + Math.floor(Math.random() * 150)));
+  return await sendBrokerShutdownOnce(endpoint);
+}
+
+async function sendBrokerShutdownOnce(endpoint) {
+  return await new Promise((resolve) => {
     const socket = connectToEndpoint(endpoint);
     socket.setEncoding("utf8");
+    let buffer = "";
+    let settled = false;
+    let connected = false;
+    const finish = (outcome) => {
+      if (!settled) {
+        settled = true;
+        resolve(outcome);
+      }
+    };
     socket.on("connect", () => {
+      connected = true;
       socket.write(`${JSON.stringify({ id: 1, method: "broker/shutdown", params: {} })}\n`);
     });
-    socket.on("data", () => {
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      const newlineIndex = buffer.indexOf("\n");
+      if (newlineIndex === -1) {
+        return;
+      }
+      // The broker refuses shutdown while another connection is mid-turn,
+      // so a shutdown that raced a fresh turn admission cannot kill it.
+      let refused = false;
+      try {
+        refused = JSON.parse(buffer.slice(0, newlineIndex))?.error?.code === BROKER_BUSY_RPC_CODE;
+      } catch {
+        refused = false;
+      }
       socket.end();
-      resolve();
+      finish({ delivered: !refused, refused, unreachable: false });
     });
-    socket.on("error", resolve);
-    socket.on("close", resolve);
+    // A connection lost mid-exchange is ambiguous: the broker may be alive
+    // and busy but its refusal reply was lost. Only a failure to connect at
+    // all marks the broker unreachable (safe to reap).
+    socket.on("error", () => finish({ delivered: false, refused: false, unreachable: !connected }));
+    socket.on("close", () => finish({ delivered: false, refused: false, unreachable: !connected }));
   });
 }
 

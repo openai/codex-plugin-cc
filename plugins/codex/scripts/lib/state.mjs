@@ -11,6 +11,7 @@ const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
+const MIN_TERMINAL_JOBS = 10;
 
 function nowIso() {
   return new Date().toISOString();
@@ -77,10 +78,36 @@ export function loadState(cwd) {
   }
 }
 
+// Shared by the pruner, the session-end broker guard, and the dead-worker
+// reaper: "what pins the broker" and "what survives pruning" must agree.
+export function isActiveJob(job) {
+  return job.status === "queued" || job.status === "running";
+}
+
 function pruneJobs(jobs) {
-  return [...jobs]
-    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")))
-    .slice(0, MAX_JOBS);
+  const sorted = [...jobs].sort((left, right) =>
+    String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? ""))
+  );
+  if (sorted.length <= MAX_JOBS) {
+    return sorted;
+  }
+  // Never prune active records, however old: dropping one would hide
+  // in-flight work from the session-end broker guard and delete the running
+  // worker's files out from under it. Only terminal records age out — and a
+  // floor keeps the newest terminal records retained even when active jobs
+  // consume the whole cap, so a job finishing alongside many active peers
+  // does not vanish the moment it completes.
+  let terminalBudget = Math.max(MIN_TERMINAL_JOBS, MAX_JOBS - sorted.filter(isActiveJob).length);
+  return sorted.filter((job) => {
+    if (isActiveJob(job)) {
+      return true;
+    }
+    if (terminalBudget > 0) {
+      terminalBudget -= 1;
+      return true;
+    }
+    return false;
+  });
 }
 
 function removeFileIfExists(filePath) {
@@ -108,6 +135,7 @@ export function saveState(cwd, state) {
       continue;
     }
     removeJobFile(resolveJobFile(cwd, job.id));
+    removeFileIfExists(resolveJobClaimFile(cwd, job.id));
     removeFileIfExists(job.logFile);
   }
 
@@ -166,7 +194,13 @@ export function getConfig(cwd) {
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  // Write-then-rename so concurrent readers never see a torn record: the
+  // enqueue rewrites this file (merging the worker pid) at the same moment
+  // the detached worker's startup reads it, and a truncate-in-place write
+  // hands that reader invalid JSON.
+  const tempFile = `${jobFile}.${process.pid}.tmp`;
+  fs.writeFileSync(tempFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  fs.renameSync(tempFile, jobFile);
   return jobFile;
 }
 
@@ -188,4 +222,9 @@ export function resolveJobLogFile(cwd, jobId) {
 export function resolveJobFile(cwd, jobId) {
   ensureStateDir(cwd);
   return path.join(resolveJobsDir(cwd), `${jobId}.json`);
+}
+
+export function resolveJobClaimFile(cwd, jobId) {
+  ensureStateDir(cwd);
+  return path.join(resolveJobsDir(cwd), `${jobId}.terminal`);
 }

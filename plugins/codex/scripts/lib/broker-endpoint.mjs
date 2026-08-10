@@ -1,6 +1,8 @@
 import path from "node:path";
 import process from "node:process";
 
+export const BROKER_BUSY_RPC_CODE = -32001;
+
 function sanitizePipeName(value) {
   return String(value ?? "")
     .replace(/[^A-Za-z0-9._-]/g, "-")

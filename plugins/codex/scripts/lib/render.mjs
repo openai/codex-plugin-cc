@@ -445,11 +445,18 @@ export function renderStoredJobResult(job, storedJob) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-export function renderCancelReport(job) {
+export function renderCancelReport(job, options = {}) {
+  // An adopted orphan claim can resolve to a status other than cancelled
+  // (e.g. failed when the worker died before recording its outcome); the
+  // text path must report that outcome, not a cancellation.
+  const headline =
+    job.status && job.status !== "cancelled"
+      ? `Cleaned up ${job.id}: recorded as ${job.status} (its previous finalizer died before recording the outcome).`
+      : `Cancelled ${job.id}.`;
   const lines = [
     "# Codex Cancel",
     "",
-    `Cancelled ${job.id}.`,
+    headline,
     ""
   ];
 
@@ -458,6 +465,9 @@ export function renderCancelReport(job) {
   }
   if (job.summary) {
     lines.push(`- Summary: ${job.summary}`);
+  }
+  if (options.workerTerminated === false) {
+    lines.push("- Warning: the worker process could not be terminated and may still be running; the job is recorded as cancelled.");
   }
   lines.push("- Check `/codex:status` for the updated queue.");
 

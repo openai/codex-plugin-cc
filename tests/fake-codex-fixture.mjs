@@ -585,8 +585,10 @@ rl.on("line", (line) => {
           }
         ];
 
-	        if (BEHAVIOR === "interruptible-slow-task") {
-	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	        if (BEHAVIOR === "interruptible-slow-task" || BEHAVIOR === "interrupt-hang" || BEHAVIOR === "no-turn-started") {
+	          if (BEHAVIOR !== "no-turn-started") {
+	            send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          }
 	          const timer = setTimeout(() => {
 	            if (!interruptibleTurns.has(turnId)) {
 	              return;
@@ -600,6 +602,16 @@ rl.on("line", (line) => {
 	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
 	          }, 5000);
 	          interruptibleTurns.set(turnId, { threadId: thread.id, timer });
+	        } else if (BEHAVIOR === "final-answer-then-exit") {
+	          // Emit the final answer but never turn/completed, then close the
+	          // connection well before the inferred-completion timer fires.
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          for (const entry of items) {
+	            if (entry && entry.completed) {
+	              send({ method: "item/completed", params: { threadId: thread.id, turnId, item: entry.completed } });
+	            }
+	          }
+	          setTimeout(() => process.exit(0), 20);
 	        } else if (BEHAVIOR === "slow-task") {
 	          emitTurnCompletedLater(thread.id, turnId, items, 400);
 	        } else {
@@ -614,6 +626,11 @@ rl.on("line", (line) => {
 	          turnId: message.params.turnId
 	        };
 	        saveState(state);
+	        if (BEHAVIOR === "interrupt-hang") {
+	          // Never answer the interrupt: callers must time out and tear
+	          // their connection down instead of waiting forever.
+	          break;
+	        }
 	        const pending = interruptibleTurns.get(message.params.turnId);
 	        if (pending) {
 	          clearTimeout(pending.timer);
