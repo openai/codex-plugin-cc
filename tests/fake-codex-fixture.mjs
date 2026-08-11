@@ -295,6 +295,10 @@ function structuredReviewPayload(prompt) {
     if (BEHAVIOR === "verified-review-invalid-finding-shape") {
       delete findings[0].body;
     }
+    if (BEHAVIOR === "verified-review-inverted-line-range") {
+      findings[0].line_start = 20;
+      findings[0].line_end = 10;
+    }
     return JSON.stringify({
       verdict: "needs-attention",
       summary: "Every native finding was independently classified.",

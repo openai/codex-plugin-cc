@@ -261,9 +261,7 @@ function buildAdversarialReviewPrompt(context, focusText) {
 function buildVerifiedReviewPrompt({ target, nativeReview, nativeFindings, checks }) {
   const template = loadPromptTemplate(ROOT_DIR, "verified-review");
   const explicitChecks = checks.length > 0 ? checks.map((command) => `- ${command}`).join("\n") : "- None supplied.";
-  const findingList = nativeFindings.length > 0
-    ? nativeFindings.map((finding) => `- ${finding.id}: ${finding.text}`).join("\n")
-    : "- None.";
+  const findingList = JSON.stringify(nativeFindings, null, 2);
   return interpolateTemplate(template, {
     TARGET_LABEL: target.label,
     NATIVE_REVIEW_OUTPUT: nativeReview || "Native review returned no text.",
@@ -578,6 +576,9 @@ function validateVerifiedFindingShape(finding, index) {
     if (!Number.isInteger(finding[field]) || finding[field] < 1) {
       return `${label}.${field} must be a positive integer.`;
     }
+  }
+  if (finding.line_end < finding.line_start) {
+    return `${label}.line_end must be greater than or equal to line_start.`;
   }
   if (!Number.isFinite(finding.confidence) || finding.confidence < 0 || finding.confidence > 1) {
     return `${label}.confidence must be a number from 0 to 1.`;

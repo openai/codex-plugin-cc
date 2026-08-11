@@ -21,7 +21,7 @@ Target: {{TARGET_LABEL}}
 
 <rules>
 - Work in this fresh, read-only turn. Do not rely on the native review's conclusion without checking its evidence.
-- Classify every entry in `<native_findings>` exactly once. Set each returned finding's `native_finding_id` to that entry's ID. Do not add, omit, or repeat IDs. If it says `None.`, return an empty findings array.
+- Classify every entry in the JSON array inside `<native_findings>` exactly once. Set each returned finding's `native_finding_id` to that entry's ID. Do not add, omit, or repeat IDs. If the array is empty, return an empty findings array.
 - Prefix every returned finding title with one of: `[confirmed]`, `[false-positive]`, `[style-only]`, or `[unverified]`.
 - Put concrete verification evidence in every finding body, including source locations, observed behavior, and any explicit-check result that applies.
 - Execute only these explicitly supplied commands as validation checks. Run each supplied command exactly once; do not infer, substitute, expand, or run a default test, build, lint, or check command.

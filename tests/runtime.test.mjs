@@ -1386,7 +1386,8 @@ test("verified review rejects omitted, duplicate, and unknown native finding cla
 test("verified review fails closed on schema-invalid verifier output", () => {
   for (const [behavior, expectedError] of [
     ["verified-review-invalid-shape", /next_steps/],
-    ["verified-review-invalid-finding-shape", /findings\[0\]\.body/]
+    ["verified-review-invalid-finding-shape", /findings\[0\]\.body/],
+    ["verified-review-inverted-line-range", /line_end.*line_start/]
   ]) {
     const { repo, binDir } = createVerifiedReviewRepo(behavior);
     const result = run("node", [SCRIPT, "verified-review", "--json"], {
@@ -1519,6 +1520,9 @@ test("verified review ignores nested and fenced list markers in native output", 
   const payload = JSON.parse(result.stdout);
   assert.deepEqual(payload.native.findings.map((finding) => finding.id), ["native-1", "native-2"]);
   assert.deepEqual(payload.result.findings.map((finding) => finding.native_finding_id), ["native-1", "native-2"]);
+  const prompt = fakeCodexState(binDir).turnStarts[0].prompt;
+  const serializedFindings = prompt.match(/<native_findings>\n([\s\S]*?)\n<\/native_findings>/)?.[1];
+  assert.deepEqual(JSON.parse(serializedFindings), payload.native.findings);
 });
 
 test("verified review preserves native target selection for auto, working-tree, branch, and --base", () => {
