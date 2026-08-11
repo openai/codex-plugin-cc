@@ -95,18 +95,19 @@ function parseStopReviewOutput(rawOutput) {
   };
 }
 
-function runStopReview(cwd, input = {}) {
+export function runStopReview(cwd, input = {}, { spawnSyncImpl = spawnSync } = {}) {
   const scriptPath = path.join(SCRIPT_DIR, "codex-companion.mjs");
   const prompt = buildStopReviewPrompt(input);
   const childEnv = {
     ...process.env,
     ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {})
   };
-  const result = spawnSync(process.execPath, [scriptPath, "task", "--json", prompt], {
+  const result = spawnSyncImpl(process.execPath, [scriptPath, "task", "--json", prompt], {
     cwd,
     env: childEnv,
     encoding: "utf8",
-    timeout: STOP_REVIEW_TIMEOUT_MS
+    timeout: STOP_REVIEW_TIMEOUT_MS,
+    windowsHide: true
   });
 
   if (result.error?.code === "ETIMEDOUT") {
@@ -175,10 +176,25 @@ function main() {
   logNote(runningTaskNote);
 }
 
-try {
-  main();
-} catch (error) {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${message}\n`);
-  process.exitCode = 1;
+export function isMainModule(entryPath = process.argv[1]) {
+  if (!entryPath) {
+    return false;
+  }
+
+  const modulePath = fileURLToPath(import.meta.url);
+  try {
+    return fs.realpathSync.native(modulePath) === fs.realpathSync.native(path.resolve(entryPath));
+  } catch {
+    return modulePath === path.resolve(entryPath);
+  }
+}
+
+if (isMainModule()) {
+  try {
+    main();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${message}\n`);
+    process.exitCode = 1;
+  }
 }
