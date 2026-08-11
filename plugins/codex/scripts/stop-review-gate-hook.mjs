@@ -4,7 +4,7 @@ import fs from "node:fs";
 import process from "node:process";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { getCodexAvailability } from "./lib/codex.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
@@ -95,18 +95,19 @@ function parseStopReviewOutput(rawOutput) {
   };
 }
 
-function runStopReview(cwd, input = {}) {
+export function runStopReview(cwd, input = {}, { spawnSyncImpl = spawnSync } = {}) {
   const scriptPath = path.join(SCRIPT_DIR, "codex-companion.mjs");
   const prompt = buildStopReviewPrompt(input);
   const childEnv = {
     ...process.env,
     ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {})
   };
-  const result = spawnSync(process.execPath, [scriptPath, "task", "--json", prompt], {
+  const result = spawnSyncImpl(process.execPath, [scriptPath, "task", "--json", prompt], {
     cwd,
     env: childEnv,
     encoding: "utf8",
-    timeout: STOP_REVIEW_TIMEOUT_MS
+    timeout: STOP_REVIEW_TIMEOUT_MS,
+    windowsHide: true
   });
 
   if (result.error?.code === "ETIMEDOUT") {
@@ -175,10 +176,16 @@ function main() {
   logNote(runningTaskNote);
 }
 
-try {
-  main();
-} catch (error) {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${message}\n`);
-  process.exitCode = 1;
+function isMainModule() {
+  return process.argv[1] ? import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href : false;
+}
+
+if (isMainModule()) {
+  try {
+    main();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${message}\n`);
+    process.exitCode = 1;
+  }
 }
