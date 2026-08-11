@@ -8,13 +8,25 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { readJobFile, resolveJobFile, resolveStateDir, upsertJob, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
+import {
+  cancelTrackedJob,
+  createJobProgressUpdater,
+  recordQueuedJobPid,
+  runTrackedJob
+} from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
+import {
+  captureVerifiedReviewInput,
+  cleanupVerifiedReviewInputs,
+  consumeVerifiedReviewInput
+} from "../plugins/codex/scripts/lib/verified-review-input.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
+const VERIFIED_REVIEW_INPUT_HOOK = path.join(PLUGIN_ROOT, "scripts", "verified-review-input-hook.mjs");
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   const start = Date.now();
@@ -26,6 +38,52 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
   throw new Error("Timed out waiting for condition.");
+}
+
+function createVerifiedReviewRepo(behavior) {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, behavior);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 1;\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0].id;\n");
+  return { repo, binDir };
+}
+
+function verifiedReviewInputFiles(cwd) {
+  const directory = path.join(path.dirname(resolveStateDir(cwd)), "verified-review-inputs");
+  return fs.existsSync(directory) ? fs.readdirSync(directory).filter((name) => name.endsWith(".json")) : [];
+}
+
+function verifiedReviewInputDir(cwd) {
+  return path.join(path.dirname(resolveStateDir(cwd)), "verified-review-inputs");
+}
+
+function captureVerifiedReviewArguments({ cwd, env, sessionId, rawArguments }) {
+  const result = run("node", [VERIFIED_REVIEW_INPUT_HOOK], {
+    cwd,
+    env,
+    input: JSON.stringify({
+      hook_event_name: "UserPromptExpansion",
+      command_name: "codex:verified-review",
+      command_args: rawArguments,
+      session_id: sessionId,
+      cwd
+    })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
+  const match = /^CODEX_VERIFIED_REVIEW_CAPTURE_ID=([0-9a-f-]{36})$/i.exec(context);
+  assert.ok(match, `Missing verified-review capture ID in ${context}`);
+  return match[1];
+}
+
+function fakeCodexState(binDir) {
+  const filePath = path.join(binDir, "fake-codex-state.json");
+  return fs.existsSync(filePath) ? JSON.parse(fs.readFileSync(filePath, "utf8")) : null;
 }
 
 test("setup reports ready when fake codex is installed and authenticated", () => {
@@ -1060,6 +1118,608 @@ test("review accepts --background while still running as a tracked review job", 
   assert.match(status.stdout, /# Codex Status/);
   assert.match(status.stdout, /Codex Review/);
   assert.match(status.stdout, /completed/);
+});
+
+test("verified review runs one native pass, then one fresh read-only verification pass with explicit check evidence", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "verified-review-findings");
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 1;\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const sourceBefore = "export const value = items[0].id;\n";
+  fs.writeFileSync(path.join(repo, "src", "app.js"), sourceBefore);
+
+  const result = run(
+    "node",
+    [SCRIPT, "verified-review", "--scope", "working-tree", "--check", "npm test -- --runInBand", "--json"],
+    { cwd: repo, env: buildEnv(binDir) }
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.readFileSync(path.join(repo, "src", "app.js"), "utf8"), sourceBefore);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.review, "Verified Review");
+  assert.equal(payload.native.stdout.includes("Missing empty-state guard"), true);
+  assert.deepEqual(payload.native.findings.map((finding) => finding.id), ["native-1", "native-2"]);
+  assert.deepEqual(payload.verification.requestedChecks, ["npm test -- --runInBand"]);
+  assert.equal(payload.verification.checks.length, 1);
+  assert.deepEqual(payload.verification.checks.map((check) => check.command), ["npm test -- --runInBand"]);
+  assert.deepEqual(payload.verification.inspectionExecutions.map((execution) => execution.command), ["git diff --stat"]);
+  assert.deepEqual(payload.verification.missingChecks, []);
+  assert.deepEqual(payload.verification.duplicateChecks, []);
+  assert.equal(payload.verification.checks[0].exitCode, 0);
+  assert.deepEqual(
+    payload.result.findings.map((finding) => finding.title),
+    ["[confirmed] Missing empty-state guard", "[style-only] Naming could be clearer"]
+  );
+  assert.deepEqual(payload.result.findings.map((finding) => finding.native_finding_id), ["native-1", "native-2"]);
+
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(state.reviewStarts.length, 1);
+  assert.equal(state.turnStarts.length, 1);
+  assert.notEqual(state.reviewStarts[0].threadId, state.turnStarts[0].threadId);
+  assert.equal(state.threads.find((thread) => thread.id === state.turnStarts[0].threadId).ephemeral, true);
+  assert.match(state.turnStarts[0].prompt, /npm test -- --runInBand/);
+  assert.match(state.turnStarts[0].prompt, /read-only/i);
+
+  const stateDir = resolveStateDir(repo);
+  const jobState = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const log = fs.readFileSync(jobState.jobs[0].logFile, "utf8");
+  assert.match(log, /npm test -- --runInBand/);
+  assert.match(log, /exit 0/);
+});
+
+test("verified review captures slash arguments as opaque input before the shell can expand them", () => {
+  const { repo, binDir } = createVerifiedReviewRepo("verified-review-findings");
+  const sessionId = "sess-captured-input";
+  const marker = path.join(makeTempDir(), "must-not-exist");
+  const literal = `$HOME \`never-run\` $(touch ${marker}) 'single quote' "double quote" \\\\path 한국어\nembedded line`;
+  const rawArguments = `--base "${literal.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+  const env = {
+    ...buildEnv(binDir),
+    CODEX_COMPANION_SESSION_ID: sessionId
+  };
+  const captureId = captureVerifiedReviewArguments({ cwd: repo, env, sessionId, rawArguments });
+  const captureFile = path.join(verifiedReviewInputDir(repo), `${captureId}.json`);
+
+  assert.equal(JSON.parse(fs.readFileSync(captureFile, "utf8")).rawArguments, rawArguments);
+  assert.equal(fs.existsSync(marker), false);
+
+  const result = run("node", [SCRIPT, "verified-review", "--captured-input", captureId], { cwd: repo, env });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(marker), false);
+  assert.equal(fs.existsSync(captureFile), false);
+  const state = fakeCodexState(binDir);
+  assert.equal(state.reviewStarts.length, 1);
+  assert.equal(state.turnStarts.length, 1);
+  assert.equal(state.reviewStarts[0].target.branch, literal);
+});
+
+test("captured verified-review input fails closed before Codex for invalid ownership and reuse", () => {
+  const { repo, binDir } = createVerifiedReviewRepo("verified-review-findings");
+  const ownerSession = "sess-capture-owner";
+  const ownerEnv = {
+    ...buildEnv(binDir),
+    CODEX_COMPANION_SESSION_ID: ownerSession
+  };
+  const runCaptured = (captureId, env = ownerEnv, cwd = repo) =>
+    run("node", [SCRIPT, "verified-review", "--captured-input", captureId], { cwd, env });
+  const noCodexRan = () => assert.equal(fakeCodexState(binDir), null);
+
+  const malformed = runCaptured("not-a-capture-id");
+  assert.notEqual(malformed.status, 0);
+  noCodexRan();
+
+  const missing = runCaptured("00000000-0000-4000-8000-000000000000");
+  assert.notEqual(missing.status, 0);
+  noCodexRan();
+
+  const malformedId = "11111111-1111-4111-8111-111111111111";
+  const captureDir = verifiedReviewInputDir(repo);
+  fs.mkdirSync(captureDir, { recursive: true });
+  fs.writeFileSync(path.join(captureDir, `${malformedId}.json`), "not json", "utf8");
+  const malformedRecord = runCaptured(malformedId);
+  assert.notEqual(malformedRecord.status, 0);
+  noCodexRan();
+
+  const wrongSessionId = captureVerifiedReviewInput({
+    cwd: repo,
+    sessionId: ownerSession,
+    rawArguments: "--scope working-tree"
+  }).id;
+  const wrongSession = runCaptured(wrongSessionId, {
+    ...ownerEnv,
+    CODEX_COMPANION_SESSION_ID: "sess-not-owner"
+  });
+  assert.notEqual(wrongSession.status, 0);
+  noCodexRan();
+
+  const otherWorkspace = makeTempDir();
+  initGitRepo(otherWorkspace);
+  const wrongWorkspaceId = captureVerifiedReviewInput({
+    cwd: repo,
+    sessionId: ownerSession,
+    rawArguments: "--scope working-tree"
+  }).id;
+  const wrongWorkspace = runCaptured(wrongWorkspaceId, ownerEnv, otherWorkspace);
+  assert.notEqual(wrongWorkspace.status, 0);
+  noCodexRan();
+
+  const reusableId = captureVerifiedReviewInput({
+    cwd: repo,
+    sessionId: ownerSession,
+    rawArguments: "--scope working-tree"
+  }).id;
+  const firstUse = runCaptured(reusableId);
+  assert.equal(firstUse.status, 0, firstUse.stderr);
+  const secondUse = runCaptured(reusableId);
+  assert.notEqual(secondUse.status, 0);
+  assert.equal(fakeCodexState(binDir).reviewStarts.length, 1);
+  assert.equal(fakeCodexState(binDir).turnStarts.length, 1);
+});
+
+test("verified-review capture runtime failures exit 2 without emitting a capture marker", () => {
+  const repo = makeTempDir();
+  const pluginData = makeTempDir();
+  initGitRepo(repo);
+  const captureDir = path.join(pluginData, "state", "verified-review-inputs");
+  fs.mkdirSync(path.dirname(captureDir), { recursive: true });
+  fs.writeFileSync(captureDir, "not a directory", "utf8");
+  const result = run("node", [VERIFIED_REVIEW_INPUT_HOOK], {
+    cwd: repo,
+    env: { ...process.env, CLAUDE_PLUGIN_DATA: pluginData },
+    input: JSON.stringify({
+      hook_event_name: "UserPromptExpansion",
+      command_name: "verified-review",
+      command_args: "--scope branch",
+      session_id: "sess-hook-failure",
+      cwd: repo
+    })
+  });
+
+  assert.equal(result.status, 2, result.stderr);
+  assert.equal(result.stdout, "");
+  assert.doesNotMatch(result.stdout, /CODEX_VERIFIED_REVIEW_CAPTURE_ID/);
+  assert.equal(fs.readFileSync(captureDir, "utf8"), "not a directory");
+});
+
+test("captured verified-review input expires before use", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const capture = captureVerifiedReviewInput({ cwd: repo, sessionId: "sess-expired", rawArguments: "--scope branch" });
+  const captureFile = path.join(verifiedReviewInputDir(repo), `${capture.id}.json`);
+  const record = JSON.parse(fs.readFileSync(captureFile, "utf8"));
+  fs.writeFileSync(captureFile, `${JSON.stringify({ ...record, createdAt: Date.now() - 10 * 60 * 1000 - 1 })}\n`);
+
+  assert.deepEqual(consumeVerifiedReviewInput(repo, capture.id, { sessionId: "sess-expired" }), null);
+  assert.equal(fs.existsSync(captureFile), false);
+});
+
+test("verified-review capture cleanup spans workspaces, retains live claims, and prunes stale claims", () => {
+  const repo = makeTempDir();
+  const otherWorkspace = makeTempDir();
+  initGitRepo(repo);
+  initGitRepo(otherWorkspace);
+  const env = { ...process.env };
+  const first = captureVerifiedReviewInput({ cwd: repo, sessionId: "sess-cleanup", rawArguments: "--scope working-tree" });
+  const second = captureVerifiedReviewInput({
+    cwd: otherWorkspace,
+    sessionId: "sess-cleanup",
+    rawArguments: "--scope branch"
+  });
+  const otherSession = captureVerifiedReviewInput({
+    cwd: otherWorkspace,
+    sessionId: "sess-other",
+    rawArguments: "--check npm test"
+  });
+  const stale = captureVerifiedReviewInput({
+    cwd: repo,
+    sessionId: "sess-stale",
+    rawArguments: "--base main"
+  });
+  const captureDir = verifiedReviewInputDir(repo);
+  const stalePath = path.join(captureDir, `${stale.id}.json`);
+  const staleRecord = JSON.parse(fs.readFileSync(stalePath, "utf8"));
+  fs.renameSync(stalePath, path.join(captureDir, `.${stale.id}.crash.claimed`));
+  fs.writeFileSync(
+    path.join(captureDir, `.${stale.id}.crash.claimed`),
+    `${JSON.stringify({ ...staleRecord, createdAt: Date.now() - 10 * 60 * 1000 - 1 })}\n`
+  );
+  const liveClaim = captureVerifiedReviewInput({
+    cwd: repo,
+    sessionId: "sess-cleanup",
+    rawArguments: "--scope staged"
+  });
+  const liveClaimPath = path.join(captureDir, `.${liveClaim.id}.active.claimed`);
+  fs.renameSync(path.join(captureDir, `${liveClaim.id}.json`), liveClaimPath);
+  const malformedId = "22222222-2222-4222-8222-222222222222";
+  const malformedPath = path.join(captureDir, `.${malformedId}.crash.claimed`);
+  fs.writeFileSync(malformedPath, "not json", "utf8");
+  const staleAt = new Date(Date.now() - 10 * 60 * 1000 - 1);
+  fs.utimesSync(malformedPath, staleAt, staleAt);
+
+  assert.equal(verifiedReviewInputFiles(repo).length, 3);
+  assert.deepEqual(consumeVerifiedReviewInput(repo, first.id, { sessionId: "sess-cleanup" }), {
+    rawArguments: "--scope working-tree"
+  });
+  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo, session_id: "sess-cleanup" })
+  });
+  assert.equal(cleanup.status, 0, cleanup.stderr);
+  assert.equal(verifiedReviewInputFiles(repo).length, 1);
+  assert.deepEqual(consumeVerifiedReviewInput(otherWorkspace, second.id, { sessionId: "sess-cleanup" }), null);
+  assert.equal(fs.existsSync(liveClaimPath), true);
+  assert.equal(fs.existsSync(path.join(captureDir, `.${stale.id}.crash.claimed`)), false);
+  assert.equal(fs.existsSync(malformedPath), false);
+  assert.deepEqual(consumeVerifiedReviewInput(otherWorkspace, otherSession.id, { sessionId: "sess-other" }), {
+    rawArguments: "--check npm test"
+  });
+  assert.equal(cleanupVerifiedReviewInputs({ cwd: repo, sessionId: "sess-other" }), 0);
+});
+
+test("verified review rejects omitted, duplicate, and unknown native finding classifications", () => {
+  for (const behavior of [
+    "verified-review-missing-finding",
+    "verified-review-duplicate-finding",
+    "verified-review-unknown-finding"
+  ]) {
+    const { repo, binDir } = createVerifiedReviewRepo(behavior);
+    const result = run("node", [SCRIPT, "verified-review", "--json"], {
+      cwd: repo,
+      env: buildEnv(binDir)
+    });
+
+    assert.notEqual(result.status, 0, `${behavior} unexpectedly succeeded`);
+    const payload = JSON.parse(result.stdout);
+    assert.equal(payload.result, null);
+    assert.match(payload.parseError, /native finding|classification|one-to-one|duplicate|unknown/i);
+  }
+});
+
+test("verified review fails closed on schema-invalid verifier output", () => {
+  for (const [behavior, expectedError] of [
+    ["verified-review-invalid-shape", /next_steps/],
+    ["verified-review-invalid-finding-shape", /findings\[0\]\.body/],
+    ["verified-review-inverted-line-range", /line_end.*line_start/]
+  ]) {
+    const { repo, binDir } = createVerifiedReviewRepo(behavior);
+    const result = run("node", [SCRIPT, "verified-review", "--json"], {
+      cwd: repo,
+      env: buildEnv(binDir)
+    });
+
+    assert.notEqual(result.status, 0);
+    const payload = JSON.parse(result.stdout);
+    assert.equal(payload.result, null);
+    assert.match(payload.parseError, expectedError);
+  }
+});
+
+test("verified review separates normal inspection from explicitly requested check executions", () => {
+  const requestedCheck = "npm test -- --runInBand";
+  const cases = [
+    { behavior: "verified-review-check-skipped", actual: [], missing: [requestedCheck], duplicate: [] },
+    { behavior: "verified-review-check-duplicate", actual: [requestedCheck, requestedCheck], missing: [], duplicate: [requestedCheck] }
+  ];
+
+  for (const { behavior, actual, missing, duplicate } of cases) {
+    const { repo, binDir } = createVerifiedReviewRepo(behavior);
+    const result = run("node", [SCRIPT, "verified-review", "--check", requestedCheck, "--json"], {
+      cwd: repo,
+      env: buildEnv(binDir)
+    });
+
+    assert.notEqual(result.status, 0, `${behavior} unexpectedly succeeded`);
+    const payload = JSON.parse(result.stdout);
+    assert.deepEqual(payload.verification.requestedChecks, [requestedCheck]);
+    assert.deepEqual(payload.verification.checks.map((check) => check.command), actual);
+    assert.deepEqual(payload.verification.inspectionExecutions.map((execution) => execution.command), ["git diff --stat"]);
+    assert.deepEqual(payload.verification.missingChecks, missing);
+    assert.deepEqual(payload.verification.duplicateChecks, duplicate);
+    assert.match(payload.parseError, /explicit check|requested|missing|unexpected|duplicate/i);
+  }
+
+  const { repo, binDir } = createVerifiedReviewRepo("verified-review-check-skipped");
+  const rendered = run("node", [SCRIPT, "verified-review", "--check", requestedCheck], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.notEqual(rendered.status, 0);
+  assert.match(rendered.stdout, /Requested explicit checks/i);
+  assert.match(rendered.stdout, /Missing explicit checks/i);
+  assert.match(rendered.stdout, /npm test -- --runInBand/);
+});
+
+test("verified review accepts requested checks and read-only inspection but rejects unrequested validation commands", () => {
+  const requestedCheck = "npm test -- --runInBand";
+  const allowed = createVerifiedReviewRepo("verified-review-check-readonly-inspection");
+  const allowedResult = run("node", [SCRIPT, "verified-review", "--check", requestedCheck, "--json"], {
+    cwd: allowed.repo,
+    env: buildEnv(allowed.binDir)
+  });
+
+  assert.equal(allowedResult.status, 0, allowedResult.stderr);
+  const allowedPayload = JSON.parse(allowedResult.stdout);
+  assert.deepEqual(allowedPayload.verification.checks.map((check) => check.command), [requestedCheck]);
+  assert.deepEqual(
+    allowedPayload.verification.inspectionExecutions.map((execution) => execution.command),
+    ["git diff --stat", "git diff --check"]
+  );
+  assert.deepEqual(allowedPayload.verification.unauthorizedValidationExecutions, []);
+
+  const rejected = createVerifiedReviewRepo("verified-review-unauthorized-check");
+  const rejectedResult = run("node", [SCRIPT, "verified-review", "--check", requestedCheck, "--json"], {
+    cwd: rejected.repo,
+    env: buildEnv(rejected.binDir)
+  });
+
+  assert.notEqual(rejectedResult.status, 0);
+  const rejectedPayload = JSON.parse(rejectedResult.stdout);
+  assert.deepEqual(
+    rejectedPayload.verification.unauthorizedValidationExecutions.map((execution) => execution.command),
+    ["npm run build"]
+  );
+  assert.match(rejectedPayload.parseError, /unauthorized|explicit check|validation/i);
+
+  const rendered = run("node", [SCRIPT, "verified-review", "--check", requestedCheck], {
+    cwd: rejected.repo,
+    env: buildEnv(rejected.binDir)
+  });
+  assert.notEqual(rendered.status, 0);
+  assert.match(rendered.stdout, /unauthorized validation/i);
+  assert.match(rendered.stdout, /npm run build/);
+});
+
+test("verified review accepts only explicit native clean sentinels", () => {
+  const cases = [
+    { behavior: "verified-review-native-empty", success: false },
+    { behavior: "verified-review-native-clean", success: true },
+    { behavior: "verified-review-native-clean-after-heading", success: true },
+    { behavior: "verified-review-native-ambiguous", success: false },
+    { behavior: "verified-review-native-none", success: true },
+    { behavior: "verified-review-native-no-findings", success: true },
+    { behavior: "verified-review-native-no-issues", success: true },
+    { behavior: "verified-review-native-no-problems", success: true },
+    { behavior: "verified-review-native-clean-mixed", success: false }
+  ];
+
+  for (const { behavior, success } of cases) {
+    const { repo, binDir } = createVerifiedReviewRepo(behavior);
+    const result = run("node", [SCRIPT, "verified-review", "--json"], {
+      cwd: repo,
+      env: buildEnv(binDir)
+    });
+    const payload = JSON.parse(result.stdout);
+
+    assert.equal(result.status === 0, success, `${behavior} had the wrong success status`);
+    if (success) {
+      assert.deepEqual(payload.native.findings, []);
+      assert.equal(payload.parseError, null);
+    } else {
+      assert.equal(payload.result, null);
+      assert.match(payload.parseError, /native review output|no text|cannot be verified|recognizable finding|explicit clean|clean sentinel|ambiguous/i);
+    }
+  }
+});
+
+test("verified review ignores nested and fenced list markers in native output", () => {
+  const { repo, binDir } = createVerifiedReviewRepo("verified-review-native-nested-and-fenced");
+  const result = run("node", [SCRIPT, "verified-review", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.native.findings.map((finding) => finding.id), ["native-1", "native-2"]);
+  assert.deepEqual(payload.result.findings.map((finding) => finding.native_finding_id), ["native-1", "native-2"]);
+  const prompt = fakeCodexState(binDir).turnStarts[0].prompt;
+  const serializedFindings = prompt.match(/<native_findings>\n([\s\S]*?)\n<\/native_findings>/)?.[1];
+  assert.deepEqual(JSON.parse(serializedFindings), payload.native.findings);
+});
+
+test("verified review preserves native target selection for auto, working-tree, branch, and --base", () => {
+  const cases = [
+    { args: [], targetType: "uncommittedChanges" },
+    { args: ["--scope", "working-tree"], targetType: "uncommittedChanges" },
+    { args: ["--scope", "branch"], targetType: "baseBranch" },
+    { args: ["--base", "main"], targetType: "baseBranch" }
+  ];
+
+  for (const { args, targetType } of cases) {
+    const repo = makeTempDir();
+    const binDir = makeTempDir();
+    installFakeCodex(binDir, "verified-review-findings");
+    initGitRepo(repo);
+    fs.writeFileSync(path.join(repo, "README.md"), "before\n");
+    run("git", ["add", "README.md"], { cwd: repo });
+    run("git", ["commit", "-m", "init"], { cwd: repo });
+    fs.writeFileSync(path.join(repo, "README.md"), "after\n");
+
+    const result = run("node", [SCRIPT, "verified-review", ...args, "--json"], {
+      cwd: repo,
+      env: buildEnv(binDir)
+    });
+
+    assert.equal(result.status, 0, `${args.join(" ")} ${result.stderr}`);
+    const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+    assert.equal(state.reviewStarts.length, 1);
+    assert.equal(state.reviewStarts[0].target.type, targetType);
+    assert.equal(state.turnStarts.length, 1);
+  }
+});
+
+test("verified review background jobs expose status and result", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "verified-review-findings");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "before\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "after\n");
+
+  const launched = run("node", [SCRIPT, "verified-review", "--background", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(launched.status, 0, launched.stderr);
+  const launchPayload = JSON.parse(launched.stdout);
+  assert.equal(launchPayload.status, "queued");
+  assert.match(launchPayload.jobId, /^review-/);
+
+  const waited = run(
+    "node",
+    [SCRIPT, "status", launchPayload.jobId, "--wait", "--timeout-ms", "15000", "--json"],
+    { cwd: repo, env: buildEnv(binDir) }
+  );
+  assert.equal(waited.status, 0, waited.stderr);
+  assert.equal(JSON.parse(waited.stdout).job.status, "completed");
+
+  const resultPayload = await waitFor(() => {
+    const jobResult = run("node", [SCRIPT, "result", launchPayload.jobId, "--json"], {
+      cwd: repo,
+      env: buildEnv(binDir)
+    });
+    return jobResult.status === 0 ? JSON.parse(jobResult.stdout) : null;
+  });
+  assert.equal(resultPayload.job.kind, "verified-review");
+  assert.match(resultPayload.storedJob.rendered, /Verified Review/);
+});
+
+test("verified review saves its queued request before spawning and recording the detached worker", () => {
+  const source = fs.readFileSync(SCRIPT, "utf8");
+  const start = source.indexOf("function enqueueBackgroundVerifiedReview");
+  const end = source.indexOf("async function handleReviewCommand", start);
+  const enqueueSource = source.slice(start, end);
+
+  assert.ok(start >= 0, "verified-review enqueue function is missing");
+  const writeIndex = enqueueSource.indexOf("writeJobFile(job.workspaceRoot, job.id, queuedRecord)");
+  const spawnIndex = enqueueSource.indexOf("spawnDetachedVerifiedReviewWorker(cwd, job.id)");
+  const pidIndex = enqueueSource.indexOf("recordQueuedJobPid(job.workspaceRoot, job.id");
+  assert.ok(writeIndex < spawnIndex);
+  assert.ok(spawnIndex < pidIndex);
+});
+
+test("queued worker PID recording preserves cancellation", () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "review-pid-race", status: "queued", phase: "queued", pid: null };
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, job);
+
+  assert.equal(recordQueuedJobPid(workspaceRoot, job.id, 12345), true);
+  assert.equal(readJobFile(resolveJobFile(workspaceRoot, job.id)).pid, 12345);
+  cancelTrackedJob(workspaceRoot, job.id, { completedAt: "2026-08-11T00:00:00.000Z" });
+  assert.equal(recordQueuedJobPid(workspaceRoot, job.id, 54321), false);
+  assert.equal(readJobFile(resolveJobFile(workspaceRoot, job.id)).status, "cancelled");
+});
+
+test("verified review worker leaves an already-cancelled queued job untouched", () => {
+  const { repo, binDir } = createVerifiedReviewRepo("verified-review-findings");
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  const jobId = "review-cancelled";
+  const logFile = path.join(jobsDir, `${jobId}.log`);
+  const storedJob = {
+    id: jobId,
+    kind: "verified-review",
+    title: "Codex Verified Review",
+    status: "cancelled",
+    phase: "cancelled",
+    pid: null,
+    logFile,
+    request: { cwd: repo, checks: [], jobId }
+  };
+  fs.mkdirSync(jobsDir, { recursive: true });
+  fs.writeFileSync(logFile, "Queued for background execution.\n", "utf8");
+  fs.writeFileSync(path.join(jobsDir, `${jobId}.json`), `${JSON.stringify(storedJob, null, 2)}\n`, "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [storedJob] }, null, 2)}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "verified-review-worker", "--cwd", repo, "--job-id", jobId], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(jobsDir, `${jobId}.json`), "utf8")).status, "cancelled");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs[0].status, "cancelled");
+  assert.equal(fs.existsSync(path.join(binDir, "fake-codex-state.json")), false);
+});
+
+test("tracked jobs do not start from a stale queued snapshot after cancellation", async () => {
+  const workspaceRoot = makeTempDir();
+  const job = {
+    id: "review-cancel-race",
+    workspaceRoot,
+    kind: "verified-review",
+    status: "queued",
+    phase: "queued",
+    request: { cwd: workspaceRoot, checks: [] }
+  };
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, job);
+  const staleWorkerSnapshot = readJobFile(resolveJobFile(workspaceRoot, job.id));
+  const cancellation = cancelTrackedJob(workspaceRoot, job.id, {
+    completedAt: "2026-08-06T00:00:00.000Z",
+    errorMessage: "Cancelled by user."
+  });
+  let started = false;
+
+  const result = await runTrackedJob(staleWorkerSnapshot, async () => {
+    started = true;
+    return { exitStatus: 0, payload: {}, rendered: "", summary: "" };
+  });
+
+  assert.ok(cancellation);
+  assert.equal(result, null);
+  assert.equal(started, false);
+  assert.equal(readJobFile(resolveJobFile(workspaceRoot, job.id)).status, "cancelled");
+});
+
+test("tracked job progress and completion preserve cancellation", async () => {
+  const workspaceRoot = makeTempDir();
+  const job = {
+    id: "review-cancel-progress-race",
+    workspaceRoot,
+    kind: "verified-review",
+    status: "queued",
+    phase: "queued",
+    request: { cwd: workspaceRoot, checks: [] }
+  };
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, job);
+  let releaseRunner;
+  const runnerFinished = new Promise((resolve) => {
+    releaseRunner = resolve;
+  });
+  const execution = runTrackedJob(job, async () => {
+    await runnerFinished;
+    return { exitStatus: 0, payload: {}, rendered: "", summary: "" };
+  });
+
+  await waitFor(() => readJobFile(resolveJobFile(workspaceRoot, job.id)).status === "running");
+  cancelTrackedJob(workspaceRoot, job.id, {
+    completedAt: "2026-08-06T00:00:00.000Z",
+    errorMessage: "Cancelled by user."
+  });
+  createJobProgressUpdater(workspaceRoot, job.id)({ phase: "verifying", threadId: "thread-after-cancel" });
+  releaseRunner();
+  await execution;
+
+  assert.equal(readJobFile(resolveJobFile(workspaceRoot, job.id)).status, "cancelled");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(resolveStateDir(workspaceRoot), "state.json"), "utf8")).jobs[0].status, "cancelled");
 });
 
 test("status shows phases, hints, and the latest finished job", () => {

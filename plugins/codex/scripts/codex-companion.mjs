@@ -8,6 +8,10 @@ import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import {
+  consumeVerifiedReviewInput,
+  VERIFIED_REVIEW_CAPTURE_ID_PATTERN
+} from "./lib/verified-review-input.mjs";
+import {
     buildPersistentTaskThreadName,
     DEFAULT_CONTINUE_PROMPT,
     findLatestTaskThread,
@@ -44,11 +48,13 @@ import {
 } from "./lib/job-control.mjs";
 import {
   appendLogLine,
+  cancelTrackedJob,
   createJobLogFile,
   createJobProgressUpdater,
   createJobRecord,
   createProgressReporter,
   nowIso,
+  recordQueuedJobPid,
   runTrackedJob,
   SESSION_ID_ENV
 } from "./lib/tracked-jobs.mjs";
@@ -61,11 +67,13 @@ import {
   renderJobStatusReport,
   renderSetupReport,
   renderStatusReport,
-  renderTaskResult
+  renderTaskResult,
+  validateReviewResultShape
 } from "./lib/render.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
+const VERIFIED_REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "verified-review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
@@ -79,6 +87,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
+      "  node scripts/codex-companion.mjs verified-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--check <command>]...",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
@@ -246,6 +255,18 @@ function buildAdversarialReviewPrompt(context, focusText) {
     USER_FOCUS: focusText || "No extra focus provided.",
     REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
     REVIEW_INPUT: context.content
+  });
+}
+
+function buildVerifiedReviewPrompt({ target, nativeReview, nativeFindings, checks }) {
+  const template = loadPromptTemplate(ROOT_DIR, "verified-review");
+  const explicitChecks = checks.length > 0 ? checks.map((command) => `- ${command}`).join("\n") : "- None supplied.";
+  const findingList = JSON.stringify(nativeFindings, null, 2);
+  return interpolateTemplate(template, {
+    TARGET_LABEL: target.label,
+    NATIVE_REVIEW_OUTPUT: nativeReview || "Native review returned no text.",
+    NATIVE_FINDINGS: findingList,
+    EXPLICIT_CHECKS: explicitChecks
   });
 }
 
@@ -457,6 +478,372 @@ async function executeReviewRun(request) {
   };
 }
 
+const VERIFIED_FINDING_PREFIX = /^\[(?:confirmed|false-positive|style-only|unverified)\]\s+/;
+const VERIFIED_FINDING_SEVERITIES = new Set(["critical", "high", "medium", "low"]);
+const NATIVE_FINDING_ITEM = /^(?:[-*+]\s+|\d+[.)]\s+|\[P\d+\]\s+)(\S.*)$/i;
+const NATIVE_REVIEW_FENCE = /^\s*(`{3,}|~{3,})(.*)$/;
+const NATIVE_REVIEW_HEADER = /^reviewed\b(?!.*\b(?:but|however|found|issue|finding|problem)\b).*?[.!]?$/i;
+const NATIVE_REVIEW_CLEAN = /^(?:[-*+]\s+)?(?:none|no\s+(?:material\s+)?(?:issues?|findings?|problems?)(?:\s+found)?|looks\s+good|nothing\s+to\s+report)\.?$/i;
+
+function extractNativeFindings(reviewText) {
+  const text = String(reviewText ?? "");
+  if (!text.trim()) {
+    return { findings: [], error: "Native review returned no text, so there are no findings to verify." };
+  }
+
+  const findings = [];
+  let current = null;
+  let fence = null;
+  const topLevelLines = [];
+  for (const rawLine of text.split(/\r?\n/)) {
+    const normalized = rawLine.replace(/\s+/g, " ").trim();
+    const fenceMatch = rawLine.match(NATIVE_REVIEW_FENCE);
+    const isFenceClose = fence && fenceMatch && fenceMatch[1][0] === fence.marker && fenceMatch[1].length >= fence.length && !fenceMatch[2].trim();
+    if (fence || fenceMatch) {
+      if (current && normalized) {
+        current.text += `\n${normalized}`;
+      }
+      if (isFenceClose) {
+        fence = null;
+      } else if (!fence && fenceMatch) {
+        fence = { marker: fenceMatch[1][0], length: fenceMatch[1].length };
+      }
+      continue;
+    }
+    if (!normalized) {
+      continue;
+    }
+    if (/^\s/.test(rawLine)) {
+      if (current) {
+        current.text += `\n${normalized}`;
+      }
+      continue;
+    }
+
+    topLevelLines.push(normalized);
+    const match = normalized.match(NATIVE_FINDING_ITEM);
+    if (match) {
+      current = { id: `native-${findings.length + 1}`, text: match[1] };
+      findings.push(current);
+    } else if (current) {
+      current.text += `\n${normalized}`;
+    }
+  }
+
+  if (fence) {
+    return {
+      findings: [],
+      error: "Native review contains an unterminated fenced block, so its finding set cannot be verified."
+    };
+  }
+
+  if (topLevelLines.some((line) => NATIVE_REVIEW_CLEAN.test(line))) {
+    if (topLevelLines.every((line) => NATIVE_REVIEW_HEADER.test(line) || NATIVE_REVIEW_CLEAN.test(line))) {
+      return { findings: [], error: null };
+    }
+    return {
+      findings: [],
+      error: "Native review combines a clean sentinel with substantive text, so its finding set is ambiguous."
+    };
+  }
+  if (findings.length === 0) {
+    return {
+      findings: [],
+      error: "Native review output did not use a recognizable finding list or an explicit clean result. It cannot be verified one-to-one."
+    };
+  }
+  return { findings, error: null };
+}
+
+function invalidVerifiedReview(parsed, parseError) {
+  return { ...parsed, parsed: null, parseError };
+}
+
+function validateVerifiedFindingShape(finding, index) {
+  const label = `findings[${index}]`;
+  if (!finding || typeof finding !== "object" || Array.isArray(finding)) {
+    return `${label} must be an object.`;
+  }
+  for (const field of ["native_finding_id", "title", "body", "file"]) {
+    if (typeof finding[field] !== "string" || !finding[field].trim()) {
+      return `${label}.${field} must be a non-empty string.`;
+    }
+  }
+  if (!VERIFIED_FINDING_SEVERITIES.has(finding.severity)) {
+    return `${label}.severity is invalid.`;
+  }
+  for (const field of ["line_start", "line_end"]) {
+    if (!Number.isInteger(finding[field]) || finding[field] < 1) {
+      return `${label}.${field} must be a positive integer.`;
+    }
+  }
+  if (finding.line_end < finding.line_start) {
+    return `${label}.line_end must be greater than or equal to line_start.`;
+  }
+  if (!Number.isFinite(finding.confidence) || finding.confidence < 0 || finding.confidence > 1) {
+    return `${label}.confidence must be a number from 0 to 1.`;
+  }
+  if (typeof finding.recommendation !== "string") {
+    return `${label}.recommendation must be a string.`;
+  }
+  return null;
+}
+
+function parseVerifiedReviewOutput(result, nativeFindings) {
+  const parsed = parseStructuredOutput(result.finalMessage, {
+    status: result.status,
+    failureMessage: result.error?.message ?? result.stderr
+  });
+  if (!parsed.parsed) {
+    return parsed;
+  }
+
+  const shapeError = validateReviewResultShape(parsed.parsed);
+  if (shapeError) {
+    return invalidVerifiedReview(parsed, shapeError);
+  }
+
+  for (let index = 0; index < parsed.parsed.findings.length; index += 1) {
+    const findingError = validateVerifiedFindingShape(parsed.parsed.findings[index], index);
+    if (findingError) {
+      return invalidVerifiedReview(parsed, findingError);
+    }
+  }
+
+  if (!parsed.parsed.findings.every((finding) => VERIFIED_FINDING_PREFIX.test(finding?.title ?? ""))) {
+    return invalidVerifiedReview(
+      parsed,
+      "Every verified-review finding title must begin with [confirmed], [false-positive], [style-only], or [unverified]."
+    );
+  }
+
+  const expectedIds = nativeFindings.map((finding) => finding.id);
+  const actualIds = parsed.parsed.findings.map((finding) => finding?.native_finding_id);
+  const actualIdSet = new Set(actualIds);
+  if (
+    actualIds.some((id) => typeof id !== "string") ||
+    actualIds.length !== expectedIds.length ||
+    actualIdSet.size !== actualIds.length ||
+    actualIdSet.size !== expectedIds.length ||
+    expectedIds.some((id) => !actualIdSet.has(id))
+  ) {
+    return invalidVerifiedReview(
+      parsed,
+      "Verified findings must map one-to-one to the native finding IDs; missing, duplicate, and unexpected IDs are not verifiable."
+    );
+  }
+
+  return parsed;
+}
+
+function summarizeCheckExecutions(commandExecutions) {
+  return commandExecutions.map((execution) => ({
+    command: String(execution.command ?? ""),
+    commandActions: Array.isArray(execution.commandActions) ? execution.commandActions : [],
+    status: execution.status ?? null,
+    exitCode: execution.exitCode ?? null,
+    log: String(execution.aggregatedOutput ?? execution.output ?? execution.stdout ?? execution.stderr ?? "").trim()
+  }));
+}
+
+function separateCheckExecutions(requestedChecks, executions) {
+  const requested = new Set(requestedChecks);
+  const checks = [];
+  const inspectionExecutions = [];
+  const unauthorizedValidationExecutions = [];
+  for (const execution of executions) {
+    if (requested.has(execution.command)) {
+      checks.push(execution);
+    } else if (
+      execution.commandActions.length > 0 &&
+      execution.commandActions.every((action) => ["read", "listFiles", "search"].includes(typeof action === "string" ? action : action?.type))
+    ) {
+      inspectionExecutions.push(execution);
+    } else {
+      unauthorizedValidationExecutions.push(execution);
+    }
+  }
+  return { checks, inspectionExecutions, unauthorizedValidationExecutions };
+}
+
+function compareCheckExecutions(requestedChecks, checks) {
+  const expected = new Map();
+  const actual = new Map();
+  for (const command of requestedChecks) {
+    expected.set(command, (expected.get(command) ?? 0) + 1);
+  }
+  for (const check of checks) {
+    actual.set(check.command, (actual.get(check.command) ?? 0) + 1);
+  }
+
+  const missingChecks = [];
+  const duplicateChecks = [];
+  for (const [command, count] of expected) {
+    const observed = actual.get(command) ?? 0;
+    for (let index = observed; index < count; index += 1) missingChecks.push(command);
+    for (let index = count; index < observed; index += 1) duplicateChecks.push(command);
+  }
+  return { missingChecks, duplicateChecks };
+}
+
+function renderVerifiedReviewResult(parsed, meta) {
+  const renderedReview = renderReviewResult(parsed, {
+    reviewLabel: "Verified Review",
+    targetLabel: meta.targetLabel,
+    reasoningSummary: meta.reasoningSummary
+  }).trimEnd();
+  const lines = [renderedReview, "", "Verification evidence:", `- Native review exit: ${meta.native.status}`];
+
+  if (meta.native.stdout) {
+    lines.push("", "Native review output:", "", "```text", meta.native.stdout.trimEnd(), "```");
+  }
+
+  if (meta.requestedChecks.length === 0) {
+    lines.push("- Requested explicit checks: none supplied.");
+  } else {
+    lines.push("- Requested explicit checks:");
+    for (const command of meta.requestedChecks) {
+      lines.push(`  - \`${command.replace(/`/g, "\\`")}\``);
+    }
+  }
+  lines.push("- Explicit check executions:");
+  if (meta.checks.length === 0) {
+    lines.push("  - None executed.");
+  } else {
+    for (const check of meta.checks) {
+      lines.push(`  - Command: \`${check.command.replace(/`/g, "\\`")}\``);
+      lines.push(`    Exit: ${check.exitCode ?? "unknown"}; status: ${check.status ?? "unknown"}`);
+      if (check.log) {
+        lines.push("", "    Log:", "", "```text", check.log, "```");
+      }
+    }
+  }
+
+  if (meta.checkCoverage.missingChecks.length > 0) {
+    lines.push("- Missing explicit checks:", ...meta.checkCoverage.missingChecks.map((command) => `  - \`${command.replace(/`/g, "\\`")}\``));
+  }
+  if (meta.checkCoverage.duplicateChecks.length > 0) {
+    lines.push("- Duplicate explicit checks:", ...meta.checkCoverage.duplicateChecks.map((command) => `  - \`${command.replace(/`/g, "\\`")}\``));
+  }
+  if (meta.inspectionExecutions.length > 0) {
+    lines.push("- Read-only inspection executions:");
+    for (const execution of meta.inspectionExecutions) {
+      lines.push(`  - Command: \`${execution.command.replace(/`/g, "\\`")}\``);
+      lines.push(`    Exit: ${execution.exitCode ?? "unknown"}; status: ${execution.status ?? "unknown"}`);
+      if (execution.log) {
+        lines.push("", "    Log:", "", "```text", execution.log, "```");
+      }
+    }
+  }
+  if (meta.unauthorizedValidationExecutions.length > 0) {
+    lines.push("- Unauthorized validation commands:");
+    for (const execution of meta.unauthorizedValidationExecutions) {
+      lines.push(`  - Command: \`${execution.command.replace(/`/g, "\\`")}\``);
+      lines.push(`    Exit: ${execution.exitCode ?? "unknown"}; status: ${execution.status ?? "unknown"}`);
+      if (execution.log) {
+        lines.push("", "    Log:", "", "```text", execution.log, "```");
+      }
+    }
+  }
+
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+async function executeVerifiedReviewRun(request) {
+  ensureCodexAvailable(request.cwd);
+  ensureGitRepository(request.cwd);
+
+  const target = resolveReviewTarget(request.cwd, {
+    base: request.base,
+    scope: request.scope
+  });
+  const nativeTarget = validateNativeReviewRequest(target, "");
+  const native = await runAppServerReview(request.cwd, {
+    target: nativeTarget,
+    onProgress: request.onProgress
+  });
+  const nativeFindingExtraction = extractNativeFindings(native.reviewText);
+  const verification = await runAppServerTurn(request.cwd, {
+    prompt: buildVerifiedReviewPrompt({
+      target,
+      nativeReview: native.reviewText,
+      nativeFindings: nativeFindingExtraction.findings,
+      checks: request.checks
+    }),
+    sandbox: "read-only",
+    outputSchema: readOutputSchema(VERIFIED_REVIEW_SCHEMA),
+    onProgress: request.onProgress
+  });
+  const verificationParsed = parseVerifiedReviewOutput(verification, nativeFindingExtraction.findings);
+  const executions = summarizeCheckExecutions(verification.commandExecutions);
+  const { checks, inspectionExecutions, unauthorizedValidationExecutions } = separateCheckExecutions(request.checks, executions);
+  const checkCoverage = compareCheckExecutions(request.checks, checks);
+  const checkCoverageError = [
+    ...checkCoverage.missingChecks.map((command) => `missing: ${command}`),
+    ...checkCoverage.duplicateChecks.map((command) => `duplicate: ${command}`)
+  ];
+  const parsed = nativeFindingExtraction.error
+    ? invalidVerifiedReview(verificationParsed, nativeFindingExtraction.error)
+    : checkCoverageError.length > 0
+      ? invalidVerifiedReview(verificationParsed, `Explicit check execution mismatch (${checkCoverageError.join("; ")}).`)
+      : unauthorizedValidationExecutions.length > 0
+        ? invalidVerifiedReview(verificationParsed, "Unauthorized validation commands ran outside the requested checks or read-only inspection actions.")
+      : verificationParsed;
+  const payload = {
+    review: "Verified Review",
+    target,
+    native: {
+      status: native.status,
+      threadId: native.threadId,
+      sourceThreadId: native.sourceThreadId,
+      turnId: native.turnId,
+      stdout: native.reviewText,
+      stderr: native.stderr,
+      reasoning: native.reasoningSummary,
+      findings: nativeFindingExtraction.findings
+    },
+    verification: {
+      status: verification.status,
+      threadId: verification.threadId,
+      turnId: verification.turnId,
+      stdout: verification.finalMessage,
+      stderr: verification.stderr,
+      reasoning: verification.reasoningSummary,
+      requestedChecks: request.checks,
+      checks,
+      inspectionExecutions,
+      unauthorizedValidationExecutions,
+      missingChecks: checkCoverage.missingChecks,
+      duplicateChecks: checkCoverage.duplicateChecks
+    },
+    result: parsed.parsed,
+    rawOutput: parsed.rawOutput,
+    parseError: parsed.parseError
+  };
+  const exitStatus = native.status === 0 && verification.status === 0 && parsed.parsed ? 0 : 1;
+
+  return {
+    exitStatus,
+    threadId: verification.threadId,
+    turnId: verification.turnId,
+    payload,
+    rendered: renderVerifiedReviewResult(parsed, {
+      targetLabel: target.label,
+      native,
+      requestedChecks: request.checks,
+      checks,
+      inspectionExecutions,
+      unauthorizedValidationExecutions,
+      checkCoverage,
+      reasoningSummary: verification.reasoningSummary
+    }),
+    summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(verification.finalMessage, "Verified Review finished."),
+    jobTitle: "Codex Verified Review",
+    jobClass: "review",
+    targetLabel: target.label
+  };
+}
+
 
 async function executeTaskRun(request) {
   const workspaceRoot = resolveWorkspaceRoot(request.cwd);
@@ -531,7 +918,7 @@ async function executeTaskRun(request) {
 
 function buildReviewJobMetadata(reviewName, target) {
   return {
-    kind: reviewName === "Adversarial Review" ? "adversarial-review" : "review",
+    kind: reviewName === "Adversarial Review" ? "adversarial-review" : reviewName === "Verified Review" ? "verified-review" : "review",
     title: reviewName === "Review" ? "Codex Review" : `Codex ${reviewName}`,
     summary: `${reviewName} ${target.label}`
   };
@@ -560,6 +947,9 @@ function renderQueuedTaskLaunch(payload) {
 function getJobKindLabel(kind, jobClass) {
   if (kind === "adversarial-review") {
     return "adversarial-review";
+  }
+  if (kind === "verified-review") {
+    return "verified-review";
   }
   return jobClass === "review" ? "review" : "rescue";
 }
@@ -661,6 +1051,9 @@ async function runForegroundCommand(job, runner, options = {}) {
     stderr: !options.json
   });
   const execution = await runTrackedJob(job, () => runner(progress), { logFile });
+  if (!execution) {
+    return null;
+  }
   outputResult(options.json ? execution.payload : execution.rendered, options.json);
   if (execution.exitStatus !== 0) {
     process.exitCode = execution.exitStatus;
@@ -684,7 +1077,6 @@ function spawnDetachedTaskWorker(cwd, jobId) {
 function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
-
   const child = spawnDetachedTaskWorker(cwd, job.id);
   const queuedRecord = {
     ...job,
@@ -696,6 +1088,49 @@ function enqueueBackgroundTask(cwd, job, request) {
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
+
+  return {
+    payload: {
+      jobId: job.id,
+      status: "queued",
+      title: job.title,
+      summary: job.summary,
+      logFile
+    },
+    logFile
+  };
+}
+
+function spawnDetachedVerifiedReviewWorker(cwd, jobId) {
+  const scriptPath = path.join(ROOT_DIR, "scripts", "codex-companion.mjs");
+  const child = spawn(process.execPath, [scriptPath, "verified-review-worker", "--cwd", cwd, "--job-id", jobId], {
+    cwd,
+    env: process.env,
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true
+  });
+  child.unref();
+  return child;
+}
+
+function enqueueBackgroundVerifiedReview(cwd, job, request) {
+  const { logFile } = createTrackedProgress(job);
+  appendLogLine(logFile, "Queued for background execution.");
+  const queuedRecord = {
+    ...job,
+    status: "queued",
+    phase: "queued",
+    pid: null,
+    logFile,
+    request
+  };
+  writeJobFile(job.workspaceRoot, job.id, queuedRecord);
+  upsertJob(job.workspaceRoot, queuedRecord);
+  const child = spawnDetachedVerifiedReviewWorker(cwd, job.id);
+  if (!recordQueuedJobPid(job.workspaceRoot, job.id, child.pid ?? null)) {
+    terminateProcessTree(child.pid ?? Number.NaN);
+  }
 
   return {
     payload: {
@@ -756,6 +1191,80 @@ async function handleReview(argv) {
   return handleReviewCommand(argv, {
     reviewName: "Review",
     validateRequest: validateNativeReviewRequest
+  });
+}
+
+function readExplicitChecks(checks) {
+  const values = (checks ?? []).map((check) => String(check));
+  if (values.some((check) => !check.trim())) {
+    throw new Error("Each --check command must be non-empty.");
+  }
+  return values;
+}
+
+async function resolveVerifiedReviewArgv(argv) {
+  const hasCapturedInput = argv.some(
+    (argument) => argument === "--captured-input" || argument.startsWith("--captured-input=")
+  );
+  if (!hasCapturedInput) {
+    return argv;
+  }
+
+  if (
+    argv.length !== 2 ||
+    argv[0] !== "--captured-input" ||
+    !VERIFIED_REVIEW_CAPTURE_ID_PATTERN.test(argv[1])
+  ) {
+    throw new Error("`--captured-input` must be the only verified-review option and use a valid capture ID.");
+  }
+
+  const sessionId = getCurrentClaudeSessionId();
+  if (!sessionId) {
+    throw new Error("`--captured-input` requires an active Claude session.");
+  }
+
+  const captured = await consumeVerifiedReviewInput(process.cwd(), argv[1], { sessionId });
+  if (!captured || typeof captured.rawArguments !== "string") {
+    throw new Error("Captured verified-review input is invalid.");
+  }
+  return [captured.rawArguments];
+}
+
+async function handleVerifiedReview(argv) {
+  argv = await resolveVerifiedReviewArgv(argv);
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["base", "scope", "cwd", "check"],
+    repeatableValueOptions: ["check"],
+    booleanOptions: ["json", "background", "wait"]
+  });
+  if (positionals.length > 0) {
+    throw new Error("`/codex:verified-review` accepts review options and repeated --check commands only.");
+  }
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveCommandWorkspace(options);
+  const checks = readExplicitChecks(options.check);
+  const target = resolveReviewTarget(cwd, { base: options.base, scope: options.scope });
+  const metadata = buildReviewJobMetadata("Verified Review", target);
+  const job = createCompanionJob({
+    prefix: "review",
+    kind: metadata.kind,
+    title: metadata.title,
+    workspaceRoot,
+    jobClass: "review",
+    summary: metadata.summary
+  });
+  const request = { cwd, base: options.base, scope: options.scope, checks, jobId: job.id };
+
+  if (options.background) {
+    ensureCodexAvailable(cwd);
+    const { payload } = enqueueBackgroundVerifiedReview(cwd, job, request);
+    outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
+    return;
+  }
+
+  await runForegroundCommand(job, (progress) => executeVerifiedReviewRun({ ...request, onProgress: progress }), {
+    json: options.json
   });
 }
 
@@ -880,6 +1389,34 @@ async function handleTaskWorker(argv) {
   );
 }
 
+async function handleVerifiedReviewWorker(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "job-id"]
+  });
+  if (!options["job-id"]) {
+    throw new Error("Missing required --job-id for verified-review-worker.");
+  }
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveCommandWorkspace(options);
+  const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
+  if (!storedJob?.request || typeof storedJob.request !== "object") {
+    throw new Error(`Stored job ${options["job-id"]} is missing its verified review request payload.`);
+  }
+  if (storedJob.status === "cancelled") {
+    return;
+  }
+  const { logFile, progress } = createTrackedProgress(
+    { ...storedJob, workspaceRoot },
+    { logFile: storedJob.logFile ?? null }
+  );
+  await runTrackedJob(
+    { ...storedJob, workspaceRoot, logFile },
+    () => executeVerifiedReviewRun({ ...storedJob.request, onProgress: progress }),
+    { logFile }
+  );
+}
+
 async function handleStatus(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
@@ -969,9 +1506,19 @@ async function handleCancel(argv) {
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
   const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
-  const existing = readStoredJob(workspaceRoot, job.id) ?? {};
-  const threadId = existing.threadId ?? job.threadId ?? null;
-  const turnId = existing.turnId ?? job.turnId ?? null;
+  const completedAt = nowIso();
+  const cancellation = cancelTrackedJob(workspaceRoot, job.id, {
+    ...job,
+    completedAt,
+    errorMessage: "Cancelled by user.",
+    cancelledAt: completedAt
+  });
+  if (!cancellation) {
+    throw new Error(`No active job found for "${job.id}".`);
+  }
+  const { previous, job: nextJob } = cancellation;
+  const threadId = previous.threadId ?? job.threadId ?? null;
+  const turnId = previous.turnId ?? job.turnId ?? null;
 
   const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
   if (interrupt.attempted) {
@@ -983,32 +1530,8 @@ async function handleCancel(argv) {
     );
   }
 
-  terminateProcessTree(job.pid ?? Number.NaN);
-  appendLogLine(job.logFile, "Cancelled by user.");
-
-  const completedAt = nowIso();
-  const nextJob = {
-    ...job,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    completedAt,
-    errorMessage: "Cancelled by user."
-  };
-
-  writeJobFile(workspaceRoot, job.id, {
-    ...existing,
-    ...nextJob,
-    cancelledAt: completedAt
-  });
-  upsertJob(workspaceRoot, {
-    id: job.id,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    errorMessage: "Cancelled by user.",
-    completedAt
-  });
+  terminateProcessTree(previous.pid ?? job.pid ?? Number.NaN);
+  appendLogLine(nextJob.logFile ?? job.logFile, "Cancelled by user.");
 
   const payload = {
     jobId: job.id,
@@ -1040,6 +1563,9 @@ async function main() {
         reviewName: "Adversarial Review"
       });
       break;
+    case "verified-review":
+      await handleVerifiedReview(argv);
+      break;
     case "task":
       await handleTask(argv);
       break;
@@ -1048,6 +1574,9 @@ async function main() {
       break;
     case "task-worker":
       await handleTaskWorker(argv);
+      break;
+    case "verified-review-worker":
+      await handleVerifiedReviewWorker(argv);
       break;
     case "status":
       await handleStatus(argv);

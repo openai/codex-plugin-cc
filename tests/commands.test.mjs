@@ -70,6 +70,41 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /can still take extra focus text after the flags/i);
 });
 
+test("verified review command exposes the two-pass read-only contract", () => {
+  const source = read("commands/verified-review.md");
+  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+  const executableBlocks = [...source.matchAll(/```(?:bash|typescript)\n([\s\S]*?)```/g)].map((match) => match[1]);
+
+  assert.match(source, /AskUserQuestion/);
+  assert.match(source, /\bBash\(/);
+  assert.match(source, /CODEX_VERIFIED_REVIEW_CAPTURE_ID=<uuid>/);
+  assert.match(source, /fail closed/i);
+  assert.match(source, /--captured-input "<uuid>"/);
+  assert.match(source, /Never copy, interpolate, export, pipe, or otherwise place raw `\$ARGUMENTS` in Bash/i);
+  assert.doesNotMatch(source, /git diff --shortstat <base>\.\.\.HEAD/);
+  assert.match(source, /If raw arguments explicitly select a branch with `--base` or `--scope branch`, never run Bash to size that branch; recommend background/i);
+  assert.match(source, /Never copy or interpolate a raw base or ref into Bash/i);
+  assert.match(source, /git status --short --untracked-files=all/);
+  assert.match(source, /git diff --shortstat --cached/);
+  assert.match(source, /If the working tree is clean, the companion will fall back to branch review, or the size is unclear, recommend background/i);
+  assert.equal(executableBlocks.length, 2);
+  for (const block of executableBlocks) {
+    assert.match(block, /verified-review --captured-input "<uuid>"/);
+    assert.doesNotMatch(block, /\$ARGUMENTS/);
+    assert.doesNotMatch(block, /<base>|<ref>/);
+  }
+  assert.doesNotMatch(source, /verified-review "\$ARGUMENTS"/);
+  assert.match(source, /\[--scope auto\|working-tree\|branch\]/);
+  assert.match(source, /\[--base <ref>\]/);
+  assert.match(source, /\[--check "<command>"\]/);
+  assert.match(source, /run_in_background:\s*true/);
+  assert.match(source, /Do not fix issues/i);
+  assert.match(source, /read-only/i);
+  assert.match(source, /Return the command stdout verbatim to the user/i);
+  assert.match(readme, /### `\/codex:verified-review`/);
+  assert.match(readme, /--check/i);
+});
+
 test("continue is not exposed as a user-facing command", () => {
   const commandFiles = fs.readdirSync(path.join(PLUGIN_ROOT, "commands")).sort();
   assert.deepEqual(commandFiles, [
@@ -80,7 +115,8 @@ test("continue is not exposed as a user-facing command", () => {
     "review.md",
     "setup.md",
     "status.md",
-    "transfer.md"
+    "transfer.md",
+    "verified-review.md"
   ]);
 });
 

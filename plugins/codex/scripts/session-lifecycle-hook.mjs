@@ -15,6 +15,8 @@ import {
 } from "./lib/broker-lifecycle.mjs";
 import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
+import { cleanupVerifiedReviewInputs } from "./lib/verified-review-input.mjs";
+import { cancelTrackedJob } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
@@ -61,8 +63,9 @@ function cleanupSessionJobs(cwd, sessionId) {
     if (!stillRunning) {
       continue;
     }
+    const cancellation = cancelTrackedJob(workspaceRoot, job.id, job);
     try {
-      terminateProcessTree(job.pid ?? Number.NaN);
+      terminateProcessTree(cancellation?.previous.pid ?? job.pid ?? Number.NaN);
     } catch {
       // Ignore teardown failures during session shutdown.
     }
@@ -102,6 +105,10 @@ async function handleSessionEnd(input) {
   }
 
   cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
+  cleanupVerifiedReviewInputs({
+    cwd,
+    sessionId: input.session_id || process.env[SESSION_ID_ENV]
+  });
   teardownBrokerSession({
     endpoint: brokerEndpoint,
     pidFile,

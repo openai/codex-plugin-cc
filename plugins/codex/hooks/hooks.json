@@ -1,6 +1,18 @@
 {
   "description": "Optional stop-time review gate for Codex Companion.",
   "hooks": {
+    "UserPromptExpansion": [
+      {
+        "matcher": "^(?:codex:)?verified-review$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/verified-review-input-hook.mjs\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "hooks": [
