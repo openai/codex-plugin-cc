@@ -4,7 +4,7 @@ import fs from "node:fs";
 import process from "node:process";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 import { getCodexAvailability } from "./lib/codex.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
@@ -176,8 +176,17 @@ function main() {
   logNote(runningTaskNote);
 }
 
-function isMainModule() {
-  return process.argv[1] ? import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href : false;
+export function isMainModule(entryPath = process.argv[1]) {
+  if (!entryPath) {
+    return false;
+  }
+
+  const modulePath = fileURLToPath(import.meta.url);
+  try {
+    return fs.realpathSync.native(modulePath) === fs.realpathSync.native(path.resolve(entryPath));
+  } catch {
+    return modulePath === path.resolve(entryPath);
+  }
 }
 
 if (isMainModule()) {

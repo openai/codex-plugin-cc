@@ -1,9 +1,14 @@
+import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { runStopReview } from "../plugins/codex/scripts/stop-review-gate-hook.mjs";
+import { isMainModule, runStopReview } from "../plugins/codex/scripts/stop-review-gate-hook.mjs";
 import { makeTempDir } from "./helpers.mjs";
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const STOP_HOOK = path.join(ROOT, "plugins", "codex", "scripts", "stop-review-gate-hook.mjs");
 
 test("runStopReview hides stop-gate task windows on Windows", () => {
   const cwd = makeTempDir();
@@ -36,4 +41,12 @@ test("runStopReview hides stop-gate task windows on Windows", () => {
   assert.equal(captured.options.encoding, "utf8");
   assert.equal(captured.options.windowsHide, true);
   assert.equal(captured.options.env.CODEX_COMPANION_SESSION_ID, "session-123");
+});
+
+test("isMainModule treats a symlinked hook path as the hook entrypoint", () => {
+  const cwd = makeTempDir();
+  const linkedHook = path.join(cwd, "stop-review-gate-hook.mjs");
+  fs.symlinkSync(STOP_HOOK, linkedHook);
+
+  assert.equal(isMainModule(linkedHook), true);
 });
