@@ -54,6 +54,7 @@ import {
   createJobRecord,
   createProgressReporter,
   nowIso,
+  recordQueuedJobPid,
   runTrackedJob,
   SESSION_ID_ENV
 } from "./lib/tracked-jobs.mjs";
@@ -480,6 +481,7 @@ async function executeReviewRun(request) {
 }
 
 const VERIFIED_FINDING_PREFIX = /^\[(?:confirmed|false-positive|style-only|unverified)\]\s+/;
+const VERIFIED_FINDING_SEVERITIES = new Set(["critical", "high", "medium", "low"]);
 const NATIVE_FINDING_ITEM = /^(?:[-*+]\s+|\d+[.)]\s+|\[P\d+\]\s+)(\S.*)$/i;
 const NATIVE_REVIEW_FENCE = /^\s*(`{3,}|~{3,})(.*)$/;
 const NATIVE_REVIEW_HEADER = /^reviewed\b(?!.*\b(?:but|however|found|issue|finding|problem)\b).*?[.!]?$/i;
@@ -559,6 +561,33 @@ function invalidVerifiedReview(parsed, parseError) {
   return { ...parsed, parsed: null, parseError };
 }
 
+function validateVerifiedFindingShape(finding, index) {
+  const label = `findings[${index}]`;
+  if (!finding || typeof finding !== "object" || Array.isArray(finding)) {
+    return `${label} must be an object.`;
+  }
+  for (const field of ["native_finding_id", "title", "body", "file"]) {
+    if (typeof finding[field] !== "string" || !finding[field].trim()) {
+      return `${label}.${field} must be a non-empty string.`;
+    }
+  }
+  if (!VERIFIED_FINDING_SEVERITIES.has(finding.severity)) {
+    return `${label}.severity is invalid.`;
+  }
+  for (const field of ["line_start", "line_end"]) {
+    if (!Number.isInteger(finding[field]) || finding[field] < 1) {
+      return `${label}.${field} must be a positive integer.`;
+    }
+  }
+  if (!Number.isFinite(finding.confidence) || finding.confidence < 0 || finding.confidence > 1) {
+    return `${label}.confidence must be a number from 0 to 1.`;
+  }
+  if (typeof finding.recommendation !== "string") {
+    return `${label}.recommendation must be a string.`;
+  }
+  return null;
+}
+
 function parseVerifiedReviewOutput(result, nativeFindings) {
   const parsed = parseStructuredOutput(result.finalMessage, {
     status: result.status,
@@ -571,6 +600,13 @@ function parseVerifiedReviewOutput(result, nativeFindings) {
   const shapeError = validateReviewResultShape(parsed.parsed);
   if (shapeError) {
     return invalidVerifiedReview(parsed, shapeError);
+  }
+
+  for (let index = 0; index < parsed.parsed.findings.length; index += 1) {
+    const findingError = validateVerifiedFindingShape(parsed.parsed.findings[index], index);
+    if (findingError) {
+      return invalidVerifiedReview(parsed, findingError);
+    }
   }
 
   if (!parsed.parsed.findings.every((finding) => VERIFIED_FINDING_PREFIX.test(finding?.title ?? ""))) {
@@ -1090,7 +1126,10 @@ function enqueueBackgroundVerifiedReview(cwd, job, request) {
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
-  spawnDetachedVerifiedReviewWorker(cwd, job.id);
+  const child = spawnDetachedVerifiedReviewWorker(cwd, job.id);
+  if (!recordQueuedJobPid(job.workspaceRoot, job.id, child.pid ?? null)) {
+    terminateProcessTree(child.pid ?? Number.NaN);
+  }
 
   return {
     payload: {

@@ -9,7 +9,12 @@ import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { readJobFile, resolveJobFile, resolveStateDir, upsertJob, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
-import { cancelTrackedJob, createJobProgressUpdater, runTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
+import {
+  cancelTrackedJob,
+  createJobProgressUpdater,
+  recordQueuedJobPid,
+  runTrackedJob
+} from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 import {
   captureVerifiedReviewInput,
   cleanupVerifiedReviewInputs,
@@ -1379,16 +1384,21 @@ test("verified review rejects omitted, duplicate, and unknown native finding cla
 });
 
 test("verified review fails closed on schema-invalid verifier output", () => {
-  const { repo, binDir } = createVerifiedReviewRepo("verified-review-invalid-shape");
-  const result = run("node", [SCRIPT, "verified-review", "--json"], {
-    cwd: repo,
-    env: buildEnv(binDir)
-  });
+  for (const [behavior, expectedError] of [
+    ["verified-review-invalid-shape", /next_steps/],
+    ["verified-review-invalid-finding-shape", /findings\[0\]\.body/]
+  ]) {
+    const { repo, binDir } = createVerifiedReviewRepo(behavior);
+    const result = run("node", [SCRIPT, "verified-review", "--json"], {
+      cwd: repo,
+      env: buildEnv(binDir)
+    });
 
-  assert.notEqual(result.status, 0);
-  const payload = JSON.parse(result.stdout);
-  assert.equal(payload.result, null);
-  assert.match(payload.parseError, /next_steps/);
+    assert.notEqual(result.status, 0);
+    const payload = JSON.parse(result.stdout);
+    assert.equal(payload.result, null);
+    assert.match(payload.parseError, expectedError);
+  }
 });
 
 test("verified review separates normal inspection from explicitly requested check executions", () => {
@@ -1581,14 +1591,31 @@ test("verified review background jobs expose status and result", async () => {
   assert.match(resultPayload.storedJob.rendered, /Verified Review/);
 });
 
-test("verified review saves its queued request before spawning the detached worker", () => {
+test("verified review saves its queued request before spawning and recording the detached worker", () => {
   const source = fs.readFileSync(SCRIPT, "utf8");
   const start = source.indexOf("function enqueueBackgroundVerifiedReview");
   const end = source.indexOf("async function handleReviewCommand", start);
   const enqueueSource = source.slice(start, end);
 
   assert.ok(start >= 0, "verified-review enqueue function is missing");
-  assert.ok(enqueueSource.indexOf("writeJobFile(job.workspaceRoot, job.id, queuedRecord)") < enqueueSource.indexOf("spawnDetachedVerifiedReviewWorker(cwd, job.id)"));
+  const writeIndex = enqueueSource.indexOf("writeJobFile(job.workspaceRoot, job.id, queuedRecord)");
+  const spawnIndex = enqueueSource.indexOf("spawnDetachedVerifiedReviewWorker(cwd, job.id)");
+  const pidIndex = enqueueSource.indexOf("recordQueuedJobPid(job.workspaceRoot, job.id");
+  assert.ok(writeIndex < spawnIndex);
+  assert.ok(spawnIndex < pidIndex);
+});
+
+test("queued worker PID recording preserves cancellation", () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "review-pid-race", status: "queued", phase: "queued", pid: null };
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, job);
+
+  assert.equal(recordQueuedJobPid(workspaceRoot, job.id, 12345), true);
+  assert.equal(readJobFile(resolveJobFile(workspaceRoot, job.id)).pid, 12345);
+  cancelTrackedJob(workspaceRoot, job.id, { completedAt: "2026-08-11T00:00:00.000Z" });
+  assert.equal(recordQueuedJobPid(workspaceRoot, job.id, 54321), false);
+  assert.equal(readJobFile(resolveJobFile(workspaceRoot, job.id)).status, "cancelled");
 });
 
 test("verified review worker leaves an already-cancelled queued job untouched", () => {

@@ -268,33 +268,37 @@ function structuredReviewPayload(prompt) {
           : BEHAVIOR === "verified-review-unknown-finding"
             ? ["native-1", "native-99"]
             : ["native-1", "native-2"];
+    const findings = (emptyNativeFindings.has(BEHAVIOR) ? [] : [
+      {
+        native_finding_id: nativeFindingIds[0],
+        severity: "high",
+        title: "[confirmed] Missing empty-state guard",
+        body: "The unguarded index access can throw for an empty collection.",
+        file: "src/app.js",
+        line_start: 4,
+        line_end: 4,
+        confidence: 0.95,
+        recommendation: "Handle empty collections before indexing."
+      },
+      {
+        native_finding_id: nativeFindingIds[1],
+        severity: "low",
+        title: "[style-only] Naming could be clearer",
+        body: "This is readability-only and has no behavior impact.",
+        file: "src/app.js",
+        line_start: 1,
+        line_end: 1,
+        confidence: 0.8,
+        recommendation: "Rename when editing this code next."
+      }
+    ]).filter((finding) => finding.native_finding_id);
+    if (BEHAVIOR === "verified-review-invalid-finding-shape") {
+      delete findings[0].body;
+    }
     return JSON.stringify({
       verdict: "needs-attention",
       summary: "Every native finding was independently classified.",
-      findings: (emptyNativeFindings.has(BEHAVIOR) ? [] : [
-        {
-          native_finding_id: nativeFindingIds[0],
-          severity: "high",
-          title: "[confirmed] Missing empty-state guard",
-          body: "The unguarded index access can throw for an empty collection.",
-          file: "src/app.js",
-          line_start: 4,
-          line_end: 4,
-          confidence: 0.95,
-          recommendation: "Handle empty collections before indexing."
-        },
-        {
-          native_finding_id: nativeFindingIds[1],
-          severity: "low",
-          title: "[style-only] Naming could be clearer",
-          body: "This is readability-only and has no behavior impact.",
-          file: "src/app.js",
-          line_start: 1,
-          line_end: 1,
-          confidence: 0.8,
-          recommendation: "Rename when editing this code next."
-        }
-      ]).filter((finding) => finding.native_finding_id),
+      findings,
       next_steps: ["Fix the confirmed empty-state guard."]
     });
   }

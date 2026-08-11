@@ -230,6 +230,25 @@ export function cancelTrackedJob(workspaceRoot, jobId, patch) {
   });
 }
 
+export function recordQueuedJobPid(workspaceRoot, jobId, pid) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  return withJobLock(workspaceRoot, jobId, () => {
+    const storedJob = readStoredJobOrNull(workspaceRoot, jobId);
+    if (storedJob?.status === "running") {
+      return storedJob.pid === pid;
+    }
+    if (storedJob?.status !== "queued") {
+      return false;
+    }
+    const queuedJob = { ...storedJob, pid };
+    writeJobFile(workspaceRoot, jobId, queuedJob);
+    upsertJob(workspaceRoot, { id: jobId, status: "queued", pid });
+    return true;
+  });
+}
+
 export async function runTrackedJob(job, runner, options = {}) {
   const runningRecord = writeRunningJob(job, options);
   if (!runningRecord) {
