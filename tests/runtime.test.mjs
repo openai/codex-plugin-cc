@@ -784,6 +784,34 @@ test("task forwards model selection and reasoning effort to app-server turn/star
   assert.equal(fakeState.lastTurnStart.effort, "low");
 });
 
+test("task accepts the max and ultra reasoning tiers and still rejects unknown ones", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  for (const effort of ["max", "ultra"]) {
+    const accepted = run("node", [SCRIPT, "task", "--effort", effort, "diagnose the failing test"], {
+      cwd: repo,
+      env: buildEnv(binDir)
+    });
+    assert.equal(accepted.status, 0, accepted.stderr);
+    const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.equal(fakeState.lastTurnStart.effort, effort);
+  }
+
+  const rejected = run("node", [SCRIPT, "task", "--effort", "turbo", "diagnose the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr + rejected.stdout, /Unsupported reasoning effort "turbo"/);
+});
+
 test("task logs reasoning summaries and assistant messages to the job log", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
