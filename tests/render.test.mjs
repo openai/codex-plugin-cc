@@ -1,7 +1,26 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { renderReviewResult, renderStoredJobResult } from "../plugins/codex/scripts/lib/render.mjs";
+import { renderCancelReport, renderReviewResult, renderStoredJobResult } from "../plugins/codex/scripts/lib/render.mjs";
+
+test("renderCancelReport reports a non-cancelled adopted outcome instead of a cancel stub", () => {
+  const failed = renderCancelReport({ id: "task-1", title: "Codex Task", status: "failed" });
+  assert.match(failed, /recorded as failed/);
+  assert.doesNotMatch(failed, /Cancelled task-1\./);
+
+  const cancelled = renderCancelReport({ id: "task-1", title: "Codex Task", status: "cancelled" });
+  assert.match(cancelled, /Cancelled task-1\./);
+});
+
+test("renderCancelReport warns when the worker could not be terminated", () => {
+  const job = { id: "task-1", title: "Codex Task" };
+
+  const clean = renderCancelReport(job, { workerTerminated: true });
+  assert.doesNotMatch(clean, /Warning/);
+
+  const survived = renderCancelReport(job, { workerTerminated: false });
+  assert.match(survived, /Warning: the worker process could not be terminated/);
+});
 
 test("renderReviewResult degrades gracefully when JSON is missing required review fields", () => {
   const output = renderReviewResult(

@@ -556,7 +556,7 @@ function applyTurnNotification(state, message) {
   }
 }
 
-async function captureTurn(client, threadId, startRequest, options = {}) {
+export async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
 
@@ -587,6 +587,13 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     state.turnId = response.turn?.id ?? null;
     if (state.turnId) {
       state.threadTurnIds.set(state.threadId, state.turnId);
+      // Persist the turn id from the response itself: the turn/started
+      // notification can lag or go missing, and cancel/session-end cleanup
+      // can only interrupt a turn whose id made it into the stored record.
+      emitProgress(state.onProgress, `Turn accepted (${state.turnId}).`, "starting", {
+        threadId: state.threadId,
+        turnId: state.turnId
+      });
     }
     for (const message of state.bufferedNotifications) {
       if (belongsToTurn(state, message)) {
@@ -603,7 +610,30 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       completeTurn(state, response.turn);
     }
 
-    return await state.completion;
+    // The turn outcome arrives via notifications. If the transport dies first
+    // (broker shutdown, app-server crash), no `turn/completed` will ever come,
+    // so fail fast instead of waiting forever on a dead connection.
+    const connectionClosed = client.exitPromise.then(() => {
+      // A clean close can outrun the 250 ms inferred-completion timer; if the
+      // final answer already arrived and no subagent work is pending, the
+      // turn is done — don't turn a finished run into a transport failure.
+      if (
+        !client.exitError &&
+        !state.completed &&
+        !state.finalTurn &&
+        state.finalAnswerSeen &&
+        state.pendingCollaborations.size === 0 &&
+        state.activeSubagentTurns.size === 0
+      ) {
+        completeTurn(state, null, { inferred: true });
+        return state;
+      }
+      throw (
+        client.exitError ??
+        new Error("codex app-server connection closed before the turn completed.")
+      );
+    });
+    return await Promise.race([state.completion, connectionClosed]);
   } finally {
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
@@ -883,7 +913,24 @@ async function getCodexAuthStatusFromClient(client, cwd) {
   }
 }
 
+// The probes below spawn the codex binary synchronously (hundreds of ms on
+// shimmed installs). Callers that loop — the SessionEnd hook interrupts one
+// turn per job under a 5-second hook timeout — must not pay that per call,
+// so the result is memoized per cwd for the life of the process.
+const codexAvailabilityCache = new Map();
+
 export function getCodexAvailability(cwd) {
+  const cacheKey = String(cwd ?? "");
+  const cached = codexAvailabilityCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+  const result = probeCodexAvailability(cwd);
+  codexAvailabilityCache.set(cacheKey, result);
+  return result;
+}
+
+function probeCodexAvailability(cwd) {
   const versionStatus = binaryAvailable("codex", ["--version"], { cwd });
   if (!versionStatus.available) {
     return versionStatus;
@@ -957,7 +1004,11 @@ export async function getCodexAuthStatus(cwd, options = {}) {
   }
 }
 
-export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
+/**
+ * @param {string} cwd
+ * @param {{ threadId?: string | null, turnId?: string | null, timeoutMs?: number | null, skipAvailabilityProbe?: boolean }} [options]
+ */
+export async function interruptAppServerTurn(cwd, { threadId, turnId, timeoutMs = null, skipAvailabilityProbe = false } = {}) {
   if (!threadId || !turnId) {
     return {
       attempted: false,
@@ -967,20 +1018,105 @@ export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
     };
   }
 
-  const availability = getCodexAvailability(cwd);
-  if (!availability.available) {
-    return {
-      attempted: false,
-      interrupted: false,
-      transport: null,
-      detail: availability.detail
-    };
+  // The probe spawns the codex binary synchronously, outside any deadline;
+  // deadline-critical callers that already know a broker session exists
+  // (the SessionEnd hook) skip it — a dead endpoint fails fast in connect.
+  if (!skipAvailabilityProbe) {
+    const availability = getCodexAvailability(cwd);
+    if (!availability.available) {
+      return {
+        attempted: false,
+        interrupted: false,
+        transport: null,
+        detail: availability.detail
+      };
+    }
   }
 
+  // The whole attempt — connect and RPC — shares the deadline, and a timeout
+  // must tear the connection down, not merely abandon the promise: a
+  // half-closed socket with a pending request stays registered as an active
+  // request on the broker (blocking a later broker/shutdown) and keeps the
+  // caller's event loop alive.
+  const deadline = timeoutMs == null ? null : Date.now() + timeoutMs;
+  const raceBudget = async (promise) => {
+    if (deadline == null) {
+      try {
+        return { outcome: "ok", value: await promise };
+      } catch (error) {
+        return { outcome: "failed", error };
+      }
+    }
+    const budget = deadline - Date.now();
+    if (budget <= 0) {
+      // The promise was already created; the finally-destroy will reject it,
+      // and without a handler that becomes an unhandled rejection that can
+      // kill the caller (e.g. the SessionEnd hook mid-cleanup).
+      promise.catch(() => {});
+      return { outcome: "timeout" };
+    }
+    let timer = null;
+    return await Promise.race([
+      promise.then(
+        (value) => ({ outcome: "ok", value }),
+        (error) => ({ outcome: "failed", error })
+      ),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ outcome: "timeout" }), budget);
+        timer.unref?.();
+      })
+    ]).finally(() => clearTimeout(timer));
+  };
+
   let client = null;
+  /** @type {{ destroy: () => void } | null} */
+  let pendingClient = null;
+  let timedOut = false;
   try {
-    client = await CodexAppServerClient.connect(cwd, { reuseExistingBroker: true });
-    await client.request("turn/interrupt", { threadId, turnId });
+    const connectPromise = CodexAppServerClient.connect(cwd, {
+      reuseExistingBroker: true,
+      onClientCreated: (created) => {
+        pendingClient = created;
+      }
+    });
+    const connected = await raceBudget(connectPromise);
+    if (connected.outcome === "timeout") {
+      timedOut = true;
+      // Destroy the in-progress client immediately: a connect wedged inside
+      // initialize (endpoint accepts but never answers) would otherwise hold
+      // its socket or child process past the timeout and keep the caller's
+      // event loop alive. The late chain is a fallback for a connect that
+      // resolves after the race.
+      pendingClient?.destroy();
+      connectPromise.then(
+        (lateClient) => lateClient.destroy(),
+        () => {}
+      );
+      return {
+        attempted: true,
+        interrupted: false,
+        transport: null,
+        detail: `Timed out after ${timeoutMs}ms connecting for turn/interrupt.`
+      };
+    }
+    if (connected.outcome === "failed") {
+      throw connected.error;
+    }
+    client = connected.value;
+
+    const requested = await raceBudget(client.request("turn/interrupt", { threadId, turnId }));
+    if (requested.outcome === "timeout") {
+      timedOut = true;
+      return {
+        attempted: true,
+        interrupted: false,
+        transport: client.transport,
+        detail: `Timed out after ${timeoutMs}ms waiting for turn/interrupt.`
+      };
+    }
+    if (requested.outcome === "failed") {
+      throw requested.error;
+    }
     return {
       attempted: true,
       interrupted: true,
@@ -995,7 +1131,13 @@ export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
       detail: error instanceof Error ? error.message : String(error)
     };
   } finally {
-    await client?.close().catch(() => {});
+    if (client) {
+      if (timedOut) {
+        client.destroy();
+      } else {
+        await client.close().catch(() => {});
+      }
+    }
   }
 }
 

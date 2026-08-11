@@ -20,7 +20,7 @@ const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.m
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
 
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
-export const BROKER_BUSY_RPC_CODE = -32001;
+export { BROKER_BUSY_RPC_CODE } from "./broker-endpoint.mjs";
 
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
@@ -265,6 +265,30 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     await this.exitPromise;
   }
 
+  // Immediate teardown for callers that cannot wait for a graceful close
+  // (e.g. a timed-out request whose response may never come): kill the
+  // process so the exit handler rejects any pending requests.
+  destroy() {
+    this.closed = true;
+    if (this.readline) {
+      this.readline.close();
+    }
+    if (this.proc && !this.proc.killed) {
+      try {
+        if (process.platform === "win32") {
+          // With shell: true the direct child is cmd.exe; kill the whole
+          // tree so the codex app-server grandchild does not survive the
+          // timeout (mirrors the graceful close() path).
+          terminateProcessTree(this.proc.pid);
+        } else {
+          this.proc.kill("SIGKILL");
+        }
+      } catch {
+        // Ignore missing process.
+      }
+    }
+  }
+
   sendMessage(message) {
     const line = `${JSON.stringify(message)}\n`;
     const stdin = this.proc?.stdin;
@@ -322,6 +346,16 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
     await this.exitPromise;
   }
 
+  // Immediate teardown for callers that cannot wait for a graceful close: a
+  // half-closed socket with a pending request would stay registered as an
+  // active request on the broker and keep this process's event loop alive.
+  destroy() {
+    this.closed = true;
+    if (this.socket) {
+      this.socket.destroy();
+    }
+  }
+
   sendMessage(message) {
     const line = `${JSON.stringify(message)}\n`;
     const socket = this.socket;
@@ -348,6 +382,10 @@ export class CodexAppServerClient {
     const client = brokerEndpoint
       ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
       : new SpawnedCodexAppServerClient(cwd, options);
+    // Hand the instance out before initialize: a caller racing connect
+    // against a deadline must be able to destroy a client wedged inside
+    // initialize, whose socket/child would otherwise outlive the timeout.
+    options.onClientCreated?.(client);
     await client.initialize();
     return client;
   }
