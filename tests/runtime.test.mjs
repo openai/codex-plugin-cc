@@ -19,8 +19,26 @@ const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.m
 // Companion invocations start a broker that is deliberately long-lived so it
 // can be reused. Nothing else shuts it down, so without this the suite leaves a
 // broker plus its app-server child behind for every workspace it touches.
+//
+// ROOT is a stable workspace a developer may already have a live companion
+// session on, so it is only torn down when this run is the thing that started
+// it: the session is sampled before any test and stopped only if it changed.
+const rootBrokerPidBeforeRun = readRootBrokerPid();
+
+function readRootBrokerPid() {
+  try {
+    return loadBrokerSession(ROOT)?.pid ?? null;
+  } catch {
+    return null;
+  }
+}
+
 after(() => {
-  cleanupTempWorkspaces([ROOT]);
+  const rootBrokerPidAfterRun = readRootBrokerPid();
+  const startedRootBroker =
+    rootBrokerPidAfterRun !== null && rootBrokerPidAfterRun !== rootBrokerPidBeforeRun;
+
+  cleanupTempWorkspaces(startedRootBroker ? [ROOT] : []);
 });
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
