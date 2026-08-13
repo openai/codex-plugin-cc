@@ -4,7 +4,11 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 
-import { loadBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import {
+  clearBrokerSession,
+  loadBrokerSession,
+  teardownBrokerSession
+} from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
 
 /**
@@ -20,12 +24,17 @@ export function makeTempDir(prefix = "codex-plugin-test-") {
 }
 
 /**
- * Stop the broker registered for a workspace, if one is still running.
+ * Stop the broker registered for a workspace, if one is still running, and
+ * clear its session so nothing later reads a dead PID.
  *
  * The broker is deliberately long-lived so it can be reused across companion
  * invocations, which means nothing in a test run ever shuts it down. Each test
  * that runs the companion therefore leaves a broker and its app-server child
  * behind for the lifetime of the machine.
+ *
+ * The session file has to go too. It records a bare PID, so leaving it behind
+ * for a stable workspace such as the repository root means a later run can read
+ * it and signal whatever process has since inherited that PID.
  */
 export function stopBrokerFor(cwd) {
   let session = null;
@@ -35,8 +44,27 @@ export function stopBrokerFor(cwd) {
     return;
   }
 
-  if (session && Number.isFinite(session.pid)) {
-    terminateProcessTree(session.pid);
+  if (!session) {
+    return;
+  }
+
+  try {
+    teardownBrokerSession({
+      endpoint: session.endpoint ?? null,
+      pidFile: session.pidFile ?? null,
+      logFile: session.logFile ?? null,
+      sessionDir: session.sessionDir ?? null,
+      pid: Number.isFinite(session.pid) ? session.pid : null,
+      killProcess: (pid) => terminateProcessTree(pid)
+    });
+  } catch {
+    // Best effort: teardown must never fail the suite.
+  }
+
+  try {
+    clearBrokerSession(cwd);
+  } catch {
+    // Best effort.
   }
 }
 
