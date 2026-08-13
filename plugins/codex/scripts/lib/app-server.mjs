@@ -22,6 +22,64 @@ const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"))
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
 
+/**
+ * Server-initiated request Codex uses to gate MCP tool calls. The same method
+ * also carries ordinary form and URL elicitations from configured MCP servers.
+ * See `ServerRequest` in `codex-rs/app-server-protocol`.
+ */
+export const MCP_ELICITATION_REQUEST_METHOD = "mcpServer/elicitation/request";
+
+/**
+ * Discriminator that marks a privileged Codex approval rather than a plain MCP
+ * elicitation. See `APPROVAL_KIND_KEY` / `APPROVAL_KIND_MCP_TOOL_CALL` in
+ * `codex-rs/protocol/src/mcp_approval_meta.rs`.
+ */
+const APPROVAL_KIND_KEY = "codex_approval_kind";
+const APPROVAL_KIND_MCP_TOOL_CALL = "mcp_tool_call";
+
+/** @param {unknown} meta */
+function isMcpToolCallApproval(meta) {
+  return (
+    typeof meta === "object" &&
+    meta !== null &&
+    meta[APPROVAL_KIND_KEY] === APPROVAL_KIND_MCP_TOOL_CALL
+  );
+}
+
+/**
+ * Build the reply to a server-initiated request.
+ *
+ * Codex gates MCP tool calls behind an MCP elicitation rather than the
+ * exec/patch approval channel, so the `approvalPolicy: "never"` that every
+ * thread started by this client already declares does not cover them.
+ * Replying with an error leaves the elicitation unresolved, and core maps that
+ * to `ReviewDecision::Abort`, surfaced as "user rejected MCP tool call". Runs
+ * driven by this client are headless, so no one can accept interactively and
+ * every MCP tool call would fail. Accept those explicitly.
+ *
+ * The same method also delivers ordinary form and URL elicitations from
+ * configured MCP servers. A headless client cannot render a form or complete a
+ * URL flow, so accepting one with empty content would hand the server bogus
+ * consent or invalid input. Decline those instead, which is a valid protocol
+ * answer and lets the server fail cleanly.
+ *
+ * @param {{ id: unknown, method?: string, params?: { _meta?: unknown } }} message
+ */
+export function buildServerRequestResponse(message) {
+  if (message.method === MCP_ELICITATION_REQUEST_METHOD) {
+    const action = isMcpToolCallApproval(message.params?._meta) ? "accept" : "decline";
+    return {
+      id: message.id,
+      result: { action, content: null, _meta: null }
+    };
+  }
+
+  return {
+    id: message.id,
+    error: buildJsonRpcError(-32601, `Unsupported server request: ${message.method}`)
+  };
+}
+
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
   title: "Codex Plugin",
@@ -154,10 +212,7 @@ class AppServerClientBase {
   }
 
   handleServerRequest(message) {
-    this.sendMessage({
-      id: message.id,
-      error: buildJsonRpcError(-32601, `Unsupported server request: ${message.method}`)
-    });
+    this.sendMessage(buildServerRequestResponse(message));
   }
 
   handleExit(error) {
