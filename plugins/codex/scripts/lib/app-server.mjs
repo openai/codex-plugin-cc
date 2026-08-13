@@ -22,6 +22,39 @@ const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"))
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
 
+/**
+ * Server-initiated request Codex uses to gate MCP tool calls.
+ * See `ServerRequest` in `codex-rs/app-server-protocol`.
+ */
+export const MCP_ELICITATION_REQUEST_METHOD = "mcpServer/elicitation/request";
+
+/**
+ * Build the reply to a server-initiated request.
+ *
+ * Codex gates MCP tool calls behind an MCP elicitation rather than the
+ * exec/patch approval channel, so the `approvalPolicy: "never"` that every
+ * thread started by this client already declares does not cover them.
+ * Replying with an error leaves the elicitation unresolved, and core maps that
+ * to `ReviewDecision::Abort`, surfaced as "user rejected MCP tool call". Runs
+ * driven by this client are headless, so no one can accept interactively and
+ * every MCP tool call would fail. Accept explicitly instead.
+ *
+ * @param {{ id: unknown, method?: string }} message
+ */
+export function buildServerRequestResponse(message) {
+  if (message.method === MCP_ELICITATION_REQUEST_METHOD) {
+    return {
+      id: message.id,
+      result: { action: "accept", content: null, _meta: null }
+    };
+  }
+
+  return {
+    id: message.id,
+    error: buildJsonRpcError(-32601, `Unsupported server request: ${message.method}`)
+  };
+}
+
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
   title: "Codex Plugin",
@@ -154,10 +187,7 @@ class AppServerClientBase {
   }
 
   handleServerRequest(message) {
-    this.sendMessage({
-      id: message.id,
-      error: buildJsonRpcError(-32601, `Unsupported server request: ${message.method}`)
-    });
+    this.sendMessage(buildServerRequestResponse(message));
   }
 
   handleExit(error) {
