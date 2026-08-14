@@ -263,6 +263,8 @@ function describeStartedItem(state, item) {
     }
     case "webSearch":
       return { message: `Searching: ${shorten(item.query, 96)}`, phase: "investigating" };
+    case "reasoning":
+      return { message: "Thinking.", phase: null };
     default:
       return null;
   }
