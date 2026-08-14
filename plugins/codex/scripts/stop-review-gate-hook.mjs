@@ -13,7 +13,10 @@ import { sortJobsNewestFirst } from "./lib/job-control.mjs";
 import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
-const STOP_REVIEW_TIMEOUT_MS = 15 * 60 * 1000;
+// The companion enforces the real deadline; this outer guard only exists as a
+// backstop and stays a minute longer than the workload it wraps.
+const STOP_REVIEW_EXECUTION_TIMEOUT_MS = 14 * 60 * 1000;
+const STOP_REVIEW_TIMEOUT_MS = STOP_REVIEW_EXECUTION_TIMEOUT_MS + 60 * 1000;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
@@ -102,12 +105,16 @@ function runStopReview(cwd, input = {}) {
     ...process.env,
     ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {})
   };
-  const result = spawnSync(process.execPath, [scriptPath, "task", "--json", prompt], {
-    cwd,
-    env: childEnv,
-    encoding: "utf8",
-    timeout: STOP_REVIEW_TIMEOUT_MS
-  });
+  const result = spawnSync(
+    process.execPath,
+    [scriptPath, "task", "--json", "--timeout-ms", String(STOP_REVIEW_EXECUTION_TIMEOUT_MS), prompt],
+    {
+      cwd,
+      env: childEnv,
+      encoding: "utf8",
+      timeout: STOP_REVIEW_TIMEOUT_MS
+    }
+  );
 
   if (result.error?.code === "ETIMEDOUT") {
     return {

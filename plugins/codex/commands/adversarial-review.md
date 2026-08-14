@@ -38,7 +38,8 @@ Argument handling:
 - Preserve the user's arguments exactly.
 - Do not strip `--wait` or `--background` yourself.
 - Do not weaken the adversarial framing or rewrite the user's focus text.
-- The companion script parses `--wait` and `--background`, but Claude Code's `Bash(..., run_in_background: true)` is what actually detaches the run.
+- The companion script owns detachment: `--background` spawns its own worker, returns a job id immediately, and keeps running even if this shell exits.
+- The companion also owns queueing and the execution deadline. Pass `--timeout-ms <ms>` to change the deadline; keep any outer Bash timeout at least 60s longer than it.
 - `/codex:adversarial-review` uses the same review target selection as `/codex:review`.
 - It supports working-tree review, branch review, and `--base <ref>`.
 - It does not support `--scope staged` or `--scope unstaged`.
@@ -54,7 +55,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" adversarial-review "$AR
 - Do not fix any issues mentioned in the review output.
 
 Background flow:
-- Launch the review with `Bash` in the background:
+- Launch the review with `Bash`. The companion detaches its own worker, so this call returns a job id straight away:
 ```typescript
 Bash({
   command: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" adversarial-review "$ARGUMENTS"`,
@@ -62,5 +63,7 @@ Bash({
   run_in_background: true
 })
 ```
+- `run_in_background: true` is a convenience only; the review's lifetime no longer depends on it.
 - Do not call `BashOutput` or wait for completion in this turn.
 - After launching the command, tell the user: "Codex adversarial review started in the background. Check `/codex:status` for progress."
+- Once it finishes, `/codex:result <id>` returns the bounded verdict envelope and `/codex:result <id> --full` returns the complete review.

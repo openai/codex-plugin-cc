@@ -265,6 +265,14 @@ test("result returns the bounded envelope by default and the full answer with --
   assert.equal(envelope.verdict, "needs-attention");
 });
 
+test("the stop-gate review runs under its own deadline inside a longer hook guard", () => {
+  const source = fs.readFileSync(path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs"), "utf8");
+
+  assert.match(source, /STOP_REVIEW_EXECUTION_TIMEOUT_MS = 14 \* 60 \* 1000/);
+  assert.match(source, /"--timeout-ms", String\(STOP_REVIEW_EXECUTION_TIMEOUT_MS\)/);
+  assert.match(source, /STOP_REVIEW_TIMEOUT_MS = STOP_REVIEW_EXECUTION_TIMEOUT_MS \+ 60 \* 1000/);
+});
+
 test("no plugin-owned codex exec launch site inherits the parent stdin", () => {
   const scriptsDir = path.join(PLUGIN_ROOT, "scripts");
   const files = fs

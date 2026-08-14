@@ -32,8 +32,10 @@ test("review command uses AskUserQuestion and background Bash while staying revi
   assert.match(source, /Treat untracked files or directories as reviewable work/i);
   assert.match(source, /Recommend waiting only when the review is clearly tiny, roughly 1-2 files total/i);
   assert.match(source, /In every other case, including unclear size, recommend background/i);
-  assert.match(source, /The companion script parses `--wait` and `--background`/i);
-  assert.match(source, /Claude Code's `Bash\(..., run_in_background: true\)` is what actually detaches the run/i);
+  assert.match(source, /The companion script owns detachment/i);
+  assert.match(source, /returns a job id immediately, and keeps running even if this shell exits/i);
+  assert.match(source, /--timeout-ms <ms>/);
+  assert.equal(/is what actually detaches the run/i.test(source), false);
   assert.match(source, /When in doubt, run the review/i);
   assert.match(source, /\(Recommended\)/);
   assert.match(source, /does not support staged-only review, unstaged-only review, or extra focus text/i);
@@ -60,8 +62,10 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /Treat untracked files or directories as reviewable work/i);
   assert.match(source, /Recommend waiting only when the scoped review is clearly tiny, roughly 1-2 files total/i);
   assert.match(source, /In every other case, including unclear size, recommend background/i);
-  assert.match(source, /The companion script parses `--wait` and `--background`/i);
-  assert.match(source, /Claude Code's `Bash\(..., run_in_background: true\)` is what actually detaches the run/i);
+  assert.match(source, /The companion script owns detachment/i);
+  assert.match(source, /returns a job id immediately, and keeps running even if this shell exits/i);
+  assert.match(source, /--timeout-ms <ms>/);
+  assert.equal(/is what actually detaches the run/i.test(source), false);
   assert.match(source, /When in doubt, run the review/i);
   assert.match(source, /\(Recommended\)/);
   assert.match(source, /uses the same review target selection as `\/codex:review`/i);
@@ -152,7 +156,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /Strip it before calling `task`/i);
   assert.match(runtimeSkill, /`--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`/i);
   assert.match(runtimeSkill, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
-  assert.match(runtimeSkill, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
+  assert.match(runtimeSkill, /If the Bash call fails or Codex cannot be invoked, return the failure envelope/i);
   assert.match(readme, /`codex:codex-rescue` subagent/i);
   assert.match(readme, /if you do not pass `--model` or `--effort`, Codex chooses its own defaults/i);
   assert.match(readme, /--model gpt-5\.6-luna --effort medium/i);
@@ -200,6 +204,58 @@ test("internal docs use task terminology for rescue runs", () => {
   assert.match(promptRecipes, /Use these as starting templates for Codex task prompts/i);
   assert.match(promptRecipes, /## Diagnosis/);
   assert.match(promptRecipes, /## Narrow Fix/);
+});
+
+test("runtime docs point one-shot judgments at consult instead of raw codex exec", () => {
+  const runtimeSkill = read("skills/codex-cli-runtime/SKILL.md");
+
+  assert.match(runtimeSkill, /The companion owns queueing and deadlines/i);
+  assert.match(runtimeSkill, /outer Bash timeout at least 60s longer than the companion's internal deadline/i);
+  assert.match(runtimeSkill, /never uses raw `codex exec`/i);
+  assert.match(runtimeSkill, /codex-companion\.mjs" consult --prompt-file "<absolute-prompt-path>"/);
+  assert.match(runtimeSkill, /--timeout-ms 420000/);
+  assert.match(runtimeSkill, /< \/dev\/null/);
+  assert.match(runtimeSkill, /returns a normalized failure envelope, not nothing/i);
+  assert.match(runtimeSkill, /Never return silence/i);
+  assert.equal(/return nothing\./i.test(runtimeSkill), false);
+});
+
+test("result command documents the bounded envelope and the full-output escape hatch", () => {
+  const result = read("commands/result.md");
+
+  assert.match(result, /bounded result envelope/i);
+  assert.match(result, /severity tally/i);
+  assert.match(result, /result <job-id> --full/);
+  assert.match(result, /`--json` returns the same envelope as JSON/);
+  assert.match(result, /Never report it as an approval/i);
+});
+
+test("every documented codex exec invocation closes stdin and states a deadline", () => {
+  const docRoots = ["commands", "skills", "prompts", "agents"];
+  const offenders = [];
+
+  for (const root of docRoots) {
+    const dir = path.join(PLUGIN_ROOT, root);
+    if (!fs.existsSync(dir)) {
+      continue;
+    }
+    for (const entry of fs.readdirSync(dir, { recursive: true })) {
+      const file = path.join(dir, String(entry));
+      if (!file.endsWith(".md") || !fs.statSync(file).isFile()) {
+        continue;
+      }
+      const source = fs.readFileSync(file, "utf8");
+      const invokesRawExec = /^\s*(cd .*&&\s*)?codex exec /m.test(source);
+      if (!invokesRawExec) {
+        continue;
+      }
+      if (!/< \/dev\/null/.test(source) || !/timeout/i.test(source)) {
+        offenders.push(path.relative(PLUGIN_ROOT, file));
+      }
+    }
+  }
+
+  assert.deepEqual(offenders, []);
 });
 
 test("hooks keep session-end cleanup and stop gating enabled", () => {

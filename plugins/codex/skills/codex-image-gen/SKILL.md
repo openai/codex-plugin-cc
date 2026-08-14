@@ -11,14 +11,20 @@ native image-generation tool, exposed headlessly through `codex exec`.
 ## Invocation contract
 
 ```
-cd <target-dir> && codex exec -m gpt-5.6-sol --sandbox workspace-write \
+codex exec -C <absolute-target-dir> -m gpt-5.6-sol --sandbox workspace-write \
   [--skip-git-repo-check] \
-  "<image brief>. Save as <name>.png in the current directory. Reply DONE when written."
+  "<image brief>. Save as <name>.png in the current directory. Reply DONE when written." \
+  < /dev/null
 ```
 
 - `--sandbox workspace-write` is REQUIRED. The default sandbox is read-only and
   cannot save into the workspace.
-- Run with cwd = the directory that should receive the files.
+- Use absolute paths for the target directory, every reference image, and every
+  brief file.
+- Always redirect stdin from `/dev/null`. An inherited open stdin makes Codex wait
+  for EOF that never comes.
+- Always give the Bash call an explicit timeout of about 1800000ms; image runs have
+  no internal deadline of their own.
 - `--skip-git-repo-check` when the cwd is not a git repo (scratchpads, temp dirs).
 - Mechanics: images land first in `~/.codex/generated_images/<uuid>/*.png`; the
   model then copies them into the cwd — so ALWAYS specify exact output filenames.

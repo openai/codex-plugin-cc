@@ -11,6 +11,15 @@ Use this skill only inside the `codex:codex-rescue` subagent.
 Primary helper:
 - `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task "<raw arguments>"`
 
+Runtime contract:
+- The companion owns queueing and deadlines. Every workload joins one user-global FIFO queue with a single Codex slot, and every run carries its own execution deadline (`--timeout-ms`, default 1800000 for `task`).
+- A foreground call must use an outer Bash timeout at least 60s longer than the companion's internal deadline, so the wrapper's own normalization is what reports a timeout.
+- Review and one-shot second-opinion work never uses raw `codex exec`. Use `review` / `adversarial-review`, or the stateless read-only entry point for a one-shot judgment:
+  `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" consult --prompt-file "<absolute-prompt-path>" --cwd "<absolute-project-path>" --model gpt-5.6-luna --effort high --timeout-ms 420000 --json < /dev/null`
+- `consult` takes its prompt only from an absolute `--prompt-file`, ignores inherited stdin, is read-only, works outside a Git repository, and returns a bounded envelope. A `verdict` of `inconclusive` means timeout, launch failure, or unparseable output — never an approval.
+- A failed companion call returns a normalized failure envelope, not nothing. Empty output would make an exit 143/144 indistinguishable from a routing failure.
+- All documented invocations use absolute paths and an explicit deadline.
+
 Execution rules:
 - The rescue subagent is a forwarder, not an orchestrator. Its only job is to invoke `task` once and return that stdout unchanged.
 - Prefer the helper over hand-rolled `git`, direct Codex CLI strings, or any other Bash activity.
@@ -40,4 +49,4 @@ Safety rules:
 - Preserve the user's task text as-is apart from stripping routing flags.
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own.
 - Return the stdout of the `task` command exactly as-is.
-- If the Bash call fails or Codex cannot be invoked, return nothing.
+- If the Bash call fails or Codex cannot be invoked, return the failure envelope the companion printed, or — if there was no output at all — one line naming the command, its exit code, and that no Codex result was produced. Never return silence.
