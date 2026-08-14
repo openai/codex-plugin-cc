@@ -65,7 +65,7 @@ function buildThreadParams(cwd, options = {}) {
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
-    sandbox: options.sandbox ?? "read-only",
+    sandbox: options.sandbox ?? null,
     serviceName: SERVICE_NAME,
     ephemeral: options.ephemeral ?? true
   };
@@ -78,8 +78,17 @@ function buildResumeParams(threadId, cwd, options = {}) {
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
-    sandbox: options.sandbox ?? "read-only"
+    sandbox: options.sandbox ?? null
   };
+}
+
+function enforceReadOnlySandbox(requestedSandbox, resolvedSandbox) {
+  if (requestedSandbox !== "read-only" || resolvedSandbox?.type === "readOnly") {
+    return;
+  }
+  throw new Error(
+    "A read-only sandbox was requested, but the Codex app-server kept a write-capable sandbox for this thread. Refusing to start the turn. Rerun without a resume flag to start a fresh thread, or drop --read-only."
+  );
 }
 
 /** @returns {UserInput[]} */
@@ -1099,27 +1108,27 @@ export async function runAppServerTurn(cwd, options = {}) {
   }
 
   return withAppServer(cwd, async (client) => {
-    let threadId;
+    let response;
 
     if (options.resumeThreadId) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
-      const response = await resumeThread(client, options.resumeThreadId, cwd, {
+      response = await resumeThread(client, options.resumeThreadId, cwd, {
         model: options.model,
         sandbox: options.sandbox,
         ephemeral: false
       });
-      threadId = response.thread.id;
     } else {
       emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
-      const response = await startThread(client, cwd, {
+      response = await startThread(client, cwd, {
         model: options.model,
         sandbox: options.sandbox,
         ephemeral: options.persistThread ? false : true,
         threadName: options.persistThread ? options.threadName : options.threadName ?? null
       });
-      threadId = response.thread.id;
     }
 
+    enforceReadOnlySandbox(options.sandbox, response.sandbox);
+    const threadId = response.thread.id;
     emitProgress(options.onProgress, `Thread ready (${threadId}).`, "starting", {
       threadId
     });
@@ -1146,6 +1155,7 @@ export async function runAppServerTurn(cwd, options = {}) {
     return {
       status: buildResultStatus(turnState),
       threadId,
+      sandbox: response.sandbox ?? null,
       turnId: turnState.turnId,
       finalMessage: turnState.lastAgentMessage,
       reasoningSummary: turnState.reasoningSummary,
