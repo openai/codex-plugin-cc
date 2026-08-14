@@ -15,6 +15,16 @@ const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
+const FAKE_RESOLVED_SETTINGS = {
+  model: "gpt-5.4",
+  modelProvider: "openai",
+  reasoningEffort: null,
+  sandbox: {
+    type: "readOnly",
+    access: { type: "fullAccess" },
+    networkAccess: false
+  }
+};
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   const start = Date.now();
@@ -26,6 +36,13 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
   throw new Error("Timed out waiting for condition.");
+}
+
+function readPersistedJob(workspaceRoot, jobId = null) {
+  const stateDir = resolveStateDir(workspaceRoot);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const resolvedJobId = jobId ?? state.jobs[0].id;
+  return JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${resolvedJobId}.json`), "utf8"));
 }
 
 test("setup reports ready when fake codex is installed and authenticated", () => {
@@ -155,6 +172,7 @@ test("review renders a no-findings result from app-server review/start", () => {
   assert.equal(result.status, 0);
   assert.match(result.stdout, /Reviewed uncommitted changes/);
   assert.match(result.stdout, /No material issues found/);
+  assert.deepEqual(readPersistedJob(repo).resolved, FAKE_RESOLVED_SETTINGS);
 });
 
 test("task runs when the active provider does not require OpenAI login", () => {
@@ -384,6 +402,7 @@ test("adversarial review renders structured findings over app-server turn/start"
 
   assert.equal(result.status, 0);
   assert.match(result.stdout, /Missing empty-state guard/);
+  assert.deepEqual(readPersistedJob(repo).resolved, FAKE_RESOLVED_SETTINGS);
 });
 
 test("adversarial review accepts the same base-branch targeting as review", () => {
@@ -501,6 +520,7 @@ test("task --resume-last resumes the latest persisted task thread", () => {
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
+  assert.deepEqual(readPersistedJob(repo).resolved, FAKE_RESOLVED_SETTINGS);
 });
 
 test("task-resume-candidate returns the latest rescue thread from the current session", () => {
@@ -767,7 +787,7 @@ test("task forwards model selection and reasoning effort to app-server turn/star
   const repo = makeTempDir();
   const binDir = makeTempDir();
   const statePath = path.join(binDir, "fake-codex-state.json");
-  installFakeCodex(binDir);
+  installFakeCodex(binDir, "resolved-effort");
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
   run("git", ["add", "README.md"], { cwd: repo });
@@ -782,6 +802,35 @@ test("task forwards model selection and reasoning effort to app-server turn/star
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(fakeState.lastTurnStart.model, "gpt-5.3-codex-spark");
   assert.equal(fakeState.lastTurnStart.effort, "low");
+  assert.deepEqual(readPersistedJob(repo).resolved, {
+    ...FAKE_RESOLVED_SETTINGS,
+    model: "gpt-5.3-codex-spark",
+    reasoningEffort: "low"
+  });
+});
+
+test("task preserves resolved settings when turn/start fails", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "turn-start-fails");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "--effort", "xhigh", "diagnose the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /turn\/start failed after thread resolution/);
+  const storedJob = readPersistedJob(repo);
+  assert.equal(storedJob.status, "failed");
+  assert.deepEqual(storedJob.resolved, FAKE_RESOLVED_SETTINGS);
+  const stateDir = resolveStateDir(repo);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.deepEqual(state.jobs[0].resolved, FAKE_RESOLVED_SETTINGS);
 });
 
 test("task logs reasoning summaries and assistant messages to the job log", () => {
@@ -939,6 +988,18 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.equal(launchPayload.status, "queued");
   assert.match(launchPayload.jobId, /^task-/);
 
+  const runningJob = await waitFor(() => {
+    try {
+      const storedJob = readPersistedJob(repo, launchPayload.jobId);
+      return storedJob.status === "running" && storedJob.resolved ? storedJob : null;
+    } catch {
+      return null;
+    }
+  });
+  assert.deepEqual(runningJob.resolved, FAKE_RESOLVED_SETTINGS);
+  const runningState = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "state.json"), "utf8"));
+  assert.deepEqual(runningState.jobs.find((job) => job.id === launchPayload.jobId).resolved, FAKE_RESOLVED_SETTINGS);
+
   const waitedStatus = run(
     "node",
     [SCRIPT, "status", launchPayload.jobId, "--wait", "--timeout-ms", "15000", "--json"],
@@ -966,6 +1027,8 @@ test("task --background enqueues a detached worker and exposes per-job status", 
 
   assert.equal(resultPayload.job.id, launchPayload.jobId);
   assert.equal(resultPayload.job.status, "completed");
+  assert.deepEqual(resultPayload.job.resolved, FAKE_RESOLVED_SETTINGS);
+  assert.deepEqual(resultPayload.storedJob.resolved, FAKE_RESOLVED_SETTINGS);
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
 });
 
