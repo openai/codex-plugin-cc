@@ -293,6 +293,7 @@ test("a huge review stays bounded on stdout in both text and JSON mode", () => {
 
   const asJson = run("node", [SCRIPT, "review", "--json"], { cwd: repo, env });
   assert.equal(asJson.status, 0, asJson.stderr);
+  // Measured on what is actually written to stdout, pretty-printing included.
   assert.equal(
     Buffer.byteLength(asJson.stdout, "utf8") < MAX_ENVELOPE_STDOUT_BYTES,
     true,
@@ -313,6 +314,27 @@ test("a huge review stays bounded on stdout in both text and JSON mode", () => {
   );
 });
 
+test("a structured built-in review is parsed into the envelope", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "structured-native-review");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "app.js"), "const a = 1;\n");
+  run("git", ["add", "app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "app.js"), "const a = 2;\n");
+
+  const review = run("node", [SCRIPT, "review", "--json"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(review.status, 0, review.stderr);
+
+  const envelope = JSON.parse(review.stdout).envelope;
+  assert.equal(envelope.verdict, "needs-attention");
+  assert.equal(envelope.structured, true);
+  assert.equal(envelope.finding_count, 1);
+  assert.deepEqual(envelope.severity_tally, { critical: 0, high: 0, medium: 1, low: 0 });
+  assert.equal(envelope.findings_preview[0].file, "app.js");
+});
+
 test("a background task keeps the deadline it was given", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -330,6 +352,26 @@ test("a background task keeps the deadline it was given", () => {
   const stateDir = resolveStateDir(repo);
   const stored = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${jobId}.json`), "utf8"));
   assert.equal(stored.request.timeoutMs, 123456);
+});
+
+test("a background task carries its queue wait budget too", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+
+  const launched = run(
+    "node",
+    [SCRIPT, "task", "--background", "--queue-wait-ms", "45000", "--json", "look into the flake"],
+    { cwd: repo, env }
+  );
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+
+  const stateDir = resolveStateDir(repo);
+  const stored = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${jobId}.json`), "utf8"));
+  assert.equal(stored.request.queueWaitMs, 45000);
 });
 
 test("a consult that cannot launch persists its inconclusive envelope", () => {

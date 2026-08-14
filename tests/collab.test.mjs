@@ -3,7 +3,7 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { makeTempDir, run } from "./helpers.mjs";
+import { makeTempDir, run, writeExecutable } from "./helpers.mjs";
 
 const COLLAB_CLI = path.resolve("plugins/codex/scripts/collab.mjs");
 
@@ -81,6 +81,41 @@ test("assign creates a worktree, branch, and registry entry", () => {
   assert.equal(assignments["fix-auth"].base, "main");
   const duplicate = collab(repo, ["assign", "--agent", "claude", "--issue", "fix-auth"]);
   assert.notEqual(duplicate.status, 0);
+});
+
+test("a successful codex run is reported as success, not failure", () => {
+  const repo = makeRepo();
+  const binDir = makeTempDir();
+  const schedulerDir = makeTempDir("codex-collab-scheduler-");
+  writeExecutable(
+    path.join(binDir, "codex"),
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const outputIndex = args.indexOf("-o");
+if (outputIndex >= 0) {
+  fs.writeFileSync(args[outputIndex + 1], "Implemented the change.\\n");
+}
+console.log("session id: 11111111-2222-3333-4444-555555555555");
+process.exit(0);
+`
+  );
+  collab(repo, ["assign", "--agent", "codex", "--issue", "add-guard", "--title", "Add guard"]);
+
+  const result = run("node", [COLLAB_CLI, "run", "--issue", "add-guard", "--prompt", "add the guard"], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      PATH: `${binDir}:${process.env.PATH}`,
+      CODEX_COMPANION_SCHEDULER_DIR: schedulerDir
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Implemented the change\./);
+  assert.doesNotMatch(result.stderr, /codex exec failed/);
+  const assignments = JSON.parse(fs.readFileSync(path.join(repo, ".codex-claude", "assignments.json"), "utf8"));
+  assert.deepEqual(assignments["add-guard"].sessions, ["11111111-2222-3333-4444-555555555555"]);
 });
 
 test("merge requires an approving review from the non-author agent", () => {

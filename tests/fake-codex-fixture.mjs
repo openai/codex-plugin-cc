@@ -181,6 +181,25 @@ function emitTurnCompletedLater(threadId, turnId, item, delayMs) {
 }
 
 function nativeReviewText(target) {
+  if (BEHAVIOR === "structured-native-review") {
+    return JSON.stringify({
+      verdict: "needs-attention",
+      summary: "The built-in reviewer returned a structured result.",
+      findings: [
+        {
+          severity: "medium",
+          title: "Unchecked index access",
+          body: "The change indexes a collection that can be empty.",
+          file: "app.js",
+          line_start: 1,
+          line_end: 1,
+          confidence: 0.8,
+          recommendation: "Guard the empty case."
+        }
+      ],
+      next_steps: ["Add a regression test."]
+    });
+  }
   if (BEHAVIOR === "huge-review") {
     return "Reviewed uncommitted changes.\\n" + "detail line about the change under review. ".repeat(20000);
   }

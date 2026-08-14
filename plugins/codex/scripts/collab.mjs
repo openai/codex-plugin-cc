@@ -420,8 +420,8 @@ async function cmdRun(mainRoot, flags) {
     assignment.sessions.push(sessionMatch[1]);
     writeJson(paths.assignments, assignments);
   }
-  if (result.status !== 0) {
-    fail(`codex exec failed (exit ${result.status}); see ${logFile}`);
+  if (result.exitCode !== 0) {
+    fail(`codex exec failed (exit ${result.exitCode}); see ${logFile}`);
   }
   const finalMessage = fs.existsSync(finalFile) ? fs.readFileSync(finalFile, "utf8").trim() : "(no final message)";
   console.log(finalMessage);

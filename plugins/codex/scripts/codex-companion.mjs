@@ -24,7 +24,13 @@ import {
     runAppServerReview,
     runAppServerTurn
   } from "./lib/codex.mjs";
-import { buildResultEnvelope, MAX_ENVELOPE_STDOUT_BYTES, renderResultEnvelope } from "./lib/envelope.mjs";
+import {
+  buildResultEnvelope,
+  emittedJsonBytes,
+  MAX_ENVELOPE_STDOUT_BYTES,
+  renderResultEnvelope,
+  validateStructuredResult
+} from "./lib/envelope.mjs";
 import { cancelQueuedWorkload, readSchedulerSnapshot } from "./lib/scheduler.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
@@ -205,6 +211,38 @@ function storeFinalOutput(workspaceRoot, jobId, text) {
   const finalOutputPath = resolveJobFinalOutputFile(workspaceRoot, jobId);
   fs.writeFileSync(finalOutputPath, `${String(text ?? "").trimEnd()}\n`, "utf8");
   return finalOutputPath;
+}
+
+function extractJsonBlock(text) {
+  const trimmed = String(text ?? "").trim();
+  if (!trimmed) {
+    return null;
+  }
+  if (trimmed.startsWith("{")) {
+    return trimmed;
+  }
+  const fenced = trimmed.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/i);
+  return fenced ? fenced[1].trim() : null;
+}
+
+/**
+ * The app-server types give the built-in reviewer's output as a plain string
+ * (ThreadItem `exitedReviewMode.review`), and `review/start` takes no output
+ * schema, so there is no structured verdict to read. When the reviewer does put
+ * a JSON result in that string, parse it for real; otherwise report an absent
+ * verdict rather than guessing one from prose.
+ */
+function parseNativeReviewOutput(reviewText) {
+  const block = extractJsonBlock(reviewText);
+  if (!block) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(block);
+    return validateStructuredResult(parsed) === null ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 function jobStatusForExecution({ timedOut, exitStatus }) {
@@ -461,14 +499,16 @@ async function executeReviewRun(request) {
     );
     const jobStatus = jobStatusForExecution({ timedOut: result.timedOut, exitStatus: result.status });
     const finalOutputPath = storeFinalOutput(workspaceRoot, request.jobId, fullText);
+    // Parse the reviewer's output when it carries a structured result; when it
+    // answers in prose the verdict is absent by design, which is not the same
+    // as a failed or unparseable run.
+    const parsedNative = result.timedOut ? null : parseNativeReviewOutput(result.reviewText);
     const envelope = buildResultEnvelope({
       jobId: request.jobId ?? null,
       kind: "review",
       status: jobStatus,
-      // The built-in reviewer answers in prose: the verdict is absent by design,
-      // which is not the same as a failed or unparseable run.
-      parsed: null,
-      unstructuredKind: !result.timedOut,
+      parsed: parsedNative,
+      unstructuredKind: !parsedNative && !result.timedOut,
       parseError: result.timedOut ? "The review deadline expired before Codex finished." : null,
       summaryText: result.reviewText,
       rawOutput: result.reviewText,
@@ -805,7 +845,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId, timeoutMs, noWait }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId, timeoutMs, queueWaitMs, noWait }) {
   return {
     cwd,
     model,
@@ -815,6 +855,7 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId
     resumeLast,
     jobId,
     timeoutMs,
+    queueWaitMs,
     noWait
   };
 }
@@ -876,9 +917,9 @@ function boundedPayload(execution) {
     return payload;
   }
   // JSON mode carries the same budget as text mode: review payloads embed the
-  // whole transcript, so oversized ones collapse to the envelope.
-  const size = Buffer.byteLength(JSON.stringify(payload ?? null), "utf8");
-  return size <= MAX_ENVELOPE_STDOUT_BYTES ? payload : execution.envelope;
+  // whole transcript, so oversized ones collapse to the envelope. Measured on
+  // the pretty-printed form, because that is what gets written to stdout.
+  return emittedJsonBytes(payload ?? null) <= MAX_ENVELOPE_STDOUT_BYTES ? payload : execution.envelope;
 }
 
 async function runForegroundCommand(job, runner, options = {}) {
@@ -1026,6 +1067,7 @@ async function handleTask(argv) {
   }
   const write = Boolean(options.write);
   const timeoutMs = normalizeTimeoutMs(options["timeout-ms"], DEFAULT_TASK_TIMEOUT_MS);
+  const queueWaitMs = options["queue-wait-ms"] ? Number(options["queue-wait-ms"]) : null;
   const taskMetadata = buildTaskRunMetadata({
     prompt,
     resumeLast
@@ -1045,6 +1087,7 @@ async function handleTask(argv) {
       resumeLast,
       jobId: job.id,
       timeoutMs,
+      queueWaitMs,
       noWait: Boolean(options["no-wait"])
     });
     const { payload } = enqueueBackgroundJob(cwd, job, request);
@@ -1065,6 +1108,7 @@ async function handleTask(argv) {
         resumeLast,
         jobId: job.id,
         timeoutMs,
+        queueWaitMs,
         noWait: Boolean(options["no-wait"]),
         onProgress: progress
       }),
