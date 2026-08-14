@@ -43,6 +43,7 @@ import { readJsonFile } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
+import { acquireWorkloadLease } from "./scheduler.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
@@ -50,6 +51,12 @@ const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
 const EXTERNAL_AGENT_IMPORT_TIMEOUT_MS = 2 * 60 * 1000;
+const DEFAULT_INTERRUPT_GRACE_MS = 10000;
+
+export const DEFAULT_CONSULT_TIMEOUT_MS = 420000;
+export const DEFAULT_REVIEW_TIMEOUT_MS = 900000;
+export const DEFAULT_TASK_TIMEOUT_MS = 1800000;
+export const TIMED_OUT_EXIT_CODE = 124;
 
 function cleanCodexStderr(stderr) {
   return stderr
@@ -610,7 +617,26 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   }
 }
 
-async function withAppServer(cwd, fn) {
+const BROKER_BUSY_RETRY_DELAY_MS = 2000;
+const BROKER_BUSY_MAX_RETRIES = 5;
+
+/**
+ * A busy broker means another Codex workload owns it. Starting a second direct
+ * app-server would defeat the global one-workload-at-a-time policy, so busy is
+ * retried against the same broker; only a stale or unreachable broker falls back.
+ */
+export function shouldRetryWithDirectAppServer(error, { transport = null, brokerRequested = false } = {}) {
+  if (transport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE) {
+    return false;
+  }
+  return Boolean(brokerRequested) && (error?.code === "ENOENT" || error?.code === "ECONNREFUSED");
+}
+
+function isBrokerBusyError(error, transport) {
+  return transport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE;
+}
+
+async function withAppServer(cwd, fn, attempt = 0) {
   let client = null;
   try {
     client = await CodexAppServerClient.connect(cwd);
@@ -618,17 +644,23 @@ async function withAppServer(cwd, fn) {
     await client.close();
     return result;
   } catch (error) {
-    const brokerRequested = client?.transport === "broker" || Boolean(process.env[BROKER_ENDPOINT_ENV]);
-    const shouldRetryDirect =
-      (client?.transport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE) ||
-      (brokerRequested && (error?.code === "ENOENT" || error?.code === "ECONNREFUSED"));
+    const transport = client?.transport ?? null;
+    const brokerRequested = transport === "broker" || Boolean(process.env[BROKER_ENDPOINT_ENV]);
 
     if (client) {
       await client.close().catch(() => {});
       client = null;
     }
 
-    if (!shouldRetryDirect) {
+    if (isBrokerBusyError(error, transport)) {
+      if (attempt >= BROKER_BUSY_MAX_RETRIES) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, BROKER_BUSY_RETRY_DELAY_MS));
+      return withAppServer(cwd, fn, attempt + 1);
+    }
+
+    if (!shouldRetryWithDirectAppServer(error, { transport, brokerRequested })) {
       throw error;
     }
 
@@ -639,6 +671,71 @@ async function withAppServer(cwd, fn) {
       await directClient.close();
     }
   }
+}
+
+async function withWorkloadLease(lease, fn) {
+  if (!lease) {
+    return fn({ queueWaitMs: 0 });
+  }
+
+  const acquired = await acquireWorkloadLease(lease);
+  try {
+    return await fn({ queueWaitMs: acquired.queueWaitMs });
+  } finally {
+    acquired.release();
+  }
+}
+
+/**
+ * Run a turn under an execution deadline. On expiry the turn is interrupted
+ * (never silently dropped), partial output is preserved, and the caller learns
+ * the run timed out.
+ */
+async function captureTurnWithDeadline(client, threadId, startRequest, options = {}) {
+  const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 0;
+  let observedTurnId = null;
+  const captureOptions = {
+    ...options,
+    onResponse(response, state) {
+      observedTurnId = response?.turn?.id ?? observedTurnId;
+      options.onResponse?.(response, state);
+    }
+  };
+
+  const turnPromise = captureTurn(client, threadId, startRequest, captureOptions);
+  if (!timeoutMs) {
+    return { turnState: await turnPromise, timedOut: false };
+  }
+
+  let timer = null;
+  const expiry = new Promise((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), timeoutMs);
+  });
+
+  try {
+    const settled = await Promise.race([turnPromise.then((turnState) => ({ turnState })), expiry]);
+    if (settled !== "timeout") {
+      return { turnState: settled.turnState, timedOut: false };
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+
+  emitProgress(options.onProgress, `Execution deadline of ${timeoutMs}ms expired; interrupting the Codex turn.`, "timed-out");
+  if (observedTurnId) {
+    await client.request("turn/interrupt", { threadId, turnId: observedTurnId }).catch(() => {});
+  }
+
+  const graceMs = Number(options.interruptGraceMs) > 0 ? Number(options.interruptGraceMs) : DEFAULT_INTERRUPT_GRACE_MS;
+  const partial = await Promise.race([
+    turnPromise.catch(() => null),
+    new Promise((resolve) => {
+      const graceTimer = setTimeout(() => resolve(null), graceMs);
+      graceTimer.unref?.();
+    })
+  ]);
+
+  return { turnState: partial, timedOut: true, turnId: observedTurnId };
 }
 
 async function withDirectAppServer(cwd, fn) {
@@ -1005,7 +1102,7 @@ export async function runAppServerReview(cwd, options = {}) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
   }
 
-  return withAppServer(cwd, async (client) => {
+  return withWorkloadLease(options.lease, ({ queueWaitMs }) => withAppServer(cwd, async (client) => {
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
     const thread = await startThread(client, cwd, {
       model: options.model,
@@ -1019,7 +1116,7 @@ export async function runAppServerReview(cwd, options = {}) {
     });
     const delivery = options.delivery ?? "inline";
 
-    const turnState = await captureTurn(
+    const { turnState, timedOut, turnId } = await captureTurnWithDeadline(
       client,
       sourceThreadId,
       () =>
@@ -1029,6 +1126,8 @@ export async function runAppServerReview(cwd, options = {}) {
           target: options.target
         }),
       {
+        timeoutMs: options.timeoutMs,
+        interruptGraceMs: options.interruptGraceMs,
         onProgress: options.onProgress,
         onResponse(response, state) {
           if (response.reviewThreadId) {
@@ -1042,17 +1141,19 @@ export async function runAppServerReview(cwd, options = {}) {
     );
 
     return {
-      status: buildResultStatus(turnState),
-      threadId: turnState.threadId,
+      status: timedOut ? TIMED_OUT_EXIT_CODE : buildResultStatus(turnState),
+      timedOut,
+      queueWaitMs,
+      threadId: turnState?.threadId ?? sourceThreadId,
       sourceThreadId,
-      turnId: turnState.turnId,
-      reviewText: turnState.reviewText,
-      reasoningSummary: turnState.reasoningSummary,
-      turn: turnState.finalTurn,
-      error: turnState.error,
+      turnId: turnState?.turnId ?? turnId ?? null,
+      reviewText: turnState?.reviewText ?? "",
+      reasoningSummary: turnState?.reasoningSummary ?? [],
+      turn: turnState?.finalTurn ?? null,
+      error: turnState?.error ?? null,
       stderr: cleanCodexStderr(client.stderr)
     };
-  });
+  }));
 }
 
 export async function importExternalAgentSession(cwd, options = {}) {
@@ -1098,7 +1199,7 @@ export async function runAppServerTurn(cwd, options = {}) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
   }
 
-  return withAppServer(cwd, async (client) => {
+  return withWorkloadLease(options.lease, ({ queueWaitMs }) => withAppServer(cwd, async (client) => {
     let threadId;
 
     if (options.resumeThreadId) {
@@ -1129,7 +1230,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       throw new Error("A prompt is required for this Codex run.");
     }
 
-    const turnState = await captureTurn(
+    const { turnState, timedOut, turnId } = await captureTurnWithDeadline(
       client,
       threadId,
       () =>
@@ -1140,23 +1241,29 @@ export async function runAppServerTurn(cwd, options = {}) {
           effort: options.effort ?? null,
           outputSchema: options.outputSchema ?? null
         }),
-      { onProgress: options.onProgress }
+      {
+        timeoutMs: options.timeoutMs,
+        interruptGraceMs: options.interruptGraceMs,
+        onProgress: options.onProgress
+      }
     );
 
     return {
-      status: buildResultStatus(turnState),
+      status: timedOut ? TIMED_OUT_EXIT_CODE : buildResultStatus(turnState),
+      timedOut,
+      queueWaitMs,
       threadId,
-      turnId: turnState.turnId,
-      finalMessage: turnState.lastAgentMessage,
-      reasoningSummary: turnState.reasoningSummary,
-      turn: turnState.finalTurn,
-      error: turnState.error,
+      turnId: turnState?.turnId ?? turnId ?? null,
+      finalMessage: turnState?.lastAgentMessage ?? "",
+      reasoningSummary: turnState?.reasoningSummary ?? [],
+      turn: turnState?.finalTurn ?? null,
+      error: turnState?.error ?? null,
       stderr: cleanCodexStderr(client.stderr),
-      fileChanges: turnState.fileChanges,
-      touchedFiles: collectTouchedFiles(turnState.fileChanges),
-      commandExecutions: turnState.commandExecutions
+      fileChanges: turnState?.fileChanges ?? [],
+      touchedFiles: collectTouchedFiles(turnState?.fileChanges ?? []),
+      commandExecutions: turnState?.commandExecutions ?? []
     };
-  });
+  }));
 }
 
 export async function findLatestTaskThread(cwd) {
