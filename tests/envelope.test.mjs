@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   buildResultEnvelope,
   buildSeverityTally,
+  emittedJsonBytes,
   MAX_ENVELOPE_STDOUT_BYTES,
   MAX_FINDINGS_PREVIEW,
   renderResultEnvelope
@@ -16,7 +17,9 @@ function makeFindings(count, severity = "medium") {
     body: "Body",
     file: "src/app.js",
     line_start: index + 1,
-    line_end: index + 1
+    line_end: index + 1,
+    confidence: 0.5,
+    recommendation: "Fix it."
   }));
 }
 
@@ -64,7 +67,7 @@ test("a huge transcript still renders a bounded envelope on stdout", () => {
   });
 
   const rendered = renderResultEnvelope(envelope);
-  assert.equal(Buffer.byteLength(JSON.stringify(envelope), "utf8") < MAX_ENVELOPE_STDOUT_BYTES, true);
+  assert.equal(emittedJsonBytes(envelope) < MAX_ENVELOPE_STDOUT_BYTES, true, `emitted ${emittedJsonBytes(envelope)} bytes`);
   assert.equal(Buffer.byteLength(rendered, "utf8") < MAX_ENVELOPE_STDOUT_BYTES, true);
   assert.equal(envelope.summary.length <= 2000, true);
   assert.match(rendered, /Full result: \/tmp\/final\.md/);
@@ -98,6 +101,53 @@ test("a parsed object missing required fields is malformed, not an approval", ()
   assert.equal(valid.parse_error, undefined);
 });
 
+test("a finding must carry the whole documented shape, not just a severity", () => {
+  const complete = {
+    severity: "high",
+    title: "Missing empty-state guard",
+    body: "The change assumes data is always present.",
+    file: "src/app.js",
+    line_start: 4,
+    line_end: 6,
+    confidence: 0.87,
+    recommendation: "Handle empty collections before indexing."
+  };
+
+  const valid = buildResultEnvelope({
+    jobId: "j",
+    kind: "review",
+    status: "completed",
+    parsed: { verdict: "needs-attention", summary: "One issue.", findings: [complete], next_steps: [] }
+  });
+  assert.equal(valid.verdict, "needs-attention");
+  assert.equal(valid.structured, true);
+  assert.equal(valid.finding_count, 1);
+
+  const brokenFindings = [
+    { severity: "high", title: "only these two" },
+    { ...complete, body: undefined },
+    { ...complete, file: "" },
+    { ...complete, line_start: "4" },
+    { ...complete, line_end: 2 },
+    { ...complete, confidence: 1.5 },
+    { ...complete, confidence: undefined },
+    { ...complete, recommendation: undefined },
+    { ...complete, severity: "blocker" }
+  ];
+
+  for (const finding of brokenFindings) {
+    const envelope = buildResultEnvelope({
+      jobId: "j",
+      kind: "review",
+      status: "completed",
+      parsed: { verdict: "approve", summary: "Looks fine.", findings: [finding], next_steps: [] }
+    });
+    assert.equal(envelope.verdict, "inconclusive", JSON.stringify(finding));
+    assert.equal(envelope.structured, false, JSON.stringify(finding));
+    assert.match(envelope.parse_error, /^Finding 1 /);
+  }
+});
+
 test("the envelope stays inside its byte budget even with hostile field values", () => {
   const envelope = buildResultEnvelope({
     jobId: "review-3",
@@ -107,12 +157,14 @@ test("the envelope stays inside its byte budget even with hostile field values",
       verdict: "needs-attention",
       summary: "🙂".repeat(5000),
       findings: Array.from({ length: 40 }, (_, index) => ({
-        severity: "critical".repeat(50),
+        severity: "critical",
         title: "t".repeat(5000),
         body: "b",
         file: `src/${"nested-directory/".repeat(200)}file-${index}.ts`,
         line_start: index + 1,
-        line_end: index + 1
+        line_end: index + 1,
+        confidence: 0.5,
+        recommendation: "r".repeat(3000)
       })),
       next_steps: []
     },
@@ -120,7 +172,7 @@ test("the envelope stays inside its byte budget even with hostile field values",
     logPath: "/tmp/run.log"
   });
 
-  assert.equal(Buffer.byteLength(JSON.stringify(envelope), "utf8") < MAX_ENVELOPE_STDOUT_BYTES, true);
+  assert.equal(emittedJsonBytes(envelope) < MAX_ENVELOPE_STDOUT_BYTES, true, `emitted ${emittedJsonBytes(envelope)} bytes`);
   assert.equal(Buffer.byteLength(renderResultEnvelope(envelope), "utf8") < MAX_ENVELOPE_STDOUT_BYTES, true);
   assert.equal(Buffer.byteLength(envelope.summary, "utf8") <= 2000, true);
   for (const finding of envelope.findings_preview) {

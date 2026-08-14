@@ -46,26 +46,60 @@ export function validateStructuredResult(data) {
     return "Missing array `next_steps`.";
   }
 
-  const invalidIndex = data.findings.findIndex(
-    (finding) =>
-      !finding ||
-      typeof finding !== "object" ||
-      Array.isArray(finding) ||
-      typeof finding.severity !== "string" ||
-      !finding.severity.trim() ||
-      typeof finding.title !== "string" ||
-      !finding.title.trim()
-  );
-  if (invalidIndex >= 0) {
-    return `Finding ${invalidIndex + 1} is missing a string \`severity\` or \`title\`.`;
+  for (const [index, finding] of data.findings.entries()) {
+    const error = validateFinding(finding);
+    if (error) {
+      return `Finding ${index + 1} ${error}`;
+    }
   }
 
   return null;
 }
 
+/**
+ * The full finding shape from schemas/review-output.schema.json. A finding that
+ * names a severity and nothing else is not a finding this contract can report.
+ */
+function validateFinding(finding) {
+  if (!finding || typeof finding !== "object" || Array.isArray(finding)) {
+    return "is not an object.";
+  }
+  for (const field of ["severity", "title", "body", "file"]) {
+    if (typeof finding[field] !== "string" || !finding[field].trim()) {
+      return `is missing a non-empty string \`${field}\`.`;
+    }
+  }
+  if (!SEVERITIES.includes(finding.severity.trim().toLowerCase())) {
+    return `has severity "${finding.severity}", which is not one of ${SEVERITIES.join(", ")}.`;
+  }
+  for (const field of ["line_start", "line_end"]) {
+    if (!Number.isInteger(finding[field]) || finding[field] < 1) {
+      return `is missing a positive integer \`${field}\`.`;
+    }
+  }
+  if (finding.line_end < finding.line_start) {
+    return "has `line_end` before `line_start`.";
+  }
+  if (typeof finding.confidence !== "number" || !Number.isFinite(finding.confidence) || finding.confidence < 0 || finding.confidence > 1) {
+    return "is missing a `confidence` between 0 and 1.";
+  }
+  if (typeof finding.recommendation !== "string") {
+    return "is missing a string `recommendation`.";
+  }
+  return null;
+}
+
+/**
+ * Size is measured on the JSON that is actually printed — pretty-printed, the
+ * same form `outputResult` emits — never on a compact form nobody sees.
+ */
+export function emittedJsonBytes(value) {
+  return Buffer.byteLength(JSON.stringify(value, null, 2), "utf8");
+}
+
 /** Last line of defence: the envelope itself must fit the stdout budget. */
 function enforceEnvelopeBudget(envelope) {
-  const jsonBytes = () => Buffer.byteLength(JSON.stringify(envelope), "utf8");
+  const jsonBytes = () => emittedJsonBytes(envelope);
 
   while (envelope.findings_preview.length > 0 && jsonBytes() > MAX_ENVELOPE_JSON_BYTES) {
     envelope.findings_preview.pop();
