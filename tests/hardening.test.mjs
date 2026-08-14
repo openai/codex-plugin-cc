@@ -7,6 +7,9 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { MAX_ENVELOPE_STDOUT_BYTES } from "../plugins/codex/scripts/lib/envelope.mjs";
+import { BROKER_BUSY_RPC_CODE } from "../plugins/codex/scripts/lib/app-server.mjs";
+import { shouldRetryWithDirectAppServer } from "../plugins/codex/scripts/lib/codex.mjs";
+import { appendLogBlock, MAX_LOGGED_BLOCK_BYTES } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -268,6 +271,29 @@ test("result returns the bounded envelope by default and the full answer with --
   const envelope = JSON.parse(asJson.stdout);
   assert.equal(envelope.schema_version, 1);
   assert.equal(envelope.verdict, "needs-attention");
+});
+
+test("a busy broker keeps waiting for the broker instead of starting a second Codex", () => {
+  assert.equal(
+    shouldRetryWithDirectAppServer({ rpcCode: BROKER_BUSY_RPC_CODE }, { transport: "broker", brokerRequested: true }),
+    false
+  );
+  // A stale or unreachable broker is a different failure and keeps its recovery path.
+  assert.equal(shouldRetryWithDirectAppServer({ code: "ENOENT" }, { transport: null, brokerRequested: true }), true);
+  assert.equal(shouldRetryWithDirectAppServer({ code: "ECONNREFUSED" }, { transport: null, brokerRequested: true }), true);
+  assert.equal(shouldRetryWithDirectAppServer({ code: "ENOENT" }, { transport: null, brokerRequested: false }), false);
+});
+
+test("the progress log does not duplicate an arbitrarily large final result", () => {
+  const dir = makeTempDir("codex-log-");
+  const logFile = path.join(dir, "job.log");
+  fs.writeFileSync(logFile, "", "utf8");
+
+  appendLogBlock(logFile, "Final output", "x".repeat(715 * 1024), { maxBytes: MAX_LOGGED_BLOCK_BYTES });
+
+  const size = fs.statSync(logFile).size;
+  assert.equal(size < MAX_LOGGED_BLOCK_BYTES + 512, true, `log grew to ${size} bytes`);
+  assert.match(fs.readFileSync(logFile, "utf8"), /truncated; the complete output is stored with the job/);
 });
 
 test("the stop-gate review runs under its own deadline inside a longer hook guard", () => {
