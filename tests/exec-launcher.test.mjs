@@ -87,6 +87,27 @@ test("an over-running child is killed at the deadline and reported as timed out"
   assert.match(describeExecOutcome(result), /deadline expired/);
 });
 
+test("a SIGTERM-resistant child is escalated to SIGKILL after the grace period", async () => {
+  const dir = makeTempDir("codex-exec-");
+  const scriptPath = installFakeExec(
+    dir,
+    `  process.on("SIGTERM", () => {});
+  process.on("SIGINT", () => {});
+  setInterval(() => {}, 1000);`
+  );
+
+  const startedAt = Date.now();
+  const result = await runHardenedCodexExec(
+    launcherOptions(dir, scriptPath, { timeoutMs: 400, killGraceMs: 400 })
+  );
+  const elapsed = Date.now() - startedAt;
+
+  assert.equal(result.timedOut, true);
+  assert.equal(result.exitCode, 124);
+  assert.equal(result.signal, "SIGKILL");
+  assert.equal(elapsed < 10000, true, `the deadline took ${elapsed}ms to take effect`);
+});
+
 test("exit codes keep signals visible", () => {
   assert.equal(normalizeExitCode(0, null), 0);
   assert.equal(normalizeExitCode(2, null), 2);

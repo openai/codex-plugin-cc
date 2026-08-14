@@ -687,6 +687,60 @@ async function withWorkloadLease(lease, fn) {
 }
 
 /**
+ * A workload abandoned at its deadline must not leave its app server running:
+ * the client owns a child process whose open pipes would keep this process alive.
+ */
+function abandonAppServer(holder) {
+  const client = holder?.client;
+  if (!client) {
+    return;
+  }
+  holder.client = null;
+  Promise.resolve()
+    .then(() => client.close())
+    .catch(() => {});
+}
+
+function remainingMs(deadlineAt) {
+  if (!deadlineAt) {
+    return 0;
+  }
+  return Math.max(1, deadlineAt - Date.now());
+}
+
+/**
+ * The deadline covers the whole workload, not just the turn: connecting to the
+ * broker, initializing, and creating the thread can all hang while this process
+ * holds the single global lease.
+ */
+async function raceWorkloadDeadline(workloadPromise, deadlineAt, buildTimeoutResult, timeoutMs = 0) {
+  if (!deadlineAt) {
+    return workloadPromise;
+  }
+
+  let timer = null;
+  // The turn-level interrupt normally settles first; this backstop only fires
+  // when the setup phase itself hangs. Scale its tail to the deadline.
+  const graceMs = Math.min(DEFAULT_INTERRUPT_GRACE_MS, Math.max(1000, Math.round((timeoutMs || 0) / 2)));
+  const hardDeadline = deadlineAt + graceMs + 1000;
+  const expiry = new Promise((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), Math.max(1, hardDeadline - Date.now()));
+    timer.unref?.();
+  });
+
+  try {
+    const settled = await Promise.race([workloadPromise.then((value) => ({ value })), expiry]);
+    if (settled === "timeout") {
+      workloadPromise.catch(() => {});
+      return buildTimeoutResult();
+    }
+    return settled.value;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * Run a turn under an execution deadline. On expiry the turn is interrupted
  * (never silently dropped), partial output is preserved, and the caller learns
  * the run timed out.
@@ -1102,7 +1156,36 @@ export async function runAppServerReview(cwd, options = {}) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
   }
 
-  return withWorkloadLease(options.lease, ({ queueWaitMs }) => withAppServer(cwd, async (client) => {
+  return withWorkloadLease(options.lease, ({ queueWaitMs }) => {
+    const deadlineAt = Number(options.timeoutMs) > 0 ? Date.now() + Number(options.timeoutMs) : 0;
+    const holder = {};
+    return raceWorkloadDeadline(
+      runAppServerReviewWorkload(cwd, options, queueWaitMs, deadlineAt, holder),
+      deadlineAt,
+      () => {
+        abandonAppServer(holder);
+        return {
+          status: TIMED_OUT_EXIT_CODE,
+          timedOut: true,
+          queueWaitMs,
+          threadId: null,
+          sourceThreadId: null,
+          turnId: null,
+          reviewText: "",
+          reasoningSummary: [],
+          turn: null,
+          error: null,
+          stderr: ""
+        };
+      },
+      Number(options.timeoutMs) || 0
+    );
+  });
+}
+
+function runAppServerReviewWorkload(cwd, options, queueWaitMs, deadlineAt, holder = {}) {
+  return withAppServer(cwd, async (client) => {
+    holder.client = client;
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
     const thread = await startThread(client, cwd, {
       model: options.model,
@@ -1126,7 +1209,8 @@ export async function runAppServerReview(cwd, options = {}) {
           target: options.target
         }),
       {
-        timeoutMs: options.timeoutMs,
+        // Whatever the setup phase consumed is gone from the deadline.
+        timeoutMs: remainingMs(deadlineAt),
         interruptGraceMs: options.interruptGraceMs,
         onProgress: options.onProgress,
         onResponse(response, state) {
@@ -1153,7 +1237,7 @@ export async function runAppServerReview(cwd, options = {}) {
       error: turnState?.error ?? null,
       stderr: cleanCodexStderr(client.stderr)
     };
-  }));
+  });
 }
 
 export async function importExternalAgentSession(cwd, options = {}) {
@@ -1199,7 +1283,38 @@ export async function runAppServerTurn(cwd, options = {}) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
   }
 
-  return withWorkloadLease(options.lease, ({ queueWaitMs }) => withAppServer(cwd, async (client) => {
+  return withWorkloadLease(options.lease, ({ queueWaitMs }) => {
+    const deadlineAt = Number(options.timeoutMs) > 0 ? Date.now() + Number(options.timeoutMs) : 0;
+    const holder = {};
+    return raceWorkloadDeadline(
+      runAppServerTurnWorkload(cwd, options, queueWaitMs, deadlineAt, holder),
+      deadlineAt,
+      () => {
+        abandonAppServer(holder);
+        return {
+          status: TIMED_OUT_EXIT_CODE,
+          timedOut: true,
+          queueWaitMs,
+          threadId: null,
+          turnId: null,
+          finalMessage: "",
+          reasoningSummary: [],
+          turn: null,
+          error: null,
+          stderr: "",
+          fileChanges: [],
+          touchedFiles: [],
+          commandExecutions: []
+        };
+      },
+      Number(options.timeoutMs) || 0
+    );
+  });
+}
+
+function runAppServerTurnWorkload(cwd, options, queueWaitMs, deadlineAt, holder = {}) {
+  return withAppServer(cwd, async (client) => {
+    holder.client = client;
     let threadId;
 
     if (options.resumeThreadId) {
@@ -1242,7 +1357,8 @@ export async function runAppServerTurn(cwd, options = {}) {
           outputSchema: options.outputSchema ?? null
         }),
       {
-        timeoutMs: options.timeoutMs,
+        // Whatever the setup phase consumed is gone from the deadline.
+        timeoutMs: remainingMs(deadlineAt),
         interruptGraceMs: options.interruptGraceMs,
         onProgress: options.onProgress
       }
@@ -1263,7 +1379,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       touchedFiles: collectTouchedFiles(turnState?.fileChanges ?? []),
       commandExecutions: turnState?.commandExecutions ?? []
     };
-  }));
+  });
 }
 
 export async function findLatestTaskThread(cwd) {
