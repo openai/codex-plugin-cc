@@ -78,21 +78,30 @@ const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "hi
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
+const USAGE_LINES = [
+  "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
+  "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--timeout-ms <ms>]",
+  "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--timeout-ms <ms>] [focus text]",
+  "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [--timeout-ms <ms>] [prompt]",
+  "  node scripts/codex-companion.mjs consult --prompt-file <path> [--cwd <path>] [--model <model>] [--effort <level>] [--timeout-ms <ms>] [--no-wait] [--json]",
+  "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
+  "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
+  "  node scripts/codex-companion.mjs result [job-id] [--full] [--json]",
+  "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
+];
+
 function printUsage() {
-  console.log(
-    [
-      "Usage:",
-      "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
-      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--timeout-ms <ms>]",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--timeout-ms <ms>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [--timeout-ms <ms>] [prompt]",
-      "  node scripts/codex-companion.mjs consult --prompt-file <path> [--cwd <path>] [--model <model>] [--effort <level>] [--timeout-ms <ms>] [--no-wait] [--json]",
-      "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
-      "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
-      "  node scripts/codex-companion.mjs result [job-id] [--full] [--json]",
-      "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
-    ].join("\n")
-  );
+  console.log(["Usage:", ...USAGE_LINES].join("\n"));
+}
+
+function printCommandUsage(subcommand) {
+  const marker = `codex-companion.mjs ${subcommand} `;
+  const lines = USAGE_LINES.filter((line) => line.includes(marker));
+  console.log(["Usage:", ...(lines.length > 0 ? lines : USAGE_LINES)].join("\n"));
+}
+
+function requestsHelp(argv) {
+  return argv.some((token) => token === "--help" || token === "-h");
 }
 
 function outputResult(value, asJson) {
@@ -1349,9 +1358,17 @@ async function handleCancel(argv) {
 }
 
 async function main() {
-  const [subcommand, ...argv] = process.argv.slice(2);
-  if (!subcommand || subcommand === "help" || subcommand === "--help") {
+  const [subcommand, ...rawArgv] = process.argv.slice(2);
+  if (!subcommand || subcommand === "help" || subcommand === "--help" || subcommand === "-h") {
     printUsage();
+    return;
+  }
+
+  // Help is answered at dispatch: asking a thread-launching command for its
+  // usage must never start a Codex run.
+  const argv = normalizeArgv(rawArgv);
+  if (requestsHelp(argv)) {
+    printCommandUsage(subcommand);
     return;
   }
 

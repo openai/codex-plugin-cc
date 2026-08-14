@@ -273,6 +273,32 @@ test("result returns the bounded envelope by default and the full answer with --
   assert.equal(envelope.verdict, "needs-attention");
 });
 
+test("every command answers --help with usage instead of launching a Codex run", () => {
+  for (const command of ["review", "adversarial-review", "task", "consult", "status", "result", "cancel", "setup"]) {
+    for (const flag of ["--help", "-h"]) {
+      const repo = makeTempDir();
+      const binDir = makeTempDir();
+      installFakeCodex(binDir);
+      initGitRepo(repo);
+      const env = buildEnv(binDir);
+
+      const help = run("node", [SCRIPT, command, flag], { cwd: repo, env });
+
+      assert.equal(help.status, 0, `${command} ${flag}: ${help.stderr}`);
+      assert.match(help.stdout, /^Usage:/);
+      assert.match(help.stdout, new RegExp(`codex-companion\\.mjs ${command} `));
+      // No app-server was started, so no thread was ever launched.
+      assert.equal(fs.existsSync(path.join(binDir, "fake-codex-state.json")), false, `${command} ${flag} started Codex`);
+
+      const status = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env });
+      const snapshot = JSON.parse(status.stdout);
+      assert.deepEqual(snapshot.running, []);
+      assert.deepEqual(snapshot.recent, []);
+      assert.equal(snapshot.latestFinished, null);
+    }
+  }
+});
+
 test("a busy broker keeps waiting for the broker instead of starting a second Codex", () => {
   assert.equal(
     shouldRetryWithDirectAppServer({ rpcCode: BROKER_BUSY_RPC_CODE }, { transport: "broker", brokerRequested: true }),
