@@ -198,6 +198,11 @@ test("an expired deadline interrupts the turn, stores a timed-out job, and relea
   assert.equal(snapshot.scheduler.active, null);
   assert.deepEqual(snapshot.scheduler.queue, []);
 
+  // A timed-out job is finished: its stored record stays reachable.
+  const stored = run("node", [SCRIPT, "result", job.id], { cwd: repo, env });
+  assert.equal(stored.status, 0, stored.stderr);
+  assert.match(stored.stdout, /timed-out/);
+
   // The lease is free again, so the next workload runs immediately.
   installFakeCodex(binDir);
   const promptPath = writePromptFile(repo, "Now answer quickly.");

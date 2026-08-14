@@ -170,7 +170,7 @@ export function enrichJob(job, options = {}) {
         : [],
     elapsed: formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? null),
     duration:
-      job.status === "completed" || job.status === "failed" || job.status === "cancelled"
+      job.status !== "queued" && job.status !== "running"
         ? formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? job.updatedAt)
         : null
   };
@@ -262,7 +262,8 @@ export function resolveResultJob(cwd, reference) {
   const selected = matchJobReference(
     jobs,
     reference,
-    (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled"
+    // A timed-out job is finished too: its partial result must stay reachable.
+    (job) => job.status !== "queued" && job.status !== "running"
   );
 
   if (selected) {
