@@ -636,10 +636,22 @@ function isBrokerBusyError(error, transport) {
   return transport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE;
 }
 
-async function withAppServer(cwd, fn, attempt = 0) {
+async function withAppServer(cwd, fn, attempt = 0, holder = null) {
   let client = null;
   try {
-    client = await CodexAppServerClient.connect(cwd);
+    // The holder is populated the moment the client exists, before connect
+    // finishes: a hang in broker startup or initialize must still be closable
+    // by whoever owns the deadline.
+    client = await CodexAppServerClient.connect(cwd, {
+      onClient: (pending) => {
+        if (holder) {
+          holder.client = pending;
+        }
+      }
+    });
+    if (holder) {
+      holder.client = client;
+    }
     const result = await fn(client);
     await client.close();
     return result;
@@ -657,14 +669,24 @@ async function withAppServer(cwd, fn, attempt = 0) {
         throw error;
       }
       await new Promise((resolve) => setTimeout(resolve, BROKER_BUSY_RETRY_DELAY_MS));
-      return withAppServer(cwd, fn, attempt + 1);
+      return withAppServer(cwd, fn, attempt + 1, holder);
     }
 
     if (!shouldRetryWithDirectAppServer(error, { transport, brokerRequested })) {
       throw error;
     }
 
-    const directClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
+    const directClient = await CodexAppServerClient.connect(cwd, {
+      disableBroker: true,
+      onClient: (pending) => {
+        if (holder) {
+          holder.client = pending;
+        }
+      }
+    });
+    if (holder) {
+      holder.client = directClient;
+    }
     try {
       return await fn(directClient);
     } finally {
@@ -1185,7 +1207,6 @@ export async function runAppServerReview(cwd, options = {}) {
 
 function runAppServerReviewWorkload(cwd, options, queueWaitMs, deadlineAt, holder = {}) {
   return withAppServer(cwd, async (client) => {
-    holder.client = client;
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
     const thread = await startThread(client, cwd, {
       model: options.model,
@@ -1237,7 +1258,7 @@ function runAppServerReviewWorkload(cwd, options, queueWaitMs, deadlineAt, holde
       error: turnState?.error ?? null,
       stderr: cleanCodexStderr(client.stderr)
     };
-  });
+  }, 0, holder);
 }
 
 export async function importExternalAgentSession(cwd, options = {}) {
@@ -1314,7 +1335,6 @@ export async function runAppServerTurn(cwd, options = {}) {
 
 function runAppServerTurnWorkload(cwd, options, queueWaitMs, deadlineAt, holder = {}) {
   return withAppServer(cwd, async (client) => {
-    holder.client = client;
     let threadId;
 
     if (options.resumeThreadId) {
@@ -1379,7 +1399,7 @@ function runAppServerTurnWorkload(cwd, options, queueWaitMs, deadlineAt, holder 
       touchedFiles: collectTouchedFiles(turnState?.fileChanges ?? []),
       commandExecutions: turnState?.commandExecutions ?? []
     };
-  });
+  }, 0, holder);
 }
 
 export async function findLatestTaskThread(cwd) {

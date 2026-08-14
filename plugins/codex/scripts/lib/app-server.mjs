@@ -243,6 +243,17 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
 
     if (this.proc && !this.proc.killed) {
       this.proc.stdin.end();
+      // A SIGTERM-resistant app server must not keep this process alive.
+      const forceKillTimer = setTimeout(() => {
+        if (this.proc && this.proc.exitCode === null) {
+          try {
+            this.proc.kill("SIGKILL");
+          } catch {
+            // Already gone.
+          }
+        }
+      }, 5000);
+      forceKillTimer.unref?.();
       setTimeout(() => {
         if (this.proc && !this.proc.killed && this.proc.exitCode === null) {
           // On Windows with shell: true, the direct child is cmd.exe.
@@ -348,6 +359,9 @@ export class CodexAppServerClient {
     const client = brokerEndpoint
       ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
       : new SpawnedCodexAppServerClient(cwd, options);
+    // Hand the client over before initializing: a caller enforcing a deadline
+    // must be able to close it even if initialization never returns.
+    options.onClient?.(client);
     await client.initialize();
     return client;
   }
