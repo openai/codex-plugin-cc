@@ -109,6 +109,7 @@ export function saveState(cwd, state) {
     }
     removeJobFile(resolveJobFile(cwd, job.id));
     removeFileIfExists(job.logFile);
+    removeFileIfExists(job.finalOutputPath);
   }
 
   fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
@@ -183,6 +184,11 @@ function removeJobFile(jobFile) {
 export function resolveJobLogFile(cwd, jobId) {
   ensureStateDir(cwd);
   return path.join(resolveJobsDir(cwd), `${jobId}.log`);
+}
+
+export function resolveJobFinalOutputFile(cwd, jobId) {
+  ensureStateDir(cwd);
+  return path.join(resolveJobsDir(cwd), `${jobId}.final.md`);
 }
 
 export function resolveJobFile(cwd, jobId) {

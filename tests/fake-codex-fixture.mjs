@@ -653,6 +653,9 @@ export function buildEnv(binDir) {
   const sep = process.platform === "win32" ? ";" : ":";
   return {
     ...process.env,
-    PATH: `${binDir}${sep}${process.env.PATH}`
+    PATH: `${binDir}${sep}${process.env.PATH}`,
+    // Keep the user-global Codex queue out of the developer's home directory:
+    // every fixture gets its own scheduler root, shared by the runs of one test.
+    CODEX_COMPANION_SCHEDULER_DIR: path.join(binDir, "scheduler")
   };
 }

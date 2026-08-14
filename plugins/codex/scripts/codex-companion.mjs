@@ -9,7 +9,10 @@ import { fileURLToPath } from "node:url";
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import {
     buildPersistentTaskThreadName,
+    DEFAULT_CONSULT_TIMEOUT_MS,
     DEFAULT_CONTINUE_PROMPT,
+    DEFAULT_REVIEW_TIMEOUT_MS,
+    DEFAULT_TASK_TIMEOUT_MS,
     findLatestTaskThread,
     getCodexAuthStatus,
     getCodexAvailability,
@@ -21,6 +24,8 @@ import {
     runAppServerReview,
     runAppServerTurn
   } from "./lib/codex.mjs";
+import { buildResultEnvelope, MAX_ENVELOPE_STDOUT_BYTES, renderResultEnvelope } from "./lib/envelope.mjs";
+import { cancelQueuedWorkload, readSchedulerSnapshot } from "./lib/scheduler.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
@@ -30,6 +35,7 @@ import {
   generateJobId,
   getConfig,
   listJobs,
+  resolveJobFinalOutputFile,
   setConfig,
   upsertJob,
   writeJobFile
@@ -77,12 +83,13 @@ function printUsage() {
     [
       "Usage:",
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
-      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--timeout-ms <ms>]",
+      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--timeout-ms <ms>] [focus text]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [--timeout-ms <ms>] [prompt]",
+      "  node scripts/codex-companion.mjs consult --prompt-file <path> [--cwd <path>] [--model <model>] [--effort <level>] [--timeout-ms <ms>] [--no-wait] [--json]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
-      "  node scripts/codex-companion.mjs result [job-id] [--json]",
+      "  node scripts/codex-companion.mjs result [job-id] [--full] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
     ].join("\n")
   );
@@ -158,6 +165,44 @@ function resolveCommandWorkspace(options = {}) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeTimeoutMs(value, fallback) {
+  if (value == null || String(value).trim() === "") {
+    return fallback;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`--timeout-ms must be a positive number of milliseconds, got "${value}".`);
+  }
+  return Math.round(parsed);
+}
+
+function buildWorkloadLease({ jobId, kind, workspaceRoot, timeoutMs, noWait = false, queueWaitMs = null }) {
+  return {
+    jobId,
+    kind,
+    workspace: workspaceRoot,
+    timeoutMs,
+    noWait: Boolean(noWait),
+    ...(queueWaitMs == null ? {} : { waitTimeoutMs: queueWaitMs })
+  };
+}
+
+function storeFinalOutput(workspaceRoot, jobId, text) {
+  if (!workspaceRoot || !jobId) {
+    return null;
+  }
+  const finalOutputPath = resolveJobFinalOutputFile(workspaceRoot, jobId);
+  fs.writeFileSync(finalOutputPath, `${String(text ?? "").trimEnd()}\n`, "utf8");
+  return finalOutputPath;
+}
+
+function jobStatusForExecution({ timedOut, exitStatus }) {
+  if (timedOut) {
+    return "timed-out";
+  }
+  return exitStatus === 0 ? "completed" : "failed";
 }
 
 function shorten(text, limit = 96) {
@@ -365,11 +410,24 @@ async function executeReviewRun(request) {
   });
   const focusText = request.focusText?.trim() ?? "";
   const reviewName = request.reviewName ?? "Review";
+  const workspaceRoot = request.workspaceRoot ?? resolveWorkspaceRoot(request.cwd);
+  const timeoutMs = request.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
+  const lease = buildWorkloadLease({
+    jobId: request.jobId ?? generateJobId("review"),
+    kind: request.reviewName === "Adversarial Review" ? "adversarial-review" : "review",
+    workspaceRoot,
+    timeoutMs,
+    noWait: request.noWait,
+    queueWaitMs: request.queueWaitMs
+  });
+
   if (reviewName === "Review") {
     const reviewTarget = validateNativeReviewRequest(target, focusText);
     const result = await runAppServerReview(request.cwd, {
       target: reviewTarget,
       model: request.model,
+      timeoutMs,
+      lease,
       onProgress: request.onProgress
     });
     const payload = {
@@ -384,7 +442,7 @@ async function executeReviewRun(request) {
         reasoning: result.reasoningSummary
       }
     };
-    const rendered = renderNativeReviewResult(
+    const fullText = renderNativeReviewResult(
       {
         status: result.status,
         stdout: result.reviewText,
@@ -392,13 +450,36 @@ async function executeReviewRun(request) {
       },
       { reviewLabel: reviewName, targetLabel: target.label, reasoningSummary: result.reasoningSummary }
     );
+    const jobStatus = jobStatusForExecution({ timedOut: result.timedOut, exitStatus: result.status });
+    const finalOutputPath = storeFinalOutput(workspaceRoot, request.jobId, fullText);
+    const envelope = buildResultEnvelope({
+      jobId: request.jobId ?? null,
+      kind: "review",
+      status: jobStatus,
+      // The built-in reviewer returns prose, so there is no machine-readable verdict.
+      parsed: null,
+      parseError: result.timedOut ? "The review deadline expired before Codex finished." : null,
+      summaryText: result.reviewText,
+      rawOutput: result.reviewText,
+      durationMs: request.durationMs,
+      queueWaitMs: result.queueWaitMs,
+      threadId: result.threadId,
+      finalOutputPath,
+      logPath: request.logFile ?? null,
+      exitCode: result.status
+    });
 
     return {
       exitStatus: result.status,
+      jobStatus,
+      timedOut: Boolean(result.timedOut),
+      queueWaitMs: result.queueWaitMs ?? null,
+      envelope,
+      finalOutputPath,
       threadId: result.threadId,
       turnId: result.turnId,
-      payload,
-      rendered,
+      payload: { ...payload, envelope, finalOutputPath },
+      rendered: fullText,
       summary: firstMeaningfulLine(result.reviewText, `${reviewName} completed.`),
       jobTitle: `Codex ${reviewName}`,
       jobClass: "review",
@@ -413,6 +494,8 @@ async function executeReviewRun(request) {
     model: request.model,
     sandbox: "read-only",
     outputSchema: readOutputSchema(REVIEW_SCHEMA),
+    timeoutMs,
+    lease,
     onProgress: request.onProgress
   });
   const parsed = parseStructuredOutput(result.finalMessage, {
@@ -440,16 +523,39 @@ async function executeReviewRun(request) {
     reasoningSummary: result.reasoningSummary
   };
 
+  const rendered = renderReviewResult(parsed, {
+    reviewLabel: reviewName,
+    targetLabel: context.target.label,
+    reasoningSummary: result.reasoningSummary
+  });
+  const jobStatus = jobStatusForExecution({ timedOut: result.timedOut, exitStatus: result.status });
+  const finalOutputPath = storeFinalOutput(workspaceRoot, request.jobId, rendered);
+  const envelope = buildResultEnvelope({
+    jobId: request.jobId ?? null,
+    kind: "adversarial-review",
+    status: jobStatus,
+    parsed: parsed.parsed,
+    parseError: parsed.parseError,
+    rawOutput: parsed.rawOutput,
+    durationMs: request.durationMs,
+    queueWaitMs: result.queueWaitMs,
+    threadId: result.threadId,
+    finalOutputPath,
+    logPath: request.logFile ?? null,
+    exitCode: result.status
+  });
+
   return {
     exitStatus: result.status,
+    jobStatus,
+    timedOut: Boolean(result.timedOut),
+    queueWaitMs: result.queueWaitMs ?? null,
+    envelope,
+    finalOutputPath,
     threadId: result.threadId,
     turnId: result.turnId,
-    payload,
-    rendered: renderReviewResult(parsed, {
-      reviewLabel: reviewName,
-      targetLabel: context.target.label,
-      reasoningSummary: result.reasoningSummary
-    }),
+    payload: { ...payload, envelope, finalOutputPath },
+    rendered,
     summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
     jobTitle: `Codex ${reviewName}`,
     jobClass: "review",
@@ -482,6 +588,7 @@ async function executeTaskRun(request) {
     throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
   }
 
+  const timeoutMs = request.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS;
   const result = await runAppServerTurn(workspaceRoot, {
     resumeThreadId,
     prompt: request.prompt,
@@ -489,6 +596,15 @@ async function executeTaskRun(request) {
     model: request.model,
     effort: request.effort,
     sandbox: request.write ? "workspace-write" : "read-only",
+    timeoutMs,
+    lease: buildWorkloadLease({
+      jobId: request.jobId ?? generateJobId("task"),
+      kind: "task",
+      workspaceRoot,
+      timeoutMs,
+      noWait: request.noWait,
+      queueWaitMs: request.queueWaitMs
+    }),
     onProgress: request.onProgress,
     persistThread: true,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
@@ -508,16 +624,24 @@ async function executeTaskRun(request) {
       write: Boolean(request.write)
     }
   );
+  const jobStatus = jobStatusForExecution({ timedOut: result.timedOut, exitStatus: result.status });
+  const finalOutputPath = storeFinalOutput(workspaceRoot, request.jobId, rendered);
   const payload = {
     status: result.status,
+    timedOut: Boolean(result.timedOut),
     threadId: result.threadId,
     rawOutput,
     touchedFiles: result.touchedFiles,
-    reasoningSummary: result.reasoningSummary
+    reasoningSummary: result.reasoningSummary,
+    finalOutputPath
   };
 
   return {
     exitStatus: result.status,
+    jobStatus,
+    timedOut: Boolean(result.timedOut),
+    queueWaitMs: result.queueWaitMs ?? null,
+    finalOutputPath,
     threadId: result.threadId,
     turnId: result.turnId,
     payload,
@@ -526,6 +650,75 @@ async function executeTaskRun(request) {
     jobTitle: taskMetadata.title,
     jobClass: "task",
     write: Boolean(request.write)
+  };
+}
+
+async function executeConsultRun(request) {
+  ensureCodexAvailable(request.cwd);
+
+  const workspaceRoot = request.workspaceRoot ?? resolveWorkspaceRoot(request.cwd);
+  const timeoutMs = request.timeoutMs ?? DEFAULT_CONSULT_TIMEOUT_MS;
+  const startedAt = Date.now();
+  const result = await runAppServerTurn(request.cwd, {
+    prompt: request.prompt,
+    model: request.model,
+    effort: request.effort,
+    // Consult is stateless: fresh ephemeral thread, read-only, never resumable.
+    sandbox: "read-only",
+    persistThread: false,
+    // Same structured contract as adversarial review so every consult returns a verdict.
+    outputSchema: readOutputSchema(REVIEW_SCHEMA),
+    timeoutMs,
+    lease: buildWorkloadLease({
+      jobId: request.jobId,
+      kind: "consult",
+      workspaceRoot,
+      timeoutMs,
+      noWait: request.noWait,
+      queueWaitMs: request.queueWaitMs
+    }),
+    onProgress: request.onProgress
+  });
+
+  const parsed = parseStructuredOutput(result.finalMessage, {
+    status: result.status,
+    failureMessage: result.error?.message ?? result.stderr
+  });
+  const jobStatus = jobStatusForExecution({ timedOut: result.timedOut, exitStatus: result.status });
+  const finalOutputPath = storeFinalOutput(
+    workspaceRoot,
+    request.jobId,
+    parsed.parsed ? JSON.stringify(parsed.parsed, null, 2) : parsed.rawOutput
+  );
+  const envelope = buildResultEnvelope({
+    jobId: request.jobId,
+    kind: "consult",
+    status: jobStatus,
+    parsed: parsed.parsed,
+    parseError: result.timedOut ? "The consult deadline expired before Codex finished." : parsed.parseError,
+    rawOutput: parsed.rawOutput,
+    durationMs: Date.now() - startedAt,
+    queueWaitMs: result.queueWaitMs,
+    threadId: result.threadId,
+    finalOutputPath,
+    logPath: request.logFile ?? null,
+    exitCode: result.status
+  });
+
+  return {
+    exitStatus: result.status,
+    jobStatus,
+    timedOut: Boolean(result.timedOut),
+    queueWaitMs: result.queueWaitMs ?? null,
+    envelope,
+    finalOutputPath,
+    threadId: result.threadId,
+    turnId: result.turnId,
+    payload: envelope,
+    rendered: renderResultEnvelope(envelope),
+    summary: envelope.summary || "Consult finished.",
+    jobTitle: "Codex Consult",
+    jobClass: "consult"
   };
 }
 
@@ -655,22 +848,31 @@ function requireTaskRequest(prompt, resumeLast) {
   }
 }
 
+function boundedStdout(execution) {
+  const rendered = execution.rendered ?? "";
+  if (!execution.envelope || Buffer.byteLength(rendered, "utf8") <= MAX_ENVELOPE_STDOUT_BYTES) {
+    return rendered;
+  }
+  // Never dump an unbounded transcript: the complete text stays on disk.
+  return renderResultEnvelope(execution.envelope);
+}
+
 async function runForegroundCommand(job, runner, options = {}) {
   const { logFile, progress } = createTrackedProgress(job, {
     logFile: options.logFile,
     stderr: !options.json
   });
-  const execution = await runTrackedJob(job, () => runner(progress), { logFile });
-  outputResult(options.json ? execution.payload : execution.rendered, options.json);
+  const execution = await runTrackedJob(job, () => runner(progress, logFile), { logFile });
+  outputResult(options.json ? execution.payload : boundedStdout(execution), options.json);
   if (execution.exitStatus !== 0) {
     process.exitCode = execution.exitStatus;
   }
   return execution;
 }
 
-function spawnDetachedTaskWorker(cwd, jobId) {
+function spawnDetachedWorker(cwd, jobId, workerCommand = "task-worker") {
   const scriptPath = path.join(ROOT_DIR, "scripts", "codex-companion.mjs");
-  const child = spawn(process.execPath, [scriptPath, "task-worker", "--cwd", cwd, "--job-id", jobId], {
+  const child = spawn(process.execPath, [scriptPath, workerCommand, "--cwd", cwd, "--job-id", jobId], {
     cwd,
     env: process.env,
     detached: true,
@@ -681,11 +883,11 @@ function spawnDetachedTaskWorker(cwd, jobId) {
   return child;
 }
 
-function enqueueBackgroundTask(cwd, job, request) {
+function enqueueBackgroundJob(cwd, job, request, workerCommand = "task-worker") {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
+  const child = spawnDetachedWorker(cwd, job.id, workerCommand);
   const queuedRecord = {
     ...job,
     status: "queued",
@@ -711,8 +913,8 @@ function enqueueBackgroundTask(cwd, job, request) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
-    booleanOptions: ["json", "background", "wait"],
+    valueOptions: ["base", "scope", "model", "cwd", "timeout-ms", "queue-wait-ms"],
+    booleanOptions: ["json", "background", "wait", "no-wait"],
     aliasMap: {
       m: "model"
     }
@@ -736,16 +938,35 @@ async function handleReviewCommand(argv, config) {
     jobClass: "review",
     summary: metadata.summary
   });
+  const request = {
+    cwd,
+    workspaceRoot,
+    base: options.base,
+    scope: options.scope,
+    model: options.model,
+    focusText,
+    reviewName: config.reviewName,
+    jobId: job.id,
+    timeoutMs: normalizeTimeoutMs(options["timeout-ms"], DEFAULT_REVIEW_TIMEOUT_MS),
+    queueWaitMs: options["queue-wait-ms"] ? Number(options["queue-wait-ms"]) : null,
+    noWait: Boolean(options["no-wait"])
+  };
+
+  if (options.background) {
+    ensureCodexAvailable(cwd);
+    // The companion detaches its own review worker; callers must not depend on
+    // the host shell keeping the run alive.
+    const { payload } = enqueueBackgroundJob(cwd, job, request, "review-worker");
+    outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
+    return;
+  }
+
   await runForegroundCommand(
     job,
-    (progress) =>
+    (progress, logFile) =>
       executeReviewRun({
-        cwd,
-        base: options.base,
-        scope: options.scope,
-        model: options.model,
-        focusText,
-        reviewName: config.reviewName,
+        ...request,
+        logFile,
         onProgress: progress
       }),
     { json: options.json }
@@ -761,8 +982,8 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "timeout-ms", "queue-wait-ms"],
+    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "no-wait"],
     aliasMap: {
       m: "model"
     }
@@ -780,6 +1001,7 @@ async function handleTask(argv) {
     throw new Error("Choose either --resume/--resume-last or --fresh.");
   }
   const write = Boolean(options.write);
+  const timeoutMs = normalizeTimeoutMs(options["timeout-ms"], DEFAULT_TASK_TIMEOUT_MS);
   const taskMetadata = buildTaskRunMetadata({
     prompt,
     resumeLast
@@ -797,9 +1019,10 @@ async function handleTask(argv) {
       prompt,
       write,
       resumeLast,
-      jobId: job.id
+      jobId: job.id,
+      timeoutMs
     });
-    const { payload } = enqueueBackgroundTask(cwd, job, request);
+    const { payload } = enqueueBackgroundJob(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
   }
@@ -816,10 +1039,90 @@ async function handleTask(argv) {
         write,
         resumeLast,
         jobId: job.id,
+        timeoutMs,
+        noWait: Boolean(options["no-wait"]),
         onProgress: progress
       }),
     { json: options.json }
   );
+}
+
+async function handleConsult(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "model", "effort", "prompt-file", "timeout-ms", "queue-wait-ms"],
+    booleanOptions: ["json", "write", "no-wait"],
+    aliasMap: {
+      m: "model"
+    }
+  });
+
+  // Rejected before anything is queued: consult is a read-only entry point.
+  if (options.write) {
+    throw new Error("`consult` is read-only and does not accept --write. Use `task --write` for changes.");
+  }
+  if (!options["prompt-file"]) {
+    throw new Error("`consult` requires --prompt-file <absolute-path>. Positional prompts and stdin are not accepted.");
+  }
+  if (positionals.length > 0) {
+    throw new Error("`consult` takes its prompt only from --prompt-file. Remove the positional prompt text.");
+  }
+
+  const cwd = resolveCommandCwd(options);
+  // Consult must work outside a Git repository; the workspace falls back to cwd.
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const promptPath = path.resolve(cwd, options["prompt-file"]);
+  if (!fs.existsSync(promptPath)) {
+    throw new Error(`No prompt file found at ${promptPath}.`);
+  }
+  const prompt = fs.readFileSync(promptPath, "utf8");
+  if (!prompt.trim()) {
+    throw new Error(`The prompt file ${promptPath} is empty.`);
+  }
+
+  const job = createCompanionJob({
+    prefix: "consult",
+    kind: "consult",
+    title: "Codex Consult",
+    workspaceRoot,
+    jobClass: "consult",
+    summary: shorten(prompt)
+  });
+  const timeoutMs = normalizeTimeoutMs(options["timeout-ms"], DEFAULT_CONSULT_TIMEOUT_MS);
+
+  try {
+    await runForegroundCommand(
+      job,
+      (progress, logFile) =>
+        executeConsultRun({
+          cwd,
+          workspaceRoot,
+          prompt,
+          promptPath,
+          model: normalizeRequestedModel(options.model),
+          effort: normalizeReasoningEffort(options.effort),
+          jobId: job.id,
+          timeoutMs,
+          queueWaitMs: options["queue-wait-ms"] ? Number(options["queue-wait-ms"]) : null,
+          noWait: Boolean(options["no-wait"]),
+          logFile,
+          onProgress: progress
+        }),
+      { json: options.json }
+    );
+  } catch (error) {
+    // A launch, queue, or transport failure still returns a bounded envelope so
+    // callers can tell "no second opinion" apart from "silence".
+    const envelope = buildResultEnvelope({
+      jobId: job.id,
+      kind: "consult",
+      status: "failed",
+      parsed: null,
+      errorMessage: error instanceof Error ? error.message : String(error),
+      logPath: job.logFile ?? null
+    });
+    outputResult(options.json ? envelope : renderResultEnvelope(envelope), options.json);
+    process.exitCode = 1;
+  }
 }
 
 async function handleTransfer(argv) {
@@ -835,13 +1138,15 @@ async function handleTransfer(argv) {
   outputCommandResult(payload, rendered, options.json);
 }
 
-async function handleTaskWorker(argv) {
+async function handleTaskWorker(argv, config = {}) {
+  const workerName = config.workerName ?? "task-worker";
+  const runner = config.runner ?? executeTaskRun;
   const { options } = parseCommandInput(argv, {
     valueOptions: ["cwd", "job-id"]
   });
 
   if (!options["job-id"]) {
-    throw new Error("Missing required --job-id for task-worker.");
+    throw new Error(`Missing required --job-id for ${workerName}.`);
   }
 
   const cwd = resolveCommandCwd(options);
@@ -853,7 +1158,7 @@ async function handleTaskWorker(argv) {
 
   const request = storedJob.request;
   if (!request || typeof request !== "object") {
-    throw new Error(`Stored job ${options["job-id"]} is missing its task request payload.`);
+    throw new Error(`Stored job ${options["job-id"]} is missing its ${workerName} request payload.`);
   }
 
   const { logFile, progress } = createTrackedProgress(
@@ -872,8 +1177,9 @@ async function handleTaskWorker(argv) {
       logFile
     },
     () =>
-      executeTaskRun({
+      runner({
         ...request,
+        logFile,
         onProgress: progress
       }),
     { logFile }
@@ -910,19 +1216,33 @@ async function handleStatus(argv) {
 function handleResult(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd"],
-    booleanOptions: ["json"]
+    booleanOptions: ["json", "full"]
   });
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
   const { workspaceRoot, job } = resolveResultJob(cwd, reference);
   const storedJob = readStoredJob(workspaceRoot, job.id);
-  const payload = {
-    job,
-    storedJob
-  };
+  const envelope = storedJob?.envelope ?? null;
 
-  outputCommandResult(payload, renderStoredJobResult(job, storedJob), options.json);
+  if (options.full) {
+    const finalOutputPath = storedJob?.finalOutputPath ?? null;
+    const fullText =
+      finalOutputPath && fs.existsSync(finalOutputPath)
+        ? fs.readFileSync(finalOutputPath, "utf8")
+        : renderStoredJobResult(job, storedJob);
+    outputCommandResult({ job, storedJob, envelope, fullOutput: fullText }, fullText, options.json);
+    return;
+  }
+
+  // Jobs that carry an envelope answer with the bounded envelope by default;
+  // the complete text stays one `--full` away.
+  if (envelope) {
+    outputCommandResult(envelope, renderResultEnvelope(envelope), options.json);
+    return;
+  }
+
+  outputCommandResult({ job, storedJob }, renderStoredJobResult(job, storedJob), options.json);
 }
 
 function handleTaskResumeCandidate(argv) {
@@ -972,6 +1292,13 @@ async function handleCancel(argv) {
   const existing = readStoredJob(workspaceRoot, job.id) ?? {};
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
+
+  // Cancelling a queued job only removes its queue record; the active workload
+  // is interrupted first and only then has its worker terminated.
+  const dequeued = cancelQueuedWorkload(job.id);
+  if (dequeued.removed) {
+    appendLogLine(job.logFile, "Removed from the global Codex queue before it started.");
+  }
 
   const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
   if (interrupt.attempted) {
@@ -1046,8 +1373,14 @@ async function main() {
     case "transfer":
       await handleTransfer(argv);
       break;
+    case "consult":
+      await handleConsult(argv);
+      break;
     case "task-worker":
       await handleTaskWorker(argv);
+      break;
+    case "review-worker":
+      await handleTaskWorker(argv, { workerName: "review-worker", runner: executeReviewRun });
       break;
     case "status":
       await handleStatus(argv);

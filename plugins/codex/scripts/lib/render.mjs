@@ -121,6 +121,13 @@ function appendActiveJobsTable(lines, jobs) {
   }
 }
 
+function formatSeverityTally(tally) {
+  if (!tally || typeof tally !== "object") {
+    return null;
+  }
+  return `critical ${tally.critical ?? 0}, high ${tally.high ?? 0}, medium ${tally.medium ?? 0}, low ${tally.low ?? 0}`;
+}
+
 function pushJobDetails(lines, job, options = {}) {
   lines.push(`- ${formatJobLine(job)}`);
   if (job.summary) {
@@ -128,6 +135,19 @@ function pushJobDetails(lines, job, options = {}) {
   }
   if (job.phase) {
     lines.push(`  Phase: ${job.phase}`);
+  }
+  if (job.queuePosition) {
+    lines.push(`  Queue position: ${job.queuePosition}`);
+  }
+  if (job.verdict) {
+    lines.push(`  Verdict: ${job.verdict}`);
+  }
+  const tally = formatSeverityTally(job.severityTally);
+  if (tally) {
+    lines.push(`  Findings: ${tally}`);
+  }
+  if (job.finalOutputPath) {
+    lines.push(`  Result file: ${job.finalOutputPath}`);
   }
   if (options.showElapsed && job.elapsed) {
     lines.push(`  Elapsed: ${job.elapsed}`);
@@ -330,6 +350,15 @@ export function renderStatusReport(report) {
     `Review gate: ${report.config.stopReviewGate ? "enabled" : "disabled"}`,
     ""
   ];
+
+  if (report.scheduler?.active || report.scheduler?.queue?.length) {
+    lines.push(
+      `Codex queue: ${report.scheduler.active ? `${report.scheduler.active.jobId} running` : "idle"}, ${
+        report.scheduler.queue.length
+      } waiting`,
+      ""
+    );
+  }
 
   if (report.running.length > 0) {
     appendActiveJobsTable(lines, report.running);

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
+import { getQueuePosition, readSchedulerSnapshot } from "./scheduler.mjs";
 import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
@@ -176,6 +177,7 @@ export function enrichJob(job, options = {}) {
 
   return {
     ...enriched,
+    queuePosition: job.status === "queued" || job.status === "running" ? getQueuePosition(job.id) : null,
     phase: enriched.phase ?? inferLegacyJobPhase(enriched, enriched.progressPreview)
   };
 }
@@ -232,6 +234,7 @@ export function buildStatusSnapshot(cwd, options = {}) {
     workspaceRoot,
     config,
     sessionRuntime: getSessionRuntimeStatus(options.env, workspaceRoot),
+    scheduler: readSchedulerSnapshot({ env: options.env }),
     running,
     latestFinished,
     recent,

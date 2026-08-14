@@ -41,11 +41,19 @@ export function appendLogLine(logFile, message) {
   fs.appendFileSync(logFile, `[${nowIso()}] ${normalized}\n`, "utf8");
 }
 
-export function appendLogBlock(logFile, title, body) {
+export const MAX_LOGGED_BLOCK_BYTES = 8192;
+
+export function appendLogBlock(logFile, title, body, options = {}) {
   if (!logFile || !body) {
     return;
   }
-  fs.appendFileSync(logFile, `\n[${nowIso()}] ${title}\n${String(body).trimEnd()}\n`, "utf8");
+  const text = String(body).trimEnd();
+  const maxBytes = Number.isFinite(options.maxBytes) ? options.maxBytes : 0;
+  const bounded =
+    maxBytes > 0 && Buffer.byteLength(text, "utf8") > maxBytes
+      ? `${text.slice(0, maxBytes)}\n[truncated; the complete output is stored with the job]`
+      : text;
+  fs.appendFileSync(logFile, `\n[${nowIso()}] ${title}\n${bounded}\n`, "utf8");
 }
 
 export function createJobLogFile(workspaceRoot, jobId, title) {
@@ -153,7 +161,8 @@ export async function runTrackedJob(job, runner, options = {}) {
 
   try {
     const execution = await runner();
-    const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
+    const completionStatus = execution.jobStatus ?? (execution.exitStatus === 0 ? "completed" : "failed");
+    const phase = completionStatus === "completed" ? "done" : completionStatus;
     const completedAt = nowIso();
     writeJobFile(job.workspaceRoot, job.id, {
       ...runningRecord,
@@ -161,8 +170,12 @@ export async function runTrackedJob(job, runner, options = {}) {
       threadId: execution.threadId ?? null,
       turnId: execution.turnId ?? null,
       pid: null,
-      phase: completionStatus === "completed" ? "done" : "failed",
+      phase,
       completedAt,
+      exitCode: execution.exitStatus ?? null,
+      envelope: execution.envelope ?? null,
+      finalOutputPath: execution.finalOutputPath ?? null,
+      queueWaitMs: execution.queueWaitMs ?? null,
       result: execution.payload,
       rendered: execution.rendered
     });
@@ -172,11 +185,16 @@ export async function runTrackedJob(job, runner, options = {}) {
       threadId: execution.threadId ?? null,
       turnId: execution.turnId ?? null,
       summary: execution.summary,
-      phase: completionStatus === "completed" ? "done" : "failed",
+      phase,
       pid: null,
-      completedAt
+      completedAt,
+      verdict: execution.envelope?.verdict ?? null,
+      severityTally: execution.envelope?.severity_tally ?? null,
+      finalOutputPath: execution.finalOutputPath ?? null
     });
-    appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
+    appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered, {
+      maxBytes: MAX_LOGGED_BLOCK_BYTES
+    });
     return execution;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);

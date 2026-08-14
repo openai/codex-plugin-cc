@@ -1031,35 +1031,42 @@ test("adversarial review rejects staged-only scope to match review target select
   assert.match(result.stderr, /Use one of: auto, working-tree, branch, or pass --base <ref>/i);
 });
 
-test("review accepts --background while still running as a tracked review job", () => {
+test("review --background returns a job id immediately and its own worker finishes the review", async () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
-  installFakeCodex(binDir);
+  installFakeCodex(binDir, "slow-task");
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
   fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+  const env = buildEnv(binDir);
 
   const launched = run("node", [SCRIPT, "review", "--background", "--json"], {
     cwd: repo,
-    env: buildEnv(binDir)
+    env
   });
 
   assert.equal(launched.status, 0, launched.stderr);
   const launchPayload = JSON.parse(launched.stdout);
-  assert.equal(launchPayload.review, "Review");
-  assert.match(launchPayload.codex.stdout, /No material issues found/);
+  assert.match(launchPayload.jobId, /^review-/);
+  assert.equal(launchPayload.status, "queued");
+  assert.equal(launchPayload.codex, undefined);
 
-  const status = run("node", [SCRIPT, "status"], {
-    cwd: repo,
-    env: buildEnv(binDir)
-  });
+  const finished = await waitFor(() => {
+    const status = run("node", [SCRIPT, "status", launchPayload.jobId, "--json"], { cwd: repo, env });
+    if (status.status !== 0) {
+      return null;
+    }
+    const snapshot = JSON.parse(status.stdout);
+    return snapshot.job.status === "completed" ? snapshot.job : null;
+  }, { timeoutMs: 20000 });
 
-  assert.equal(status.status, 0, status.stderr);
-  assert.match(status.stdout, /# Codex Status/);
-  assert.match(status.stdout, /Codex Review/);
-  assert.match(status.stdout, /completed/);
+  assert.equal(finished.kindLabel, "review");
+
+  const result = run("node", [SCRIPT, "result", launchPayload.jobId, "--full"], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /No material issues found/);
 });
 
 test("status shows phases, hints, and the latest finished job", () => {
