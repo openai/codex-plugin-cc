@@ -71,6 +71,92 @@ test("a huge transcript still renders a bounded envelope on stdout", () => {
   assert.match(rendered, /Log: \/tmp\/run\.log/);
 });
 
+test("a parsed object missing required fields is malformed, not an approval", () => {
+  for (const parsed of [
+    { verdict: "approve" },
+    { verdict: "approve", summary: "ok" },
+    { verdict: "approve", summary: "ok", findings: [] },
+    { verdict: "approve", summary: "", findings: [], next_steps: [] },
+    { summary: "ok", findings: [], next_steps: [] },
+    { verdict: "approve", summary: "ok", findings: [{ body: "no severity or title" }], next_steps: [] }
+  ]) {
+    const envelope = buildResultEnvelope({ jobId: "j", kind: "consult", status: "completed", parsed });
+    assert.equal(envelope.verdict, "inconclusive", JSON.stringify(parsed));
+    assert.equal(typeof envelope.parse_error, "string", JSON.stringify(parsed));
+    assert.equal(envelope.structured, false);
+    assert.equal(envelope.finding_count, 0);
+  }
+
+  const valid = buildResultEnvelope({
+    jobId: "j",
+    kind: "consult",
+    status: "completed",
+    parsed: { verdict: "approve", summary: "All good.", findings: [], next_steps: [] }
+  });
+  assert.equal(valid.verdict, "approve");
+  assert.equal(valid.structured, true);
+  assert.equal(valid.parse_error, undefined);
+});
+
+test("the envelope stays inside its byte budget even with hostile field values", () => {
+  const envelope = buildResultEnvelope({
+    jobId: "review-3",
+    kind: "review",
+    status: "completed",
+    parsed: {
+      verdict: "needs-attention",
+      summary: "🙂".repeat(5000),
+      findings: Array.from({ length: 40 }, (_, index) => ({
+        severity: "critical".repeat(50),
+        title: "t".repeat(5000),
+        body: "b",
+        file: `src/${"nested-directory/".repeat(200)}file-${index}.ts`,
+        line_start: index + 1,
+        line_end: index + 1
+      })),
+      next_steps: []
+    },
+    finalOutputPath: "/tmp/final.md",
+    logPath: "/tmp/run.log"
+  });
+
+  assert.equal(Buffer.byteLength(JSON.stringify(envelope), "utf8") < MAX_ENVELOPE_STDOUT_BYTES, true);
+  assert.equal(Buffer.byteLength(renderResultEnvelope(envelope), "utf8") < MAX_ENVELOPE_STDOUT_BYTES, true);
+  assert.equal(Buffer.byteLength(envelope.summary, "utf8") <= 2000, true);
+  for (const finding of envelope.findings_preview) {
+    assert.equal(Buffer.byteLength(finding.file, "utf8") <= 201, true);
+    assert.equal(Buffer.byteLength(finding.title, "utf8") <= 201, true);
+    assert.equal(["critical", "high", "medium", "low"].includes(finding.severity), true);
+  }
+  assert.equal(envelope.finding_count, 40);
+  assert.equal(envelope.truncated, true);
+});
+
+test("a workload that answers in prose reports a missing verdict, not a failed one", () => {
+  const completed = buildResultEnvelope({
+    jobId: "review-4",
+    kind: "review",
+    status: "completed",
+    parsed: null,
+    unstructuredKind: true,
+    summaryText: "Reviewed uncommitted changes. No material issues found."
+  });
+  assert.equal(completed.verdict, "not-applicable");
+  assert.equal(completed.structured, false);
+  assert.equal(completed.parse_error, undefined);
+  assert.match(completed.summary, /No material issues found/);
+
+  const timedOut = buildResultEnvelope({
+    jobId: "review-5",
+    kind: "review",
+    status: "timed-out",
+    parsed: null,
+    unstructuredKind: false,
+    parseError: "The review deadline expired before Codex finished."
+  });
+  assert.equal(timedOut.verdict, "inconclusive");
+});
+
 test("malformed structured output is inconclusive, never approved", () => {
   const envelope = buildResultEnvelope({
     jobId: "consult-1",

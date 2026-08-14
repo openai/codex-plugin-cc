@@ -6,13 +6,83 @@ export const MAX_ENVELOPE_STDOUT_BYTES = 32768;
 const SEVERITIES = ["critical", "high", "medium", "low"];
 const VALID_STATUSES = new Set(["queued", "running", "completed", "failed", "timed-out", "cancelled"]);
 const VALID_VERDICTS = new Set(["approve", "needs-attention", "inconclusive", "not-applicable"]);
+const MAX_TITLE_LENGTH = 200;
+const MAX_FILE_LENGTH = 200;
+// Leave headroom below the stdout budget so the rendered form fits as well.
+const MAX_ENVELOPE_JSON_BYTES = 24576;
 
+/** Bounded by characters and by bytes: a character limit alone is not a size limit. */
 function boundedText(value, limit = MAX_SUMMARY_LENGTH) {
   const text = String(value ?? "").trim();
-  if (text.length <= limit) {
+  if (text.length <= limit && Buffer.byteLength(text, "utf8") <= limit) {
     return { text, truncated: false };
   }
-  return { text: `${text.slice(0, limit - 1)}…`, truncated: true };
+
+  let clipped = [...text].slice(0, limit).join("");
+  while (clipped && Buffer.byteLength(clipped, "utf8") > limit - 1) {
+    clipped = [...clipped].slice(0, Math.max(0, Math.floor([...clipped].length * 0.9) - 1)).join("");
+  }
+  return { text: `${clipped}…`, truncated: true };
+}
+
+/**
+ * Structured output is only structured if it carries the fields the contract
+ * promises. A bare `{"verdict":"approve"}` is malformed, not an approval.
+ */
+export function validateStructuredResult(data) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return "Expected a top-level JSON object.";
+  }
+  if (typeof data.verdict !== "string" || !data.verdict.trim()) {
+    return "Missing string `verdict`.";
+  }
+  if (typeof data.summary !== "string" || !data.summary.trim()) {
+    return "Missing string `summary`.";
+  }
+  if (!Array.isArray(data.findings)) {
+    return "Missing array `findings`.";
+  }
+  if (!Array.isArray(data.next_steps)) {
+    return "Missing array `next_steps`.";
+  }
+
+  const invalidIndex = data.findings.findIndex(
+    (finding) =>
+      !finding ||
+      typeof finding !== "object" ||
+      Array.isArray(finding) ||
+      typeof finding.severity !== "string" ||
+      !finding.severity.trim() ||
+      typeof finding.title !== "string" ||
+      !finding.title.trim()
+  );
+  if (invalidIndex >= 0) {
+    return `Finding ${invalidIndex + 1} is missing a string \`severity\` or \`title\`.`;
+  }
+
+  return null;
+}
+
+/** Last line of defence: the envelope itself must fit the stdout budget. */
+function enforceEnvelopeBudget(envelope) {
+  const jsonBytes = () => Buffer.byteLength(JSON.stringify(envelope), "utf8");
+
+  while (envelope.findings_preview.length > 0 && jsonBytes() > MAX_ENVELOPE_JSON_BYTES) {
+    envelope.findings_preview.pop();
+    envelope.truncated = true;
+  }
+  if (jsonBytes() > MAX_ENVELOPE_JSON_BYTES) {
+    envelope.summary = boundedText(envelope.summary, 500).text;
+    envelope.truncated = true;
+  }
+  if (jsonBytes() > MAX_ENVELOPE_JSON_BYTES) {
+    envelope.summary = "";
+    envelope.parse_error = envelope.parse_error ? boundedText(envelope.parse_error, 200).text : envelope.parse_error;
+    envelope.error_message = envelope.error_message ? boundedText(envelope.error_message, 200).text : envelope.error_message;
+    envelope.truncated = true;
+  }
+
+  return envelope;
 }
 
 export function buildSeverityTally(findings) {
@@ -28,11 +98,19 @@ export function buildSeverityTally(findings) {
   return tally;
 }
 
+function normalizeSeverity(severity) {
+  const normalized = typeof severity === "string" ? severity.trim().toLowerCase() : "";
+  return SEVERITIES.includes(normalized) ? normalized : "low";
+}
+
 function buildFindingsPreview(findings) {
   return (Array.isArray(findings) ? findings : []).slice(0, MAX_FINDINGS_PREVIEW).map((finding, index) => ({
-    severity: typeof finding?.severity === "string" && finding.severity.trim() ? finding.severity.trim() : "low",
-    title: boundedText(finding?.title || `Finding ${index + 1}`, 200).text,
-    file: typeof finding?.file === "string" && finding.file.trim() ? finding.file.trim() : null,
+    severity: normalizeSeverity(finding?.severity),
+    title: boundedText(finding?.title || `Finding ${index + 1}`, MAX_TITLE_LENGTH).text,
+    file:
+      typeof finding?.file === "string" && finding.file.trim()
+        ? boundedText(finding.file, MAX_FILE_LENGTH).text
+        : null,
     line_start: Number.isInteger(finding?.line_start) ? finding.line_start : null
   }));
 }
@@ -54,11 +132,18 @@ function normalizeVerdict(verdict) {
 export function buildResultEnvelope(input = {}) {
   const status = normalizeStatus(input.status);
   const parsed = input.parsed && typeof input.parsed === "object" && !Array.isArray(input.parsed) ? input.parsed : null;
-  const parseError = input.parseError ?? null;
-  const findings = Array.isArray(parsed?.findings) ? parsed.findings : [];
-  const parsedVerdict = normalizeVerdict(parsed?.verdict);
+  // Shape is part of validity: a parsed object missing required fields is
+  // malformed output, and malformed output can never read as an approval.
+  const shapeError = parsed ? validateStructuredResult(parsed) : null;
+  const parseError = input.parseError ?? shapeError ?? null;
+  const findings = shapeError ? [] : Array.isArray(parsed?.findings) ? parsed.findings : [];
+  const parsedVerdict = shapeError ? null : normalizeVerdict(parsed?.verdict);
   const structured = Boolean(parsed) && !parseError;
   const cleanRun = status === "completed" && structured;
+  // Some workloads (the built-in reviewer) return prose by design: that is a
+  // missing verdict, not a failed one.
+  const unstructuredKind = Boolean(input.unstructuredKind) && !input.parseError;
+  const unstructuredVerdict = status === "completed" ? "not-applicable" : "inconclusive";
 
   const summarySource = parsed?.summary || input.summaryText || input.rawOutput || "";
   const summary = boundedText(summarySource);
@@ -69,7 +154,8 @@ export function buildResultEnvelope(input = {}) {
     kind: input.kind ?? null,
     status,
     // A clean verdict is only valid when the workload completed and parsed.
-    verdict: cleanRun ? parsedVerdict ?? "inconclusive" : "inconclusive",
+    verdict: cleanRun ? parsedVerdict ?? "inconclusive" : unstructuredKind ? unstructuredVerdict : "inconclusive",
+    structured,
     severity_tally: buildSeverityTally(findings),
     summary: summary.text,
     findings_preview: buildFindingsPreview(findings),
@@ -85,7 +171,7 @@ export function buildResultEnvelope(input = {}) {
   if (!cleanRun && parsedVerdict) {
     envelope.partial_verdict = parsedVerdict;
   }
-  if (parseError) {
+  if (parseError && !unstructuredKind) {
     envelope.parse_error = boundedText(parseError, 500).text;
   }
   if (Number.isFinite(input.exitCode)) {
@@ -95,7 +181,7 @@ export function buildResultEnvelope(input = {}) {
     envelope.error_message = boundedText(input.errorMessage, 500).text;
   }
 
-  return envelope;
+  return enforceEnvelopeBudget(envelope);
 }
 
 export function buildInconclusiveEnvelope(input = {}) {
@@ -113,7 +199,11 @@ export function renderResultEnvelope(envelope) {
     "",
     `Job: ${envelope.job_id ?? "unknown"}`,
     `Status: ${envelope.status}`,
-    `Verdict: ${envelope.verdict}`,
+    `Verdict: ${envelope.verdict}${
+      envelope.structured === false && envelope.verdict === "not-applicable"
+        ? " (this reviewer answers in prose; read the summary or the full result)"
+        : ""
+    }`,
     `Findings: ${envelope.finding_count} (critical ${tally.critical ?? 0}, high ${tally.high ?? 0}, medium ${tally.medium ?? 0}, low ${tally.low ?? 0})`
   ];
 
