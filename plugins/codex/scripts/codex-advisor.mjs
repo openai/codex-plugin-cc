@@ -16,6 +16,8 @@ import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
+import { describeExecOutcome, runHardenedCodexExec } from './lib/exec-launcher.mjs';
+
 const HOME = homedir();
 const PROJECTS = join(HOME, '.claude', 'projects');
 // Live run logs — the canonical persistent location (one <runId> subdir per run). Never /tmp.
@@ -192,17 +194,34 @@ const writeMeta = (status) => {
 try { writeFileSync(join(LOG_DIR, 'prompt.txt'), prompt); } catch {}
 
 const outFile = join(LOG_DIR, 'output.txt');
-const r = spawnSync('codex', [
-  'exec', '--skip-git-repo-check', '-m', MODEL, '-s', 'read-only',
-  '-c', `model_reasoning_effort=${EFFORT}`,
-  '-o', outFile, '-',
-], { input: prompt, cwd: REPO_ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+const promptFile = join(LOG_DIR, 'prompt.txt');
+// One blessed launcher: prompt from a file, stdin never inherited, a global queue
+// slot, an execution deadline, and the skip-git-repo-check decision made for us.
+// Deadline + queue wait stay under the exit-plan hook's 450s outer guard.
+let r;
+try {
+  r = await runHardenedCodexExec({
+    cwd: REPO_ROOT,
+    promptFile,
+    outputFile: outFile,
+    logFile: join(LOG_DIR, 'run.log'),
+    model: MODEL,
+    effort: EFFORT,
+    sandbox: 'read-only',
+    kind: 'advisor',
+    timeoutMs: 300000,
+    queueWaitMs: 60000,
+  });
+} catch (error) {
+  writeMeta('codex-error');
+  done(`[codex-advisor] codex unavailable: ${error.message}\n[codex-advisor] log: ${LOG_DIR}`);
+}
 
-if (r.error) { writeMeta('codex-error'); done(`[codex-advisor] codex unavailable: ${r.error.message}\n[codex-advisor] log: ${LOG_DIR}`); }
-let answer = '';
-try { answer = readFileSync(outFile, 'utf8').trim(); } catch {}
-if (!answer) answer = (r.stdout || '').trim();
-if (!answer) { writeMeta('no-output'); done(`[codex-advisor] codex produced no output (exit ${r.status}). ${(r.stderr || '').slice(-400)}\n[codex-advisor] log: ${LOG_DIR}`); }
+const answer = r.finalOutput;
+if (!answer) {
+  writeMeta(r.timedOut ? 'timed-out' : 'no-output');
+  done(`[codex-advisor] ${describeExecOutcome(r)} No opinion was produced.\n[codex-advisor] log: ${LOG_DIR}`);
+}
 
 console.log(`===== GPT SECOND OPINION (codex-advisor · ${MODEL} · ${plan ? 'plan' : 'advisor-verdict'} · effort=${EFFORT}) =====\n`);
 console.log(answer);

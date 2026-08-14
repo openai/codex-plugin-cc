@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const PROTOCOL_TEMPLATE = path.join(path.dirname(SCRIPT_PATH), "..", "prompts", "collab-protocol.md");
 const COLLAB_DIR_NAME = ".codex-claude";
+const COLLAB_EXEC_TIMEOUT_MS = 1800000;
 const AGENTS = new Set(["codex", "claude"]);
 const MESSAGE_TYPES = new Set([
   "assign",
@@ -396,8 +397,16 @@ function cmdRun(mainRoot, flags) {
   }
   args.push(fullPrompt);
   const logFd = fs.openSync(logFile, "w");
-  const result = spawnSync("codex", args, { stdio: ["ignore", logFd, logFd] });
+  // Stdin is never inherited and the run carries its own deadline, so a wedged
+  // Codex cannot hold a collab lane open forever.
+  const result = spawnSync("codex", args, {
+    stdio: ["ignore", logFd, logFd],
+    timeout: COLLAB_EXEC_TIMEOUT_MS
+  });
   fs.closeSync(logFd);
+  if (result.error?.code === "ETIMEDOUT") {
+    fail(`codex exec exceeded its ${COLLAB_EXEC_TIMEOUT_MS}ms deadline; see ${logFile}`);
+  }
   const log = fs.readFileSync(logFile, "utf8");
   const sessionMatch = log.match(/session id: ([0-9a-f-]+)/);
   if (sessionMatch && assignment.sessions[assignment.sessions.length - 1] !== sessionMatch[1]) {
