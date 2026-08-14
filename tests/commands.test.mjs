@@ -230,7 +230,7 @@ test("result command documents the bounded envelope and the full-output escape h
   assert.match(result, /Never report it as an approval/i);
 });
 
-test("every documented codex exec invocation closes stdin and states a deadline", () => {
+test("no plugin doc instructs a direct codex exec launch", () => {
   const docRoots = ["commands", "skills", "prompts", "agents"];
   const offenders = [];
 
@@ -245,17 +245,25 @@ test("every documented codex exec invocation closes stdin and states a deadline"
         continue;
       }
       const source = fs.readFileSync(file, "utf8");
-      const invokesRawExec = /^\s*(cd .*&&\s*)?codex exec /m.test(source);
-      if (!invokesRawExec) {
-        continue;
-      }
-      if (!/< \/dev\/null/.test(source) || !/timeout/i.test(source)) {
+      // Prose about codex exec is fine; a line that launches it is not.
+      if (/^\s*(cd .*&&\s*)?codex exec /m.test(source)) {
         offenders.push(path.relative(PLUGIN_ROOT, file));
       }
     }
   }
 
   assert.deepEqual(offenders, []);
+});
+
+test("the image generation skill routes through the companion, queue included", () => {
+  const skill = read("skills/codex-image-gen/SKILL.md");
+
+  assert.match(skill, /Go through the companion, never `codex exec` directly/i);
+  assert.match(skill, /codex-companion\.mjs" task --write/);
+  assert.match(skill, /--timeout-ms 1800000/);
+  assert.match(skill, /< \/dev\/null/);
+  assert.match(skill, /there is no `--skip-git-repo-check` for you to remember/i);
+  assert.match(skill, /bypasses the queue/i);
 });
 
 test("hooks keep session-end cleanup and stop gating enabled", () => {

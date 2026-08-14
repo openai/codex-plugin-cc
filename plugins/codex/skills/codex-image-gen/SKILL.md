@@ -10,22 +10,30 @@ native image-generation tool, exposed headlessly through `codex exec`.
 
 ## Invocation contract
 
+Go through the companion, never `codex exec` directly. It takes the single global
+Codex slot, closes stdin, and enforces the deadline:
+
 ```
-codex exec -C <absolute-target-dir> -m gpt-5.6-sol --sandbox workspace-write \
-  [--skip-git-repo-check] \
-  "<image brief>. Save as <name>.png in the current directory. Reply DONE when written." \
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --write \
+  --cwd <absolute-target-dir> \
+  --model gpt-5.6-sol \
+  --timeout-ms 1800000 \
+  --prompt-file <absolute-brief-path> \
   < /dev/null
 ```
 
-- `--sandbox workspace-write` is REQUIRED. The default sandbox is read-only and
-  cannot save into the workspace.
-- Use absolute paths for the target directory, every reference image, and every
+- `--write` is REQUIRED. A read-only run cannot save into the workspace.
+- `--cwd` is the directory that should receive the files; it may be a scratch
+  directory outside any Git repository, and the companion handles that itself —
+  there is no `--skip-git-repo-check` for you to remember.
+- Use absolute paths for the target directory, every reference image, and the
   brief file.
 - Always redirect stdin from `/dev/null`. An inherited open stdin makes Codex wait
   for EOF that never comes.
-- Always give the Bash call an explicit timeout of about 1800000ms; image runs have
-  no internal deadline of their own.
-- `--skip-git-repo-check` when the cwd is not a git repo (scratchpads, temp dirs).
+- Keep the outer Bash timeout at least 60s above `--timeout-ms`; the companion's
+  own deadline is what should fire first.
+- A direct `codex exec` launch bypasses the queue and can run a second Codex
+  workload alongside a companion job. Do not do it.
 - Mechanics: images land first in `~/.codex/generated_images/<uuid>/*.png`; the
   model then copies them into the cwd — so ALWAYS specify exact output filenames.
 - Reference images: include absolute paths in the prompt; the model can view them
