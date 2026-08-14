@@ -465,8 +465,10 @@ async function executeReviewRun(request) {
       jobId: request.jobId ?? null,
       kind: "review",
       status: jobStatus,
-      // The built-in reviewer returns prose, so there is no machine-readable verdict.
+      // The built-in reviewer answers in prose: the verdict is absent by design,
+      // which is not the same as a failed or unparseable run.
       parsed: null,
+      unstructuredKind: !result.timedOut,
       parseError: result.timedOut ? "The review deadline expired before Codex finished." : null,
       summaryText: result.reviewText,
       rawOutput: result.reviewText,
@@ -803,7 +805,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId, timeoutMs, noWait }) {
   return {
     cwd,
     model,
@@ -811,7 +813,9 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId
     prompt,
     write,
     resumeLast,
-    jobId
+    jobId,
+    timeoutMs,
+    noWait
   };
 }
 
@@ -866,13 +870,24 @@ function boundedStdout(execution) {
   return renderResultEnvelope(execution.envelope);
 }
 
+function boundedPayload(execution) {
+  const payload = execution.payload;
+  if (!execution.envelope) {
+    return payload;
+  }
+  // JSON mode carries the same budget as text mode: review payloads embed the
+  // whole transcript, so oversized ones collapse to the envelope.
+  const size = Buffer.byteLength(JSON.stringify(payload ?? null), "utf8");
+  return size <= MAX_ENVELOPE_STDOUT_BYTES ? payload : execution.envelope;
+}
+
 async function runForegroundCommand(job, runner, options = {}) {
   const { logFile, progress } = createTrackedProgress(job, {
     logFile: options.logFile,
     stderr: !options.json
   });
   const execution = await runTrackedJob(job, () => runner(progress, logFile), { logFile });
-  outputResult(options.json ? execution.payload : boundedStdout(execution), options.json);
+  outputResult(options.json ? boundedPayload(execution) : boundedStdout(execution), options.json);
   if (execution.exitStatus !== 0) {
     process.exitCode = execution.exitStatus;
   }
@@ -1029,7 +1044,8 @@ async function handleTask(argv) {
       write,
       resumeLast,
       jobId: job.id,
-      timeoutMs
+      timeoutMs,
+      noWait: Boolean(options["no-wait"])
     });
     const { payload } = enqueueBackgroundJob(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
@@ -1121,13 +1137,37 @@ async function handleConsult(argv) {
   } catch (error) {
     // A launch, queue, or transport failure still returns a bounded envelope so
     // callers can tell "no second opinion" apart from "silence".
+    const stored = readStoredJob(workspaceRoot, job.id) ?? {};
     const envelope = buildResultEnvelope({
       jobId: job.id,
       kind: "consult",
       status: "failed",
       parsed: null,
       errorMessage: error instanceof Error ? error.message : String(error),
-      logPath: job.logFile ?? null
+      logPath: stored.logFile ?? job.logFile ?? null
+    });
+    // Persist it too, so /codex:result <id> answers with the same envelope.
+    writeJobFile(workspaceRoot, job.id, {
+      ...stored,
+      id: job.id,
+      kind: "consult",
+      jobClass: "consult",
+      title: job.title,
+      workspaceRoot,
+      status: "failed",
+      phase: "failed",
+      pid: null,
+      errorMessage: envelope.error_message,
+      envelope
+    });
+    upsertJob(workspaceRoot, {
+      id: job.id,
+      status: "failed",
+      phase: "failed",
+      pid: null,
+      errorMessage: envelope.error_message,
+      verdict: envelope.verdict,
+      completedAt: nowIso()
     });
     outputResult(options.json ? envelope : renderResultEnvelope(envelope), options.json);
     process.exitCode = 1;

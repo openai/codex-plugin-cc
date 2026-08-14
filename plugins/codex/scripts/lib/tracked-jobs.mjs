@@ -134,7 +134,9 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
       process.stderr.write(`[codex] ${stderrMessage}\n`);
     }
     appendLogLine(logFile, event.message);
-    appendLogBlock(logFile, event.logTitle, event.logBody);
+    // Progress blocks carry whole assistant and review messages: cap them too,
+    // or the log grows to the size of the transcript.
+    appendLogBlock(logFile, event.logTitle, event.logBody, { maxBytes: MAX_LOGGED_BLOCK_BYTES });
     onEvent?.(event);
   };
 }

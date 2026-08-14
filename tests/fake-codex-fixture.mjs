@@ -181,6 +181,9 @@ function emitTurnCompletedLater(threadId, turnId, item, delayMs) {
 }
 
 function nativeReviewText(target) {
+  if (BEHAVIOR === "huge-review") {
+    return "Reviewed uncommitted changes.\\n" + "detail line about the change under review. ".repeat(20000);
+  }
   if (target.type === "baseBranch") {
     return "Reviewed changes against " + target.branch + ".\\nNo material issues found.";
   }
@@ -249,6 +252,10 @@ function taskPayload(prompt, resume) {
 
 const args = process.argv.slice(2);
 if (args[0] === "--version") {
+  if (BEHAVIOR === "unavailable") {
+    console.error("codex: command failed");
+    process.exit(1);
+  }
   console.log("codex-cli test");
   process.exit(0);
 }
@@ -308,6 +315,10 @@ rl.on("line", (line) => {
       case "thread/start": {
         if (BEHAVIOR === "auth-run-fails") {
           throw new Error("authentication expired; run codex login");
+        }
+        if (BEHAVIOR === "hang-before-turn") {
+          // Never answers: the setup phase hangs while holding the global lease.
+          break;
         }
         if (requiresExperimental("persistExtendedHistory", message, state) || requiresExperimental("persistFullHistory", message, state)) {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");

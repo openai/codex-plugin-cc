@@ -10,6 +10,7 @@ import { MAX_ENVELOPE_STDOUT_BYTES } from "../plugins/codex/scripts/lib/envelope
 import { BROKER_BUSY_RPC_CODE } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { shouldRetryWithDirectAppServer } from "../plugins/codex/scripts/lib/codex.mjs";
 import { appendLogBlock, MAX_LOGGED_BLOCK_BYTES } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
+import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -229,6 +230,12 @@ test("native review and adversarial review both produce the common envelope", ()
   const nativeEnvelope = JSON.parse(native.stdout).envelope;
   assert.equal(nativeEnvelope.kind, "review");
   assert.equal(nativeEnvelope.status, "completed");
+  // The built-in reviewer answers in prose: no verdict to report, and that is
+  // not the same as a failed or unparseable run.
+  assert.equal(nativeEnvelope.verdict, "not-applicable");
+  assert.equal(nativeEnvelope.structured, false);
+  assert.equal(nativeEnvelope.parse_error, undefined);
+  assert.match(nativeEnvelope.summary, /No material issues found/);
   assert.deepEqual(nativeEnvelope.severity_tally, { critical: 0, high: 0, medium: 0, low: 0 });
   assert.equal(fs.existsSync(nativeEnvelope.final_output_path), true);
 
@@ -271,6 +278,103 @@ test("result returns the bounded envelope by default and the full answer with --
   const envelope = JSON.parse(asJson.stdout);
   assert.equal(envelope.schema_version, 1);
   assert.equal(envelope.verdict, "needs-attention");
+});
+
+test("a huge review stays bounded on stdout in both text and JSON mode", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "huge-review");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "app.js"), "const a = 1;\n");
+  run("git", ["add", "app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "app.js"), "const a = 2;\n");
+  const env = buildEnv(binDir);
+
+  const asJson = run("node", [SCRIPT, "review", "--json"], { cwd: repo, env });
+  assert.equal(asJson.status, 0, asJson.stderr);
+  assert.equal(
+    Buffer.byteLength(asJson.stdout, "utf8") < MAX_ENVELOPE_STDOUT_BYTES,
+    true,
+    `json stdout was ${Buffer.byteLength(asJson.stdout, "utf8")} bytes`
+  );
+  const envelope = JSON.parse(asJson.stdout);
+  assert.equal(envelope.schema_version, 1);
+  // The complete review is on disk, not on stdout.
+  assert.equal(fs.statSync(envelope.final_output_path).size > 715 * 1024, true);
+  assert.equal(fs.statSync(envelope.log_path).size < 128 * 1024, true);
+
+  const asText = run("node", [SCRIPT, "review", "--json=false"], { cwd: repo, env });
+  assert.equal(asText.status, 0, asText.stderr);
+  assert.equal(
+    Buffer.byteLength(asText.stdout, "utf8") < MAX_ENVELOPE_STDOUT_BYTES,
+    true,
+    `text stdout was ${Buffer.byteLength(asText.stdout, "utf8")} bytes`
+  );
+});
+
+test("a background task keeps the deadline it was given", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+
+  const launched = run("node", [SCRIPT, "task", "--background", "--timeout-ms", "123456", "--json", "look into the flake"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+
+  const stateDir = resolveStateDir(repo);
+  const stored = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${jobId}.json`), "utf8"));
+  assert.equal(stored.request.timeoutMs, 123456);
+});
+
+test("a consult that cannot launch persists its inconclusive envelope", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "unavailable");
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+  const promptPath = writePromptFile(repo, "Second opinion, please.");
+
+  const result = run("node", [SCRIPT, "consult", "--prompt-file", promptPath, "--json"], { cwd: repo, env });
+  assert.notEqual(result.status, 0);
+  const envelope = JSON.parse(result.stdout);
+  assert.equal(envelope.status, "failed");
+  assert.equal(envelope.verdict, "inconclusive");
+  assert.match(envelope.error_message, /Codex CLI is not installed/);
+
+  const stored = run("node", [SCRIPT, "result", envelope.job_id, "--json"], { cwd: repo, env });
+  assert.equal(stored.status, 0, stored.stderr);
+  const storedEnvelope = JSON.parse(stored.stdout);
+  assert.equal(storedEnvelope.job_id, envelope.job_id);
+  assert.equal(storedEnvelope.verdict, "inconclusive");
+  assert.equal(storedEnvelope.status, "failed");
+});
+
+test("the deadline covers thread setup, not just the turn", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "hang-before-turn");
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+
+  const startedAt = Date.now();
+  const result = run("node", [SCRIPT, "task", "--timeout-ms", "800", "--json", "investigate"], { cwd: repo, env });
+  const elapsed = Date.now() - startedAt;
+
+  assert.equal(result.status, 124, result.stderr);
+  assert.equal(elapsed < 20000, true, `the hung setup phase took ${elapsed}ms to give up`);
+
+  const status = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env });
+  const snapshot = JSON.parse(status.stdout);
+  assert.equal(snapshot.latestFinished.status, "timed-out");
+  // The lease must not be left behind by a workload that never reached its turn.
+  assert.equal(snapshot.scheduler.active, null);
+  assert.deepEqual(snapshot.scheduler.queue, []);
 });
 
 test("every command answers --help with usage instead of launching a Codex run", () => {
