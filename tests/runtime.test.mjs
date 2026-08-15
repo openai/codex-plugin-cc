@@ -1979,6 +1979,52 @@ test("stop hook runs a stop-time review task and blocks on findings when the rev
   assert.match(status.stdout, /Codex Stop Gate Review/);
 });
 
+test("stop hook does not re-run the review and does not block on a forced retry (stop_hook_active)", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  // `appServerStarts` only increments when the fake Codex binary's
+  // `app-server` subcommand actually runs (i.e. a real review turn was
+  // spawned). Snapshot it now so we can prove below that the forced retry
+  // does not spawn a second review.
+  const appServerStartsBeforeRetry = fs.existsSync(fakeStatePath)
+    ? JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts || 0
+    : 0;
+
+  const retried = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: JSON.stringify({
+      cwd: repo,
+      session_id: "sess-stop-review-retry",
+      stop_hook_active: true,
+      last_assistant_message: "I completed the refactor and updated the retry logic."
+    })
+  });
+
+  assert.equal(retried.status, 0, retried.stderr);
+  const payload = JSON.parse(retried.stdout.trim());
+  assert.equal(payload.decision, undefined);
+  assert.match(payload.systemMessage, /skipped/i);
+
+  const appServerStartsAfterRetry = fs.existsSync(fakeStatePath)
+    ? JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts || 0
+    : 0;
+  assert.equal(appServerStartsAfterRetry, appServerStartsBeforeRetry);
+});
+
 test("stop hook logs running tasks to stderr without blocking when the review gate is disabled", () => {
   const repo = makeTempDir();
   initGitRepo(repo);
