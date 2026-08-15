@@ -95,7 +95,11 @@ export function saveBrokerSession(cwd, session) {
 export function clearBrokerSession(cwd) {
   const stateFile = resolveBrokerStateFile(cwd);
   if (fs.existsSync(stateFile)) {
-    fs.unlinkSync(stateFile);
+    try {
+      fs.unlinkSync(stateFile);
+    } catch {
+      // Ignore locked or already-removed broker state files during cleanup.
+    }
   }
 }
 
@@ -180,11 +184,19 @@ export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessi
   }
 
   if (pidFile && fs.existsSync(pidFile)) {
-    fs.unlinkSync(pidFile);
+    try {
+      fs.unlinkSync(pidFile);
+    } catch {
+      // Ignore locked or already-removed broker pid files during teardown.
+    }
   }
 
   if (logFile && fs.existsSync(logFile)) {
-    fs.unlinkSync(logFile);
+    try {
+      fs.unlinkSync(logFile);
+    } catch {
+      // Ignore locked or already-removed broker log files during teardown.
+    }
   }
 
   if (endpoint) {
