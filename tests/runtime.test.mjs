@@ -2015,7 +2015,9 @@ test("stop hook does not re-run the review and does not block on a forced retry 
   });
 
   assert.equal(retried.status, 0, retried.stderr);
-  assert.equal(retried.stdout.trim(), "");
+  const payload = JSON.parse(retried.stdout.trim());
+  assert.equal(payload.decision, undefined);
+  assert.match(payload.systemMessage, /skipped/i);
 
   const appServerStartsAfterRetry = fs.existsSync(fakeStatePath)
     ? JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts || 0

@@ -163,6 +163,16 @@ function main() {
     // failure, invalid JSON) re-blocks unconditionally -- until the harness's
     // forced-retry cap kicks in and ends the turn anyway. Skip the re-run and
     // let this retry succeed instead of repeating it up to the cap.
+    //
+    // logNote() alone is invisible to the user (it only writes to stderr, which
+    // isn't surfaced for a successful hook run) -- a skipped review would look
+    // identical to a passed one. Emit a systemMessage instead: it reaches the
+    // user without blocking (no "decision" key), so the skip is visible right
+    // when it matters -- the previous review blocked on something.
+    emitDecision({
+      systemMessage:
+        "Codex stop-gate review skipped on this continuation turn. Run /codex:review --wait to verify the fixes."
+    });
     logNote(runningTaskNote);
     return;
   }
