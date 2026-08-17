@@ -119,6 +119,9 @@ async function main() {
   const abandonedThreadIds = new Set();
   // Turns that completed before the request continuation could take ownership of them.
   const completedBeforeHandoff = new Set();
+  // Threads whose streaming start is in flight right now, so a completion arriving for them is
+  // genuinely racing the handoff rather than belonging to some earlier turn.
+  const awaitingHandoff = new Set();
   const idleShutdownMs = brokerIdleShutdownMs();
   let idleTimer = null;
   let shuttingDown = false;
@@ -169,19 +172,20 @@ async function main() {
       return;
     }
 
-    if (message.method === "turn/completed" && !activeStreamSocket) {
-      // The response and its completion can arrive in one chunk, so this can land before the
-      // request continuation assigns ownership. Remember it, or that continuation would take
-      // ownership of a turn that is already over and hold the broker busy until the client leaves.
-      if (threadId) {
-        // Only ever consumed by a handoff that is racing this notification. One that never comes —
-        // a failed request, say — would otherwise sit here for the life of the broker, so keep the
-        // set to the handful of turns that could plausibly still be in flight.
-        if (completedBeforeHandoff.size >= COMPLETED_HANDOFF_MEMORY) {
-          completedBeforeHandoff.delete(completedBeforeHandoff.values().next().value);
-        }
-        completedBeforeHandoff.add(threadId);
+    // The response and its completion can arrive in one chunk, so a completion can land before the
+    // request continuation assigns ownership. Remember it, or that continuation would take
+    // ownership of a turn that is already over and hold the broker busy until the client leaves.
+    //
+    // Only while that very start is still awaiting its handoff, though. A turn whose client
+    // disconnected after handoff also completes with no stream owner, and remembering that would
+    // strand an entry: the next client to use the same persistent thread would have its own turn
+    // treated as finished, never be made stream owner, and hang waiting for notifications that
+    // were dropped.
+    if (message.method === "turn/completed" && threadId && awaitingHandoff.has(threadId)) {
+      if (completedBeforeHandoff.size >= COMPLETED_HANDOFF_MEMORY) {
+        completedBeforeHandoff.delete(completedBeforeHandoff.values().next().value);
       }
+      completedBeforeHandoff.add(threadId);
     }
 
     const target = activeRequestSocket ?? activeStreamSocket;
@@ -403,6 +407,13 @@ async function main() {
         const isStreaming = STREAMING_METHODS.has(message.method);
         activeRequestSocket = socket;
 
+        // Marked before the await so a completion racing the response can tell it apart from one
+        // belonging to an earlier turn on the same thread.
+        const startingThreadId = isStreaming ? (message.params?.threadId ?? null) : null;
+        if (startingThreadId) {
+          awaitingHandoff.add(startingThreadId);
+        }
+
         try {
           const result = await appClient.request(message.method, message.params ?? {});
           send(socket, { id: message.id, result });
@@ -438,6 +449,12 @@ async function main() {
           if (activeStreamSocket === socket && !isStreaming) {
             activeStreamSocket = null;
             activeStreamThreadIds = null;
+          }
+        } finally {
+          // The handoff is over either way; a later completion on this thread belongs to the turn
+          // itself, not to a start still waiting to be handed over.
+          if (startingThreadId) {
+            awaitingHandoff.delete(startingThreadId);
           }
         }
       }
