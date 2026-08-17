@@ -896,6 +896,9 @@ async function handleTaskWorker(argv) {
  *
  * Returns a function that disarms the timer once the job finishes normally.
  */
+/** How long the tree gets to leave on SIGTERM before the group is killed outright. */
+const WORKER_TERMINATION_GRACE_MS = 5000;
+
 function armWorkerTtl({ workspaceRoot, jobId, storedJob, logFile }) {
   const ttlMs = workerTtlMs();
   const timer = armTimeout(ttlMs, () => {
@@ -937,8 +940,22 @@ function armWorkerTtl({ workspaceRoot, jobId, storedJob, logFile }) {
 
     // Terminate the tree rather than just this process: the app-server and MCP servers underneath
     // are the expensive part, and they do not exit on their own.
+    // Terminate the tree rather than just this process: the app-server and MCP servers underneath
+    // are the expensive part, and they do not exit on their own.
+    //
+    // SIGTERM alone is not a ceiling, though — a descendant that traps or ignores it keeps running,
+    // and once this worker is gone nothing is left to escalate. So stop dying on our own signal,
+    // give the tree a moment to leave politely, then take what is left with SIGKILL.
+    process.on("SIGTERM", () => {});
     terminateProcessTree(process.pid);
-    process.exit(1);
+    setTimeout(() => {
+      try {
+        process.kill(-process.pid, "SIGKILL");
+      } catch {
+        // Nothing left in the group, or we were never its leader.
+      }
+      process.exit(1);
+    }, WORKER_TERMINATION_GRACE_MS);
   });
   return () => disarmTimeout(timer);
 }
