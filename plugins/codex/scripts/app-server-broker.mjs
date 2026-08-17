@@ -144,7 +144,7 @@ async function main() {
    * delivered to whichever client connects next, because routing follows whoever currently owns
    * the broker rather than the turn that produced them.
    */
-  async function abandonStream(threadIds) {
+  async function abandonStream(threadIds, turnId) {
     for (const threadId of threadIds) {
       // Bounded: an interrupt need not be followed by a completion, and an entry left here
       // silently discards every future turn on that thread.
@@ -153,7 +153,9 @@ async function main() {
       }
       abandonedThreadIds.add(threadId);
       try {
-        await appClient.request("turn/interrupt", { threadId });
+        // The turn id is required alongside the thread; without it the interrupt is rejected and
+        // the turn we meant to stop keeps running while its thread stays marked abandoned.
+        await appClient.request("turn/interrupt", { threadId, turnId });
       } catch {
         // Best effort: the turn may already be finishing on its own.
       }
@@ -429,7 +431,7 @@ async function main() {
               // The client left while the turn was starting. Taking ownership on its behalf would
               // hold the broker busy for a socket nobody reads; leaving the turn running would let
               // its notifications reach the next client. Stop it instead.
-              await abandonStream(threadIds);
+              await abandonStream(threadIds, result?.turn?.id ?? null);
             } else {
               activeStreamSocket = socket;
               activeStreamThreadIds = threadIds;
@@ -437,6 +439,10 @@ async function main() {
           }
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
+            // The close handler could not arm the timer while this request still owned the broker,
+            // and for a non-streaming request no notification follows to do it later. Releasing
+            // ownership here can therefore be the last event the broker ever sees.
+            armIdleShutdown();
           }
         } catch (error) {
           send(socket, {
@@ -450,6 +456,7 @@ async function main() {
             activeStreamSocket = null;
             activeStreamThreadIds = null;
           }
+          armIdleShutdown();
         } finally {
           // The handoff is over either way; a later completion on this thread belongs to the turn
           // itself, not to a start still waiting to be handed over.
