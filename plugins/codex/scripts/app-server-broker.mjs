@@ -26,12 +26,18 @@ const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact
 /** How long each step of a shutdown waits before giving up and going down without it. */
 const SHUTDOWN_GRACE_MS = 5000;
 
+/** How many just-completed turns to remember while their handoff may still be racing us. */
+const COMPLETED_HANDOFF_MEMORY = 32;
+
 /** A deadline that never keeps the event loop alive on its own. */
 function grace(ms = SHUTDOWN_GRACE_MS) {
   return new Promise((resolve) => {
     setTimeout(resolve, ms).unref?.();
   });
 }
+
+/** Whether the app-server — and with it every configured MCP server — has been started. */
+let backendStarted = false;
 
 function buildStreamThreadIds(method, params, result) {
   const threadIds = new Set();
@@ -100,6 +106,7 @@ async function main() {
   });
 
   const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
+  backendStarted = true;
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
@@ -159,6 +166,12 @@ async function main() {
       // request continuation assigns ownership. Remember it, or that continuation would take
       // ownership of a turn that is already over and hold the broker busy until the client leaves.
       if (threadId) {
+        // Only ever consumed by a handoff that is racing this notification. One that never comes —
+        // a failed request, say — would otherwise sit here for the life of the broker, so keep the
+        // set to the handful of turns that could plausibly still be in flight.
+        if (completedBeforeHandoff.size >= COMPLETED_HANDOFF_MEMORY) {
+          completedBeforeHandoff.delete(completedBeforeHandoff.values().next().value);
+        }
         completedBeforeHandoff.add(threadId);
       }
     }
@@ -459,9 +472,12 @@ async function main() {
 
 main().catch((error) => {
   process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-  // By the time most failures reach here the app-server and its MCP servers are already running.
-  // The broker is detached, so exiting alone would leave that tree with no parent and no record —
-  // the leak this script is supposed to prevent. Take the group down with us.
-  terminateProcessTree(process.pid);
+  // Once the app-server is up it has its own MCP servers under it, and this process is detached —
+  // exiting alone would leave that tree with no parent and no record, the leak this script exists
+  // to prevent. Only then, though: a bad argument fails before anything was spawned, and there is
+  // nothing to take down.
+  if (backendStarted) {
+    terminateProcessTree(process.pid);
+  }
   process.exit(1);
 });

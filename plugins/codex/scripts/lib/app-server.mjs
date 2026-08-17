@@ -13,14 +13,8 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import {
-  clearBrokerSession,
-  ensureBrokerSession,
-  isBrokerEndpointReady,
-  loadBrokerSession,
-  teardownBrokerSession
-} from "./broker-lifecycle.mjs";
-import { isProcessAlive, terminateProcessTree } from "./process.mjs";
+import { ensureBrokerSession, isBrokerEndpointReady, loadBrokerSession } from "./broker-lifecycle.mjs";
+import { terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
@@ -370,36 +364,17 @@ export class CodexAppServerClient {
         // its session behind, and connecting to that endpoint surfaces ENOENT/ECONNREFUSED as a
         // failure of whatever the caller was doing — an authentication check, most visibly —
         // rather than as a broker that is simply gone. Discard it and fall through to spawning.
-        const stale = loadBrokerSession(cwd);
-        const persisted = stale?.endpoint ?? null;
+        // Probe before trusting the record. A broker that was killed rather than shut down leaves
+        // its session behind, and connecting to that endpoint surfaces ENOENT/ECONNREFUSED as a
+        // failure of whatever the caller was doing — an authentication check, most visibly —
+        // rather than as a broker that is simply gone. Fall through to spawning instead.
+        //
+        // The record itself is left alone: `status` and `setup` report a recorded shared runtime
+        // whether or not it answers, and reclaiming a dead broker's files belongs to
+        // `ensureBrokerSession`, which is the path that actually replaces it.
+        const persisted = loadBrokerSession(cwd)?.endpoint ?? null;
         if (persisted && (await isBrokerEndpointReady(persisted))) {
           brokerEndpoint = persisted;
-        } else if (
-          persisted &&
-          // A failed probe is not proof of death: it waits 150ms, which a live but busy broker can
-          // miss. Leave a running broker's record and files exactly as they are — dropping the
-          // record orphans it, so the next call starts a second broker while the first keeps its
-          // app-server and every MCP server under it, and nothing can find it to clean it up. This
-          // call still falls through to spawning, because we could not reach it.
-          !isProcessAlive(stale.pid) &&
-          // Re-read after the await: another process can have started a broker and replaced the
-          // record while we were probing, and that one is not ours to remove.
-          loadBrokerSession(cwd)?.endpoint === persisted
-        ) {
-          // Tear down before dropping the record. It is the only thing naming this broker's pid
-          // file, log, socket and session directory, so clearing it first strands them for good —
-          // every later call sees no session to hand to teardown.
-          try {
-            teardownBrokerSession({
-              endpoint: persisted,
-              pidFile: stale.pidFile ?? null,
-              logFile: stale.logFile ?? null,
-              sessionDir: stale.sessionDir ?? null
-            });
-          } catch {
-            // Best effort; the record still goes, so we do not reuse a dead endpoint.
-          }
-          clearBrokerSession(cwd);
         }
       }
       if (!brokerEndpoint && !options.reuseExistingBroker) {
