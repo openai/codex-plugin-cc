@@ -122,6 +122,10 @@ async function main() {
         if (activeRequestSocket === target) {
           activeRequestSocket = null;
         }
+        // Releasing ownership can be the moment the broker becomes idle — the client may already
+        // have disconnected mid-turn. Nothing else fires afterwards, so if the timer is not armed
+        // here it never is.
+        armIdleShutdown();
       }
     }
   }
@@ -138,7 +142,7 @@ async function main() {
   // A broker outlives the client that spawned it, so without this it survives a crashed or
   // timed-out SessionEnd hook and keeps its app-server (and every MCP server under it) alive
   // indefinitely. Re-armed whenever the last client disconnects, cancelled when one connects.
-  function armIdleShutdown(server) {
+  function armIdleShutdown() {
     cancelIdleShutdown();
     if (isBrokerBusy()) {
       return;
@@ -146,7 +150,7 @@ async function main() {
     idleTimer = armTimeout(idleShutdownMs, async () => {
       idleTimer = null;
       if (isBrokerBusy()) {
-        armIdleShutdown(server);
+        armIdleShutdown();
         return;
       }
       await shutdown(server).catch(() => {});
@@ -284,7 +288,11 @@ async function main() {
         try {
           const result = await appClient.request(message.method, message.params ?? {});
           send(socket, { id: message.id, result });
-          if (isStreaming) {
+          // Only hand the stream to a client that is still here. Disconnecting during the await
+          // above already cleared this socket's ownership and armed the idle timer; taking
+          // ownership back now would leave the broker permanently "busy" on behalf of a socket
+          // nobody is reading, and no later notification would ever hand it back.
+          if (isStreaming && sockets.has(socket)) {
             activeStreamSocket = socket;
             activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
           }
@@ -309,13 +317,13 @@ async function main() {
     socket.on("close", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
-      armIdleShutdown(server);
+      armIdleShutdown();
     });
 
     socket.on("error", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
-      armIdleShutdown(server);
+      armIdleShutdown();
     });
   });
 
@@ -333,7 +341,7 @@ async function main() {
   // ever connects to must not linger either, so arm it immediately.
   server.listen(listenTarget.path, () => {
     disarmTimeout(startupTimer);
-    armIdleShutdown(server);
+    armIdleShutdown();
   });
 }
 
