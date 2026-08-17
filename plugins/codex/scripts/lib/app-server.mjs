@@ -350,7 +350,10 @@ export class CodexAppServerClient {
         const persisted = loadBrokerSession(cwd)?.endpoint ?? null;
         if (persisted && (await isBrokerEndpointReady(persisted))) {
           brokerEndpoint = persisted;
-        } else if (persisted) {
+        } else if (persisted && loadBrokerSession(cwd)?.endpoint === persisted) {
+          // Re-read after the await: another process can have started a broker and replaced the
+          // record while we were probing. Deleting that one would leave a healthy broker untracked,
+          // so later commands start duplicates and cleanup cannot find it.
           clearBrokerSession(cwd);
         }
       }

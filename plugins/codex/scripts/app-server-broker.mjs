@@ -8,7 +8,11 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
-import { clearBrokerSession, loadBrokerSession } from "./lib/broker-lifecycle.mjs";
+import {
+  clearBrokerSession,
+  loadBrokerSession,
+  teardownBrokerSession
+} from "./lib/broker-lifecycle.mjs";
 import {
   armTimeout,
   brokerIdleShutdownMs,
@@ -157,28 +161,39 @@ async function main() {
     shuttingDown = true;
     const closed = new Promise((resolve) => server.close(() => resolve()));
 
-    // Drop our own persisted session, or the next caller reconnects to an endpoint we are about to
-    // remove — and `reuseExistingBroker` readers load it without probing, so they surface that as
-    // an authentication failure rather than a missing broker. Only when the record still points at
-    // us: a newer broker may already have claimed this workspace.
-    try {
-      if (loadBrokerSession(cwd)?.endpoint === endpoint) {
-        clearBrokerSession(cwd);
-      }
-    } catch {
-      // Best effort; never let bookkeeping block the shutdown.
-    }
-
     for (const socket of sockets) {
       socket.end();
     }
     await appClient.close().catch(() => {});
     await closed;
-    if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
-      fs.unlinkSync(listenTarget.path);
+
+    // Clean up after ourselves. When the idle timer fires there is no session-end hook to run
+    // teardown for us, so the log and session directory would otherwise survive every expiry —
+    // and the record naming them is the very thing we are about to delete.
+    //
+    // Only treat the record as ours while it still points at this endpoint: ten idle minutes is
+    // ample time for a newer broker to have claimed the workspace, and its log, directory and
+    // session record are not ours to remove.
+    let session = null;
+    try {
+      session = loadBrokerSession(cwd);
+    } catch {
+      // An unreadable record just means we clean up what we know about below.
     }
-    if (pidFile && fs.existsSync(pidFile)) {
-      fs.unlinkSync(pidFile);
+    const isOurs = session?.endpoint === endpoint;
+
+    try {
+      teardownBrokerSession({
+        endpoint,
+        pidFile,
+        logFile: isOurs ? (session.logFile ?? null) : null,
+        sessionDir: isOurs ? (session.sessionDir ?? null) : null
+      });
+      if (isOurs) {
+        clearBrokerSession(cwd);
+      }
+    } catch {
+      // Best effort; never let bookkeeping block the shutdown.
     }
   }
 
