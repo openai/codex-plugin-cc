@@ -23,6 +23,9 @@ import { terminateProcessTree } from "./lib/process.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 
+/** How long a shutdown waits for the app-server before giving up and going down without it. */
+const SHUTDOWN_GRACE_MS = 5000;
+
 function buildStreamThreadIds(method, params, result) {
   const threadIds = new Set();
   if (params?.threadId) {
@@ -94,9 +97,15 @@ async function main() {
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
   const sockets = new Set();
+  // Turns whose client left before the stream could be handed over: their notifications go
+  // nowhere, and they are interrupted rather than left running for the next client to receive.
+  const abandonedThreadIds = new Set();
+  // Turns that completed before the request continuation could take ownership of them.
+  const completedBeforeHandoff = new Set();
   const idleShutdownMs = brokerIdleShutdownMs();
   let idleTimer = null;
   let shuttingDown = false;
+  let shutdownPromise = null;
 
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
@@ -108,14 +117,51 @@ async function main() {
     }
   }
 
+  /**
+   * Stop a turn whose client left before it could be handed the stream.
+   *
+   * Leaving it running is not harmless: nobody is reading it, and its notifications would be
+   * delivered to whichever client connects next, because routing follows whoever currently owns
+   * the broker rather than the turn that produced them.
+   */
+  async function abandonStream(threadIds) {
+    for (const threadId of threadIds) {
+      abandonedThreadIds.add(threadId);
+      try {
+        await appClient.request("turn/interrupt", { threadId });
+      } catch {
+        // Best effort: the turn may already be finishing on its own.
+      }
+    }
+  }
+
   function routeNotification(message) {
+    const threadId = message.params?.threadId ?? null;
+
+    // An abandoned turn belongs to a client that is gone. Never hand it to whoever is here now.
+    if (threadId && abandonedThreadIds.has(threadId)) {
+      if (message.method === "turn/completed") {
+        abandonedThreadIds.delete(threadId);
+        armIdleShutdown();
+      }
+      return;
+    }
+
+    if (message.method === "turn/completed" && !activeStreamSocket) {
+      // The response and its completion can arrive in one chunk, so this can land before the
+      // request continuation assigns ownership. Remember it, or that continuation would take
+      // ownership of a turn that is already over and hold the broker busy until the client leaves.
+      if (threadId) {
+        completedBeforeHandoff.add(threadId);
+      }
+    }
+
     const target = activeRequestSocket ?? activeStreamSocket;
     if (!target) {
       return;
     }
     send(target, message);
     if (message.method === "turn/completed" && activeStreamSocket === target) {
-      const threadId = message.params?.threadId ?? null;
       if (!threadId || !activeStreamThreadIds || activeStreamThreadIds.has(threadId)) {
         activeStreamSocket = null;
         activeStreamThreadIds = null;
@@ -144,7 +190,9 @@ async function main() {
   // indefinitely. Re-armed whenever the last client disconnects, cancelled when one connects.
   function armIdleShutdown() {
     cancelIdleShutdown();
-    if (isBrokerBusy()) {
+    // A shutdown already in flight must not be rescheduled behind itself; sockets closing as part
+    // of it would otherwise arm a timer for a broker that is on its way out.
+    if (shuttingDown || isBrokerBusy()) {
       return;
     }
     idleTimer = armTimeout(idleShutdownMs, async () => {
@@ -159,6 +207,16 @@ async function main() {
   }
 
   async function shutdown(server) {
+    // Every entry point — the idle timer, `broker/shutdown`, SIGTERM, SIGINT — can land while
+    // another is mid-flight. Run once and let the rest await that same pass.
+    if (shutdownPromise) {
+      return shutdownPromise;
+    }
+    shutdownPromise = runShutdown(server);
+    return shutdownPromise;
+  }
+
+  async function runShutdown(server) {
     cancelIdleShutdown();
     // Stop accepting before the first await. Otherwise a client can connect while we are closing
     // the app-server, get a broker that looks alive but has no backend, and hold server.close()
@@ -169,7 +227,13 @@ async function main() {
     for (const socket of sockets) {
       socket.end();
     }
-    await appClient.close().catch(() => {});
+    // A wedged app-server must not outlive the guard meant to reclaim it: waiting on it forever
+    // is exactly how the tree survives. Give it a grace period, then carry on without it — the
+    // process group goes down at the end regardless.
+    await Promise.race([
+      appClient.close().catch(() => {}),
+      new Promise((resolve) => setTimeout(resolve, SHUTDOWN_GRACE_MS).unref?.())
+    ]);
     await closed;
 
     // Clean up after ourselves. When the idle timer fires there is no session-end hook to run
@@ -231,6 +295,17 @@ async function main() {
           continue;
         }
 
+        // `null`, a bare number and an array are all valid JSON. Dereferencing them below would
+        // throw inside this async listener, which on current Node takes the whole broker down —
+        // detached, so nothing tears down its app-server or its session record.
+        if (message === null || typeof message !== "object" || Array.isArray(message)) {
+          send(socket, {
+            id: null,
+            error: buildJsonRpcError(-32600, "Invalid JSON-RPC message: expected an object.")
+          });
+          continue;
+        }
+
         if (message.id !== undefined && message.method === "initialize") {
           send(socket, {
             id: message.id,
@@ -288,13 +363,18 @@ async function main() {
         try {
           const result = await appClient.request(message.method, message.params ?? {});
           send(socket, { id: message.id, result });
-          // Only hand the stream to a client that is still here. Disconnecting during the await
-          // above already cleared this socket's ownership and armed the idle timer; taking
-          // ownership back now would leave the broker permanently "busy" on behalf of a socket
-          // nobody is reading, and no later notification would ever hand it back.
-          if (isStreaming && sockets.has(socket)) {
-            activeStreamSocket = socket;
-            activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
+          if (isStreaming) {
+            const threadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
+            const finishedAlready = [...threadIds].some((id) => completedBeforeHandoff.delete(id));
+            if (!sockets.has(socket)) {
+              // The client left while the turn was starting. Taking ownership on its behalf would
+              // hold the broker busy for a socket nobody reads; leaving the turn running would let
+              // its notifications reach the next client. Stop it instead.
+              await abandonStream(threadIds);
+            } else if (!finishedAlready) {
+              activeStreamSocket = socket;
+              activeStreamThreadIds = threadIds;
+            }
           }
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
@@ -309,6 +389,7 @@ async function main() {
           }
           if (activeStreamSocket === socket && !isStreaming) {
             activeStreamSocket = null;
+            activeStreamThreadIds = null;
           }
         }
       }
@@ -339,13 +420,26 @@ async function main() {
 
   // Startup is over once we are accepting; from here the idle timer takes over. A broker nobody
   // ever connects to must not linger either, so arm it immediately.
-  server.listen(listenTarget.path, () => {
-    disarmTimeout(startupTimer);
-    armIdleShutdown();
+  //
+  // A listen failure — a stale socket path, a permission problem, an address already in use —
+  // must reach main()'s handler rather than surfacing as an unhandled error event, or the process
+  // dies with its app-server and MCP servers still running and its session record still on disk.
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(listenTarget.path, () => {
+      server.off("error", reject);
+      disarmTimeout(startupTimer);
+      armIdleShutdown();
+      resolve();
+    });
   });
 }
 
 main().catch((error) => {
   process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+  // By the time most failures reach here the app-server and its MCP servers are already running.
+  // The broker is detached, so exiting alone would leave that tree with no parent and no record —
+  // the leak this script is supposed to prevent. Take the group down with us.
+  terminateProcessTree(process.pid);
   process.exit(1);
 });

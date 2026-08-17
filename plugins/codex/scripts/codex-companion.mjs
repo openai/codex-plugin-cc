@@ -913,13 +913,27 @@ function armWorkerTtl({ workspaceRoot, jobId, storedJob, logFile }) {
       completedAt,
       errorMessage
     };
-    try {
-      appendLogLine(logFile, `${errorMessage} Terminating its process tree.`);
-      writeJobFile(workspaceRoot, jobId, { ...storedJob, ...terminal, logFile });
-      upsertJob(workspaceRoot, { id: jobId, ...terminal });
-    } catch {
-      // Fall through to termination regardless.
-    }
+
+    // Each of these is best effort on its own. Sharing one try means a missing log directory or a
+    // full disk would skip the terminal status too, leaving the job "running" behind a dead pid —
+    // the stale record that hides leaked workers in the first place. Status goes first, because it
+    // is the part anything else reads.
+    const attempt = (action) => {
+      try {
+        action();
+      } catch {
+        // Never let bookkeeping keep a runaway tree alive.
+      }
+    };
+
+    attempt(() => {
+      // Re-read rather than reusing the snapshot this timer closed over a day ago: it predates
+      // startedAt, threadId, turnId and every progress update since.
+      const current = readStoredJob(workspaceRoot, jobId) ?? storedJob;
+      writeJobFile(workspaceRoot, jobId, { ...current, ...terminal, logFile });
+    });
+    attempt(() => upsertJob(workspaceRoot, { id: jobId, ...terminal }));
+    attempt(() => appendLogLine(logFile, `${errorMessage} Terminating its process tree.`));
 
     // Terminate the tree rather than just this process: the app-server and MCP servers underneath
     // are the expensive part, and they do not exit on their own.

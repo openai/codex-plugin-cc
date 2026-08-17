@@ -93,6 +93,12 @@ class AppServerClientBase {
     if (this.closed) {
       throw new Error("codex app-server client is closed.");
     }
+    // `closed` only covers a close we asked for. The transport can die on its own — between a
+    // successful connect and the very next request, for instance — and a request registered after
+    // that never resolves, because the exit that would reject it has already been reported.
+    if (this.exitResolved) {
+      throw this.exitError ?? new Error("codex app-server connection closed.");
+    }
 
     const id = this.nextId;
     this.nextId += 1;
@@ -104,7 +110,7 @@ class AppServerClientBase {
   }
 
   notify(method, params = {}) {
-    if (this.closed) {
+    if (this.closed || this.exitResolved) {
       return;
     }
     this.sendMessage({ method, params });
