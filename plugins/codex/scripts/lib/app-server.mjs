@@ -13,7 +13,12 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
+import {
+  clearBrokerSession,
+  ensureBrokerSession,
+  isBrokerEndpointReady,
+  loadBrokerSession
+} from "./broker-lifecycle.mjs";
 import { terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
@@ -338,7 +343,16 @@ export class CodexAppServerClient {
     if (!options.disableBroker) {
       brokerEndpoint = options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
       if (!brokerEndpoint && options.reuseExistingBroker) {
-        brokerEndpoint = loadBrokerSession(cwd)?.endpoint ?? null;
+        // Probe before trusting the record. A broker that was killed rather than shut down leaves
+        // its session behind, and connecting to that endpoint surfaces ENOENT/ECONNREFUSED as a
+        // failure of whatever the caller was doing — an authentication check, most visibly —
+        // rather than as a broker that is simply gone. Discard it and fall through to spawning.
+        const persisted = loadBrokerSession(cwd)?.endpoint ?? null;
+        if (persisted && (await isBrokerEndpointReady(persisted))) {
+          brokerEndpoint = persisted;
+        } else if (persisted) {
+          clearBrokerSession(cwd);
+        }
       }
       if (!brokerEndpoint && !options.reuseExistingBroker) {
         const brokerSession = await ensureBrokerSession(cwd, { env: options.env });

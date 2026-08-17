@@ -99,7 +99,8 @@ export function clearBrokerSession(cwd) {
   }
 }
 
-async function isBrokerEndpointReady(endpoint) {
+/** Whether something is actually listening on a persisted endpoint, as opposed to merely recorded. */
+export async function isBrokerEndpointReady(endpoint) {
   if (!endpoint) {
     return false;
   }
