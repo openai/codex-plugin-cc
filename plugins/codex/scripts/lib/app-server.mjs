@@ -17,9 +17,10 @@ import {
   clearBrokerSession,
   ensureBrokerSession,
   isBrokerEndpointReady,
-  loadBrokerSession
+  loadBrokerSession,
+  teardownBrokerSession
 } from "./broker-lifecycle.mjs";
-import { terminateProcessTree } from "./process.mjs";
+import { isProcessAlive, terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
@@ -347,13 +348,36 @@ export class CodexAppServerClient {
         // its session behind, and connecting to that endpoint surfaces ENOENT/ECONNREFUSED as a
         // failure of whatever the caller was doing — an authentication check, most visibly —
         // rather than as a broker that is simply gone. Discard it and fall through to spawning.
-        const persisted = loadBrokerSession(cwd)?.endpoint ?? null;
+        const stale = loadBrokerSession(cwd);
+        const persisted = stale?.endpoint ?? null;
         if (persisted && (await isBrokerEndpointReady(persisted))) {
           brokerEndpoint = persisted;
         } else if (persisted && loadBrokerSession(cwd)?.endpoint === persisted) {
           // Re-read after the await: another process can have started a broker and replaced the
           // record while we were probing. Deleting that one would leave a healthy broker untracked,
           // so later commands start duplicates and cleanup cannot find it.
+          //
+          // Tear down before dropping the record. It is the only thing naming this broker's pid
+          // file, log, socket and session directory, so clearing it first strands them for good —
+          // every later call sees no session to hand to teardown.
+          //
+          // But only once the process is genuinely gone. The probe waits 150ms, which a live but
+          // busy broker can miss, and removing a running broker's socket would strand it holding
+          // every MCP server underneath — the exact leak this is meant to prevent. Dropping the
+          // record for an unresponsive broker matches what `ensureBrokerSession` already does;
+          // deleting its files does not.
+          if (!isProcessAlive(stale.pid)) {
+            try {
+              teardownBrokerSession({
+                endpoint: persisted,
+                pidFile: stale.pidFile ?? null,
+                logFile: stale.logFile ?? null,
+                sessionDir: stale.sessionDir ?? null
+              });
+            } catch {
+              // Best effort; the record still goes, so we do not reuse a dead endpoint.
+            }
+          }
           clearBrokerSession(cwd);
         }
       }

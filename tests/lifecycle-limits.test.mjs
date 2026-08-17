@@ -8,6 +8,7 @@ import {
   disarmTimeout,
   workerTtlMs
 } from "../plugins/codex/scripts/lib/lifecycle-limits.mjs";
+import { isProcessAlive } from "../plugins/codex/scripts/lib/process.mjs";
 
 const TEN_MINUTES = 10 * 60 * 1000;
 const FIVE_MINUTES = 5 * 60 * 1000;
@@ -80,6 +81,24 @@ test("an enabled limit fires and can be disarmed", async () => {
   }));
   await new Promise((resolve) => setTimeout(resolve, 30));
   assert.equal(second, false);
+});
+
+test("liveness treats a permission error as alive and a missing pid as gone", () => {
+  // A broker owned by another user still holds its socket; treating EPERM as "gone" would delete
+  // a running broker's files.
+  const eperm = () => {
+    throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+  };
+  const esrch = () => {
+    throw Object.assign(new Error("no such process"), { code: "ESRCH" });
+  };
+  assert.equal(isProcessAlive(1234, eperm), true);
+  assert.equal(isProcessAlive(1234, esrch), false);
+  assert.equal(isProcessAlive(1234, () => {}), true);
+  for (const bad of [null, undefined, 0, -1, Number.NaN, "123"]) {
+    assert.equal(isProcessAlive(bad, () => {}), false);
+  }
+  assert.equal(isProcessAlive(process.pid), true);
 });
 
 test("durations are clamped to what setTimeout can actually hold", () => {

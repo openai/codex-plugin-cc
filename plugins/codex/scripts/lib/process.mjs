@@ -54,6 +54,24 @@ function looksLikeMissingProcessMessage(text) {
   return /not found|no running instance|cannot find|does not exist|no such process/i.test(text);
 }
 
+/**
+ * Whether a pid still names a running process.
+ *
+ * Signal `0` runs the existence and permission checks without delivering anything. `EPERM` means
+ * the process is there but owned by someone else, which still counts as alive.
+ */
+export function isProcessAlive(pid, killImpl = process.kill.bind(process)) {
+  if (!Number.isFinite(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    killImpl(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
 export function terminateProcessTree(pid, options = {}) {
   if (!Number.isFinite(pid)) {
     return { attempted: false, delivered: false, method: null };
