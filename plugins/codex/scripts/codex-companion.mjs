@@ -983,7 +983,19 @@ async function handleCancel(argv) {
     );
   }
 
-  terminateProcessTree(job.pid ?? Number.NaN);
+  try {
+    terminateProcessTree(job.pid ?? Number.NaN);
+  } catch (error) {
+    // terminateProcessTree already treats "process already gone" as
+    // best-effort/non-fatal; a partial `taskkill /T` tree-kill failure
+    // (e.g. Windows refusing to kill a subset of grandchild processes)
+    // deserves the same treatment rather than aborting the cancel before
+    // the job's on-disk status is ever updated, leaving it stuck at
+    // "running"/"finalizing" forever even though the turn interrupt above
+    // already succeeded.
+    const detail = error instanceof Error ? error.message : String(error);
+    appendLogLine(job.logFile, `Process tree termination failed (continuing cancel): ${detail}`);
+  }
   appendLogLine(job.logFile, "Cancelled by user.");
 
   const completedAt = nowIso();

@@ -191,7 +191,10 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       cwd: this.cwd,
       env: this.options.env ?? process.env,
       stdio: ["pipe", "pipe", "pipe"],
-      shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
+      // See the matching comment in lib/process.mjs's runCommand: `SHELL` is
+      // a POSIX convention and must not be consulted for native Windows
+      // process creation.
+      shell: process.platform === "win32" ? true : false,
       windowsHide: true
     });
 

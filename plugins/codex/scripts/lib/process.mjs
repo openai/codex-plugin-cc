@@ -9,7 +9,12 @@ export function runCommand(command, args = [], options = {}) {
     input: options.input,
     maxBuffer: options.maxBuffer,
     stdio: options.stdio ?? "pipe",
-    shell: options.shell ?? (process.platform === "win32" ? (process.env.SHELL || true) : false),
+    // `process.env.SHELL` is a POSIX convention with no meaning for native
+    // Windows process creation; consulting it here routes commands through
+    // whatever POSIX shell happens to be set (e.g. Git Bash, which Claude
+    // Code's own Bash tool sets), which mangles Windows-style flags like
+    // `/PID` via MSYS's automatic POSIX-path conversion.
+    shell: options.shell ?? (process.platform === "win32" ? true : false),
     windowsHide: true
   });
 
