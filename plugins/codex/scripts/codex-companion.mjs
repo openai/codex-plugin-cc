@@ -25,7 +25,7 @@ import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { armTimeout, disarmTimeout, workerTtlMs } from "./lib/lifecycle-limits.mjs";
-import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import { binaryAvailable, terminateProcessTree, terminateProcessTreeAndExit } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
@@ -946,16 +946,7 @@ function armWorkerTtl({ workspaceRoot, jobId, storedJob, logFile }) {
     // SIGTERM alone is not a ceiling, though — a descendant that traps or ignores it keeps running,
     // and once this worker is gone nothing is left to escalate. So stop dying on our own signal,
     // give the tree a moment to leave politely, then take what is left with SIGKILL.
-    process.on("SIGTERM", () => {});
-    terminateProcessTree(process.pid);
-    setTimeout(() => {
-      try {
-        process.kill(-process.pid, "SIGKILL");
-      } catch {
-        // Nothing left in the group, or we were never its leader.
-      }
-      process.exit(1);
-    }, WORKER_TERMINATION_GRACE_MS);
+    terminateProcessTreeAndExit(process.pid, { graceMs: WORKER_TERMINATION_GRACE_MS });
   });
   return () => disarmTimeout(timer);
 }

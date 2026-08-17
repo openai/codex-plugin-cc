@@ -19,7 +19,7 @@ import {
   brokerStartupTimeoutMs,
   disarmTimeout
 } from "./lib/lifecycle-limits.mjs";
-import { terminateProcessTree } from "./lib/process.mjs";
+import { terminateProcessTreeAndExit } from "./lib/process.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 
@@ -51,6 +51,21 @@ function buildStreamThreadIds(method, params, result) {
     threadIds.add(result.reviewThreadId);
   }
   return threadIds;
+}
+
+/**
+ * The single thread the started turn actually runs on.
+ *
+ * A detached review streams on the review thread it just created, not on the source thread it was
+ * launched from. Both need routing, but only this one will ever produce a completion — marking the
+ * other abandoned would leave it marked for good, and every later turn resumed on it would have
+ * its notifications discarded.
+ */
+function turnThreadId(method, params, result) {
+  if (method === "review/start") {
+    return result?.reviewThreadId ?? params?.threadId ?? null;
+  }
+  return params?.threadId ?? null;
 }
 
 function buildJsonRpcError(code, message, data) {
@@ -104,8 +119,7 @@ async function main() {
   const startupTimeoutMs = brokerStartupTimeoutMs();
   const startupTimer = armTimeout(startupTimeoutMs, () => {
     process.stderr.write(`broker startup exceeded ${startupTimeoutMs}ms; terminating\n`);
-    terminateProcessTree(process.pid);
-    process.exit(1);
+    terminateProcessTreeAndExit(process.pid);
   });
 
   const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
@@ -144,21 +158,22 @@ async function main() {
    * delivered to whichever client connects next, because routing follows whoever currently owns
    * the broker rather than the turn that produced them.
    */
-  async function abandonStream(threadIds, turnId) {
-    for (const threadId of threadIds) {
-      // Bounded: an interrupt need not be followed by a completion, and an entry left here
-      // silently discards every future turn on that thread.
-      if (abandonedThreadIds.size >= ABANDONED_THREAD_MEMORY) {
-        abandonedThreadIds.delete(abandonedThreadIds.values().next().value);
-      }
-      abandonedThreadIds.add(threadId);
-      try {
-        // The turn id is required alongside the thread; without it the interrupt is rejected and
-        // the turn we meant to stop keeps running while its thread stays marked abandoned.
-        await appClient.request("turn/interrupt", { threadId, turnId });
-      } catch {
-        // Best effort: the turn may already be finishing on its own.
-      }
+  async function abandonStream(threadId, turnId) {
+    if (!threadId) {
+      return;
+    }
+    // Bounded: an interrupt need not be followed by a completion, and an entry left here
+    // silently discards every future turn on that thread.
+    if (abandonedThreadIds.size >= ABANDONED_THREAD_MEMORY) {
+      abandonedThreadIds.delete(abandonedThreadIds.values().next().value);
+    }
+    abandonedThreadIds.add(threadId);
+    try {
+      // The turn id is required alongside the thread; without it the interrupt is rejected and
+      // the turn we meant to stop keeps running while its thread stays marked abandoned.
+      await appClient.request("turn/interrupt", { threadId, turnId });
+    } catch {
+      // Best effort: the turn may already be finishing on its own.
     }
   }
 
@@ -303,7 +318,7 @@ async function main() {
     // this broker and defeat the whole point of shutting down. Take the group with us. Done last,
     // after the artifacts and the record are already cleaned up, because this ends us too.
     if (!backendClosed) {
-      terminateProcessTree(process.pid);
+      terminateProcessTreeAndExit(process.pid);
     }
   }
 
@@ -430,8 +445,12 @@ async function main() {
             } else if (!sockets.has(socket)) {
               // The client left while the turn was starting. Taking ownership on its behalf would
               // hold the broker busy for a socket nobody reads; leaving the turn running would let
-              // its notifications reach the next client. Stop it instead.
-              await abandonStream(threadIds, result?.turn?.id ?? null);
+              // its notifications reach the next client. Stop it instead — the turn's own thread
+              // only, since that is the one that will report the completion clearing the mark.
+              await abandonStream(
+                turnThreadId(message.method, message.params ?? {}, result),
+                result?.turn?.id ?? null
+              );
             } else {
               activeStreamSocket = socket;
               activeStreamThreadIds = threadIds;
@@ -514,7 +533,8 @@ main().catch((error) => {
   // to prevent. Only then, though: a bad argument fails before anything was spawned, and there is
   // nothing to take down.
   if (backendStarted) {
-    terminateProcessTree(process.pid);
+    terminateProcessTreeAndExit(process.pid);
+    return;
   }
   process.exit(1);
 });

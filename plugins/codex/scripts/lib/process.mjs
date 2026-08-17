@@ -72,6 +72,33 @@ export function isProcessAlive(pid, killImpl = process.kill.bind(process)) {
   }
 }
 
+/**
+ * Terminate a process tree and make sure it is actually gone.
+ *
+ * `terminateProcessTree` sends SIGTERM and stops there, so a descendant that traps or ignores it
+ * survives — and when the tree being terminated is our own, we die with the signal and nothing is
+ * left to escalate. This keeps the caller alive through its own SIGTERM, gives the tree a grace
+ * period to leave on its own, then kills what remains and exits.
+ *
+ * Only meaningful for a group leader; a caller that is not one signals nothing, which is the
+ * existing behaviour of `terminateProcessTree`.
+ */
+export function terminateProcessTreeAndExit(pid, { graceMs = 5000, exitCode = 1 } = {}) {
+  if (pid === process.pid) {
+    process.on("SIGTERM", () => {});
+  }
+  terminateProcessTree(pid);
+  // Deliberately not unref'd: this timer is the escalation, and the process must stay up for it.
+  setTimeout(() => {
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      // Nothing left in the group, or the caller was never its leader.
+    }
+    process.exit(exitCode);
+  }, graceMs);
+}
+
 export function terminateProcessTree(pid, options = {}) {
   if (!Number.isFinite(pid)) {
     return { attempted: false, delivered: false, method: null };
