@@ -698,6 +698,126 @@ test("session start hook exports the Claude session id, transcript path, and plu
   );
 });
 
+function runSessionStartHook({ repo, envFile, pluginDataDir, sessionId, transcriptPath }) {
+  return run("node", [SESSION_HOOK, "SessionStart"], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      CLAUDE_ENV_FILE: envFile,
+      CLAUDE_PLUGIN_DATA: pluginDataDir
+    },
+    input: JSON.stringify({
+      hook_event_name: "SessionStart",
+      session_id: sessionId,
+      transcript_path: transcriptPath,
+      cwd: repo
+    })
+  });
+}
+
+function managedExports({ sessionId, transcriptPath, pluginDataDir }) {
+  return (
+    `export CODEX_COMPANION_SESSION_ID='${sessionId}'\n` +
+    `export CODEX_COMPANION_TRANSCRIPT_PATH='${transcriptPath}'\n` +
+    `export CLAUDE_PLUGIN_DATA='${pluginDataDir}'\n`
+  );
+}
+
+test("session start hook does not accumulate exports when it fires repeatedly", () => {
+  const repo = makeTempDir();
+  const envFile = path.join(makeTempDir(), "claude-env.sh");
+  fs.writeFileSync(envFile, "", "utf8");
+  const pluginDataDir = makeTempDir();
+  const transcriptPath = path.join(repo, "session.jsonl");
+  const expected = managedExports({ sessionId: "sess-current", transcriptPath, pluginDataDir });
+
+  // SessionStart fires again on every resume and every compaction of the same session.
+  for (let firing = 1; firing <= 5; firing += 1) {
+    const result = runSessionStartHook({
+      repo,
+      envFile,
+      pluginDataDir,
+      sessionId: "sess-current",
+      transcriptPath
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.readFileSync(envFile, "utf8"), expected, `after firing ${firing}`);
+  }
+});
+
+test("session start hook prunes exports an earlier version left behind", () => {
+  const repo = makeTempDir();
+  const envFile = path.join(makeTempDir(), "claude-env.sh");
+  const pluginDataDir = makeTempDir();
+  const transcriptPath = path.join(repo, "session.jsonl");
+  const expected = managedExports({ sessionId: "sess-current", transcriptPath, pluginDataDir });
+
+  // The state a session is already in after a version that appended on every firing:
+  // hundreds of copies, of which only the last has any effect.
+  fs.writeFileSync(envFile, expected.repeat(500), "utf8");
+
+  const result = runSessionStartHook({
+    repo,
+    envFile,
+    pluginDataDir,
+    sessionId: "sess-current",
+    transcriptPath
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.readFileSync(envFile, "utf8"), expected);
+});
+
+test("session start hook keeps env file lines written by anything else", () => {
+  const repo = makeTempDir();
+  const envFile = path.join(makeTempDir(), "claude-env.sh");
+  const pluginDataDir = makeTempDir();
+  const transcriptPath = path.join(repo, "session.jsonl");
+  const expected = managedExports({ sessionId: "sess-current", transcriptPath, pluginDataDir });
+  const other = "export OTHER_PLUGIN_VALUE='keep-me'\n";
+
+  fs.writeFileSync(envFile, `${other}${expected.repeat(3)}`, "utf8");
+
+  for (let firing = 1; firing <= 2; firing += 1) {
+    const result = runSessionStartHook({
+      repo,
+      envFile,
+      pluginDataDir,
+      sessionId: "sess-current",
+      transcriptPath
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.readFileSync(envFile, "utf8"), `${other}${expected}`, `after firing ${firing}`);
+  }
+});
+
+test("session start hook replaces exports that hold a stale value", () => {
+  const repo = makeTempDir();
+  const envFile = path.join(makeTempDir(), "claude-env.sh");
+  const pluginDataDir = makeTempDir();
+  const transcriptPath = path.join(repo, "session.jsonl");
+
+  fs.writeFileSync(
+    envFile,
+    managedExports({ sessionId: "sess-previous", transcriptPath, pluginDataDir }),
+    "utf8"
+  );
+
+  const result = runSessionStartHook({
+    repo,
+    envFile,
+    pluginDataDir,
+    sessionId: "sess-current",
+    transcriptPath
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(
+    fs.readFileSync(envFile, "utf8"),
+    managedExports({ sessionId: "sess-current", transcriptPath, pluginDataDir })
+  );
+});
+
 test("write task output focuses on the Codex result without generic follow-up hints", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
