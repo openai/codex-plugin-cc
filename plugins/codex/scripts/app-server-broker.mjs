@@ -60,11 +60,11 @@ function writePidFile(pidFile) {
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (subcommand !== "serve") {
-    throw new Error("Usage: node scripts/app-server-broker.mjs serve --endpoint <value> [--cwd <path>] [--pid-file <path>]");
+    throw new Error("Usage: node scripts/app-server-broker.mjs serve --endpoint <value> [--cwd <path>] [--pid-file <path>] [--log-file <path>]");
   }
 
   const { options } = parseArgs(argv, {
-    valueOptions: ["cwd", "pid-file", "endpoint"]
+    valueOptions: ["cwd", "pid-file", "endpoint", "log-file"]
   });
 
   if (!options.endpoint) {
@@ -75,6 +75,7 @@ async function main() {
   const endpoint = String(options.endpoint);
   const listenTarget = parseBrokerEndpoint(endpoint);
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
+  const logFile = options["log-file"] ? path.resolve(options["log-file"]) : null;
   writePidFile(pidFile);
 
   // Connecting spawns the app-server, which in turn spawns every configured MCP server. Until the
@@ -168,32 +169,24 @@ async function main() {
     await closed;
 
     // Clean up after ourselves. When the idle timer fires there is no session-end hook to run
-    // teardown for us, so the log and session directory would otherwise survive every expiry —
-    // and the record naming them is the very thing we are about to delete.
+    // teardown for us, so these would otherwise survive every expiry.
     //
-    // Only treat the record as ours while it still points at this endpoint: ten idle minutes is
-    // ample time for a newer broker to have claimed the workspace, and its log, directory and
-    // session record are not ours to remove.
-    let session = null;
+    // The artifacts are ours unconditionally — we were told their paths at startup precisely so
+    // that this does not depend on the shared record, which by now may name a broker that
+    // superseded us while we sat idle. The record itself is the one thing we must not touch in
+    // that case: it belongs to whoever it points at.
     try {
-      session = loadBrokerSession(cwd);
+      teardownBrokerSession({ endpoint, pidFile, logFile });
     } catch {
-      // An unreadable record just means we clean up what we know about below.
+      // Best effort; never let bookkeeping block the shutdown.
     }
-    const isOurs = session?.endpoint === endpoint;
 
     try {
-      teardownBrokerSession({
-        endpoint,
-        pidFile,
-        logFile: isOurs ? (session.logFile ?? null) : null,
-        sessionDir: isOurs ? (session.sessionDir ?? null) : null
-      });
-      if (isOurs) {
+      if (loadBrokerSession(cwd)?.endpoint === endpoint) {
         clearBrokerSession(cwd);
       }
     } catch {
-      // Best effort; never let bookkeeping block the shutdown.
+      // Best effort; a record we cannot read is one we must not delete.
     }
   }
 

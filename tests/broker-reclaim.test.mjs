@@ -7,7 +7,8 @@ import path from "node:path";
 import {
   ensureBrokerSession,
   loadBrokerSession,
-  saveBrokerSession
+  saveBrokerSession,
+  spawnBrokerProcess
 } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 
 /** A broker session whose files exist on disk, so we can see whether they survive. */
@@ -59,4 +60,30 @@ test("a broker that is gone is reclaimed", async () => {
 
   fs.rmSync(session.sessionDir, { recursive: true, force: true });
   fs.rmSync(cwd, { recursive: true, force: true });
+});
+
+test("a broker is told its own log path", async () => {
+  // Its record may name a successor by the time it shuts down, so it cannot rely on that to find
+  // its own artifacts — it has to be given them at startup.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cxc-args-"));
+  const argvFile = path.join(dir, "argv.json");
+  const scriptPath = path.join(dir, "fake-broker.mjs");
+  fs.writeFileSync(
+    scriptPath,
+    `import fs from "node:fs";\nfs.writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)));\n`
+  );
+  const logFile = path.join(dir, "broker.log");
+
+  const child = spawnBrokerProcess({
+    scriptPath,
+    cwd: dir,
+    endpoint: `unix:${path.join(dir, "broker.sock")}`,
+    pidFile: path.join(dir, "broker.pid"),
+    logFile
+  });
+  await new Promise((resolve) => child.on("exit", resolve));
+
+  const argv = JSON.parse(fs.readFileSync(argvFile, "utf8"));
+  assert.equal(argv[argv.indexOf("--log-file") + 1], logFile);
+  fs.rmSync(dir, { recursive: true, force: true });
 });
