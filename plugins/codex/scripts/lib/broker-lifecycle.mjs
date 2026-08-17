@@ -6,6 +6,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
+import { isProcessAlive } from "./process.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
@@ -117,7 +118,14 @@ export async function ensureBrokerSession(cwd, options = {}) {
     return existing;
   }
 
-  if (existing) {
+  // Only reclaim a broker we can prove is gone. The probe above waits 150ms, which a live but busy
+  // broker can miss, and on the normal path `killProcess` is null — so tearing down here would
+  // delete a running broker's socket without stopping it, leaving it unreachable while it still
+  // holds its app-server and every MCP server underneath.
+  //
+  // A live one is left exactly as it is. Once the replacement below takes over it has no clients,
+  // so its own idle shutdown reclaims both the process and its files.
+  if (existing && !isProcessAlive(existing.pid)) {
     teardownBrokerSession({
       endpoint: existing.endpoint ?? null,
       pidFile: existing.pidFile ?? null,
