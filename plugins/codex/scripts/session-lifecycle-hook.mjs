@@ -32,11 +32,51 @@ function shellEscape(value) {
   return `'${String(value).replace(/'/g, `'\"'\"'`)}'`;
 }
 
-function appendEnvVar(name, value) {
-  if (!process.env.CLAUDE_ENV_FILE || value == null || value === "") {
+const MANAGED_ENV_VARS = [SESSION_ID_ENV, TRANSCRIPT_PATH_ENV, PLUGIN_DATA_ENV];
+
+function isManagedExport(line) {
+  return MANAGED_ENV_VARS.some((name) => line.startsWith(`export ${name}=`));
+}
+
+// Rewrite this plugin's exports instead of appending them. SessionStart fires on
+// startup, on resume and on every compaction, so appending grew CLAUDE_ENV_FILE by
+// three lines every time and nothing ever pruned it. Only the last assignment of a
+// name takes effect, so every earlier copy did nothing but grow the file. Claude Code
+// inlines the whole file into the single `bash -c <script>` argument, so a long-running
+// session eventually pushed that argument past the operating system's limit on the
+// length of one argument, and no shell could be started at all.
+function writeManagedEnvVars(entries) {
+  const envFile = process.env.CLAUDE_ENV_FILE;
+  if (!envFile) {
     return;
   }
-  fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `export ${name}=${shellEscape(value)}\n`, "utf8");
+
+  let existing = "";
+  try {
+    existing = fs.readFileSync(envFile, "utf8");
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+  }
+
+  // Keep every line another plugin wrote, verbatim; drop only our own.
+  const lines = existing.split(/\r?\n/).filter((line) => line !== "" && !isManagedExport(line));
+  for (const [name, value] of entries) {
+    if (value != null && value !== "") {
+      lines.push(`export ${name}=${shellEscape(value)}`);
+    }
+  }
+
+  const next = lines.length > 0 ? `${lines.join("\n")}\n` : "";
+  if (next === existing) {
+    return;
+  }
+
+  // Write and rename, so that a reader never sees a half-written file.
+  const tmpFile = `${envFile}.${process.pid}.tmp`;
+  fs.writeFileSync(tmpFile, next, "utf8");
+  fs.renameSync(tmpFile, envFile);
 }
 
 function cleanupSessionJobs(cwd, sessionId) {
@@ -75,9 +115,11 @@ function cleanupSessionJobs(cwd, sessionId) {
 }
 
 function handleSessionStart(input) {
-  appendEnvVar(SESSION_ID_ENV, input.session_id);
-  appendEnvVar(TRANSCRIPT_PATH_ENV, input.transcript_path);
-  appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
+  writeManagedEnvVars([
+    [SESSION_ID_ENV, input.session_id],
+    [TRANSCRIPT_PATH_ENV, input.transcript_path],
+    [PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]]
+  ]);
 }
 
 async function handleSessionEnd(input) {
