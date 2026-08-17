@@ -348,7 +348,14 @@ export class CodexAppServerClient {
     const client = brokerEndpoint
       ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
       : new SpawnedCodexAppServerClient(cwd, options);
-    await client.initialize();
+    try {
+      await client.initialize();
+    } catch (error) {
+      // initialize() has usually already spawned the app-server, and with it every configured MCP
+      // server. The caller never receives this object, so this is the only chance to reclaim them.
+      await client.close().catch(() => {});
+      throw error;
+    }
     return client;
   }
 }

@@ -24,6 +24,7 @@ import {
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
+import { workerTtlMs } from "./lib/lifecycle-limits.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
@@ -865,19 +866,71 @@ async function handleTaskWorker(argv) {
       logFile: storedJob.logFile ?? null
     }
   );
-  await runTrackedJob(
-    {
-      ...storedJob,
-      workspaceRoot,
-      logFile
-    },
-    () =>
-      executeTaskRun({
-        ...request,
-        onProgress: progress
-      }),
-    { logFile }
-  );
+  const releaseTtl = armWorkerTtl({ workspaceRoot, jobId: storedJob.id, storedJob, logFile });
+  try {
+    await runTrackedJob(
+      {
+        ...storedJob,
+        workspaceRoot,
+        logFile
+      },
+      () =>
+        executeTaskRun({
+          ...request,
+          onProgress: progress
+        }),
+      { logFile }
+    );
+  } finally {
+    releaseTtl();
+  }
+}
+
+/**
+ * Bound how long a detached worker may live.
+ *
+ * The worker is deliberately detached so a background task survives the session that queued it,
+ * and its immediate parent exits right after enqueue — so there is no parent to watch and nothing
+ * else that ever reclaims it. Without a ceiling a single wedged task keeps its whole process tree
+ * (app-server plus every MCP server under it) alive indefinitely.
+ *
+ * Returns a function that disarms the timer once the job finishes normally.
+ */
+function armWorkerTtl({ workspaceRoot, jobId, storedJob, logFile }) {
+  const ttlMs = workerTtlMs();
+  if (!ttlMs) {
+    return () => {};
+  }
+  const timer = setTimeout(() => {
+    const errorMessage = `Worker exceeded its ${ttlMs}ms lifetime.`;
+
+    // Record the outcome before terminating: the process group is about to take this process down
+    // with it, and a job left at "running" with a dead pid is exactly the stale record that makes
+    // leaked workers invisible. All of it is best effort — a full disk or a deleted state
+    // directory must not be what keeps a runaway tree alive.
+    const completedAt = nowIso();
+    const terminal = {
+      status: "failed",
+      phase: "failed",
+      pid: null,
+      completedAt,
+      errorMessage
+    };
+    try {
+      appendLogLine(logFile, `${errorMessage} Terminating its process tree.`);
+      writeJobFile(workspaceRoot, jobId, { ...storedJob, ...terminal, logFile });
+      upsertJob(workspaceRoot, { id: jobId, ...terminal });
+    } catch {
+      // Fall through to termination regardless.
+    }
+
+    // Terminate the tree rather than just this process: the app-server and MCP servers underneath
+    // are the expensive part, and they do not exit on their own.
+    terminateProcessTree(process.pid);
+    process.exit(1);
+  }, ttlMs);
+  timer.unref?.();
+  return () => clearTimeout(timer);
 }
 
 async function handleStatus(argv) {
