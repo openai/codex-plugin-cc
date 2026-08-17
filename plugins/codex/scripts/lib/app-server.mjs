@@ -181,6 +181,20 @@ class AppServerClientBase {
     this.resolveExit(undefined);
   }
 
+  /**
+   * Settle the exit state when initialization failed before a transport existed.
+   *
+   * `close()` ends by awaiting `exitPromise`, and only a live transport ever resolves it. But
+   * initialization can fail before one is created — a malformed endpoint rejects while being
+   * parsed, a spawn can throw — and closing then waits for an exit that nothing will report,
+   * turning a configuration error into a hang.
+   */
+  settleExitIfNoTransport(hasTransport) {
+    if (!hasTransport) {
+      this.handleExit(this.exitError);
+    }
+  }
+
   sendMessage(_message) {
     throw new Error("sendMessage must be implemented by subclasses.");
   }
@@ -268,6 +282,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       }, 50).unref?.();
     }
 
+    this.settleExitIfNoTransport(Boolean(this.proc));
     await this.exitPromise;
   }
 
@@ -325,6 +340,7 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
     if (this.socket) {
       this.socket.end();
     }
+    this.settleExitIfNoTransport(Boolean(this.socket));
     await this.exitPromise;
   }
 
