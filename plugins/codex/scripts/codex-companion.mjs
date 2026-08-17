@@ -24,7 +24,7 @@ import {
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
-import { workerTtlMs } from "./lib/lifecycle-limits.mjs";
+import { armTimeout, disarmTimeout, workerTtlMs } from "./lib/lifecycle-limits.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
@@ -898,10 +898,7 @@ async function handleTaskWorker(argv) {
  */
 function armWorkerTtl({ workspaceRoot, jobId, storedJob, logFile }) {
   const ttlMs = workerTtlMs();
-  if (!ttlMs) {
-    return () => {};
-  }
-  const timer = setTimeout(() => {
+  const timer = armTimeout(ttlMs, () => {
     const errorMessage = `Worker exceeded its ${ttlMs}ms lifetime.`;
 
     // Record the outcome before terminating: the process group is about to take this process down
@@ -928,9 +925,8 @@ function armWorkerTtl({ workspaceRoot, jobId, storedJob, logFile }) {
     // are the expensive part, and they do not exit on their own.
     terminateProcessTree(process.pid);
     process.exit(1);
-  }, ttlMs);
-  timer.unref?.();
-  return () => clearTimeout(timer);
+  });
+  return () => disarmTimeout(timer);
 }
 
 async function handleStatus(argv) {

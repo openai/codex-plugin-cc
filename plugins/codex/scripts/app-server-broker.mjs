@@ -8,7 +8,12 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
-import { brokerIdleShutdownMs, brokerStartupTimeoutMs } from "./lib/lifecycle-limits.mjs";
+import {
+  armTimeout,
+  brokerIdleShutdownMs,
+  brokerStartupTimeoutMs,
+  disarmTimeout
+} from "./lib/lifecycle-limits.mjs";
 import { terminateProcessTree } from "./lib/process.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
@@ -71,11 +76,12 @@ async function main() {
   // listener below is up there is no idle timer and no parent watching — the spawning client gives
   // up after a couple of seconds and, on the normal path, kills nothing. So bound the startup
   // itself: a wedged connect would otherwise strand this whole tree for good.
-  const startupTimer = setTimeout(() => {
-    process.stderr.write(`broker startup exceeded ${brokerStartupTimeoutMs()}ms; terminating\n`);
+  const startupTimeoutMs = brokerStartupTimeoutMs();
+  const startupTimer = armTimeout(startupTimeoutMs, () => {
+    process.stderr.write(`broker startup exceeded ${startupTimeoutMs}ms; terminating\n`);
     terminateProcessTree(process.pid);
     process.exit(1);
-  }, brokerStartupTimeoutMs());
+  });
 
   const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
   let activeRequestSocket = null;
@@ -119,10 +125,8 @@ async function main() {
   }
 
   function cancelIdleShutdown() {
-    if (idleTimer) {
-      clearTimeout(idleTimer);
-      idleTimer = null;
-    }
+    disarmTimeout(idleTimer);
+    idleTimer = null;
   }
 
   // A broker outlives the client that spawned it, so without this it survives a crashed or
@@ -130,10 +134,10 @@ async function main() {
   // indefinitely. Re-armed whenever the last client disconnects, cancelled when one connects.
   function armIdleShutdown(server) {
     cancelIdleShutdown();
-    if (!idleShutdownMs || isBrokerBusy()) {
+    if (isBrokerBusy()) {
       return;
     }
-    idleTimer = setTimeout(async () => {
+    idleTimer = armTimeout(idleShutdownMs, async () => {
       idleTimer = null;
       if (isBrokerBusy()) {
         armIdleShutdown(server);
@@ -141,8 +145,7 @@ async function main() {
       }
       await shutdown(server).catch(() => {});
       process.exit(0);
-    }, idleShutdownMs);
-    idleTimer.unref?.();
+    });
   }
 
   async function shutdown(server) {
@@ -307,7 +310,7 @@ async function main() {
   // Startup is over once we are accepting; from here the idle timer takes over. A broker nobody
   // ever connects to must not linger either, so arm it immediately.
   server.listen(listenTarget.path, () => {
-    clearTimeout(startupTimer);
+    disarmTimeout(startupTimer);
     armIdleShutdown(server);
   });
 }

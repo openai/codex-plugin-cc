@@ -21,6 +21,30 @@ function readDurationMs(raw, fallback) {
 }
 
 /**
+ * Schedule `onExpiry`, treating `0` as "no limit".
+ *
+ * Every limit here documents `0` as disabled, but `setTimeout(fn, 0)` means "next tick" — passing
+ * a disabled limit straight through would fire the guard immediately instead of never. Returns
+ * the timer, or `null` when disabled; pass that back to {@link disarmTimeout}.
+ */
+export function armTimeout(ms, onExpiry) {
+  if (!ms) {
+    return null;
+  }
+  const timer = setTimeout(onExpiry, ms);
+  // Never hold the event loop open on the guard alone.
+  timer.unref?.();
+  return timer;
+}
+
+/** Counterpart to {@link armTimeout}; tolerates the `null` a disabled limit produces. */
+export function disarmTimeout(timer) {
+  if (timer) {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * How long the broker may sit with no connected client before shutting itself down, taking its
  * app-server (and every MCP server under it) with it.
  *

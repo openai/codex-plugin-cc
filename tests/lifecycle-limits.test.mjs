@@ -2,8 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  armTimeout,
   brokerIdleShutdownMs,
   brokerStartupTimeoutMs,
+  disarmTimeout,
   workerTtlMs
 } from "../plugins/codex/scripts/lib/lifecycle-limits.mjs";
 
@@ -48,6 +50,36 @@ test("worker ttl falls back to the default on unusable input", () => {
   for (const raw of ["soon", "-5", "NaN", "  "]) {
     assert.equal(workerTtlMs({ CODEX_TASK_WORKER_TTL_MS: raw }), ONE_DAY);
   }
+});
+
+test("a disabled limit never fires", async () => {
+  // setTimeout(fn, 0) means "next tick", but 0 is our documented way to disable a limit. Passing
+  // it straight through would turn "no ceiling" into "terminate immediately".
+  let fired = false;
+  const timer = armTimeout(0, () => {
+    fired = true;
+  });
+  assert.equal(timer, null);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(fired, false);
+  disarmTimeout(timer); // must tolerate the null a disabled limit produces
+});
+
+test("an enabled limit fires and can be disarmed", async () => {
+  let fired = false;
+  const timer = armTimeout(5, () => {
+    fired = true;
+  });
+  assert.notEqual(timer, null);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(fired, true);
+
+  let second = false;
+  disarmTimeout(armTimeout(5, () => {
+    second = true;
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(second, false);
 });
 
 test("durations are clamped to what setTimeout can actually hold", () => {
