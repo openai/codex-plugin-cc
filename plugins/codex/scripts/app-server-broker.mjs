@@ -29,6 +29,9 @@ const SHUTDOWN_GRACE_MS = 5000;
 /** How many just-completed turns to remember while their handoff may still be racing us. */
 const COMPLETED_HANDOFF_MEMORY = 32;
 
+/** How many abandoned turns to keep discarding notifications for. */
+const ABANDONED_THREAD_MEMORY = 32;
+
 /** A deadline that never keeps the event loop alive on its own. */
 function grace(ms = SHUTDOWN_GRACE_MS) {
   return new Promise((resolve) => {
@@ -140,6 +143,11 @@ async function main() {
    */
   async function abandonStream(threadIds) {
     for (const threadId of threadIds) {
+      // Bounded: an interrupt need not be followed by a completion, and an entry left here
+      // silently discards every future turn on that thread.
+      if (abandonedThreadIds.size >= ABANDONED_THREAD_MEMORY) {
+        abandonedThreadIds.delete(abandonedThreadIds.values().next().value);
+      }
       abandonedThreadIds.add(threadId);
       try {
         await appClient.request("turn/interrupt", { threadId });
@@ -401,12 +409,17 @@ async function main() {
           if (isStreaming) {
             const threadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
             const finishedAlready = [...threadIds].some((id) => completedBeforeHandoff.delete(id));
-            if (!sockets.has(socket)) {
+            if (finishedAlready) {
+              // Over before we got here: nothing to hand over, and nothing to abandon. Marking it
+              // abandoned now would be permanent — interrupting a finished turn need not produce
+              // another completion to clear the mark, and every later turn on that thread would
+              // have its notifications discarded, including the one its caller is waiting for.
+            } else if (!sockets.has(socket)) {
               // The client left while the turn was starting. Taking ownership on its behalf would
               // hold the broker busy for a socket nobody reads; leaving the turn running would let
               // its notifications reach the next client. Stop it instead.
               await abandonStream(threadIds);
-            } else if (!finishedAlready) {
+            } else {
               activeStreamSocket = socket;
               activeStreamThreadIds = threadIds;
             }
