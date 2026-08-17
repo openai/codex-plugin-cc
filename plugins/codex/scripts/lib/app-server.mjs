@@ -22,6 +22,9 @@ const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"))
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
 
+/** How long a failed connect waits for its transport to report an exit before killing it. */
+const CONNECT_CLEANUP_GRACE_MS = 5000;
+
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
   title: "Codex Plugin",
@@ -390,7 +393,24 @@ export class CodexAppServerClient {
     } catch (error) {
       // initialize() has usually already spawned the app-server, and with it every configured MCP
       // server. The caller never receives this object, so this is the only chance to reclaim them.
-      await client.close().catch(() => {});
+      //
+      // Bounded, because close() waits on the transport reporting its exit: an app-server that
+      // answered with an error but ignores EOF and SIGTERM would otherwise swallow the original
+      // failure entirely and leave the caller waiting forever. Whatever is still up after the
+      // grace gets killed outright.
+      await Promise.race([
+        client.close().catch(() => {}),
+        new Promise((resolve) => {
+          setTimeout(resolve, CONNECT_CLEANUP_GRACE_MS).unref?.();
+        })
+      ]);
+      if (client.proc && client.proc.exitCode === null && !client.proc.killed) {
+        try {
+          client.proc.kill("SIGKILL");
+        } catch {
+          // Already gone.
+        }
+      }
       throw error;
     }
     return client;

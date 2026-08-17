@@ -929,24 +929,31 @@ function armWorkerTtl({ workspaceRoot, jobId, storedJob, logFile }) {
       }
     };
 
-    attempt(() => {
-      // Re-read rather than reusing the snapshot this timer closed over a day ago: it predates
-      // startedAt, threadId, turnId and every progress update since.
-      const current = readStoredJob(workspaceRoot, jobId) ?? storedJob;
-      writeJobFile(workspaceRoot, jobId, { ...current, ...terminal, logFile });
-    });
-    attempt(() => upsertJob(workspaceRoot, { id: jobId, ...terminal }));
+    const recordExpiry = () => {
+      attempt(() => {
+        // Re-read rather than reusing the snapshot this timer closed over a day ago: it predates
+        // startedAt, threadId, turnId and every progress update since.
+        const current = readStoredJob(workspaceRoot, jobId) ?? storedJob;
+        writeJobFile(workspaceRoot, jobId, { ...current, ...terminal, logFile });
+      });
+      attempt(() => upsertJob(workspaceRoot, { id: jobId, ...terminal }));
+    };
+
+    recordExpiry();
     attempt(() => appendLogLine(logFile, `${errorMessage} Terminating its process tree.`));
 
     // Terminate the tree rather than just this process: the app-server and MCP servers underneath
     // are the expensive part, and they do not exit on their own.
-    // Terminate the tree rather than just this process: the app-server and MCP servers underneath
-    // are the expensive part, and they do not exit on their own.
     //
-    // SIGTERM alone is not a ceiling, though — a descendant that traps or ignores it keeps running,
-    // and once this worker is gone nothing is left to escalate. So stop dying on our own signal,
-    // give the tree a moment to leave politely, then take what is left with SIGKILL.
-    terminateProcessTreeAndExit(process.pid, { graceMs: WORKER_TERMINATION_GRACE_MS });
+    // SIGTERM alone is not a ceiling — a descendant that traps or ignores it keeps running, and
+    // once this worker is gone nothing is left to escalate. So the worker survives its own signal
+    // for a grace period. That means the job can finish during it and record a success over the
+    // expiry, which would be a lie: its tree is about to be killed. Writing the expiry again as
+    // the last act before the kill makes it the outcome that stands.
+    terminateProcessTreeAndExit(process.pid, {
+      graceMs: WORKER_TERMINATION_GRACE_MS,
+      beforeKill: recordExpiry
+    });
   });
   return () => disarmTimeout(timer);
 }

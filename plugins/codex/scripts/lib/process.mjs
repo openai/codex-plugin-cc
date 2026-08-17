@@ -83,13 +83,21 @@ export function isProcessAlive(pid, killImpl = process.kill.bind(process)) {
  * Only meaningful for a group leader; a caller that is not one signals nothing, which is the
  * existing behaviour of `terminateProcessTree`.
  */
-export function terminateProcessTreeAndExit(pid, { graceMs = 5000, exitCode = 1 } = {}) {
+export function terminateProcessTreeAndExit(pid, { graceMs = 5000, exitCode = 1, beforeKill } = {}) {
   if (pid === process.pid) {
     process.on("SIGTERM", () => {});
   }
   terminateProcessTree(pid);
   // Deliberately not unref'd: this timer is the escalation, and the process must stay up for it.
   setTimeout(() => {
+    // Surviving our own SIGTERM means ordinary work keeps running during the grace period and can
+    // record an outcome of its own. This is the last moment before the group dies, so a caller
+    // that needs the final say gets it here.
+    try {
+      beforeKill?.();
+    } catch {
+      // Never let bookkeeping stop the kill.
+    }
     try {
       process.kill(-pid, "SIGKILL");
     } catch {
