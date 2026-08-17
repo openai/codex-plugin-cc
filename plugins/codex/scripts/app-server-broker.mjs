@@ -8,6 +8,7 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
+import { clearBrokerSession, loadBrokerSession } from "./lib/broker-lifecycle.mjs";
 import {
   armTimeout,
   brokerIdleShutdownMs,
@@ -155,6 +156,19 @@ async function main() {
     // open on a socket nobody will serve.
     shuttingDown = true;
     const closed = new Promise((resolve) => server.close(() => resolve()));
+
+    // Drop our own persisted session, or the next caller reconnects to an endpoint we are about to
+    // remove — and `reuseExistingBroker` readers load it without probing, so they surface that as
+    // an authentication failure rather than a missing broker. Only when the record still points at
+    // us: a newer broker may already have claimed this workspace.
+    try {
+      if (loadBrokerSession(cwd)?.endpoint === endpoint) {
+        clearBrokerSession(cwd);
+      }
+    } catch {
+      // Best effort; never let bookkeeping block the shutdown.
+    }
+
     for (const socket of sockets) {
       socket.end();
     }
