@@ -26,9 +26,6 @@ const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact
 /** How long each step of a shutdown waits before giving up and going down without it. */
 const SHUTDOWN_GRACE_MS = 5000;
 
-/** How many just-completed turns to remember while their handoff may still be racing us. */
-const COMPLETED_HANDOFF_MEMORY = 32;
-
 /** How many abandoned turns to keep discarding notifications for. */
 const ABANDONED_THREAD_MEMORY = 32;
 
@@ -131,11 +128,10 @@ async function main() {
   // Turns whose client left before the stream could be handed over: their notifications go
   // nowhere, and they are interrupted rather than left running for the next client to receive.
   const abandonedThreadIds = new Set();
-  // Turns that completed before the request continuation could take ownership of them.
-  const completedBeforeHandoff = new Set();
-  // Threads whose streaming start is in flight right now, so a completion arriving for them is
-  // genuinely racing the handoff rather than belonging to some earlier turn.
-  const awaitingHandoff = new Set();
+  // Completions seen while a streaming start is still awaiting its response. Scoped to that
+  // window and cleared when it closes, so nothing here can outlive the handoff it belongs to.
+  const completedDuringHandoff = new Set();
+  let pendingStreamStarts = 0;
   const idleShutdownMs = brokerIdleShutdownMs();
   let idleTimer = null;
   let shuttingDown = false;
@@ -193,16 +189,12 @@ async function main() {
     // request continuation assigns ownership. Remember it, or that continuation would take
     // ownership of a turn that is already over and hold the broker busy until the client leaves.
     //
-    // Only while that very start is still awaiting its handoff, though. A turn whose client
-    // disconnected after handoff also completes with no stream owner, and remembering that would
-    // strand an entry: the next client to use the same persistent thread would have its own turn
-    // treated as finished, never be made stream owner, and hang waiting for notifications that
-    // were dropped.
-    if (message.method === "turn/completed" && threadId && awaitingHandoff.has(threadId)) {
-      if (completedBeforeHandoff.size >= COMPLETED_HANDOFF_MEMORY) {
-        completedBeforeHandoff.delete(completedBeforeHandoff.values().next().value);
-      }
-      completedBeforeHandoff.add(threadId);
+    // Recorded by window rather than by identity: a detached review runs on a thread it only names
+    // in its response, so there is nothing to match against beforehand. The window is what makes
+    // this safe — an entry cannot outlive the start it raced, and the continuation checks it
+    // against the threads the response actually reports.
+    if (message.method === "turn/completed" && threadId && pendingStreamStarts > 0) {
+      completedDuringHandoff.add(threadId);
     }
 
     const target = activeRequestSocket ?? activeStreamSocket;
@@ -424,11 +416,12 @@ async function main() {
         const isStreaming = STREAMING_METHODS.has(message.method);
         activeRequestSocket = socket;
 
-        // Marked before the await so a completion racing the response can tell it apart from one
-        // belonging to an earlier turn on the same thread.
-        const startingThreadId = isStreaming ? (message.params?.threadId ?? null) : null;
-        if (startingThreadId) {
-          awaitingHandoff.add(startingThreadId);
+        // A detached review streams on a thread it only names in its response, so a completion
+        // racing that response cannot be recognised by thread id in advance. Record completions
+        // for the duration of the start instead, and match them once the response tells us which
+        // threads this turn actually uses.
+        if (isStreaming) {
+          pendingStreamStarts += 1;
         }
 
         try {
@@ -436,7 +429,7 @@ async function main() {
           send(socket, { id: message.id, result });
           if (isStreaming) {
             const threadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
-            const finishedAlready = [...threadIds].some((id) => completedBeforeHandoff.delete(id));
+            const finishedAlready = [...threadIds].some((id) => completedDuringHandoff.has(id));
             if (finishedAlready) {
               // Over before we got here: nothing to hand over, and nothing to abandon. Marking it
               // abandoned now would be permanent — interrupting a finished turn need not produce
@@ -477,10 +470,13 @@ async function main() {
           }
           armIdleShutdown();
         } finally {
-          // The handoff is over either way; a later completion on this thread belongs to the turn
-          // itself, not to a start still waiting to be handed over.
-          if (startingThreadId) {
-            awaitingHandoff.delete(startingThreadId);
+          // The handoff is over either way. Once no start is in flight, a completion belongs to a
+          // running turn rather than to a race, so nothing recorded here may survive.
+          if (isStreaming) {
+            pendingStreamStarts -= 1;
+            if (pendingStreamStarts === 0) {
+              completedDuringHandoff.clear();
+            }
           }
         }
       }
