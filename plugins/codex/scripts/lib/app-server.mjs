@@ -13,7 +13,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
+import { ensureBrokerSession, isBrokerEndpointReady, loadBrokerSession } from "./broker-lifecycle.mjs";
 import { terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
@@ -21,6 +21,9 @@ const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"))
 
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
+
+/** How long a failed connect waits for its transport to report an exit before killing it. */
+const CONNECT_CLEANUP_GRACE_MS = 5000;
 
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
@@ -87,6 +90,12 @@ class AppServerClientBase {
     if (this.closed) {
       throw new Error("codex app-server client is closed.");
     }
+    // `closed` only covers a close we asked for. The transport can die on its own — between a
+    // successful connect and the very next request, for instance — and a request registered after
+    // that never resolves, because the exit that would reject it has already been reported.
+    if (this.exitResolved) {
+      throw this.exitError ?? new Error("codex app-server connection closed.");
+    }
 
     const id = this.nextId;
     this.nextId += 1;
@@ -98,7 +107,7 @@ class AppServerClientBase {
   }
 
   notify(method, params = {}) {
-    if (this.closed) {
+    if (this.closed || this.exitResolved) {
       return;
     }
     this.sendMessage({ method, params });
@@ -173,6 +182,20 @@ class AppServerClientBase {
     }
     this.pending.clear();
     this.resolveExit(undefined);
+  }
+
+  /**
+   * Settle the exit state when initialization failed before a transport existed.
+   *
+   * `close()` ends by awaiting `exitPromise`, and only a live transport ever resolves it. But
+   * initialization can fail before one is created — a malformed endpoint rejects while being
+   * parsed, a spawn can throw — and closing then waits for an exit that nothing will report,
+   * turning a configuration error into a hang.
+   */
+  settleExitIfNoTransport(hasTransport) {
+    if (!hasTransport) {
+      this.handleExit(this.exitError);
+    }
   }
 
   sendMessage(_message) {
@@ -262,6 +285,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       }, 50).unref?.();
     }
 
+    this.settleExitIfNoTransport(Boolean(this.proc));
     await this.exitPromise;
   }
 
@@ -319,6 +343,7 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
     if (this.socket) {
       this.socket.end();
     }
+    this.settleExitIfNoTransport(Boolean(this.socket));
     await this.exitPromise;
   }
 
@@ -338,7 +363,22 @@ export class CodexAppServerClient {
     if (!options.disableBroker) {
       brokerEndpoint = options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
       if (!brokerEndpoint && options.reuseExistingBroker) {
-        brokerEndpoint = loadBrokerSession(cwd)?.endpoint ?? null;
+        // Probe before trusting the record. A broker that was killed rather than shut down leaves
+        // its session behind, and connecting to that endpoint surfaces ENOENT/ECONNREFUSED as a
+        // failure of whatever the caller was doing — an authentication check, most visibly —
+        // rather than as a broker that is simply gone. Discard it and fall through to spawning.
+        // Probe before trusting the record. A broker that was killed rather than shut down leaves
+        // its session behind, and connecting to that endpoint surfaces ENOENT/ECONNREFUSED as a
+        // failure of whatever the caller was doing — an authentication check, most visibly —
+        // rather than as a broker that is simply gone. Fall through to spawning instead.
+        //
+        // The record itself is left alone: `status` and `setup` report a recorded shared runtime
+        // whether or not it answers, and reclaiming a dead broker's files belongs to
+        // `ensureBrokerSession`, which is the path that actually replaces it.
+        const persisted = loadBrokerSession(cwd)?.endpoint ?? null;
+        if (persisted && (await isBrokerEndpointReady(persisted))) {
+          brokerEndpoint = persisted;
+        }
       }
       if (!brokerEndpoint && !options.reuseExistingBroker) {
         const brokerSession = await ensureBrokerSession(cwd, { env: options.env });
@@ -348,7 +388,31 @@ export class CodexAppServerClient {
     const client = brokerEndpoint
       ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
       : new SpawnedCodexAppServerClient(cwd, options);
-    await client.initialize();
+    try {
+      await client.initialize();
+    } catch (error) {
+      // initialize() has usually already spawned the app-server, and with it every configured MCP
+      // server. The caller never receives this object, so this is the only chance to reclaim them.
+      //
+      // Bounded, because close() waits on the transport reporting its exit: an app-server that
+      // answered with an error but ignores EOF and SIGTERM would otherwise swallow the original
+      // failure entirely and leave the caller waiting forever. Whatever is still up after the
+      // grace gets killed outright.
+      await Promise.race([
+        client.close().catch(() => {}),
+        new Promise((resolve) => {
+          setTimeout(resolve, CONNECT_CLEANUP_GRACE_MS).unref?.();
+        })
+      ]);
+      if (client.proc && client.proc.exitCode === null && !client.proc.killed) {
+        try {
+          client.proc.kill("SIGKILL");
+        } catch {
+          // Already gone.
+        }
+      }
+      throw error;
+    }
     return client;
   }
 }

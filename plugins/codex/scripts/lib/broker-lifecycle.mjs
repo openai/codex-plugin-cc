@@ -6,6 +6,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
+import { isProcessAlive } from "./process.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
@@ -58,7 +59,10 @@ export async function sendBrokerShutdown(endpoint) {
 
 export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile, env = process.env }) {
   const logFd = fs.openSync(logFile, "a");
-  const child = spawn(process.execPath, [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile], {
+  // The broker is told its own log path, not just handed the descriptor: it has to be able to
+  // clean up after itself without consulting the shared session record, which may by then name a
+  // successor.
+  const child = spawn(process.execPath, [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile, "--log-file", logFile], {
     cwd,
     env,
     detached: true,
@@ -99,7 +103,8 @@ export function clearBrokerSession(cwd) {
   }
 }
 
-async function isBrokerEndpointReady(endpoint) {
+/** Whether something is actually listening on a persisted endpoint, as opposed to merely recorded. */
+export async function isBrokerEndpointReady(endpoint) {
   if (!endpoint) {
     return false;
   }
@@ -116,7 +121,14 @@ export async function ensureBrokerSession(cwd, options = {}) {
     return existing;
   }
 
-  if (existing) {
+  // Only reclaim a broker we can prove is gone. The probe above waits 150ms, which a live but busy
+  // broker can miss, and on the normal path `killProcess` is null — so tearing down here would
+  // delete a running broker's socket without stopping it, leaving it unreachable while it still
+  // holds its app-server and every MCP server underneath.
+  //
+  // A live one is left exactly as it is. Once the replacement below takes over it has no clients,
+  // so its own idle shutdown reclaims both the process and its files.
+  if (existing && !isProcessAlive(existing.pid)) {
     teardownBrokerSession({
       endpoint: existing.endpoint ?? null,
       pidFile: existing.pidFile ?? null,

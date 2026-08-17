@@ -24,7 +24,8 @@ import {
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
-import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import { armTimeout, disarmTimeout, workerTtlMs } from "./lib/lifecycle-limits.mjs";
+import { binaryAvailable, terminateProcessTree, terminateProcessTreeAndExit } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
@@ -865,19 +866,96 @@ async function handleTaskWorker(argv) {
       logFile: storedJob.logFile ?? null
     }
   );
-  await runTrackedJob(
-    {
-      ...storedJob,
-      workspaceRoot,
-      logFile
-    },
-    () =>
-      executeTaskRun({
-        ...request,
-        onProgress: progress
-      }),
-    { logFile }
-  );
+  const releaseTtl = armWorkerTtl({ workspaceRoot, jobId: storedJob.id, storedJob, logFile });
+  try {
+    await runTrackedJob(
+      {
+        ...storedJob,
+        workspaceRoot,
+        logFile
+      },
+      () =>
+        executeTaskRun({
+          ...request,
+          onProgress: progress
+        }),
+      { logFile }
+    );
+  } finally {
+    releaseTtl();
+  }
+}
+
+/**
+ * Bound how long a detached worker may live.
+ *
+ * The worker is deliberately detached so a background task survives the session that queued it,
+ * and its immediate parent exits right after enqueue — so there is no parent to watch and nothing
+ * else that ever reclaims it. Without a ceiling a single wedged task keeps its whole process tree
+ * (app-server plus every MCP server under it) alive indefinitely.
+ *
+ * Returns a function that disarms the timer once the job finishes normally.
+ */
+/** How long the tree gets to leave on SIGTERM before the group is killed outright. */
+const WORKER_TERMINATION_GRACE_MS = 5000;
+
+function armWorkerTtl({ workspaceRoot, jobId, storedJob, logFile }) {
+  const ttlMs = workerTtlMs();
+  const timer = armTimeout(ttlMs, () => {
+    const errorMessage = `Worker exceeded its ${ttlMs}ms lifetime.`;
+
+    // Record the outcome before terminating: the process group is about to take this process down
+    // with it, and a job left at "running" with a dead pid is exactly the stale record that makes
+    // leaked workers invisible. All of it is best effort — a full disk or a deleted state
+    // directory must not be what keeps a runaway tree alive.
+    const completedAt = nowIso();
+    const terminal = {
+      status: "failed",
+      phase: "failed",
+      pid: null,
+      completedAt,
+      errorMessage
+    };
+
+    // Each of these is best effort on its own. Sharing one try means a missing log directory or a
+    // full disk would skip the terminal status too, leaving the job "running" behind a dead pid —
+    // the stale record that hides leaked workers in the first place. Status goes first, because it
+    // is the part anything else reads.
+    const attempt = (action) => {
+      try {
+        action();
+      } catch {
+        // Never let bookkeeping keep a runaway tree alive.
+      }
+    };
+
+    const recordExpiry = () => {
+      attempt(() => {
+        // Re-read rather than reusing the snapshot this timer closed over a day ago: it predates
+        // startedAt, threadId, turnId and every progress update since.
+        const current = readStoredJob(workspaceRoot, jobId) ?? storedJob;
+        writeJobFile(workspaceRoot, jobId, { ...current, ...terminal, logFile });
+      });
+      attempt(() => upsertJob(workspaceRoot, { id: jobId, ...terminal }));
+    };
+
+    recordExpiry();
+    attempt(() => appendLogLine(logFile, `${errorMessage} Terminating its process tree.`));
+
+    // Terminate the tree rather than just this process: the app-server and MCP servers underneath
+    // are the expensive part, and they do not exit on their own.
+    //
+    // SIGTERM alone is not a ceiling — a descendant that traps or ignores it keeps running, and
+    // once this worker is gone nothing is left to escalate. So the worker survives its own signal
+    // for a grace period. That means the job can finish during it and record a success over the
+    // expiry, which would be a lie: its tree is about to be killed. Writing the expiry again as
+    // the last act before the kill makes it the outcome that stands.
+    terminateProcessTreeAndExit(process.pid, {
+      graceMs: WORKER_TERMINATION_GRACE_MS,
+      beforeKill: recordExpiry
+    });
+  });
+  return () => disarmTimeout(timer);
 }
 
 async function handleStatus(argv) {
