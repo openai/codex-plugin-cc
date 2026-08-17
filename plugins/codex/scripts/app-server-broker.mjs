@@ -23,8 +23,15 @@ import { terminateProcessTree } from "./lib/process.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 
-/** How long a shutdown waits for the app-server before giving up and going down without it. */
+/** How long each step of a shutdown waits before giving up and going down without it. */
 const SHUTDOWN_GRACE_MS = 5000;
+
+/** A deadline that never keeps the event loop alive on its own. */
+function grace(ms = SHUTDOWN_GRACE_MS) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms).unref?.();
+  });
+}
 
 function buildStreamThreadIds(method, params, result) {
   const threadIds = new Set();
@@ -227,14 +234,21 @@ async function main() {
     for (const socket of sockets) {
       socket.end();
     }
+
     // A wedged app-server must not outlive the guard meant to reclaim it: waiting on it forever
-    // is exactly how the tree survives. Give it a grace period, then carry on without it — the
-    // process group goes down at the end regardless.
-    await Promise.race([
-      appClient.close().catch(() => {}),
-      new Promise((resolve) => setTimeout(resolve, SHUTDOWN_GRACE_MS).unref?.())
-    ]);
-    await closed;
+    // is exactly how the tree survives.
+    let backendClosed = false;
+    const settled = () => {
+      backendClosed = true;
+    };
+    await Promise.race([appClient.close().then(settled, settled), grace()]);
+
+    // `end()` only half-closes: a client holding its read side open keeps server.close() pending
+    // for as long as it likes, which would hang SIGTERM and broker/shutdown just as surely.
+    await Promise.race([closed, grace()]);
+    for (const socket of sockets) {
+      socket.destroy();
+    }
 
     // Clean up after ourselves. When the idle timer fires there is no session-end hook to run
     // teardown for us, so these would otherwise survive every expiry.
@@ -255,6 +269,14 @@ async function main() {
       }
     } catch {
       // Best effort; a record we cannot read is one we must not delete.
+    }
+
+    // If the app-server never acknowledged the close, it is still running — and on POSIX the
+    // client's own fallback signals only its direct pid, so the MCP servers under it would outlive
+    // this broker and defeat the whole point of shutting down. Take the group with us. Done last,
+    // after the artifacts and the record are already cleaned up, because this ends us too.
+    if (!backendClosed) {
+      terminateProcessTree(process.pid);
     }
   }
 
