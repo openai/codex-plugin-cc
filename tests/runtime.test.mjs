@@ -1083,6 +1083,29 @@ test("terminalizer that loses the initial claim to running wins the terminal fen
   }
 });
 
+test("terminalization and reconciliation never return null jobs after removal races", () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-mutable-gone", workspaceRoot, status: "running" };
+  const jobFile = resolveJobFile(workspaceRoot, job.id);
+  upsertJob(workspaceRoot, job);
+  fs.writeFileSync(
+    jobFile.replace(/\.json$/, ".started.json"),
+    JSON.stringify({ status: "running", pid: process.pid, startedAt: "2026-08-19T12:00:00.000Z" }),
+    "utf8"
+  );
+  fs.writeFileSync(
+    resolveTerminalFenceFile(workspaceRoot, job.id),
+    JSON.stringify({ status: "failed", completedAt: "2026-08-19T12:01:00.000Z" }),
+    "utf8"
+  );
+
+  const result = terminalizeTrackedJob(workspaceRoot, job, { status: "cancelled", completedAt: "2026-08-19T12:02:00.000Z" });
+  assert.equal(result.job.status, "failed");
+
+  fs.writeFileSync(jobFile.replace(/\.json$/, ".removed"), "", "utf8");
+  assert.deepEqual(reconcileTrackedJobs(workspaceRoot), []);
+});
+
 test("progress updates an unindexed mutable job without making it visible", () => {
   const workspaceRoot = makeTempDir();
   const job = { id: "task-unindexed-progress", workspaceRoot, status: "running" };

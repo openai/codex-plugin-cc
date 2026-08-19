@@ -288,7 +288,7 @@ export function terminalizeTrackedJob(workspaceRoot, job, terminal) {
     const winner = claimed ? { status: terminal.status, completedAt } : readInitialClaim(workspaceRoot, job.id);
     const storedJob = readStoredJobOrNull(workspaceRoot, job.id);
     if (!claimed && winner?.status !== "running") {
-      return { job: storedJob ? applyTerminalFence(storedJob, winner) : null, claimed };
+      return { job: applyTerminalFence(storedJob ?? job, winner), claimed };
     }
     if (claimed) {
       const effectiveJob = applyTerminalFence({ ...(storedJob ?? job), ...terminal }, winner);
@@ -306,7 +306,7 @@ export function terminalizeTrackedJob(workspaceRoot, job, terminal) {
   const effectiveJob = applyTerminalFence({ ...(storedJob ?? job), ...terminal }, fence);
 
   if (!claimed) {
-    return { job: storedJob ? applyTerminalFence(storedJob, fence) : null, claimed };
+    return { job: applyTerminalFence(storedJob ?? job, fence), claimed };
   }
 
   writeJobFile(workspaceRoot, job.id, effectiveJob);
@@ -350,10 +350,12 @@ export function reconcileTrackedJobs(workspaceRoot, options = {}) {
 
     const ageMs = now - Date.parse(job.createdAt ?? "");
     if (job.status === "queued" && !Number.isFinite(job.pid) && Number.isFinite(ageMs) && ageMs >= 5000) {
-      return [failTrackedJob(workspaceRoot, job, "Background worker did not start within 5 seconds.")];
+      const failedJob = failTrackedJob(workspaceRoot, job, "Background worker did not start within 5 seconds.");
+      return failedJob ? [failedJob] : [];
     }
     if (Number.isFinite(job.pid) && !isProcessAlive(job.pid, { killImpl: options.killImpl })) {
-      return [failTrackedJob(workspaceRoot, job, "Background worker exited before completing the job.")];
+      const failedJob = failTrackedJob(workspaceRoot, job, "Background worker exited before completing the job.");
+      return failedJob ? [failedJob] : [];
     }
 
     return [job];
