@@ -193,14 +193,22 @@ async function main() {
     // so a child that ignores it would wedge this shutdown indefinitely
     // (record already cleared, session dir still present, both processes
     // alive while the next command spawns a replacement). After the deadline,
-    // force-kill the child's tree; its exit settles the dangling close.
+    // deliver a real force-kill; the child's exit settles the dangling close.
+    // On POSIX that must be SIGKILL to the pid itself: the child is not
+    // detached, so a process-group signal (kill(-pid)) hits ESRCH and
+    // terminateProcessTree delivers nothing there. On Windows the child is a
+    // cmd.exe wrapper, so the taskkill /T /F tree kill is the right tool.
     await Promise.race([
       appClient.close().catch(() => {}),
       new Promise((resolve) => {
         const timer = setTimeout(() => {
           try {
-            if (appClient.proc?.pid) {
-              terminateProcessTree(appClient.proc.pid);
+            if (appClient.proc && appClient.proc.exitCode === null) {
+              if (process.platform === "win32") {
+                terminateProcessTree(appClient.proc.pid);
+              } else {
+                appClient.proc.kill("SIGKILL");
+              }
             }
           } catch {
             // Best effort; the whole-shutdown backstop above still applies.
