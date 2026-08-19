@@ -66,3 +66,41 @@ test("clearBrokerSession removes a session that was registered without CLAUDE_PL
     assert.equal(loadBrokerSession(workspace), null);
   });
 });
+
+// Caught in review: this is a real reachable state, not a hypothetical --
+// it's precisely what the old (pre-fix) lookup behavior could leave behind:
+// a broker registered under one root, then a *different* broker later
+// registered under the other root because the old code couldn't see the
+// first one. Only one of the two brokers is ever the one actually acted on
+// (whichever loadBrokerSession() returns) and torn down; clearBrokerSession
+// must not delete the other root's record too, since that broker was never
+// shut down and losing its record would make it permanently untrackable.
+test("clearBrokerSession does not delete a distinct session recorded under the other root", () => {
+  const workspace = makeTempDir();
+  const pluginDataDir = makeTempDir();
+
+  withPluginDataDir(null, () => {
+    saveBrokerSession(workspace, { endpoint: "fallback-endpoint", pid: 1111 });
+  });
+  withPluginDataDir(pluginDataDir, () => {
+    saveBrokerSession(workspace, { endpoint: "plugin-data-endpoint", pid: 2222 });
+  });
+
+  withPluginDataDir(pluginDataDir, () => {
+    // loadBrokerSession() would return (and a caller would tear down) the
+    // plugin-data-root session, since it's checked first.
+    clearBrokerSession(workspace);
+  });
+
+  // The fallback-root session must survive untouched -- visible whether
+  // checked directly (env unset) or as the sole remaining candidate (env
+  // set, since the plugin-data one is now gone). If clearBrokerSession had
+  // wrongly deleted it too, this would come back null or the check with the
+  // env set would find nothing.
+  withPluginDataDir(null, () => {
+    assert.deepEqual(loadBrokerSession(workspace), { endpoint: "fallback-endpoint", pid: 1111 });
+  });
+  withPluginDataDir(pluginDataDir, () => {
+    assert.deepEqual(loadBrokerSession(workspace), { endpoint: "fallback-endpoint", pid: 1111 });
+  });
+});

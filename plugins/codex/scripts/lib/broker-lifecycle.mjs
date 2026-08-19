@@ -102,10 +102,20 @@ export function saveBrokerSession(cwd, session) {
   fs.writeFileSync(resolveBrokerStateFile(cwd), `${JSON.stringify(session, null, 2)}\n`, "utf8");
 }
 
+// Removes only the record loadBrokerSession() would return (the first
+// existing candidate), not every candidate. Both call sites act on whatever
+// loadBrokerSession() returned -- tearing that broker down and clearing its
+// record -- so clearing every candidate here would delete an *other* root's
+// broker.json for a broker that was never torn down (a real reachable case:
+// this is precisely the root-split bug's own historical fallout, where the
+// old lookup spawned a duplicate broker under the other root). Erasing that
+// record makes the still-running duplicate permanently untrackable, which
+// is worse than leaving a stale-but-discoverable file behind.
 export function clearBrokerSession(cwd) {
   for (const stateFile of resolveBrokerStateFileCandidates(cwd)) {
     if (fs.existsSync(stateFile)) {
       fs.unlinkSync(stateFile);
+      return;
     }
   }
 }
