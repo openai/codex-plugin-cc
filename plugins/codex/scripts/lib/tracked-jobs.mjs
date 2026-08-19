@@ -176,8 +176,16 @@ export function reconcileTrackedJobs(workspaceRoot, options = {}) {
 }
 
 export async function runTrackedJob(job, runner, options = {}) {
+  const storedJob = readStoredJobOrNull(job.workspaceRoot, job.id);
+  if (storedJob && storedJob.status !== "queued") {
+    return storedJob;
+  }
+  if (!storedJob && job.request) {
+    return null;
+  }
+
   const runningRecord = {
-    ...job,
+    ...(storedJob ?? job),
     status: "running",
     startedAt: nowIso(),
     phase: "starting",
