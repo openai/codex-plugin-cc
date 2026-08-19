@@ -13,7 +13,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
+import { ensureBrokerSession, loadBrokerSession, waitForBrokerEndpoint } from "./broker-lifecycle.mjs";
 import { terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
@@ -338,7 +338,14 @@ export class CodexAppServerClient {
     if (!options.disableBroker) {
       brokerEndpoint = options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
       if (!brokerEndpoint && options.reuseExistingBroker) {
-        brokerEndpoint = loadBrokerSession(cwd)?.endpoint ?? null;
+        // Validate the recorded endpoint before reusing it: the record can be
+        // stale when the broker died without a clean exit. A stale record then
+        // behaves like no record, and the caller falls back to a direct app
+        // server instead of erroring against a dead socket.
+        const recordedEndpoint = loadBrokerSession(cwd)?.endpoint ?? null;
+        if (recordedEndpoint && (await waitForBrokerEndpoint(recordedEndpoint, 150).catch(() => false))) {
+          brokerEndpoint = recordedEndpoint;
+        }
       }
       if (!brokerEndpoint && !options.reuseExistingBroker) {
         const brokerSession = await ensureBrokerSession(cwd, { env: options.env });

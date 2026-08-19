@@ -8,6 +8,7 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
+import { clearBrokerSession, loadBrokerSession } from "./lib/broker-lifecycle.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 
@@ -73,7 +74,7 @@ async function main() {
   const sockets = new Set();
 
   // Forward a request to the app server while counting it as in-flight, so idle
-  // self-shutdown can never fire while real work is running — even if the calling
+  // self-shutdown can never fire while real work is running, even if the calling
   // client disconnected mid-request (which clears activeRequestSocket).
   async function forwardAppRequest(method, params) {
     inFlightRequests += 1;
@@ -114,6 +115,19 @@ async function main() {
   }
 
   async function shutdown(server) {
+    // Retire this broker's state record first, while its socket is still the
+    // live one for this cwd: no replacement broker can have been spawned yet,
+    // so the guarded clear cannot race a newer record, and clients probing
+    // from here on fall back to starting a fresh broker instead of connecting
+    // to a dying one. Guarded on the endpoint matching, so a record that was
+    // already replaced (e.g. this broker was deemed unresponsive) is kept.
+    try {
+      if (loadBrokerSession(cwd)?.endpoint === endpoint) {
+        clearBrokerSession(cwd);
+      }
+    } catch {
+      // Ignore unreadable or already-removed state records.
+    }
     for (const socket of sockets) {
       socket.end();
     }

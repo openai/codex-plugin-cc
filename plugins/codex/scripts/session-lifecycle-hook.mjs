@@ -4,10 +4,7 @@ import fs from "node:fs";
 import process from "node:process";
 
 import { terminateProcessTree } from "./lib/process.mjs";
-import {
-  clearBrokerSession,
-  reapBrokerSessions
-} from "./lib/broker-lifecycle.mjs";
+import { reapBrokerSessions } from "./lib/broker-lifecycle.mjs";
 import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
@@ -81,12 +78,12 @@ async function handleSessionStart(input) {
 async function handleSessionEnd(input) {
   const cwd = input.cwd || process.cwd();
   cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
-  // Do not shut down or kill this cwd's broker: it may be shared with a
-  // concurrent session, and it exits itself once idle (app-server-broker.mjs).
-  // Just drop this session's pointer to it.
-  clearBrokerSession(cwd);
-  // GC the directories of brokers that have already exited. A live broker —
-  // including one a concurrent session is still using — is never touched.
+  // Do not shut down or kill this cwd's broker, and do not clear its state
+  // record: both are shared with any concurrent session on the same cwd. The
+  // broker exits itself once idle and removes its own record then
+  // (app-server-broker.mjs), so a session ending leaves it entirely alone.
+  // GC the directories of brokers that have already exited. A live broker,
+  // including one a concurrent session is still using, is never touched.
   await reapBrokerSessions();
 }
 

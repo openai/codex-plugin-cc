@@ -41,6 +41,7 @@ import path from "node:path";
 
 import { readJsonFile } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
+import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
 
@@ -903,8 +904,23 @@ export function getCodexAvailability(cwd) {
   };
 }
 
+// An endpoint reference can outlive its broker when the process died without a
+// clean exit. For unix sockets the broker removes its socket on clean shutdown
+// and the session-start reaper removes it after an unclean death, so a missing
+// socket file means no shared runtime is live. Pipe endpoints (Windows) cannot
+// be checked without connecting and are reported as-is.
+function isBrokerEndpointPresent(endpoint) {
+  try {
+    const target = parseBrokerEndpoint(endpoint);
+    return target.kind === "unix" ? fs.existsSync(target.path) : true;
+  } catch {
+    return false;
+  }
+}
+
 export function getSessionRuntimeStatus(env = process.env, cwd = process.cwd()) {
-  const endpoint = env?.[BROKER_ENDPOINT_ENV] ?? loadBrokerSession(cwd)?.endpoint ?? null;
+  const recorded = env?.[BROKER_ENDPOINT_ENV] ?? loadBrokerSession(cwd)?.endpoint ?? null;
+  const endpoint = recorded && isBrokerEndpointPresent(recorded) ? recorded : null;
   if (endpoint) {
     return {
       mode: "shared",

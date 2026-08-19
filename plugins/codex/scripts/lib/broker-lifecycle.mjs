@@ -252,12 +252,12 @@ export async function reapBrokerSessions({ tmpDir = os.tmpdir() } = {}) {
     }
     const sessionDir = path.join(tmpDir, entry.name);
     if (!fs.existsSync(path.join(sessionDir, "broker.pid"))) {
-      continue; // a broker removes its own dir on clean exit — nothing to do
+      continue; // a broker removes its own dir on clean exit; nothing to do
     }
 
     const pid = readBrokerPid(sessionDir);
     if (pid !== null && isPidAlive(pid)) {
-      continue; // live broker — leave it entirely alone (it self-exits when idle)
+      continue; // live broker: leave it entirely alone (it self-exits when idle)
     }
 
     // The broker process is gone but left its directory behind (killed, not a
