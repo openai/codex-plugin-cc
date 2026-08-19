@@ -24,7 +24,7 @@ Make Codex Companion jobs self-heal after worker loss and make the Claude Stop r
 - A running or queued job with a dead PID becomes `failed` with `Background worker exited before completing the job.`
 - Reconciliation runs before status, wait, result, cancel, task resume selection, and Stop-hook decisions.
 - Terminal state is claimed by an immutable per-job `jobs/<id>.terminal.json` fence, created with exclusive filesystem creation. The first terminal writer wins; terminal fences contain only status and completion time, never request, prompt, or log content.
-- Worker startup is separately claimed by `jobs/<id>.started.json`: its first writer is either a running PID/start time or a terminal outcome. A duplicate worker that loses this initial claim does not publish or execute.
+- Worker startup is separately claimed by `jobs/<id>.started.json`: its first writer is either a running PID/start time or a terminal outcome. The winner publishes `running`, then exclusively claims `jobs/<id>.admission.json` before calling the runner; a duplicate or terminal winner cannot execute.
 - A terminal or removed job cannot be overwritten by a late worker. Corrupt or empty fences fail closed as `failed`; all control-plane reads use the fence over mutable job/index JSON.
 - SessionEnd writes an immutable empty `jobs/<id>.removed` marker before cleanup. Removal overrides every terminal or running claim, including a completion that won before SessionEnd, and may remain as a tiny orphan fence.
 - Failed job status output includes the stored error message.
@@ -33,10 +33,10 @@ Make Codex Companion jobs self-heal after worker loss and make the Claude Stop r
 
 - An enabled gate is fail-closed for unavailable Codex, task failure, timeout, missing output, invalid output, and corrupt state.
 - Every block explains the failure and how to retry. Active jobs also show the exact status and cancel commands.
-- The gate key is a SHA-256 hash of the Claude session ID and the exact last assistant message. No message content is stored in the key.
-- A completed Stop review for the same gate key is reused. An active matching review blocks with its existing job ID instead of starting another review.
+- The gate key is a SHA-256 hash of the Claude session ID and the raw, untrimmed last assistant message. No message content is stored in the key; an empty message has no key and is never cached.
+- A Stop review uses deterministic `gate-<full-sha256>` job ID plus the immutable startup claim, making concurrent same-turn invocations single-flight. A completed matching review is reused; an active matching review blocks with its existing job ID instead of starting another review.
 - A different last assistant message gets a new gate key and a fresh review.
-- If no last assistant message is supplied, the hook runs a fresh review and does not cache it.
+- Matching cached jobs are checked before Codex availability, so a prior same-turn decision is still reusable when Codex later becomes unavailable.
 
 ### Persistence
 

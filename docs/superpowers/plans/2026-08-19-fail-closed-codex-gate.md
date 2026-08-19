@@ -4,7 +4,7 @@
 
 **Goal:** Make detached Codex jobs self-heal after worker loss and make the Claude Stop review gate deterministically fail closed without duplicate reviews of the same turn.
 
-**Architecture:** Persist queued work before spawning, reconcile active jobs against their worker PID on every control-plane read, and refuse late writes after a terminal transition. Reuse Stop-review results by a hash of session ID plus last assistant message, while retaining the existing foreground timeout.
+**Architecture:** Persist queued work before spawning, reconcile active jobs against their worker PID on every control-plane read, and refuse late writes after a terminal transition. Use a deterministic full-hash Stop job ID and immutable claims to single-flight an exact raw Claude turn, while retaining the existing foreground timeout.
 
 **Tech Stack:** Node.js ESM, built-in `node:test`, filesystem JSON state, Claude Code hooks.
 
@@ -13,7 +13,7 @@
 - No new runtime dependencies or daemon.
 - The only job transitions are `queued -> running -> completed|failed|cancelled`.
 - Enabled review gates fail closed for infrastructure and persistence errors.
-- The last assistant message is never stored in a gate cache key.
+- The raw, untrimmed last assistant message is never stored in a gate cache key; an empty message is not cached.
 - All production changes follow RED-GREEN TDD.
 
 ---
@@ -128,7 +128,7 @@ The worker sets its own PID when it enters `runTrackedJob`; queued jobs receive 
 
 - [ ] **Step 4: Protect terminal transitions**
 
-Workers first claim `jobs/<id>.started.json` with `openSync(..., "wx")`; reconciliation, SessionEnd, and startup compete there before a running publication. Later terminal outcomes compete on `jobs/<id>.terminal.json`. Empty/corrupt claims fail as failed, progress never upserts the state index, and effective reads merge mutable job-file fields. SessionEnd writes a dominant empty `jobs/<id>.removed` marker before cleanup so a late mutable artifact is never visible.
+Workers first claim `jobs/<id>.started.json` with `openSync(..., "wx")`; reconciliation, SessionEnd, and startup compete there before a running publication. After publishing `running`, only the exclusive `jobs/<id>.admission.json` winner may call the runner. Later terminal outcomes compete on `jobs/<id>.terminal.json`. Empty/corrupt claims fail as failed, progress never upserts the state index, and effective reads merge mutable job-file fields. SessionEnd writes a dominant empty `jobs/<id>.removed` marker before cleanup so a late mutable artifact is never visible.
 
 - [ ] **Step 5: Verify Task 2 GREEN**
 
@@ -168,13 +168,13 @@ Expected: unavailable Codex produces no decision and the second Stop starts anot
 
 - [ ] **Step 3: Propagate and reuse the gate key**
 
-Hash without retaining message content:
+Hash the raw, untrimmed non-empty message without retaining its content:
 
 ```js
 createHash("sha256").update(`${sessionId}\0${lastAssistantMessage}`).digest("hex")
 ```
 
-Pass it through `CODEX_COMPANION_GATE_KEY`, record it on the tracked job, and before launching find the matching current-session Stop job. Reparse completed output; block with the existing job ID for active, failed, or cancelled matches.
+Pass it through `CODEX_COMPANION_GATE_KEY`, use deterministic `gate-<full-sha256>` as the tracked-job ID, and before availability checks find the matching current-session Stop job. The immutable startup claim makes concurrent matching launches single-flight. Reparse completed output; block with the existing job ID for active, failed, or cancelled matches. With no key, run fresh without caching.
 
 - [ ] **Step 4: Make setup failures fail closed**
 
