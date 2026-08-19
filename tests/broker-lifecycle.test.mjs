@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -7,6 +9,7 @@ import {
   loadBrokerSession,
   saveBrokerSession
 } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 function withPluginDataDir(pluginDataDir, fn) {
   const previous = process.env.CLAUDE_PLUGIN_DATA;
@@ -102,5 +105,40 @@ test("clearBrokerSession does not delete a distinct session recorded under the o
   });
   withPluginDataDir(pluginDataDir, () => {
     assert.deepEqual(loadBrokerSession(workspace), { endpoint: "fallback-endpoint", pid: 1111 });
+  });
+});
+
+// Caught in review: loadBrokerSession() skips a candidate it can't parse and
+// moves on to the next one, so it can return a *fallback* session while a
+// *primary* file exists but is malformed. clearBrokerSession() must select
+// by the same rule (exists AND parses), not existence alone -- otherwise it
+// deletes the unrelated malformed primary while leaving the valid fallback
+// record behind, even though a caller just tore down the broker that record
+// points to.
+test("clearBrokerSession deletes the same record loadBrokerSession() returned, not just the first existing file", () => {
+  const workspace = makeTempDir();
+  const pluginDataDir = makeTempDir();
+
+  withPluginDataDir(null, () => {
+    saveBrokerSession(workspace, { endpoint: "fallback-endpoint", pid: 1111 });
+  });
+
+  withPluginDataDir(pluginDataDir, () => {
+    const primaryBrokerFile = path.join(resolveStateDir(workspace), "broker.json");
+    fs.mkdirSync(path.dirname(primaryBrokerFile), { recursive: true });
+    fs.writeFileSync(primaryBrokerFile, "{not valid json", "utf8");
+
+    // loadBrokerSession() skips the malformed primary and returns the valid
+    // fallback session.
+    assert.deepEqual(loadBrokerSession(workspace), { endpoint: "fallback-endpoint", pid: 1111 });
+
+    clearBrokerSession(workspace);
+
+    // The malformed primary file is untouched (clearBrokerSession() doesn't
+    // garbage-collect unrelated corrupt files, only the selected record)...
+    assert.equal(fs.existsSync(primaryBrokerFile), true);
+    // ...but the valid fallback session -- the one actually loaded and torn
+    // down -- is gone.
+    assert.equal(loadBrokerSession(workspace), null);
   });
 });

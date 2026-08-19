@@ -83,36 +83,57 @@ export function ensureStateDir(cwd) {
   fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
 }
 
-function resolveExistingStateFile(cwd) {
-  for (const stateDir of resolveStateDirCandidates(cwd)) {
-    const stateFile = path.join(stateDir, STATE_FILE_NAME);
-    if (fs.existsSync(stateFile)) {
-      return stateFile;
-    }
+function readStateFileIfValid(stateFile) {
+  if (!fs.existsSync(stateFile)) {
+    return null;
   }
-  return null;
+  try {
+    return JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  } catch {
+    return null;
+  }
 }
 
+// Unlike the broker session (at most one meaningful record per workspace,
+// so "first candidate found" is a correct selection), jobs are a growing
+// collection that can genuinely differ across roots -- a job started while
+// CLAUDE_PLUGIN_DATA was set and another started while it was unset are
+// both real and non-conflicting. Returning only the first candidate's job
+// list would silently hide whichever root wasn't picked, leaving the exact
+// cross-root invisibility this fix targets for status/result/cancel
+// whenever *both* roots happen to have a state.json (a reachable legacy
+// state after invocations alternated). So every candidate's jobs are
+// merged instead, keeping the more recently updated copy if the same job
+// id somehow appears in more than one.
 export function loadState(cwd) {
-  const stateFile = resolveExistingStateFile(cwd);
-  if (!stateFile) {
+  const parsedCandidates = resolveStateDirCandidates(cwd)
+    .map((stateDir) => readStateFileIfValid(path.join(stateDir, STATE_FILE_NAME)))
+    .filter((parsed) => parsed != null);
+
+  if (parsedCandidates.length === 0) {
     return defaultState();
   }
 
-  try {
-    const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-    return {
-      ...defaultState(),
-      ...parsed,
-      config: {
-        ...defaultState().config,
-        ...(parsed.config ?? {})
-      },
-      jobs: Array.isArray(parsed.jobs) ? parsed.jobs : []
-    };
-  } catch {
-    return defaultState();
+  const jobsById = new Map();
+  for (const parsed of parsedCandidates) {
+    for (const job of Array.isArray(parsed.jobs) ? parsed.jobs : []) {
+      const existing = jobsById.get(job.id);
+      if (!existing || String(job.updatedAt ?? "") > String(existing.updatedAt ?? "")) {
+        jobsById.set(job.id, job);
+      }
+    }
   }
+
+  const [primary] = parsedCandidates;
+  return {
+    ...defaultState(),
+    ...primary,
+    config: {
+      ...defaultState().config,
+      ...(primary.config ?? {})
+    },
+    jobs: [...jobsById.values()]
+  };
 }
 
 function pruneJobs(jobs) {

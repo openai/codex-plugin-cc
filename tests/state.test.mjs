@@ -76,6 +76,45 @@ test("loadState finds state written without CLAUDE_PLUGIN_DATA when the current 
   }
 });
 
+// Caught in review: jobs are a growing collection, not a single pointer like
+// the broker session -- a job started while CLAUDE_PLUGIN_DATA was set and a
+// different job started while it was unset are both real and non-
+// conflicting, so loadState() must merge every candidate's jobs rather than
+// returning only the first state.json found (which would silently hide
+// whichever root wasn't picked, for every status/result/cancel lookup, any
+// time both roots happen to have a state.json -- a reachable legacy state
+// after invocations alternated).
+test("loadState merges jobs from every candidate root instead of only the first found", () => {
+  const workspace = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const previousPluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
+
+  try {
+    delete process.env.CLAUDE_PLUGIN_DATA;
+    saveState(workspace, {
+      config: {},
+      jobs: [{ id: "job-fallback", status: "running", updatedAt: "2026-08-19T00:00:00.000Z" }]
+    });
+
+    process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+    saveState(workspace, {
+      config: {},
+      jobs: [{ id: "job-plugin-data", status: "running", updatedAt: "2026-08-19T00:01:00.000Z" }]
+    });
+
+    const state = loadState(workspace);
+    const jobIds = state.jobs.map((job) => job.id).sort();
+
+    assert.deepEqual(jobIds, ["job-fallback", "job-plugin-data"]);
+  } finally {
+    if (previousPluginDataDir == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
+    }
+  }
+});
+
 test("readStoredJob finds a job's detail file written without CLAUDE_PLUGIN_DATA when the current invocation has it set", () => {
   const workspace = makeTempDir();
   const pluginDataDir = makeTempDir();
