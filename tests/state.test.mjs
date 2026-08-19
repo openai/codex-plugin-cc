@@ -84,20 +84,28 @@ test("loadState finds state written without CLAUDE_PLUGIN_DATA when the current 
 // whichever root wasn't picked, for every status/result/cancel lookup, any
 // time both roots happen to have a state.json -- a reachable legacy state
 // after invocations alternated).
+function writeStateFileDirectly(stateDir, state) {
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "state.json"), `${JSON.stringify(state, null, 2)}\n`, "utf8");
+}
+
 test("loadState merges jobs from every candidate root instead of only the first found", () => {
   const workspace = makeTempDir();
   const pluginDataDir = makeTempDir();
   const previousPluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
 
   try {
+    // Written directly (not via saveState()) so this test exercises only
+    // loadState()'s read-side merge, independent of saveState()'s own
+    // write/deletion-propagation behavior (covered separately below).
     delete process.env.CLAUDE_PLUGIN_DATA;
-    saveState(workspace, {
+    writeStateFileDirectly(resolveStateDir(workspace), {
       config: {},
       jobs: [{ id: "job-fallback", status: "running", updatedAt: "2026-08-19T00:00:00.000Z" }]
     });
 
     process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
-    saveState(workspace, {
+    writeStateFileDirectly(resolveStateDir(workspace), {
       config: {},
       jobs: [{ id: "job-plugin-data", status: "running", updatedAt: "2026-08-19T00:01:00.000Z" }]
     });
@@ -106,6 +114,64 @@ test("loadState merges jobs from every candidate root instead of only the first 
     const jobIds = state.jobs.map((job) => job.id).sort();
 
     assert.deepEqual(jobIds, ["job-fallback", "job-plugin-data"]);
+  } finally {
+    if (previousPluginDataDir == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
+    }
+  }
+});
+
+// Caught in review: merging reads across roots (the previous test) isn't
+// enough on its own -- saveState() only ever wrote the new job list to the
+// current primary root, so a job that originated in a *different* root and
+// gets filtered out (e.g. cleanupSessionJobs() during SessionEnd, which
+// loads the merged view, drops jobs for the ending session, and saves the
+// remainder) never actually disappears: the other root's own state.json
+// still has its own untouched copy, and the next loadState() merges it
+// right back in. A "removed" job could keep reporting as running forever.
+test("saveState persists a job removal across every candidate root, not just the current primary", () => {
+  const workspace = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const previousPluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
+
+  try {
+    // Setup writes both roots directly (not via saveState()), exactly like
+    // the previous test -- a real caller always derives saveState()'s job
+    // list from a prior loadState() (see updateState()/cleanupSessionJobs()
+    // themselves), so seeding two roots via two independent, non-full-list
+    // saveState() calls wouldn't reflect any real call pattern and would
+    // trip the very deletion-propagation behavior under test here.
+    delete process.env.CLAUDE_PLUGIN_DATA;
+    writeStateFileDirectly(resolveStateDir(workspace), {
+      config: {},
+      jobs: [
+        { id: "job-fallback-keep", status: "running", updatedAt: "2026-08-19T00:00:00.000Z" },
+        { id: "job-fallback-remove", status: "running", updatedAt: "2026-08-19T00:00:00.000Z" }
+      ]
+    });
+
+    process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+    writeStateFileDirectly(resolveStateDir(workspace), {
+      config: {},
+      jobs: [{ id: "job-plugin-data", status: "running", updatedAt: "2026-08-19T00:01:00.000Z" }]
+    });
+
+    // Mirrors cleanupSessionJobs(): load the merged view, drop one job that
+    // originated entirely in the fallback root, save the remainder -- still
+    // with CLAUDE_PLUGIN_DATA set, the same as a real SessionEnd hook.
+    const merged = loadState(workspace);
+    saveState(workspace, {
+      ...merged,
+      jobs: merged.jobs.filter((job) => job.id !== "job-fallback-remove")
+    });
+
+    const jobIdsAfterRemoval = loadState(workspace)
+      .jobs.map((job) => job.id)
+      .sort();
+
+    assert.deepEqual(jobIdsAfterRemoval, ["job-fallback-keep", "job-plugin-data"]);
   } finally {
     if (previousPluginDataDir == null) {
       delete process.env.CLAUDE_PLUGIN_DATA;

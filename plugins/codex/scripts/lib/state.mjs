@@ -166,11 +166,40 @@ export function saveState(cwd, state) {
     if (retainedIds.has(job.id)) {
       continue;
     }
-    removeJobFile(resolveJobFile(cwd, job.id));
+    for (const jobFile of resolveJobFileCandidates(cwd, job.id)) {
+      removeJobFile(jobFile);
+    }
     removeFileIfExists(job.logFile);
   }
 
   fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+
+  // previousJobs is the merged view across every candidate root (see
+  // loadState()), so a job dropped from state.jobs here may have
+  // originated entirely in a root other than the one just written above.
+  // Without this, that root's own state.json still holds its own
+  // untouched copy, and the very next loadState() merges it right back in
+  // -- deletions could never actually stick for a job that lives only in a
+  // non-primary root. Prune every other candidate root's own file down to
+  // the same retained set; new/updated jobs still only ever get written to
+  // the primary root, above -- this only ever removes, never adds or
+  // rewrites in place.
+  const [, ...otherStateDirs] = resolveStateDirCandidates(cwd);
+  for (const otherStateDir of otherStateDirs) {
+    const otherStateFile = path.join(otherStateDir, STATE_FILE_NAME);
+    const otherParsed = readStateFileIfValid(otherStateFile);
+    const otherJobs = Array.isArray(otherParsed?.jobs) ? otherParsed.jobs : [];
+    const prunedOtherJobs = otherJobs.filter((job) => retainedIds.has(job.id));
+    if (prunedOtherJobs.length === otherJobs.length) {
+      continue;
+    }
+    fs.writeFileSync(
+      otherStateFile,
+      `${JSON.stringify({ ...otherParsed, jobs: prunedOtherJobs }, null, 2)}\n`,
+      "utf8"
+    );
+  }
+
   return nextState;
 }
 
