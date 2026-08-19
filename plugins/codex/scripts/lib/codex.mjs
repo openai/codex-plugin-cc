@@ -41,7 +41,8 @@ import path from "node:path";
 
 import { readJsonFile } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
-import { loadBrokerSession } from "./broker-lifecycle.mjs";
+import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
+import { isPidAlive, loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
@@ -612,16 +613,29 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
 
 async function withAppServer(cwd, fn) {
   let client = null;
+  let connectFailed = false;
   try {
-    client = await CodexAppServerClient.connect(cwd);
+    try {
+      client = await CodexAppServerClient.connect(cwd);
+    } catch (error) {
+      connectFailed = true;
+      throw error;
+    }
     const result = await fn(client);
     await client.close();
     return result;
   } catch (error) {
-    const brokerRequested = client?.transport === "broker" || Boolean(process.env[BROKER_ENDPOINT_ENV]);
+    // connect() itself throwing means fn never ran, so a direct retry is
+    // always safe regardless of the error's shape; this covers racing a
+    // broker's idle self-shutdown at every phase (socket gone: ENOENT or
+    // ECONNREFUSED; accepted then destroyed: ECONNRESET or a closed-connection
+    // error during initialize). Post-connect failures retry only on the
+    // broker-busy rejection, which the broker raises before any work runs;
+    // retrying fn after other mid-flight failures could replay side effects
+    // (e.g. a thread created before the failing request).
     const shouldRetryDirect =
-      (client?.transport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE) ||
-      (brokerRequested && (error?.code === "ENOENT" || error?.code === "ECONNREFUSED"));
+      connectFailed ||
+      (client?.transport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE);
 
     if (client) {
       await client.close().catch(() => {});
@@ -903,8 +917,46 @@ export function getCodexAvailability(cwd) {
   };
 }
 
+// Weak fallback liveness signal for endpoints with no recorded broker pid: a
+// unix socket file that no longer exists cannot back a live broker (the broker
+// removes it on clean shutdown; the session-start reaper removes it after an
+// unclean death). Pipe endpoints (Windows) cannot be checked without
+// connecting and are reported as-is.
+function isBrokerEndpointPresent(endpoint) {
+  try {
+    const target = parseBrokerEndpoint(endpoint);
+    return target.kind === "unix" ? fs.existsSync(target.path) : true;
+  } catch {
+    return false;
+  }
+}
+
+// A state record can outlive its broker when the process died without a clean
+// exit (a crash leaves both broker.json and the socket file behind until a
+// reaper runs). Prefer the recorded process identity: a dead pid means no
+// shared runtime regardless of what is on disk. Records without a usable pid
+// fall back to endpoint presence.
+function isBrokerSessionLive(session) {
+  if (!session?.endpoint) {
+    return false;
+  }
+  if (Number.isInteger(session.pid) && session.pid > 1) {
+    return isPidAlive(session.pid);
+  }
+  return isBrokerEndpointPresent(session.endpoint);
+}
+
 export function getSessionRuntimeStatus(env = process.env, cwd = process.cwd()) {
-  const endpoint = env?.[BROKER_ENDPOINT_ENV] ?? loadBrokerSession(cwd)?.endpoint ?? null;
+  const envEndpoint = env?.[BROKER_ENDPOINT_ENV];
+  let endpoint = null;
+  if (envEndpoint != null) {
+    // An env override takes precedence even when empty: an empty value masks
+    // the recorded session, matching the previous behavior.
+    endpoint = envEndpoint && isBrokerEndpointPresent(envEndpoint) ? envEndpoint : null;
+  } else {
+    const session = loadBrokerSession(cwd);
+    endpoint = session && isBrokerSessionLive(session) ? session.endpoint : null;
+  }
   if (endpoint) {
     return {
       mode: "shared",
@@ -957,7 +1009,7 @@ export async function getCodexAuthStatus(cwd, options = {}) {
   }
 }
 
-export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
+export async function interruptAppServerTurn(cwd, { threadId, turnId, skipAvailabilityCheck = false }) {
   if (!threadId || !turnId) {
     return {
       attempted: false,
@@ -967,14 +1019,20 @@ export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
     };
   }
 
-  const availability = getCodexAvailability(cwd);
-  if (!availability.available) {
-    return {
-      attempted: false,
-      interrupted: false,
-      transport: null,
-      detail: availability.detail
-    };
+  // The availability probe spawns codex synchronously (twice) and cannot be
+  // preempted by a caller's timeout race. A caller that has already verified a
+  // live broker endpoint (the SessionEnd hook) skips it: a responding broker
+  // proves the runtime exists.
+  if (!skipAvailabilityCheck) {
+    const availability = getCodexAvailability(cwd);
+    if (!availability.available) {
+      return {
+        attempted: false,
+        interrupted: false,
+        transport: null,
+        detail: availability.detail
+      };
+    }
   }
 
   let client = null;

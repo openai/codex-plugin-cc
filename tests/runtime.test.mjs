@@ -2240,7 +2240,10 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
   const invocationWorkspace = makeTempDir();
 
   saveBrokerSession(targetWorkspace, {
-    endpoint: "unix:/tmp/fake-broker.sock"
+    endpoint: "unix:/tmp/fake-broker.sock",
+    // Status only reports a shared runtime for a record whose broker is still
+    // live; recording this (alive) test process satisfies the pid check.
+    pid: process.pid
   });
 
   const status = run("node", [SCRIPT, "status", "--cwd", targetWorkspace], {
