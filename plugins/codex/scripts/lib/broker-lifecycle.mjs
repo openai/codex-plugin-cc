@@ -217,7 +217,7 @@ function readBrokerPid(sessionDir) {
   }
 }
 
-function isPidAlive(pid) {
+export function isPidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 1) {
     return false;
   }

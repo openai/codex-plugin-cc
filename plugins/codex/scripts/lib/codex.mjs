@@ -42,7 +42,7 @@ import path from "node:path";
 import { readJsonFile } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { loadBrokerSession } from "./broker-lifecycle.mjs";
+import { isPidAlive, loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
@@ -904,11 +904,11 @@ export function getCodexAvailability(cwd) {
   };
 }
 
-// An endpoint reference can outlive its broker when the process died without a
-// clean exit. For unix sockets the broker removes its socket on clean shutdown
-// and the session-start reaper removes it after an unclean death, so a missing
-// socket file means no shared runtime is live. Pipe endpoints (Windows) cannot
-// be checked without connecting and are reported as-is.
+// Weak fallback liveness signal for endpoints with no recorded broker pid: a
+// unix socket file that no longer exists cannot back a live broker (the broker
+// removes it on clean shutdown; the session-start reaper removes it after an
+// unclean death). Pipe endpoints (Windows) cannot be checked without
+// connecting and are reported as-is.
 function isBrokerEndpointPresent(endpoint) {
   try {
     const target = parseBrokerEndpoint(endpoint);
@@ -918,9 +918,32 @@ function isBrokerEndpointPresent(endpoint) {
   }
 }
 
+// A state record can outlive its broker when the process died without a clean
+// exit (a crash leaves both broker.json and the socket file behind until a
+// reaper runs). Prefer the recorded process identity: a dead pid means no
+// shared runtime regardless of what is on disk. Records without a usable pid
+// fall back to endpoint presence.
+function isBrokerSessionLive(session) {
+  if (!session?.endpoint) {
+    return false;
+  }
+  if (Number.isInteger(session.pid) && session.pid > 1) {
+    return isPidAlive(session.pid);
+  }
+  return isBrokerEndpointPresent(session.endpoint);
+}
+
 export function getSessionRuntimeStatus(env = process.env, cwd = process.cwd()) {
-  const recorded = env?.[BROKER_ENDPOINT_ENV] ?? loadBrokerSession(cwd)?.endpoint ?? null;
-  const endpoint = recorded && isBrokerEndpointPresent(recorded) ? recorded : null;
+  const envEndpoint = env?.[BROKER_ENDPOINT_ENV];
+  let endpoint = null;
+  if (envEndpoint != null) {
+    // An env override takes precedence even when empty: an empty value masks
+    // the recorded session, matching the previous behavior.
+    endpoint = envEndpoint && isBrokerEndpointPresent(envEndpoint) ? envEndpoint : null;
+  } else {
+    const session = loadBrokerSession(cwd);
+    endpoint = session && isBrokerSessionLive(session) ? session.endpoint : null;
+  }
   if (endpoint) {
     return {
       mode: "shared",

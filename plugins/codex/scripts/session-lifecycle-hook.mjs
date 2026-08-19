@@ -12,6 +12,11 @@ import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
+// The SessionEnd hook runs under a 5-second timeout (hooks/hooks.json). Cap
+// the total time spent on turn interrupts well below that, so an app server
+// that never answers turn/interrupt cannot get the hook killed before the
+// runner termination and state cleanup below it have run.
+const INTERRUPT_BUDGET_MS = 2000;
 
 function readHookInput() {
   const raw = fs.readFileSync(0, "utf8").trim();
@@ -85,12 +90,21 @@ async function cleanupSessionJobs(cwd, sessionId) {
       : false;
   }
 
+  const interruptDeadline = Date.now() + INTERRUPT_BUDGET_MS;
   for (const job of runningJobs) {
-    if (brokerAlive) {
+    const remainingMs = interruptDeadline - Date.now();
+    if (brokerAlive && remainingMs > 0) {
       const { threadId, turnId } = readJobTurn(workspaceRoot, job);
       if (threadId && turnId) {
         try {
-          await interruptAppServerTurn(cwd, { threadId, turnId });
+          // Race the interrupt against the remaining budget; an abandoned
+          // attempt is simply left behind (main exits explicitly).
+          await Promise.race([
+            interruptAppServerTurn(cwd, { threadId, turnId }),
+            new Promise((resolve) => {
+              setTimeout(resolve, remainingMs).unref();
+            })
+          ]);
         } catch {
           // Ignore interrupt failures during session shutdown.
         }
@@ -148,7 +162,14 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-  process.exit(1);
-});
+main()
+  .then(() => {
+    // Exit explicitly: an interrupt attempt abandoned by the budget race can
+    // hold sockets or child processes that would otherwise keep the hook
+    // process alive until the harness timeout kills it.
+    process.exit(0);
+  })
+  .catch((error) => {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exit(1);
+  });
