@@ -279,7 +279,7 @@ export function terminalizeTrackedJob(workspaceRoot, job, terminal) {
     return { job: null, claimed: false };
   }
   const completedAt = terminal.completedAt ?? nowIso();
-  const initial = readInitialClaim(workspaceRoot, job.id);
+  let initial = readInitialClaim(workspaceRoot, job.id);
   if (!initial) {
     const claimed = claimFile(resolveInitialClaimFile(workspaceRoot, job.id), {
       status: terminal.status,
@@ -287,13 +287,16 @@ export function terminalizeTrackedJob(workspaceRoot, job, terminal) {
     });
     const winner = claimed ? { status: terminal.status, completedAt } : readInitialClaim(workspaceRoot, job.id);
     const storedJob = readStoredJobOrNull(workspaceRoot, job.id);
-    if (!claimed) {
+    if (!claimed && winner?.status !== "running") {
       return { job: storedJob ? applyTerminalFence(storedJob, winner) : null, claimed };
     }
-    const effectiveJob = applyTerminalFence({ ...(storedJob ?? job), ...terminal }, winner);
-    writeJobFile(workspaceRoot, job.id, effectiveJob);
-    upsertJob(workspaceRoot, effectiveJob);
-    return { job: effectiveJob, claimed };
+    if (claimed) {
+      const effectiveJob = applyTerminalFence({ ...(storedJob ?? job), ...terminal }, winner);
+      writeJobFile(workspaceRoot, job.id, effectiveJob);
+      upsertJob(workspaceRoot, effectiveJob);
+      return { job: effectiveJob, claimed };
+    }
+    initial = winner;
   }
   if (initial.status !== "running") {
     return { job: applyTerminalFence(readStoredJobOrNull(workspaceRoot, job.id) ?? job, initial), claimed: false };
@@ -400,6 +403,13 @@ export async function runTrackedJob(job, runner, options = {}) {
   };
   writeJobFile(job.workspaceRoot, job.id, runningRecord);
   upsertJob(job.workspaceRoot, runningRecord);
+  if (isJobRemoved(job.workspaceRoot, job.id)) {
+    return null;
+  }
+  const terminalAfterStart = readTerminalFence(job.workspaceRoot, job.id);
+  if (terminalAfterStart) {
+    return applyTerminalFence(runningRecord, terminalAfterStart);
+  }
 
   try {
     const execution = await runner();

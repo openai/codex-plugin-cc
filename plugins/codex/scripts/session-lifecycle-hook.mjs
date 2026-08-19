@@ -14,7 +14,7 @@ import {
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
 import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
-import { markTrackedJobRemoved, terminalizeTrackedJob } from "./lib/tracked-jobs.mjs";
+import { markTrackedJobRemoved, readEffectiveStoredJob, terminalizeTrackedJob } from "./lib/tracked-jobs.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -58,9 +58,10 @@ function cleanupSessionJobs(cwd, sessionId) {
   }
 
   for (const job of removedJobs) {
-    markTrackedJobRemoved(workspaceRoot, job.id);
-    const stillRunning = job.status === "queued" || job.status === "running";
+    const effectiveJob = { ...job, ...(readEffectiveStoredJob(workspaceRoot, job.id) ?? {}) };
+    const stillRunning = effectiveJob.status === "queued" || effectiveJob.status === "running";
     if (!stillRunning) {
+      markTrackedJobRemoved(workspaceRoot, job.id);
       continue;
     }
     terminalizeTrackedJob(workspaceRoot, job, {
@@ -70,8 +71,9 @@ function cleanupSessionJobs(cwd, sessionId) {
       completedAt: new Date().toISOString(),
       errorMessage: "Cancelled because the Claude session ended."
     });
+    markTrackedJobRemoved(workspaceRoot, job.id);
     try {
-      terminateProcessTree(job.pid ?? Number.NaN);
+      terminateProcessTree(effectiveJob.pid ?? Number.NaN);
     } catch {
       // Ignore teardown failures during session shutdown.
     }

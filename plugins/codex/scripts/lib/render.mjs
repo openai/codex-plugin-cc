@@ -449,10 +449,11 @@ export function renderStoredJobResult(job, storedJob) {
 }
 
 export function renderCancelReport(job) {
+  const outcome = job.status === "cancelled" ? `Cancelled ${job.id}.` : `${job.id} already ${job.status}.`;
   const lines = [
     "# Codex Cancel",
     "",
-    `Cancelled ${job.id}.`,
+    outcome,
     ""
   ];
 

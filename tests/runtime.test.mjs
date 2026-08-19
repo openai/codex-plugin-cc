@@ -9,7 +9,7 @@ import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { listJobs, readJobFile, resolveJobFile, resolveStateDir, saveState, upsertJob, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
-import { createJobProgressUpdater, reconcileTrackedJobs, runTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
+import { createJobProgressUpdater, reconcileTrackedJobs, runTrackedJob, terminalizeTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -1058,6 +1058,31 @@ test("terminal initial claim prevents a late worker from publishing running stat
   assert.equal(readJobFile(resolveJobFile(workspaceRoot, job.id)).status, "queued");
 });
 
+test("terminalizer that loses the initial claim to running wins the terminal fence", () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-stage-two", workspaceRoot, status: "queued" };
+  const jobFile = resolveJobFile(workspaceRoot, job.id);
+  const initialFile = jobFile.replace(/\.json$/, ".started.json");
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, job);
+  const originalOpen = fs.openSync;
+  let intercepted = false;
+  fs.openSync = (file, flags, ...rest) => {
+    if (!intercepted && file === initialFile && flags === "wx") {
+      intercepted = true;
+      fs.writeFileSync(initialFile, JSON.stringify({ status: "running", pid: process.pid, startedAt: "2026-08-19T12:00:00.000Z" }));
+    }
+    return originalOpen(file, flags, ...rest);
+  };
+  try {
+    const result = terminalizeTrackedJob(workspaceRoot, job, { status: "cancelled", completedAt: "2026-08-19T12:01:00.000Z" });
+    assert.equal(result.claimed, true);
+    assert.equal(result.job.status, "cancelled");
+  } finally {
+    fs.openSync = originalOpen;
+  }
+});
+
 test("progress updates an unindexed mutable job without making it visible", () => {
   const workspaceRoot = makeTempDir();
   const job = { id: "task-unindexed-progress", workspaceRoot, status: "running" };
@@ -2038,6 +2063,15 @@ test("cancel reports a completed first terminal outcome without killing the work
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(JSON.parse(result.stdout).status, "completed");
+  assert.doesNotMatch(result.stdout, /Cancelled/i);
+  fs.unlinkSync(terminalFile);
+  const rendered = run("node", [SCRIPT, "cancel", job.id], {
+    cwd: workspace,
+    env: { ...process.env, CODEX_CANCEL_RACE_FENCE: terminalFile, NODE_OPTIONS: `--require ${preloadFile}` }
+  });
+  assert.equal(rendered.status, 0, rendered.stderr);
+  assert.match(rendered.stdout, /already completed/i);
+  assert.doesNotMatch(rendered.stdout, /Cancelled/i);
   process.kill(sleeper.pid, 0);
 });
 
@@ -2134,6 +2168,11 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   });
   sleeper.unref();
   fs.writeFileSync(runningJobFile, JSON.stringify({ id: "review-running" }, null, 2), "utf8");
+  fs.writeFileSync(
+    runningJobFile.replace(/\.json$/, ".started.json"),
+    JSON.stringify({ status: "running", pid: sleeper.pid, startedAt: "2026-08-19T12:00:00.000Z" }),
+    "utf8"
+  );
 
   t.after(() => {
     try {
@@ -2165,10 +2204,10 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
           },
           {
             id: "review-running",
-            status: "running",
+            status: "queued",
             title: "Codex Review",
             sessionId: "sess-current",
-            pid: sleeper.pid,
+            pid: null,
             logFile: runningLog,
             createdAt: "2026-03-18T15:32:00.000Z",
             updatedAt: "2026-03-18T15:33:00.000Z"
@@ -2212,7 +2251,9 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
       path.basename(otherJobFile),
       path.basename(otherSessionLog),
       "review-completed.removed",
-      "review-running.removed"
+      "review-running.removed",
+      "review-running.started.json",
+      "review-running.terminal.json"
     ].sort()
   );
 
