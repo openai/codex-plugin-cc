@@ -12,8 +12,21 @@ export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
 const BROKER_STATE_FILE = "broker.json";
 
+const MANAGED_MARKER_FILE = "broker.managed";
+
 export function createBrokerSessionDir(prefix = "cxc-") {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  // Persisted ownership record: only directories this plugin created carry the
+  // marker, and only marked directories are ever removed recursively (by the
+  // reaper below; the broker's own shutdown gets the equivalent signal via
+  // --managed-session-dir). A caller-selected directory that merely looks like
+  // ours never gains the marker, so it is never deleted.
+  fs.writeFileSync(
+    path.join(sessionDir, MANAGED_MARKER_FILE),
+    "Created by the codex plugin (createBrokerSessionDir); safe to remove recursively.\n",
+    "utf8"
+  );
+  return sessionDir;
 }
 
 function connectToEndpoint(endpoint) {
@@ -204,6 +217,10 @@ export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessi
   const resolvedSessionDir = sessionDir ?? (pidFile ? path.dirname(pidFile) : logFile ? path.dirname(logFile) : null);
   if (resolvedSessionDir && fs.existsSync(resolvedSessionDir)) {
     try {
+      const marker = path.join(resolvedSessionDir, MANAGED_MARKER_FILE);
+      if (fs.existsSync(marker)) {
+        fs.unlinkSync(marker);
+      }
       fs.rmdirSync(resolvedSessionDir);
     } catch {
       // Ignore non-empty or missing directories.
@@ -236,15 +253,17 @@ export function isPidAlive(pid) {
 // directory and reused across sessions, and it now exits itself once idle,
 // removing its own directory (see app-server-broker.mjs). This only cleans up
 // after a broker that died WITHOUT that clean exit (e.g. it was killed): its
-// directory is left behind with a now-dead PID. A live PID is never inspected or
-// signalled, so this can neither interrupt a session sharing a broker nor signal
-// an unrelated process that reused a stale PID. A directory is treated as a
-// broker session only when it holds a READABLE broker.pid with a valid pid: no
-// pid file, or a file that is empty/unparseable (possibly a torn write from a
-// broker still starting up), means the directory is left alone rather than
-// racing the writer. The cost is that a permanently corrupt pid file leaks its
-// (tiny) directory; the alternative was deleting a live broker's socket out
-// from under it.
+// directory is left behind with a now-dead PID. Deletion requires the
+// persisted ownership marker createBrokerSessionDir writes, so a directory
+// this plugin did not create (a manual --pid-file location, however named) is
+// never removed regardless of what its pid file says. A live PID is never
+// inspected or signalled, so this can neither interrupt a session sharing a
+// broker nor signal an unrelated process that reused a stale PID. And a
+// marked directory whose broker.pid is missing, empty, or unparseable
+// (possibly a torn write from a broker still starting up) is left alone
+// rather than racing the writer; the cost is that a permanently corrupt pid
+// file leaks its (tiny) directory, where the alternative was deleting a live
+// broker's socket out from under it.
 export async function reapBrokerSessions({ tmpDir = os.tmpdir() } = {}) {
   let entries;
   try {
@@ -258,6 +277,9 @@ export async function reapBrokerSessions({ tmpDir = os.tmpdir() } = {}) {
       continue;
     }
     const sessionDir = path.join(tmpDir, entry.name);
+    if (!fs.existsSync(path.join(sessionDir, MANAGED_MARKER_FILE))) {
+      continue; // no ownership marker: not created by this plugin, never delete
+    }
     if (!fs.existsSync(path.join(sessionDir, "broker.pid"))) {
       continue; // a broker removes its own dir on clean exit; nothing to do
     }

@@ -12,9 +12,12 @@ import {
 } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { getSessionRuntimeStatus } from "../plugins/codex/scripts/lib/codex.mjs";
 
-function makeSessionDir(tmpDir, name, pidContents) {
+function makeSessionDir(tmpDir, name, pidContents, { managed = true } = {}) {
   const sessionDir = path.join(tmpDir, name);
   fs.mkdirSync(sessionDir, { recursive: true });
+  if (managed) {
+    fs.writeFileSync(path.join(sessionDir, "broker.managed"), "test marker\n", "utf8");
+  }
   if (pidContents !== undefined) {
     fs.writeFileSync(path.join(sessionDir, "broker.pid"), pidContents, "utf8");
   }
@@ -46,10 +49,17 @@ test("reapBrokerSessions removes only dirs whose recorded broker pid is dead", a
   const garbageDir = makeSessionDir(tmpDir, "cxc-garbage", "not-a-pid\n");
   const zeroDir = makeSessionDir(tmpDir, "cxc-zero", "0\n");
   const unrelatedDir = makeSessionDir(tmpDir, "other-prefix", `${deadPid}\n`);
+  const unmarkedDir = makeSessionDir(tmpDir, "cxc-user-work", `${deadPid}\n`, { managed: false });
+  fs.writeFileSync(path.join(unmarkedDir, "important.txt"), "user file", "utf8");
 
   await reapBrokerSessions({ tmpDir });
 
   assert.equal(fs.existsSync(deadDir), false, "dead-pid dir should be removed");
+  assert.equal(
+    fs.existsSync(path.join(unmarkedDir, "important.txt")),
+    true,
+    "a dir without the ownership marker is never deleted, dead pid or not"
+  );
   assert.equal(fs.existsSync(liveDir), true, "live-pid dir must never be touched");
   assert.equal(fs.existsSync(pidlessDir), true, "dir without broker.pid is not a broker session");
   assert.equal(fs.existsSync(tornDir), true, "empty pid file may be a torn write; leave it");
