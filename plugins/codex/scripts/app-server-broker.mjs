@@ -10,6 +10,7 @@ import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 import { clearBrokerSession, loadBrokerSession } from "./lib/broker-lifecycle.mjs";
+import { terminateProcessTree } from "./lib/process.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 
@@ -168,6 +169,10 @@ async function main() {
   }
 
   async function performShutdown(server) {
+    // Whole-shutdown backstop: whatever below wedges, this process ends. The
+    // state record is cleared first, so a replacement broker is never blocked
+    // on this one finishing its cleanup.
+    setTimeout(() => process.exit(1), 15000).unref();
     // Retire this broker's state record first, while its socket is still the
     // live one for this cwd: no replacement broker can have been spawned yet,
     // so the guarded clear cannot race a newer record, and clients probing
@@ -184,7 +189,27 @@ async function main() {
     for (const socket of sockets) {
       socket.end();
     }
-    await appClient.close().catch(() => {});
+    // Bound the app-server close: close() escalates only as far as SIGTERM,
+    // so a child that ignores it would wedge this shutdown indefinitely
+    // (record already cleared, session dir still present, both processes
+    // alive while the next command spawns a replacement). After the deadline,
+    // force-kill the child's tree; its exit settles the dangling close.
+    await Promise.race([
+      appClient.close().catch(() => {}),
+      new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          try {
+            if (appClient.proc?.pid) {
+              terminateProcessTree(appClient.proc.pid);
+            }
+          } catch {
+            // Best effort; the whole-shutdown backstop above still applies.
+          }
+          resolve();
+        }, 5000);
+        timer.unref();
+      })
+    ]);
     if (server) {
       await new Promise((resolve) => server.close(resolve));
     }
