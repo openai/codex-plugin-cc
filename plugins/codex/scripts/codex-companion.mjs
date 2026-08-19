@@ -47,6 +47,7 @@ import {
   createJobProgressUpdater,
   createJobRecord,
   createProgressReporter,
+  GATE_KEY_ENV,
   nowIso,
   reconcileTrackedJobs,
   runTrackedJob,
@@ -565,16 +566,17 @@ function getJobKindLabel(kind, jobClass) {
   return jobClass === "review" ? "review" : "rescue";
 }
 
-function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false }) {
+function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false, id, gateKey }) {
   return createJobRecord({
-    id: generateJobId(prefix),
+    id: id ?? generateJobId(prefix),
     kind,
     kindLabel: getJobKindLabel(kind, jobClass),
     title,
     workspaceRoot,
     jobClass,
     summary,
-    write
+    write,
+    ...(gateKey ? { gateKey } : {})
   });
 }
 
@@ -590,7 +592,7 @@ function createTrackedProgress(job, options = {}) {
   };
 }
 
-function buildTaskJob(workspaceRoot, taskMetadata, write) {
+function buildTaskJob(workspaceRoot, taskMetadata, write, gateKey = null) {
   return createCompanionJob({
     prefix: "task",
     kind: "task",
@@ -598,7 +600,8 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
     workspaceRoot,
     jobClass: "task",
     summary: taskMetadata.summary,
-    write
+    write,
+    ...(gateKey ? { id: `gate-${gateKey}`, gateKey } : {})
   });
 }
 
@@ -663,6 +666,10 @@ async function runForegroundCommand(job, runner, options = {}) {
   });
   const execution = await runTrackedJob(job, () => runner(progress), { logFile });
   if (!Number.isFinite(execution?.exitStatus)) {
+    if (job.gateKey) {
+      outputResult({ jobId: job.id, status: execution?.status ?? "failed", gateDuplicate: true }, true);
+      return execution;
+    }
     throw new Error(`Codex job ${job.id} is ${execution?.status ?? "removed"}; no new run was started.`);
   }
   outputResult(options.json ? execution.payload : execution.rendered, options.json);
@@ -808,7 +815,10 @@ async function handleTask(argv) {
     return;
   }
 
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+  const gateKey = !resumeLast && taskMetadata.title === "Codex Stop Gate Review" && /^[a-f0-9]{64}$/.test(process.env[GATE_KEY_ENV] ?? "")
+    ? process.env[GATE_KEY_ENV]
+    : null;
+  const job = buildTaskJob(workspaceRoot, taskMetadata, write, gateKey);
   await runForegroundCommand(
     job,
     (progress) =>

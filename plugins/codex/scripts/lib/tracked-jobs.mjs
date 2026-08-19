@@ -5,6 +5,7 @@ import { isProcessAlive } from "./process.mjs";
 import { listJobs, readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
+export const GATE_KEY_ENV = "CODEX_COMPANION_GATE_KEY";
 
 export function nowIso() {
   return new Date().toISOString();
@@ -421,6 +422,15 @@ export async function runTrackedJob(job, runner, options = {}) {
     return applyTerminalFence(storedJob ?? job, initial);
   }
   if (initial?.status === "running") {
+    if (job.gateKey && !storedJob && !isProcessAlive(initial.pid)) {
+      return terminalizeTrackedJob(job.workspaceRoot, job, {
+        status: "failed",
+        phase: "failed",
+        errorMessage: "Stop-gate worker exited before publishing its job record.",
+        pid: null,
+        completedAt: nowIso()
+      }).job;
+    }
     const terminal = readTerminalFence(job.workspaceRoot, job.id);
     if (terminal) {
       return applyTerminalFence(storedJob ?? job, terminal);

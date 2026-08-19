@@ -4,13 +4,14 @@ import fs from "node:fs";
 import process from "node:process";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import { getCodexAvailability } from "./lib/codex.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { getConfig } from "./lib/state.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
-import { reconcileTrackedJobs, SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
+import { GATE_KEY_ENV, reconcileTrackedJobs, SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 const STOP_REVIEW_TIMEOUT_MS = 15 * 60 * 1000;
@@ -46,7 +47,7 @@ function filterJobsForCurrentSession(jobs, input = {}) {
 }
 
 function buildStopReviewPrompt(input = {}) {
-  const lastAssistantMessage = String(input.last_assistant_message ?? "").trim();
+  const lastAssistantMessage = String(input.last_assistant_message ?? "");
   const template = loadPromptTemplate(ROOT_DIR, "stop-review-gate");
   const claudeResponseBlock = lastAssistantMessage
     ? ["Previous Claude response:", lastAssistantMessage].join("\n")
@@ -54,6 +55,38 @@ function buildStopReviewPrompt(input = {}) {
   return interpolateTemplate(template, {
     CLAUDE_RESPONSE_BLOCK: claudeResponseBlock
   });
+}
+
+function getGateKey(input = {}) {
+  const sessionId = input.session_id || process.env[SESSION_ID_ENV] || "";
+  const lastAssistantMessage = String(input.last_assistant_message ?? "");
+  if (!sessionId || !lastAssistantMessage) {
+    return null;
+  }
+  return createHash("sha256").update(`${sessionId}\0${lastAssistantMessage}`).digest("hex");
+}
+
+function gateJobNote(job) {
+  const commands = `Check /codex:status ${job.id} and use /codex:cancel ${job.id} if you want to stop it.`;
+  if (job.status === "queued" || job.status === "running") {
+    return `The stop-time Codex review is already ${job.status} as ${job.id}. ${commands}`;
+  }
+  return `The prior stop-time Codex review ${job.id} is ${job.status}; it will not be rerun automatically. ${commands}`;
+}
+
+function getGateJob(jobs, gateKey) {
+  return gateKey ? jobs.find((job) => job.gateKey === gateKey) ?? null : null;
+}
+
+function parseStoredGateReview(job) {
+  const rawOutput = job?.result?.rawOutput;
+  if (typeof rawOutput !== "string") {
+    return {
+      ok: false,
+      reason: `The completed stop-time Codex review ${job.id} has missing or corrupt cached output and will not be rerun automatically. Run /codex:review --wait manually or bypass the gate.`
+    };
+  }
+  return parseStopReviewOutput(rawOutput);
 }
 
 function buildSetupNote(cwd) {
@@ -95,12 +128,13 @@ function parseStopReviewOutput(rawOutput) {
   };
 }
 
-function runStopReview(cwd, input = {}) {
+function runStopReview(cwd, input = {}, gateKey = null) {
   const scriptPath = path.join(SCRIPT_DIR, "codex-companion.mjs");
   const prompt = buildStopReviewPrompt(input);
   const childEnv = {
     ...process.env,
-    ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {})
+    ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {}),
+    ...(gateKey ? { [GATE_KEY_ENV]: gateKey } : {})
   };
   const result = spawnSync(process.execPath, [scriptPath, "task", "--json", prompt], {
     cwd,
@@ -129,6 +163,9 @@ function runStopReview(cwd, input = {}) {
 
   try {
     const payload = JSON.parse(result.stdout);
+    if (payload?.gateDuplicate) {
+      return { ok: false, reason: gateJobNote({ id: payload.jobId, status: payload.status }) };
+    }
     return parseStopReviewOutput(payload?.rawOutput);
   } catch {
     return {
@@ -158,12 +195,23 @@ function main() {
 
   const setupNote = buildSetupNote(cwd);
   if (setupNote) {
-    logNote(setupNote);
-    logNote(runningTaskNote);
+    emitDecision({ decision: "block", reason: setupNote });
     return;
   }
 
-  const review = runStopReview(cwd, input);
+  const gateKey = getGateKey(input);
+  const cachedJob = getGateJob(jobs, gateKey);
+  if (cachedJob) {
+    const review = cachedJob.status === "completed" ? parseStoredGateReview(cachedJob) : { ok: false, reason: gateJobNote(cachedJob) };
+    if (!review.ok) {
+      emitDecision({ decision: "block", reason: runningTaskNote ? `${runningTaskNote} ${review.reason}` : review.reason });
+    } else {
+      logNote(runningTaskNote);
+    }
+    return;
+  }
+
+  const review = runStopReview(cwd, input, gateKey);
   if (!review.ok) {
     emitDecision({
       decision: "block",
