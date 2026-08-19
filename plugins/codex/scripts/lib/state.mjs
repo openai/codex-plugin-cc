@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { isProcessAlive } from "./process.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
@@ -105,6 +106,51 @@ function removeFileIfExists(filePath) {
   }
 }
 
+function resolveJobSidecarFile(cwd, jobId, suffix) {
+  return path.join(resolveJobsDir(cwd), `${jobId}${suffix}`);
+}
+
+function markJobRemoved(cwd, jobId) {
+  try {
+    fs.closeSync(fs.openSync(resolveJobSidecarFile(cwd, jobId, ".removed"), "wx"));
+  } catch (error) {
+    if (error?.code !== "EEXIST") {
+      throw error;
+    }
+  }
+}
+
+function canRemoveJobSidecars(cwd, jobId) {
+  const startedFile = resolveJobSidecarFile(cwd, jobId, ".started.json");
+  if (!fs.existsSync(startedFile)) {
+    return true;
+  }
+  try {
+    const started = JSON.parse(fs.readFileSync(startedFile, "utf8"));
+    return started?.status !== "running" || (Number.isFinite(started.pid) && !isProcessAlive(started.pid));
+  } catch {
+    return false;
+  }
+}
+
+function removeJobSidecars(cwd, jobId) {
+  for (const suffix of [".started.json", ".admission.json", ".terminal.json", ".removed"]) {
+    removeFileIfExists(resolveJobSidecarFile(cwd, jobId, suffix));
+  }
+}
+
+function sweepRemovedJobSidecars(cwd) {
+  for (const entry of fs.readdirSync(resolveJobsDir(cwd))) {
+    if (!entry.endsWith(".removed")) {
+      continue;
+    }
+    const jobId = entry.slice(0, -".removed".length);
+    if (!fs.existsSync(resolveJobFile(cwd, jobId)) && canRemoveJobSidecars(cwd, jobId)) {
+      removeJobSidecars(cwd, jobId);
+    }
+  }
+}
+
 export function saveState(cwd, state) {
   const previousJobs = loadState(cwd).jobs;
   ensureStateDir(cwd);
@@ -123,11 +169,13 @@ export function saveState(cwd, state) {
     if (retainedIds.has(job.id)) {
       continue;
     }
+    markJobRemoved(cwd, job.id);
     removeJobFile(resolveJobFile(cwd, job.id));
     removeFileIfExists(job.logFile);
   }
 
   writeAtomicJson(resolveStateFile(cwd), nextState);
+  sweepRemovedJobSidecars(cwd);
   return nextState;
 }
 

@@ -98,6 +98,11 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
     const jobFile = resolveJobFile(workspace, jobId);
     fs.writeFileSync(logFile, `log ${jobId}\n`, "utf8");
     fs.writeFileSync(jobFile, JSON.stringify({ id: jobId, status: "completed" }, null, 2), "utf8");
+    if (jobId === "job-0") {
+      fs.writeFileSync(jobFile.replace(/\.json$/, ".started.json"), JSON.stringify({ status: "running", pid: 999999 }), "utf8");
+      fs.writeFileSync(jobFile.replace(/\.json$/, ".admission.json"), JSON.stringify({ status: "admitted" }), "utf8");
+      fs.writeFileSync(jobFile.replace(/\.json$/, ".terminal.json"), JSON.stringify({ status: "completed" }), "utf8");
+    }
     return {
       id: jobId,
       status: "completed",

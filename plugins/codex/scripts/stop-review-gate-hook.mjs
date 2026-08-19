@@ -67,11 +67,10 @@ function getGateKey(input = {}) {
 }
 
 function gateJobNote(job) {
-  const commands = `Check /codex:status ${job.id} and use /codex:cancel ${job.id} if you want to stop it.`;
   if (job.status === "queued" || job.status === "running") {
-    return `The stop-time Codex review is already ${job.status} as ${job.id}. ${commands}`;
+    return `The stop-time Codex review is already ${job.status} as ${job.id}. Check /codex:status ${job.id} and use /codex:cancel ${job.id} if you want to stop it.`;
   }
-  return `The prior stop-time Codex review ${job.id} is ${job.status}; it will not be rerun automatically. ${commands}`;
+  return `The prior stop-time Codex review ${job.id} is ${job.status}; it will not be rerun automatically. Check /codex:status ${job.id}, then run /codex:review --wait manually or bypass the gate.`;
 }
 
 function getGateJob(jobs, gateKey) {
@@ -83,7 +82,7 @@ function parseStoredGateReview(job) {
   if (typeof rawOutput !== "string") {
     return {
       ok: false,
-      reason: `The completed stop-time Codex review ${job.id} has missing or corrupt cached output and will not be rerun automatically. Run /codex:review --wait manually or bypass the gate.`
+      reason: `The completed stop-time Codex review ${job.id} has missing or corrupt cached output and will not be rerun automatically. Check /codex:status ${job.id}, then run /codex:review --wait manually or bypass the gate.`
     };
   }
   return parseStopReviewOutput(rawOutput);

@@ -2337,7 +2337,6 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
     [
       path.basename(otherJobFile),
       path.basename(otherSessionLog),
-      "review-completed.removed",
       "review-running.admission.json",
       "review-running.removed",
       "review-running.started.json"
@@ -2357,6 +2356,8 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   assert.deepEqual(state.jobs.map((job) => job.id), ["review-other"]);
   const otherJob = state.jobs[0];
   assert.equal(otherJob.logFile, otherSessionLog);
+  saveState(repo, state);
+  assert.deepEqual(fs.readdirSync(jobsDir).sort(), [path.basename(otherJobFile), path.basename(otherSessionLog)].sort());
 });
 
 test("stop hook runs a stop-time review task and blocks on findings when the review gate is enabled", () => {
@@ -2520,7 +2521,15 @@ test("stop hook blocks every matching non-reusable gate job without starting a t
     const hookResult = run("node", [STOP_HOOK], { cwd: repo, env, input: JSON.stringify({ cwd: repo, session_id: sessionId, last_assistant_message: message }) });
     assert.equal(hookResult.status, 0, hookResult.stderr);
     assert.equal(JSON.parse(hookResult.stdout).decision, "block");
-    assert.match(JSON.parse(hookResult.stdout).reason, new RegExp(jobId));
+    const reason = JSON.parse(hookResult.stdout).reason;
+    assert.match(reason, new RegExp(jobId));
+    if (status === "queued" || status === "running") {
+      assert.match(reason, new RegExp(`/codex:cancel ${jobId}`));
+    } else {
+      assert.doesNotMatch(reason, /\/codex:cancel/);
+      assert.match(reason, /\/codex:status/);
+      assert.match(reason, /manual|bypass/i);
+    }
     const afterTurns = fs.existsSync(fakeStatePath) ? JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).nextTurnId : 1;
     assert.equal(afterTurns, beforeTurns);
   }
