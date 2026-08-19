@@ -58,7 +58,10 @@ export async function sendBrokerShutdown(endpoint) {
 
 export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile, env = process.env }) {
   const logFd = fs.openSync(logFile, "a");
-  const child = spawn(process.execPath, [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile], {
+  // --managed-session-dir: this spawner created the session directory
+  // (createBrokerSessionDir's mkdtemp), so the broker may remove the whole
+  // directory on clean exit. Manual invocations lack the flag and keep theirs.
+  const child = spawn(process.execPath, [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile, "--managed-session-dir"], {
     cwd,
     env,
     detached: true,

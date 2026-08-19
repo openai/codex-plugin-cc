@@ -50,11 +50,12 @@ function writePidFile(pidFile) {
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (subcommand !== "serve") {
-    throw new Error("Usage: node scripts/app-server-broker.mjs serve --endpoint <value> [--cwd <path>] [--pid-file <path>]");
+    throw new Error("Usage: node scripts/app-server-broker.mjs serve --endpoint <value> [--cwd <path>] [--pid-file <path>] [--managed-session-dir]");
   }
 
   const { options } = parseArgs(argv, {
-    valueOptions: ["cwd", "pid-file", "endpoint"]
+    valueOptions: ["cwd", "pid-file", "endpoint"],
+    booleanOptions: ["managed-session-dir"]
   });
 
   if (!options.endpoint) {
@@ -65,6 +66,7 @@ async function main() {
   const endpoint = String(options.endpoint);
   const listenTarget = parseBrokerEndpoint(endpoint);
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
+  const managedSessionDir = options["managed-session-dir"] === true;
   writePidFile(pidFile);
 
   const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
@@ -188,11 +190,12 @@ async function main() {
     }
     // Remove the broker's own session directory (socket, pid file, log) so a
     // clean exit leaves nothing behind for the reaper to GC. Recursive removal
-    // is restricted to directories this plugin provably created: mkdtemp with
-    // the cxc- prefix directly under the OS temp dir. A manual invocation
-    // pointing --pid-file anywhere else (even a directory that happens to be
-    // named cxc-something) keeps its directory; only the broker's own files
-    // are unlinked there.
+    // requires the spawner to have declared it created the directory
+    // (--managed-session-dir, set by spawnBrokerProcess after mkdtemp) AND the
+    // plugin's own layout (cxc- prefix directly under the OS temp dir), so a
+    // manual invocation can never have a caller-selected directory deleted,
+    // even one named to look like ours; only the broker's own files are
+    // unlinked there.
     const sessionDir = pidFile
       ? path.dirname(pidFile)
       : listenTarget.kind === "unix"
@@ -215,6 +218,9 @@ async function main() {
   }
 
   function isManagedSessionDir(dir) {
+    if (!managedSessionDir) {
+      return false;
+    }
     try {
       return (
         path.basename(dir).startsWith("cxc-") &&
