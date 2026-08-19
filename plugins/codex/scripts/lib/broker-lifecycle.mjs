@@ -6,7 +6,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { resolveStateDir } from "./state.mjs";
+import { resolveStateDir, resolveStateDirCandidates } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
@@ -73,17 +73,27 @@ function resolveBrokerStateFile(cwd) {
   return path.join(resolveStateDir(cwd), BROKER_STATE_FILE);
 }
 
-export function loadBrokerSession(cwd) {
-  const stateFile = resolveBrokerStateFile(cwd);
-  if (!fs.existsSync(stateFile)) {
-    return null;
-  }
+// The state root is derived from ambient environment (CLAUDE_PLUGIN_DATA),
+// which can differ between the invocation that registered a broker and a
+// later one that looks it up -- checking every candidate root, not just the
+// current invocation's primary, is what keeps a broker registered under one
+// root from being orphaned by a lookup that resolves to the other.
+function resolveBrokerStateFileCandidates(cwd) {
+  return resolveStateDirCandidates(cwd).map((stateDir) => path.join(stateDir, BROKER_STATE_FILE));
+}
 
-  try {
-    return JSON.parse(fs.readFileSync(stateFile, "utf8"));
-  } catch {
-    return null;
+export function loadBrokerSession(cwd) {
+  for (const stateFile of resolveBrokerStateFileCandidates(cwd)) {
+    if (!fs.existsSync(stateFile)) {
+      continue;
+    }
+    try {
+      return JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    } catch {
+      continue;
+    }
   }
+  return null;
 }
 
 export function saveBrokerSession(cwd, session) {
@@ -93,9 +103,10 @@ export function saveBrokerSession(cwd, session) {
 }
 
 export function clearBrokerSession(cwd) {
-  const stateFile = resolveBrokerStateFile(cwd);
-  if (fs.existsSync(stateFile)) {
-    fs.unlinkSync(stateFile);
+  for (const stateFile of resolveBrokerStateFileCandidates(cwd)) {
+    if (fs.existsSync(stateFile)) {
+      fs.unlinkSync(stateFile);
+    }
   }
 }
 

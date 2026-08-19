@@ -26,7 +26,7 @@ function defaultState() {
   };
 }
 
-export function resolveStateDir(cwd) {
+function workspaceStateDirName(cwd) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   let canonicalWorkspaceRoot = workspaceRoot;
   try {
@@ -38,9 +38,37 @@ export function resolveStateDir(cwd) {
   const slugSource = path.basename(workspaceRoot) || "workspace";
   const slug = slugSource.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex").slice(0, 16);
+  return `${slug}-${hash}`;
+}
+
+// CLAUDE_PLUGIN_DATA is only present when the current invocation runs as a
+// plugin hook; a directly-invoked CLI call (or a hook whose env didn't
+// propagate it) resolves to the tmpdir fallback instead. Since the state
+// root is derived from ambient environment rather than anything persisted,
+// two invocations for the *same* workspace can land on different roots --
+// the primary root is still the write target for new/updated state, but
+// reads check every candidate so state written under one root is never
+// invisible to a later invocation that resolves to the other.
+function stateRootCandidates() {
   const pluginDataDir = process.env[PLUGIN_DATA_ENV];
-  const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
-  return path.join(stateRoot, `${slug}-${hash}`);
+  return pluginDataDir
+    ? [path.join(pluginDataDir, "state"), FALLBACK_STATE_ROOT_DIR]
+    : [FALLBACK_STATE_ROOT_DIR];
+}
+
+export function resolveStateDir(cwd) {
+  const [primaryRoot] = stateRootCandidates();
+  return path.join(primaryRoot, workspaceStateDirName(cwd));
+}
+
+/**
+ * All directories that could hold this workspace's state, primary root
+ * first. Use for reads that must not miss state written under a different
+ * root than the current invocation resolves to.
+ */
+export function resolveStateDirCandidates(cwd) {
+  const dirName = workspaceStateDirName(cwd);
+  return stateRootCandidates().map((root) => path.join(root, dirName));
 }
 
 export function resolveStateFile(cwd) {
@@ -55,9 +83,19 @@ export function ensureStateDir(cwd) {
   fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
 }
 
+function resolveExistingStateFile(cwd) {
+  for (const stateDir of resolveStateDirCandidates(cwd)) {
+    const stateFile = path.join(stateDir, STATE_FILE_NAME);
+    if (fs.existsSync(stateFile)) {
+      return stateFile;
+    }
+  }
+  return null;
+}
+
 export function loadState(cwd) {
-  const stateFile = resolveStateFile(cwd);
-  if (!fs.existsSync(stateFile)) {
+  const stateFile = resolveExistingStateFile(cwd);
+  if (!stateFile) {
     return defaultState();
   }
 
@@ -188,4 +226,15 @@ export function resolveJobLogFile(cwd, jobId) {
 export function resolveJobFile(cwd, jobId) {
   ensureStateDir(cwd);
   return path.join(resolveJobsDir(cwd), `${jobId}.json`);
+}
+
+/**
+ * Every path a job's detail file could be at, primary root first. A job
+ * listed via loadState()/listJobs() (which already searches every
+ * candidate root) may have had its detail file written under a different
+ * root than resolveJobFile()'s current primary; read lookups should not
+ * miss it just because it isn't in the root a fresh call resolves to.
+ */
+export function resolveJobFileCandidates(cwd, jobId) {
+  return resolveStateDirCandidates(cwd).map((stateDir) => path.join(stateDir, JOBS_DIR_NAME, `${jobId}.json`));
 }

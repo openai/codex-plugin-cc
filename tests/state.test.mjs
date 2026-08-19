@@ -5,7 +5,15 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
-import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import {
+  loadState,
+  resolveJobFile,
+  resolveJobLogFile,
+  resolveStateDir,
+  resolveStateFile,
+  saveState
+} from "../plugins/codex/scripts/lib/state.mjs";
+import { readStoredJob } from "../plugins/codex/scripts/lib/job-control.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -31,6 +39,57 @@ test("resolveStateDir uses CLAUDE_PLUGIN_DATA when it is provided", () => {
       stateDir,
       new RegExp(`^${path.join(pluginDataDir, "state").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`)
     );
+  } finally {
+    if (previousPluginDataDir == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
+    }
+  }
+});
+
+// The reverse (state written *with* CLAUDE_PLUGIN_DATA set, later read with
+// it unset) isn't fixable this way: an unset env var carries no trace of
+// what value it previously held, so there's nothing to check beyond the
+// always-known tmpdir fallback. This direction is the one with concrete
+// real-world evidence in the issue (a broker registered under the tmpdir
+// fallback, later orphaned by a lookup that ran with CLAUDE_PLUGIN_DATA set).
+test("loadState finds state written without CLAUDE_PLUGIN_DATA when the current invocation has it set", () => {
+  const workspace = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const previousPluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
+
+  try {
+    delete process.env.CLAUDE_PLUGIN_DATA;
+    saveState(workspace, { config: { stopReviewGate: true }, jobs: [] });
+
+    process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+    const state = loadState(workspace);
+
+    assert.equal(state.config.stopReviewGate, true);
+  } finally {
+    if (previousPluginDataDir == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
+    }
+  }
+});
+
+test("readStoredJob finds a job's detail file written without CLAUDE_PLUGIN_DATA when the current invocation has it set", () => {
+  const workspace = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const previousPluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
+
+  try {
+    delete process.env.CLAUDE_PLUGIN_DATA;
+    const jobFile = resolveJobFile(workspace, "job-1");
+    fs.writeFileSync(jobFile, JSON.stringify({ id: "job-1", status: "completed" }), "utf8");
+
+    process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+    const job = readStoredJob(workspace, "job-1");
+
+    assert.deepEqual(job, { id: "job-1", status: "completed" });
   } finally {
     if (previousPluginDataDir == null) {
       delete process.env.CLAUDE_PLUGIN_DATA;

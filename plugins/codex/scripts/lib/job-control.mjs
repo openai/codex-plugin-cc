@@ -1,7 +1,7 @@
 import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
+import { getConfig, listJobs, readJobFile, resolveJobFileCandidates } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -181,11 +181,12 @@ export function enrichJob(job, options = {}) {
 }
 
 export function readStoredJob(workspaceRoot, jobId) {
-  const jobFile = resolveJobFile(workspaceRoot, jobId);
-  if (!fs.existsSync(jobFile)) {
-    return null;
+  for (const jobFile of resolveJobFileCandidates(workspaceRoot, jobId)) {
+    if (fs.existsSync(jobFile)) {
+      return readJobFile(jobFile);
+    }
   }
-  return readJobFile(jobFile);
+  return null;
 }
 
 function matchJobReference(jobs, reference, predicate = () => true) {
