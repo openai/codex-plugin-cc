@@ -100,10 +100,8 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       return;
     }
 
-    upsertJob(workspaceRoot, patch);
-
     const jobFile = resolveJobFile(workspaceRoot, jobId);
-    if (!fs.existsSync(jobFile)) {
+    if (readTerminalFence(workspaceRoot, jobId) || !fs.existsSync(jobFile)) {
       return;
     }
 
@@ -112,6 +110,7 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       ...storedJob,
       ...patch
     });
+    upsertJob(workspaceRoot, patch);
   };
 }
 
@@ -140,43 +139,128 @@ function readStoredJobOrNull(workspaceRoot, jobId) {
   return readJobFile(jobFile);
 }
 
-function failTrackedJob(workspaceRoot, job, errorMessage) {
-  const completedAt = nowIso();
-  const failedJob = {
+const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+
+function resolveTerminalFenceFile(workspaceRoot, jobId) {
+  return resolveJobFile(workspaceRoot, jobId).replace(/\.json$/, ".terminal.json");
+}
+
+function terminalPhase(status) {
+  return status === "completed" ? "done" : status;
+}
+
+export function readTerminalFence(workspaceRoot, jobId) {
+  const fenceFile = resolveTerminalFenceFile(workspaceRoot, jobId);
+  if (!fs.existsSync(fenceFile)) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(fs.readFileSync(fenceFile, "utf8"));
+    if (!parsed || typeof parsed !== "object" || !TERMINAL_STATUSES.has(parsed.status)) {
+      throw new Error("invalid terminal status");
+    }
+    return {
+      status: parsed.status,
+      completedAt: typeof parsed.completedAt === "string" ? parsed.completedAt : null
+    };
+  } catch {
+    return { status: "failed", completedAt: null, corrupt: true };
+  }
+}
+
+function applyTerminalFence(job, fence) {
+  if (!fence) {
+    return job;
+  }
+  return {
     ...job,
+    status: fence.status,
+    phase: terminalPhase(fence.status),
+    pid: null,
+    completedAt: fence.completedAt ?? job.completedAt ?? null,
+    ...(fence.corrupt ? { errorMessage: "Terminal job fence is corrupt." } : {})
+  };
+}
+
+function claimTerminalFence(workspaceRoot, jobId, status, completedAt) {
+  const fenceFile = resolveTerminalFenceFile(workspaceRoot, jobId);
+  try {
+    const descriptor = fs.openSync(fenceFile, "wx");
+    try {
+      fs.writeFileSync(descriptor, `${JSON.stringify({ status, completedAt })}\n`, "utf8");
+    } finally {
+      fs.closeSync(descriptor);
+    }
+    return { fence: { status, completedAt }, claimed: true };
+  } catch (error) {
+    if (error?.code !== "EEXIST") {
+      throw error;
+    }
+    return { fence: readTerminalFence(workspaceRoot, jobId), claimed: false };
+  }
+}
+
+export function readEffectiveStoredJob(workspaceRoot, jobId) {
+  const storedJob = readStoredJobOrNull(workspaceRoot, jobId);
+  return storedJob ? applyTerminalFence(storedJob, readTerminalFence(workspaceRoot, jobId)) : null;
+}
+
+export function terminalizeTrackedJob(workspaceRoot, job, terminal) {
+  const completedAt = terminal.completedAt ?? nowIso();
+  const { fence, claimed } = claimTerminalFence(workspaceRoot, job.id, terminal.status, completedAt);
+  const storedJob = readStoredJobOrNull(workspaceRoot, job.id);
+  const effectiveJob = applyTerminalFence({ ...(storedJob ?? job), ...terminal }, fence);
+
+  if (!claimed) {
+    return { job: storedJob ? applyTerminalFence(storedJob, fence) : null, claimed };
+  }
+
+  writeJobFile(workspaceRoot, job.id, effectiveJob);
+  upsertJob(workspaceRoot, effectiveJob);
+  return { job: effectiveJob, claimed };
+}
+
+function failTrackedJob(workspaceRoot, job, errorMessage) {
+  return terminalizeTrackedJob(workspaceRoot, job, {
     status: "failed",
     phase: "failed",
     errorMessage,
     pid: null,
-    completedAt
-  };
-  writeJobFile(workspaceRoot, job.id, failedJob);
-  upsertJob(workspaceRoot, failedJob);
-  return failedJob;
+    completedAt: nowIso()
+  }).job;
 }
 
 export function reconcileTrackedJobs(workspaceRoot, options = {}) {
   const now = options.now ?? Date.now();
 
-  return listJobs(workspaceRoot).map((job) => {
+  return listJobs(workspaceRoot).flatMap((job) => {
+    const fence = readTerminalFence(workspaceRoot, job.id);
+    if (fence) {
+      return fs.existsSync(resolveJobFile(workspaceRoot, job.id)) ? [applyTerminalFence(job, fence)] : [];
+    }
     if (job.status !== "queued" && job.status !== "running") {
-      return job;
+      return [job];
     }
 
     const ageMs = now - Date.parse(job.createdAt ?? "");
     if (job.status === "queued" && !Number.isFinite(job.pid) && Number.isFinite(ageMs) && ageMs >= 5000) {
-      return failTrackedJob(workspaceRoot, job, "Background worker did not start within 5 seconds.");
+      return [failTrackedJob(workspaceRoot, job, "Background worker did not start within 5 seconds.")];
     }
     if (Number.isFinite(job.pid) && !isProcessAlive(job.pid, { killImpl: options.killImpl })) {
-      return failTrackedJob(workspaceRoot, job, "Background worker exited before completing the job.");
+      return [failTrackedJob(workspaceRoot, job, "Background worker exited before completing the job.")];
     }
 
-    return job;
+    return [job];
   });
 }
 
 export async function runTrackedJob(job, runner, options = {}) {
   const storedJob = readStoredJobOrNull(job.workspaceRoot, job.id);
+  const fence = readTerminalFence(job.workspaceRoot, job.id);
+  if (fence) {
+    return storedJob ? applyTerminalFence(storedJob, fence) : null;
+  }
   if (storedJob && storedJob.status !== "queued") {
     return storedJob;
   }
@@ -199,7 +283,7 @@ export async function runTrackedJob(job, runner, options = {}) {
     const execution = await runner();
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
-    writeJobFile(job.workspaceRoot, job.id, {
+    const terminal = terminalizeTrackedJob(job.workspaceRoot, runningRecord, {
       ...runningRecord,
       status: completionStatus,
       threadId: execution.threadId ?? null,
@@ -210,38 +294,21 @@ export async function runTrackedJob(job, runner, options = {}) {
       result: execution.payload,
       rendered: execution.rendered
     });
-    upsertJob(job.workspaceRoot, {
-      id: job.id,
-      status: completionStatus,
-      threadId: execution.threadId ?? null,
-      turnId: execution.turnId ?? null,
-      summary: execution.summary,
-      phase: completionStatus === "completed" ? "done" : "failed",
-      pid: null,
-      completedAt
-    });
-    appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
+    if (terminal.claimed) {
+      appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
+    }
     return execution;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
     const completedAt = nowIso();
-    writeJobFile(job.workspaceRoot, job.id, {
-      ...existing,
+    terminalizeTrackedJob(job.workspaceRoot, runningRecord, {
+      ...runningRecord,
       status: "failed",
       phase: "failed",
       errorMessage,
       pid: null,
       completedAt,
-      logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
-    });
-    upsertJob(job.workspaceRoot, {
-      id: job.id,
-      status: "failed",
-      phase: "failed",
-      pid: null,
-      errorMessage,
-      completedAt
+      logFile: options.logFile ?? job.logFile ?? runningRecord.logFile ?? null
     });
     throw error;
   }

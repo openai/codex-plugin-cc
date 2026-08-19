@@ -8,7 +8,8 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { listJobs, readJobFile, resolveJobFile, resolveStateDir, saveState, upsertJob, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
+import { createJobProgressUpdater, reconcileTrackedJobs, runTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -26,6 +27,10 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
   throw new Error("Timed out waiting for condition.");
+}
+
+function resolveTerminalFenceFile(workspaceRoot, jobId) {
+  return resolveJobFile(workspaceRoot, jobId).replace(/\.json$/, ".terminal.json");
 }
 
 test("setup reports ready when fake codex is installed and authenticated", () => {
@@ -967,6 +972,127 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.equal(resultPayload.job.id, launchPayload.jobId);
   assert.equal(resultPayload.job.status, "completed");
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
+});
+
+test("background task publishes its queued record before spawning the detached worker", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const markerFile = path.join(makeTempDir(), "task-worker-spawned-at");
+  const preloadFile = path.join(makeTempDir(), "record-task-worker-spawn.cjs");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(
+    preloadFile,
+    [
+      'const fs = require("node:fs");',
+      'const childProcess = require("node:child_process");',
+      "const originalSpawn = childProcess.spawn;",
+      "childProcess.spawn = (...args) => {",
+      '  if (args[1]?.includes("task-worker")) fs.writeFileSync(process.env.CODEX_TASK_WORKER_SPAWN_MARKER, String(Date.now()));',
+      "  return originalSpawn(...args);",
+      "};"
+    ].join("\n"),
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "task", "--background", "--json", "check queue publication"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_TASK_WORKER_SPAWN_MARKER: markerFile,
+      NODE_OPTIONS: `--require ${preloadFile}`
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const jobId = JSON.parse(result.stdout).jobId;
+  const jobFile = resolveJobFile(repo, jobId);
+  assert.equal(fs.existsSync(jobFile), true);
+  assert.ok(fs.statSync(jobFile).mtimeMs <= Number(fs.readFileSync(markerFile, "utf8")));
+});
+
+test("terminal job fence prevents a queued worker from running", async () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-fenced", workspaceRoot, status: "queued", request: { prompt: "do not run" } };
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, job);
+  fs.writeFileSync(
+    resolveTerminalFenceFile(workspaceRoot, job.id),
+    JSON.stringify({ status: "cancelled", completedAt: "2026-08-19T12:00:00.000Z" }),
+    "utf8"
+  );
+
+  let runnerInvoked = false;
+  const result = await runTrackedJob(job, async () => {
+    runnerInvoked = true;
+    return { exitStatus: 0 };
+  });
+
+  assert.equal(runnerInvoked, false);
+  assert.equal(result.status, "cancelled");
+  assert.equal(readJobFile(resolveJobFile(workspaceRoot, job.id)).status, "queued");
+});
+
+test("terminal job reconciliation wins over late worker finalization", async () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-race", workspaceRoot, status: "queued" };
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, job);
+
+  let releaseRunner;
+  const runnerStarted = new Promise((resolve) => {
+    releaseRunner = resolve;
+  });
+  const execution = runTrackedJob(job, async () => {
+    await runnerStarted;
+    return { exitStatus: 0 };
+  });
+
+  await waitFor(() => listJobs(workspaceRoot).some((candidate) => candidate.id === job.id && candidate.status === "running"));
+  reconcileTrackedJobs(workspaceRoot, {
+    killImpl() {
+      throw Object.assign(new Error("gone"), { code: "ESRCH" });
+    }
+  });
+  releaseRunner();
+  await execution;
+
+  assert.equal(listJobs(workspaceRoot).find((candidate) => candidate.id === job.id).status, "failed");
+  assert.equal(readJobFile(resolveJobFile(workspaceRoot, job.id)).status, "failed");
+});
+
+test("removed job terminal fence prevents progress and finalization from recreating it", async () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-removed", workspaceRoot, status: "queued" };
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, job);
+  const progress = createJobProgressUpdater(workspaceRoot, job.id);
+
+  let releaseRunner;
+  const runnerStarted = new Promise((resolve) => {
+    releaseRunner = resolve;
+  });
+  const execution = runTrackedJob(job, async () => {
+    await runnerStarted;
+    return { exitStatus: 0 };
+  });
+
+  await waitFor(() => listJobs(workspaceRoot).some((candidate) => candidate.id === job.id && candidate.status === "running"));
+  fs.writeFileSync(
+    resolveTerminalFenceFile(workspaceRoot, job.id),
+    JSON.stringify({ status: "cancelled", completedAt: "2026-08-19T12:00:00.000Z" }),
+    "utf8"
+  );
+  saveState(workspaceRoot, { config: { stopReviewGate: false }, jobs: [] });
+  progress({ phase: "investigating" });
+  releaseRunner();
+  await execution;
+
+  assert.deepEqual(listJobs(workspaceRoot), []);
+  assert.equal(fs.existsSync(resolveJobFile(workspaceRoot, job.id)), false);
 });
 
 test("review rejects focus text because it is native-review only", () => {
@@ -2006,7 +2132,7 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   assert.equal(fs.existsSync(otherJobFile), true);
   assert.deepEqual(
     fs.readdirSync(path.dirname(otherJobFile)).sort(),
-    [path.basename(otherJobFile), path.basename(otherSessionLog)].sort()
+    [path.basename(otherJobFile), path.basename(otherSessionLog), "review-running.terminal.json"].sort()
   );
 
   await waitFor(() => {

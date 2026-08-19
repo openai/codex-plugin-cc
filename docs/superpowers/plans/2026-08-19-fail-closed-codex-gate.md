@@ -102,11 +102,11 @@ Expected: PASS.
 **Interfaces:**
 - Consumes: `reconcileTrackedJobs` from Task 1.
 - Produces: queued job publication before detached worker spawn.
-- Produces: `runTrackedJob(..., { skipIfTerminal: true })` for background workers.
+- Produces: an immutable per-job terminal fence, created with exclusive filesystem creation, whose first writer wins.
 
 - [ ] **Step 1: Write failing terminal-state tests**
 
-Persist a cancelled job, call `runTrackedJob` with `skipIfTerminal: true`, and assert the runner is not called and the stored state remains cancelled. Remove a running job during a deferred runner and assert finalization does not recreate it.
+Persist a terminal fence and assert a late worker cannot run or overwrite its first terminal outcome. Remove a running job during a deferred runner after SessionEnd/cancellation fences it and assert progress/finalization does not recreate a visible job. Add a deterministic reconciliation-versus-worker interleaving test.
 
 - [ ] **Step 2: Verify the terminal-state tests are RED**
 
@@ -128,7 +128,7 @@ The worker sets its own PID when it enters `runTrackedJob`; queued jobs receive 
 
 - [ ] **Step 4: Protect terminal transitions**
 
-Before running a background job, return without executing when its stored status is terminal. Before success or failure writes, re-read the job and do not write when it is terminal or missing.
+Every terminal writer (reconciliation, completion/failure, cancel, and SessionEnd) claims `jobs/<id>.terminal.json` with `openSync(..., "wx")`; the first claimed status overrides stale mutable JSON. Empty/corrupt fences are failed, never overwritten. Progress/upsert and effective control-plane reads honor the fence, and SessionEnd removes mutable records only after fencing active jobs.
 
 - [ ] **Step 5: Verify Task 2 GREEN**
 

@@ -23,7 +23,9 @@ Make Codex Companion jobs self-heal after worker loss and make the Claude Stop r
 - A queued job without a worker PID receives a five-second startup grace period. After that it becomes `failed` with `Background worker did not start within 5 seconds.`
 - A running or queued job with a dead PID becomes `failed` with `Background worker exited before completing the job.`
 - Reconciliation runs before status, wait, result, cancel, task resume selection, and Stop-hook decisions.
-- A terminal or removed job cannot be overwritten by a late worker.
+- Terminal state is claimed by an immutable per-job `jobs/<id>.terminal.json` fence, created with exclusive filesystem creation. The first terminal writer wins; terminal fences contain only status and completion time, never request, prompt, or log content.
+- A terminal or removed job cannot be overwritten by a late worker. Corrupt or empty fences fail closed as `failed`; all control-plane reads use the fence over mutable job/index JSON.
+- SessionEnd fences active jobs before removing their mutable job and index records. It may leave the small terminal fence so a late worker cannot resurrect the job.
 - Failed job status output includes the stored error message.
 
 ### Stop gate

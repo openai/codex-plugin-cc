@@ -29,7 +29,6 @@ import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
   getConfig,
-  listJobs,
   setConfig,
   upsertJob,
   writeJobFile
@@ -49,8 +48,10 @@ import {
   createJobRecord,
   createProgressReporter,
   nowIso,
+  reconcileTrackedJobs,
   runTrackedJob,
-  SESSION_ID_ENV
+  SESSION_ID_ENV,
+  terminalizeTrackedJob
 } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
@@ -336,7 +337,7 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
 async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const sessionId = getCurrentClaudeSessionId();
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
+  const jobs = sortJobsNewestFirst(reconcileTrackedJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
   const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
   const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
   if (activeTask) {
@@ -685,17 +686,17 @@ function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
     request
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
+  spawnDetachedTaskWorker(cwd, job.id);
 
   return {
     payload: {
@@ -934,7 +935,7 @@ function handleTaskResumeCandidate(argv) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const sessionId = getCurrentClaudeSessionId();
-  const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
+  const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(reconcileTrackedJobs(workspaceRoot)));
   const candidate = findLatestResumableTaskJob(jobs);
 
   const payload = {
@@ -983,9 +984,6 @@ async function handleCancel(argv) {
     );
   }
 
-  terminateProcessTree(job.pid ?? Number.NaN);
-  appendLogLine(job.logFile, "Cancelled by user.");
-
   const completedAt = nowIso();
   const nextJob = {
     ...job,
@@ -996,19 +994,15 @@ async function handleCancel(argv) {
     errorMessage: "Cancelled by user."
   };
 
-  writeJobFile(workspaceRoot, job.id, {
+  terminalizeTrackedJob(workspaceRoot, {
     ...existing,
+    ...nextJob
+  }, {
     ...nextJob,
     cancelledAt: completedAt
   });
-  upsertJob(workspaceRoot, {
-    id: job.id,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    errorMessage: "Cancelled by user.",
-    completedAt
-  });
+  terminateProcessTree(job.pid ?? Number.NaN);
+  appendLogLine(job.logFile, "Cancelled by user.");
 
   const payload = {
     jobId: job.id,

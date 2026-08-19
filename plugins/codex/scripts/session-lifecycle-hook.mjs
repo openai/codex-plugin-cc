@@ -14,6 +14,7 @@ import {
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
 import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
+import { terminalizeTrackedJob } from "./lib/tracked-jobs.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -61,6 +62,13 @@ function cleanupSessionJobs(cwd, sessionId) {
     if (!stillRunning) {
       continue;
     }
+    terminalizeTrackedJob(workspaceRoot, job, {
+      status: "cancelled",
+      phase: "cancelled",
+      pid: null,
+      completedAt: new Date().toISOString(),
+      errorMessage: "Cancelled because the Claude session ended."
+    });
     try {
       terminateProcessTree(job.pid ?? Number.NaN);
     } catch {
