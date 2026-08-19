@@ -1452,6 +1452,7 @@ test("status shows phases, hints, and the latest finished job", () => {
             kind: "review",
             kindLabel: "review",
             status: "running",
+            pid: process.pid,
             title: "Codex Review",
             jobClass: "review",
             phase: "reviewing",
@@ -1595,6 +1596,7 @@ test("status preserves adversarial review kind labels", () => {
             id: "review-adv-live",
             kind: "adversarial-review",
             status: "running",
+            pid: process.pid,
             title: "Codex Adversarial Review",
             jobClass: "review",
             phase: "reviewing",
@@ -1670,6 +1672,7 @@ test("status --wait times out cleanly when a job is still active", () => {
           {
             id: "task-live",
             status: "running",
+            pid: process.pid,
             title: "Codex Task",
             jobClass: "task",
             summary: "Investigate flaky test",
@@ -2097,6 +2100,7 @@ test("cancel without a job id ignores active jobs from other Claude sessions", (
           {
             id: "task-other",
             status: "running",
+            pid: process.pid,
             title: "Codex Task",
             jobClass: "task",
             sessionId: "sess-other",
@@ -2134,13 +2138,26 @@ test("cancel without a job id ignores active jobs from other Claude sessions", (
   assert.equal(state.jobs[0].status, "running");
 });
 
-test("cancel with a job id can still target an active job from another Claude session", () => {
+test("cancel with a job id can still target an active job from another Claude session", (t) => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
   const jobsDir = path.join(stateDir, "jobs");
   fs.mkdirSync(jobsDir, { recursive: true });
 
   const logFile = path.join(jobsDir, "task-other.log");
+  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+  sleeper.unref();
+  t.after(() => {
+    try {
+      process.kill(-sleeper.pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(sleeper.pid, "SIGTERM");
+      } catch {
+        // Ignore missing process.
+      }
+    }
+  });
   fs.writeFileSync(logFile, "", "utf8");
   fs.writeFileSync(
     path.join(stateDir, "state.json"),
@@ -2152,6 +2169,7 @@ test("cancel with a job id can still target an active job from another Claude se
           {
             id: "task-other",
             status: "running",
+            pid: sleeper.pid,
             title: "Codex Task",
             jobClass: "task",
             sessionId: "sess-other",
@@ -2842,6 +2860,7 @@ test("stop hook logs running tasks to stderr without blocking when the review ga
           {
             id: "task-live",
             status: "running",
+            pid: process.pid,
             title: "Codex Task",
             jobClass: "task",
             sessionId: "sess-current",
