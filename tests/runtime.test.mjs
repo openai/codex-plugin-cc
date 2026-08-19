@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -8,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { listJobs, readJobFile, resolveJobFile, resolveStateDir, saveState, upsertJob, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
+import { listJobs, readJobFile, resolveJobFile, resolveJobLogFile, resolveStateDir, saveState, upsertJob, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
 import { createJobProgressUpdater, reconcileTrackedJobs, runTrackedJob, terminalizeTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -2465,10 +2466,80 @@ test("stop hook keeps cached ALLOW decisions silent", () => {
   assert.equal(first.status, 0, first.stderr);
   assert.equal(first.stdout.trim(), "");
   const nextTurnId = JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).nextTurnId;
-  const second = run("node", [STOP_HOOK], { cwd: repo, env, input });
+  const second = run(process.execPath, [STOP_HOOK], { cwd: repo, env: { ...env, PATH: "" }, input });
   assert.equal(second.status, 0, second.stderr);
   assert.equal(second.stdout.trim(), "");
   assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).nextTurnId, nextTurnId);
+});
+
+test("stop hook reuses a cached BLOCK before checking Codex availability", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+  const input = JSON.stringify({ cwd: repo, session_id: "sess-stop-cached-block", last_assistant_message: "A blocked change." });
+  const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  const first = run("node", [STOP_HOOK], { cwd: repo, env, input });
+  assert.equal(first.status, 0, first.stderr);
+  const second = run(process.execPath, [STOP_HOOK], { cwd: repo, env: { ...env, PATH: "" }, input });
+  assert.equal(second.status, 0, second.stderr);
+  assert.deepEqual(JSON.parse(second.stdout), JSON.parse(first.stdout));
+});
+
+test("stop hook blocks every matching non-reusable gate job without starting a turn", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+  const sessionId = "sess-stop-lifecycle";
+  const message = "Exact lifecycle response.";
+  const gateKey = createHash("sha256").update(`${sessionId}\0${message}`).digest("hex");
+  const jobId = `gate-${gateKey}`;
+  const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  for (const [status, cachedResult] of [
+    ["queued", undefined],
+    ["running", undefined],
+    ["failed", undefined],
+    ["cancelled", undefined],
+    ["completed", undefined],
+    ["completed", { rawOutput: null }],
+    ["completed", "corrupt"]
+  ]) {
+    saveState(repo, {
+      version: 1,
+      config: { stopReviewGate: true },
+      jobs: [{ id: jobId, gateKey, sessionId, status, title: "Codex Stop Gate Review", ...(cachedResult === undefined ? {} : { result: cachedResult }) }]
+    });
+    const beforeTurns = fs.existsSync(fakeStatePath) ? JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).nextTurnId : 1;
+    const hookResult = run("node", [STOP_HOOK], { cwd: repo, env, input: JSON.stringify({ cwd: repo, session_id: sessionId, last_assistant_message: message }) });
+    assert.equal(hookResult.status, 0, hookResult.stderr);
+    assert.equal(JSON.parse(hookResult.stdout).decision, "block");
+    assert.match(JSON.parse(hookResult.stdout).reason, new RegExp(jobId));
+    const afterTurns = fs.existsSync(fakeStatePath) ? JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).nextTurnId : 1;
+    assert.equal(afterTurns, beforeTurns);
+  }
+});
+
+test("stop hook without an assistant message runs fresh reviews", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+  const input = JSON.stringify({ cwd: repo, session_id: "sess-stop-empty-message", last_assistant_message: "" });
+  const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  assert.equal(run("node", [STOP_HOOK], { cwd: repo, env, input }).status, 0);
+  const nextTurnId = JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).nextTurnId;
+  assert.equal(run("node", [STOP_HOOK], { cwd: repo, env, input }).status, 0);
+  assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).nextTurnId, nextTurnId + 1);
 });
 
 test("concurrent stop hooks start exactly one review for the same Claude response", async () => {
@@ -2498,6 +2569,31 @@ test("concurrent stop hooks start exactly one review for the same Claude respons
   assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).nextTurnId, 2);
   const jobs = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "state.json"), "utf8")).jobs;
   assert.equal(jobs.filter((job) => job.title === "Codex Stop Gate Review").length, 1);
+});
+
+test("concurrent stop hooks do not truncate or duplicate the winner log", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+  const sessionId = "sess-stop-log-race";
+  const message = "Concurrent log response.";
+  const gateKey = createHash("sha256").update(`${sessionId}\0${message}`).digest("hex");
+  const logFile = resolveJobLogFile(repo, `gate-${gateKey}`);
+  const input = JSON.stringify({ cwd: repo, session_id: sessionId, last_assistant_message: message });
+  const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const first = runHookAsync(repo, env, input);
+  await waitFor(() => fs.existsSync(logFile) && fs.readFileSync(logFile, "utf8").includes("Starting Codex Stop Gate Review."));
+  fs.appendFileSync(logFile, "winner-marker\n", "utf8");
+  const second = runHookAsync(repo, env, input);
+  await Promise.all([first, second]);
+
+  const log = fs.readFileSync(logFile, "utf8");
+  assert.match(log, /winner-marker/);
+  assert.equal((log.match(/Starting Codex Stop Gate Review\./g) ?? []).length, 1);
 });
 
 test("stop hook logs running tasks to stderr without blocking when the review gate is disabled", () => {

@@ -52,8 +52,16 @@ export function appendLogBlock(logFile, title, body) {
 
 export function createJobLogFile(workspaceRoot, jobId, title) {
   const logFile = resolveJobLogFile(workspaceRoot, jobId);
-  fs.writeFileSync(logFile, "", "utf8");
-  if (title) {
+  let created = false;
+  try {
+    fs.closeSync(fs.openSync(logFile, "wx"));
+    created = true;
+  } catch (error) {
+    if (error?.code !== "EEXIST") {
+      throw error;
+    }
+  }
+  if (created && title) {
     appendLogLine(logFile, `Starting ${title}.`);
   }
   return logFile;

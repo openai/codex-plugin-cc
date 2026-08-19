@@ -193,12 +193,6 @@ function main() {
     return;
   }
 
-  const setupNote = buildSetupNote(cwd);
-  if (setupNote) {
-    emitDecision({ decision: "block", reason: setupNote });
-    return;
-  }
-
   const gateKey = getGateKey(input);
   const cachedJob = getGateJob(jobs, gateKey);
   if (cachedJob) {
@@ -208,6 +202,12 @@ function main() {
     } else {
       logNote(runningTaskNote);
     }
+    return;
+  }
+
+  const setupNote = buildSetupNote(cwd);
+  if (setupNote) {
+    emitDecision({ decision: "block", reason: setupNote });
     return;
   }
 
