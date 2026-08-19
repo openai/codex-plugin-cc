@@ -662,6 +662,9 @@ async function runForegroundCommand(job, runner, options = {}) {
     stderr: !options.json
   });
   const execution = await runTrackedJob(job, () => runner(progress), { logFile });
+  if (!Number.isFinite(execution?.exitStatus)) {
+    throw new Error(`Codex job ${job.id} is ${execution?.status ?? "removed"}; no new run was started.`);
+  }
   outputResult(options.json ? execution.payload : execution.rendered, options.json);
   if (execution.exitStatus !== 0) {
     process.exitCode = execution.exitStatus;

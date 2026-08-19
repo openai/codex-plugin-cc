@@ -1100,10 +1100,59 @@ test("terminalization and reconciliation never return null jobs after removal ra
   );
 
   const result = terminalizeTrackedJob(workspaceRoot, job, { status: "cancelled", completedAt: "2026-08-19T12:02:00.000Z" });
-  assert.equal(result.job.status, "failed");
+  assert.equal(result.job.status, "cancelled");
 
   fs.writeFileSync(jobFile.replace(/\.json$/, ".removed"), "", "utf8");
   assert.deepEqual(reconcileTrackedJobs(workspaceRoot), []);
+});
+
+test("terminal admission claim after running publication prevents runner invocation", async () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-admission-terminal", workspaceRoot, status: "queued" };
+  const jobFile = resolveJobFile(workspaceRoot, job.id);
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, job);
+  fs.writeFileSync(jobFile.replace(/\.json$/, ".started.json"), JSON.stringify({ status: "running", pid: process.pid, startedAt: "2026-08-19T12:00:00.000Z" }));
+  const terminal = terminalizeTrackedJob(workspaceRoot, job, { status: "cancelled", completedAt: "2026-08-19T12:01:00.000Z" });
+  let invoked = false;
+  const result = await runTrackedJob(job, async () => {
+    invoked = true;
+    return { exitStatus: 0 };
+  });
+  assert.equal(terminal.claimed, true);
+  assert.equal(result.status, "cancelled");
+  assert.equal(invoked, false);
+});
+
+test("admitted running job uses the later terminal fence", () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-admitted", workspaceRoot, status: "running" };
+  const jobFile = resolveJobFile(workspaceRoot, job.id);
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, job);
+  fs.writeFileSync(jobFile.replace(/\.json$/, ".started.json"), JSON.stringify({ status: "running", pid: process.pid, startedAt: "2026-08-19T12:00:00.000Z" }));
+  fs.writeFileSync(jobFile.replace(/\.json$/, ".admission.json"), JSON.stringify({ status: "admitted" }));
+  const result = terminalizeTrackedJob(workspaceRoot, job, { status: "cancelled", completedAt: "2026-08-19T12:01:00.000Z" });
+  assert.equal(result.claimed, true);
+  assert.equal(result.job.status, "cancelled");
+  assert.equal(fs.existsSync(resolveTerminalFenceFile(workspaceRoot, job.id)), true);
+});
+
+test("corrupt admission fails closed before runner invocation", async () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-admission-corrupt", workspaceRoot, status: "queued" };
+  const jobFile = resolveJobFile(workspaceRoot, job.id);
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, job);
+  fs.writeFileSync(jobFile.replace(/\.json$/, ".started.json"), JSON.stringify({ status: "running", pid: process.pid, startedAt: "2026-08-19T12:00:00.000Z" }));
+  fs.writeFileSync(jobFile.replace(/\.json$/, ".admission.json"), "{");
+  let invoked = false;
+  const result = await runTrackedJob(job, async () => {
+    invoked = true;
+    return { exitStatus: 0 };
+  });
+  assert.equal(result.status, "failed");
+  assert.equal(invoked, false);
 });
 
 test("progress updates an unindexed mutable job without making it visible", () => {
@@ -2063,6 +2112,7 @@ test("cancel reports a completed first terminal outcome without killing the work
     JSON.stringify({ status: "running", pid: sleeper.pid, startedAt: "2026-08-19T12:00:00.000Z" }),
     "utf8"
   );
+  fs.writeFileSync(jobFile.replace(/\.json$/, ".admission.json"), JSON.stringify({ status: "admitted" }), "utf8");
   fs.writeFileSync(
     preloadFile,
     [
@@ -2274,9 +2324,9 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
       path.basename(otherJobFile),
       path.basename(otherSessionLog),
       "review-completed.removed",
+      "review-running.admission.json",
       "review-running.removed",
-      "review-running.started.json",
-      "review-running.terminal.json"
+      "review-running.started.json"
     ].sort()
   );
 

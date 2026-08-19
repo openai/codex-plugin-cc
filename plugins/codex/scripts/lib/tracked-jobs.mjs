@@ -152,6 +152,10 @@ function resolveRemovedFenceFile(workspaceRoot, jobId) {
   return resolveJobFile(workspaceRoot, jobId).replace(/\.json$/, ".removed");
 }
 
+function resolveAdmissionFile(workspaceRoot, jobId) {
+  return resolveJobFile(workspaceRoot, jobId).replace(/\.json$/, ".admission.json");
+}
+
 function isJobRemoved(workspaceRoot, jobId) {
   return fs.existsSync(resolveRemovedFenceFile(workspaceRoot, jobId));
 }
@@ -207,6 +211,25 @@ function readInitialClaim(workspaceRoot, jobId) {
       };
     }
     throw new Error("invalid initial claim status");
+  } catch {
+    return { status: "failed", completedAt: null, corrupt: true };
+  }
+}
+
+function readAdmissionClaim(workspaceRoot, jobId) {
+  const admissionFile = resolveAdmissionFile(workspaceRoot, jobId);
+  if (!fs.existsSync(admissionFile)) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(admissionFile, "utf8"));
+    if (parsed?.status === "admitted") {
+      return { status: "admitted" };
+    }
+    if (TERMINAL_STATUSES.has(parsed?.status)) {
+      return { status: parsed.status, completedAt: typeof parsed.completedAt === "string" ? parsed.completedAt : null };
+    }
+    throw new Error("invalid admission claim");
   } catch {
     return { status: "failed", completedAt: null, corrupt: true };
   }
@@ -270,6 +293,10 @@ export function readEffectiveStoredJob(workspaceRoot, jobId) {
     return null;
   }
   const initial = readInitialClaim(workspaceRoot, jobId);
+  const admission = initial?.status === "running" ? readAdmissionClaim(workspaceRoot, jobId) : null;
+  if (admission && admission.status !== "admitted") {
+    return applyTerminalFence(applyInitialClaim(storedJob, initial), admission);
+  }
   const fence = initial?.status === "running" ? readTerminalFence(workspaceRoot, jobId) : null;
   return applyTerminalFence(applyInitialClaim(storedJob, initial), fence);
 }
@@ -300,6 +327,16 @@ export function terminalizeTrackedJob(workspaceRoot, job, terminal) {
   }
   if (initial.status !== "running") {
     return { job: applyTerminalFence(readStoredJobOrNull(workspaceRoot, job.id) ?? job, initial), claimed: false };
+  }
+  const admission = readAdmissionClaim(workspaceRoot, job.id);
+  if (!admission) {
+    const claimed = claimFile(resolveAdmissionFile(workspaceRoot, job.id), { status: terminal.status, completedAt });
+    const winner = claimed ? { status: terminal.status, completedAt } : readAdmissionClaim(workspaceRoot, job.id);
+    if (winner?.status !== "admitted") {
+      return { job: applyTerminalFence(readStoredJobOrNull(workspaceRoot, job.id) ?? job, winner), claimed };
+    }
+  } else if (admission.status !== "admitted") {
+    return { job: applyTerminalFence(readStoredJobOrNull(workspaceRoot, job.id) ?? job, admission), claimed: false };
   }
   const { fence, claimed } = claimTerminalFence(workspaceRoot, job.id, terminal.status, completedAt, terminal.removed);
   const storedJob = readStoredJobOrNull(workspaceRoot, job.id);
@@ -339,6 +376,10 @@ export function reconcileTrackedJobs(workspaceRoot, options = {}) {
     if (initial && initial.status !== "running") {
       return fs.existsSync(resolveJobFile(workspaceRoot, job.id)) ? [applyTerminalFence(job, initial)] : [];
     }
+    const admission = initial?.status === "running" ? readAdmissionClaim(workspaceRoot, job.id) : null;
+    if (admission && admission.status !== "admitted") {
+      return fs.existsSync(resolveJobFile(workspaceRoot, job.id)) ? [applyTerminalFence(job, admission)] : [];
+    }
     const fence = readTerminalFence(workspaceRoot, job.id);
     if (fence) {
       return fs.existsSync(resolveJobFile(workspaceRoot, job.id)) ? [applyTerminalFence(job, fence)] : [];
@@ -376,6 +417,10 @@ export async function runTrackedJob(job, runner, options = {}) {
     if (terminal) {
       return !storedJob ? null : applyTerminalFence(storedJob, terminal);
     }
+    const admission = readAdmissionClaim(job.workspaceRoot, job.id);
+    if (admission?.status !== "admitted") {
+      return storedJob ? applyTerminalFence(storedJob, admission) : null;
+    }
     return storedJob ? applyInitialClaim(storedJob, initial) : null;
   }
   const fence = readTerminalFence(job.workspaceRoot, job.id);
@@ -411,6 +456,10 @@ export async function runTrackedJob(job, runner, options = {}) {
   const terminalAfterStart = readTerminalFence(job.workspaceRoot, job.id);
   if (terminalAfterStart) {
     return applyTerminalFence(runningRecord, terminalAfterStart);
+  }
+  const admitted = claimFile(resolveAdmissionFile(job.workspaceRoot, job.id), { status: "admitted" });
+  if (!admitted) {
+    return applyTerminalFence(runningRecord, readAdmissionClaim(job.workspaceRoot, job.id));
   }
 
   try {
