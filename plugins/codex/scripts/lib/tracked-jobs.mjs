@@ -406,6 +406,11 @@ export function reconcileTrackedJobs(workspaceRoot, options = {}) {
       return [job];
     }
 
+    if (job.status === "running" && (!Number.isSafeInteger(job.pid) || job.pid <= 0)) {
+      const failedJob = failTrackedJob(workspaceRoot, job, "Tracked running job has an invalid process id.");
+      return failedJob ? [failedJob] : [];
+    }
+
     const ageMs = now - Date.parse(job.createdAt ?? "");
     if (job.status === "queued" && !Number.isFinite(job.pid) && Number.isFinite(ageMs) && ageMs >= 5000) {
       const failedJob = failTrackedJob(workspaceRoot, job, "Background worker did not start within 5 seconds.");
@@ -505,8 +510,9 @@ export async function runTrackedJob(job, runner, options = {}) {
     });
     if (terminal.claimed) {
       appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
+      return execution;
     }
-    return execution;
+    return terminal.job;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const completedAt = nowIso();

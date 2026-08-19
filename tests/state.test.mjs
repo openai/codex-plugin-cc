@@ -64,6 +64,15 @@ test("loadState rejects invalid state JSON with its absolute path and parse deta
   );
 });
 
+test("loadState rejects parsed state with an invalid schema", () => {
+  const workspace = makeTempDir();
+  const stateFile = resolveStateFile(workspace);
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+  fs.writeFileSync(stateFile, JSON.stringify({ version: 1, config: { stopReviewGate: "yes" }, jobs: {} }), "utf8");
+
+  assert.throws(() => loadState(workspace), /Failed to read Codex Companion state.*invalid state schema/);
+});
+
 test("state and job writes leave valid JSON without sibling temporary artifacts", () => {
   const workspace = makeTempDir();
   const stateFile = resolveStateFile(workspace);
@@ -84,6 +93,17 @@ test("state and job writes leave valid JSON without sibling temporary artifacts"
     fs.readdirSync(path.dirname(jobFile)).filter((entry) => entry.startsWith(`${path.basename(jobFile)}.`)),
     []
   );
+});
+
+test("saveState reaps a lock left by a dead owner", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, ".state.lock"), JSON.stringify({ pid: 999999, token: "dead-owner", createdAt: "2026-08-19T12:00:00.000Z" }), "utf8");
+
+  saveState(workspace, { config: { stopReviewGate: false }, jobs: [] });
+
+  assert.equal(fs.existsSync(path.join(stateDir, ".state.lock")), false);
 });
 
 test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", () => {
@@ -151,6 +171,22 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
     fs.readdirSync(jobsDir).sort(),
     Array.from({ length: 50 }, (_, index) => `job-${index + 1}`)
       .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
+      .concat("job-0.removed")
       .sort()
   );
+});
+
+test("saveState retains a removal fence for a pruned job before it starts", () => {
+  const workspace = makeTempDir();
+  const job = { id: "job-prestart", status: "queued", logFile: resolveJobLogFile(workspace, "job-prestart") };
+  writeJobFile(workspace, job.id, job);
+  fs.writeFileSync(job.logFile, "queued\n", "utf8");
+  saveState(workspace, { config: { stopReviewGate: false }, jobs: [job] });
+
+  saveState(workspace, { config: { stopReviewGate: false }, jobs: [] });
+
+  const jobFile = resolveJobFile(workspace, job.id);
+  assert.equal(fs.existsSync(jobFile), false);
+  assert.equal(fs.existsSync(job.logFile), false);
+  assert.equal(fs.existsSync(jobFile.replace(/\.json$/, ".removed")), true);
 });

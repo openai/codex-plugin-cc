@@ -51,7 +51,7 @@ export function binaryAvailable(command, versionArgs = ["--version"], options = 
 }
 
 export function isProcessAlive(pid, options = {}) {
-  if (!Number.isFinite(pid)) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
     return false;
   }
 
@@ -69,7 +69,7 @@ function looksLikeMissingProcessMessage(text) {
 }
 
 export function terminateProcessTree(pid, options = {}) {
-  if (!Number.isFinite(pid)) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
     return { attempted: false, delivered: false, method: null };
   }
 
@@ -115,19 +115,15 @@ export function terminateProcessTree(pid, options = {}) {
     killImpl(-pid, "SIGTERM");
     return { attempted: true, delivered: true, method: "process-group" };
   } catch (error) {
-    if (error?.code !== "ESRCH") {
-      try {
-        killImpl(pid, "SIGTERM");
-        return { attempted: true, delivered: true, method: "process" };
-      } catch (innerError) {
-        if (innerError?.code === "ESRCH") {
-          return { attempted: true, delivered: false, method: "process" };
-        }
-        throw innerError;
+    try {
+      killImpl(pid, "SIGTERM");
+      return { attempted: true, delivered: true, method: "process" };
+    } catch (innerError) {
+      if (innerError?.code === "ESRCH") {
+        return { attempted: true, delivered: false, method: "process" };
       }
+      throw innerError;
     }
-
-    return { attempted: true, delivered: false, method: "process-group" };
   }
 }
 

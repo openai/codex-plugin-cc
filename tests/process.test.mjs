@@ -26,6 +26,27 @@ test("isProcessAlive treats a missing process as dead", () => {
   );
 });
 
+test("process helpers reject unsafe process ids", () => {
+  for (const pid of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.equal(isProcessAlive(pid, { killImpl() { throw new Error("must not probe"); } }), false);
+    assert.equal(terminateProcessTree(pid, { killImpl() { throw new Error("must not kill"); } }).attempted, false);
+  }
+});
+
+test("terminateProcessTree falls back from a missing POSIX group to its leader", () => {
+  const calls = [];
+  const outcome = terminateProcessTree(1234, {
+    platform: "linux",
+    killImpl(pid) {
+      calls.push(pid);
+      throw Object.assign(new Error("gone"), { code: "ESRCH" });
+    }
+  });
+  assert.deepEqual(calls, [-1234, 1234]);
+  assert.equal(outcome.delivered, false);
+  assert.equal(outcome.method, "process");
+});
+
 test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;
   const outcome = terminateProcessTree(1234, {

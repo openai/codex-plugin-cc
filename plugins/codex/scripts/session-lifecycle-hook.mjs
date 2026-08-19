@@ -13,8 +13,8 @@ import {
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
-import { markTrackedJobRemoved, readEffectiveStoredJob, terminalizeTrackedJob } from "./lib/tracked-jobs.mjs";
+import { resolveStateFile, updateState } from "./lib/state.mjs";
+import { markTrackedJobRemoved, readEffectiveStoredJob } from "./lib/tracked-jobs.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -51,38 +51,25 @@ function cleanupSessionJobs(cwd, sessionId) {
     return;
   }
 
-  const state = loadState(workspaceRoot);
-  const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
-  if (removedJobs.length === 0) {
-    return;
-  }
-
-  for (const job of removedJobs) {
-    const effectiveJob = { ...job, ...(readEffectiveStoredJob(workspaceRoot, job.id) ?? {}) };
-    const stillRunning = effectiveJob.status === "queued" || effectiveJob.status === "running";
-    if (!stillRunning) {
+  const pids = [];
+  updateState(workspaceRoot, (state) => {
+    for (const job of state.jobs.filter((candidate) => candidate.sessionId === sessionId)) {
+      const effectiveJob = { ...job, ...(readEffectiveStoredJob(workspaceRoot, job.id) ?? {}) };
       markTrackedJobRemoved(workspaceRoot, job.id);
-      continue;
+      if (Number.isSafeInteger(effectiveJob.pid) && effectiveJob.pid > 0) {
+        pids.push(effectiveJob.pid);
+      }
     }
-    terminalizeTrackedJob(workspaceRoot, job, {
-      status: "cancelled",
-      phase: "cancelled",
-      pid: null,
-      completedAt: new Date().toISOString(),
-      errorMessage: "Cancelled because the Claude session ended."
-    });
-    markTrackedJobRemoved(workspaceRoot, job.id);
+    state.jobs = state.jobs.filter((job) => job.sessionId !== sessionId);
+  });
+
+  for (const pid of pids) {
     try {
-      terminateProcessTree(effectiveJob.pid ?? Number.NaN);
+      terminateProcessTree(pid);
     } catch {
       // Ignore teardown failures during session shutdown.
     }
   }
-
-  saveState(workspaceRoot, {
-    ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
-  });
 }
 
 function handleSessionStart(input) {

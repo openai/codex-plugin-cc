@@ -12,6 +12,9 @@ const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
+const STATE_LOCK_FILE_NAME = ".state.lock";
+const STATE_LOCK_WAIT_MS = 5000;
+const STATE_LOCK_RETRY_MS = 20;
 
 function nowIso() {
   return new Date().toISOString();
@@ -56,25 +59,135 @@ export function ensureStateDir(cwd) {
   fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
 }
 
+function isObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value);
+}
+
+function validateState(parsed) {
+  if (!isObject(parsed) || parsed.version !== STATE_VERSION || !isObject(parsed.config) || typeof parsed.config.stopReviewGate !== "boolean" || !Array.isArray(parsed.jobs)) {
+    throw new Error("invalid state schema");
+  }
+  for (const job of parsed.jobs) {
+    if (!isObject(job) || typeof job.id !== "string" || !job.id || typeof job.status !== "string" || !job.status) {
+      throw new Error("invalid job schema");
+    }
+  }
+}
+
 export function loadState(cwd) {
   const stateFile = path.resolve(resolveStateFile(cwd));
   try {
     const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-    return {
-      ...defaultState(),
-      ...parsed,
-      config: {
-        ...defaultState().config,
-        ...(parsed.config ?? {})
-      },
-      jobs: Array.isArray(parsed.jobs) ? parsed.jobs : []
-    };
+    validateState(parsed);
+    return parsed;
   } catch (error) {
     if (error?.code === "ENOENT") {
       return defaultState();
     }
     const detail = error instanceof Error ? error.message : String(error);
     throw new Error(`Failed to read Codex Companion state at ${stateFile}: ${detail}`, { cause: error });
+  }
+}
+
+function pauseForStateLock() {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, STATE_LOCK_RETRY_MS);
+}
+
+function readStateLockOwner(lockFile) {
+  let owner;
+  try {
+    owner = JSON.parse(fs.readFileSync(lockFile, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw error;
+    }
+    throw new Error(`Codex Companion state lock at ${path.resolve(lockFile)} has an invalid owner.`, { cause: error });
+  }
+  if (!isObject(owner) || !Number.isSafeInteger(owner.pid) || owner.pid <= 0 || typeof owner.token !== "string" || !owner.token || typeof owner.createdAt !== "string") {
+    throw new Error(`Codex Companion state lock at ${path.resolve(lockFile)} has an invalid owner.`);
+  }
+  return owner;
+}
+
+function tryCreateStateLock(filePath, payload) {
+  const temporaryFile = `${filePath}.${process.pid}.${payload.token}.tmp`;
+  try {
+    fs.writeFileSync(temporaryFile, `${JSON.stringify(payload)}\n`, "utf8");
+    fs.linkSync(temporaryFile, filePath);
+    return true;
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      return false;
+    }
+    throw error;
+  } finally {
+    removeFileIfExists(temporaryFile);
+  }
+}
+
+function releaseStateLock(lockFile, token) {
+  try {
+    if (readStateLockOwner(lockFile).token === token) {
+      fs.unlinkSync(lockFile);
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+  }
+}
+
+function reapDeadStateLock(lockFile, owner) {
+  const reapFile = `${lockFile}.reap`;
+  const token = randomUUID();
+  if (!tryCreateStateLock(reapFile, { pid: process.pid, token, createdAt: nowIso() })) {
+    return;
+  }
+  try {
+    const current = readStateLockOwner(lockFile);
+    if (current.token === owner.token && current.pid === owner.pid && !isProcessAlive(current.pid)) {
+      fs.unlinkSync(lockFile);
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+  } finally {
+    releaseStateLock(reapFile, token);
+  }
+}
+
+function withStateLock(cwd, action) {
+  ensureStateDir(cwd);
+  const lockFile = path.join(resolveStateDir(cwd), STATE_LOCK_FILE_NAME);
+  const deadline = Date.now() + STATE_LOCK_WAIT_MS;
+  const token = randomUUID();
+  while (true) {
+    if (tryCreateStateLock(lockFile, { pid: process.pid, token, createdAt: nowIso() })) {
+      try {
+        return action();
+      } finally {
+        releaseStateLock(lockFile, token);
+      }
+    }
+    try {
+      const owner = readStateLockOwner(lockFile);
+      if (!isProcessAlive(owner.pid)) {
+        reapDeadStateLock(lockFile, owner);
+        continue;
+      }
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw error;
+      }
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for Codex Companion state lock at ${path.resolve(lockFile)}.`);
+    }
+    pauseForStateLock();
   }
 }
 
@@ -120,38 +233,13 @@ function markJobRemoved(cwd, jobId) {
   }
 }
 
-function canRemoveJobSidecars(cwd, jobId) {
-  const startedFile = resolveJobSidecarFile(cwd, jobId, ".started.json");
-  if (!fs.existsSync(startedFile)) {
-    return true;
-  }
-  try {
-    const started = JSON.parse(fs.readFileSync(startedFile, "utf8"));
-    return started?.status !== "running" || (Number.isFinite(started.pid) && !isProcessAlive(started.pid));
-  } catch {
-    return false;
-  }
-}
-
 function removeJobSidecars(cwd, jobId) {
-  for (const suffix of [".started.json", ".admission.json", ".terminal.json", ".removed"]) {
+  for (const suffix of [".started.json", ".admission.json", ".terminal.json"]) {
     removeFileIfExists(resolveJobSidecarFile(cwd, jobId, suffix));
   }
 }
 
-function sweepRemovedJobSidecars(cwd) {
-  for (const entry of fs.readdirSync(resolveJobsDir(cwd))) {
-    if (!entry.endsWith(".removed")) {
-      continue;
-    }
-    const jobId = entry.slice(0, -".removed".length);
-    if (!fs.existsSync(resolveJobFile(cwd, jobId)) && canRemoveJobSidecars(cwd, jobId)) {
-      removeJobSidecars(cwd, jobId);
-    }
-  }
-}
-
-export function saveState(cwd, state) {
+function saveStateLocked(cwd, state) {
   const previousJobs = loadState(cwd).jobs;
   ensureStateDir(cwd);
   const nextJobs = pruneJobs(state.jobs ?? []);
@@ -172,17 +260,23 @@ export function saveState(cwd, state) {
     markJobRemoved(cwd, job.id);
     removeJobFile(resolveJobFile(cwd, job.id));
     removeFileIfExists(job.logFile);
+    removeJobSidecars(cwd, job.id);
   }
 
   writeAtomicJson(resolveStateFile(cwd), nextState);
-  sweepRemovedJobSidecars(cwd);
   return nextState;
 }
 
+export function saveState(cwd, state) {
+  return withStateLock(cwd, () => saveStateLocked(cwd, state));
+}
+
 export function updateState(cwd, mutate) {
-  const state = loadState(cwd);
-  mutate(state);
-  return saveState(cwd, state);
+  return withStateLock(cwd, () => {
+    const state = loadState(cwd);
+    mutate(state);
+    return saveStateLocked(cwd, state);
+  });
 }
 
 export function generateJobId(prefix = "job") {

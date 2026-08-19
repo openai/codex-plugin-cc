@@ -34,9 +34,9 @@ function resolveTerminalFenceFile(workspaceRoot, jobId) {
   return resolveJobFile(workspaceRoot, jobId).replace(/\.json$/, ".terminal.json");
 }
 
-function runHookAsync(cwd, env, input) {
+function runHookAsync(cwd, env, input, script = STOP_HOOK) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [STOP_HOOK], { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(process.execPath, [script], { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk) => { stdout += chunk; });
@@ -1202,10 +1202,22 @@ test("terminal job reconciliation wins over late worker finalization", async () 
     }
   });
   releaseRunner();
-  await execution;
+  const result = await execution;
 
+  assert.equal(result.status, "failed");
   assert.equal(listJobs(workspaceRoot).find((candidate) => candidate.id === job.id).status, "failed");
   assert.equal(readJobFile(resolveJobFile(workspaceRoot, job.id)).status, "failed");
+});
+
+test("reconciliation fails a running job with an invalid process id", () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-invalid-pid", workspaceRoot, status: "running", pid: null };
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, job);
+
+  const [result] = reconcileTrackedJobs(workspaceRoot);
+  assert.equal(result.status, "failed");
+  assert.match(result.errorMessage, /invalid process id/i);
 });
 
 test("removed job terminal fence prevents progress and finalization from recreating it", async () => {
@@ -2337,9 +2349,8 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
     [
       path.basename(otherJobFile),
       path.basename(otherSessionLog),
-      "review-running.admission.json",
-      "review-running.removed",
-      "review-running.started.json"
+      "review-completed.removed",
+      "review-running.removed"
     ].sort()
   );
 
@@ -2357,7 +2368,76 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   const otherJob = state.jobs[0];
   assert.equal(otherJob.logFile, otherSessionLog);
   saveState(repo, state);
-  assert.deepEqual(fs.readdirSync(jobsDir).sort(), [path.basename(otherJobFile), path.basename(otherSessionLog)].sort());
+  assert.deepEqual(
+    fs.readdirSync(jobsDir).sort(),
+    [path.basename(otherJobFile), path.basename(otherSessionLog), "review-completed.removed", "review-running.removed"].sort()
+  );
+});
+
+test("session end preserves an other-session job added after its stale snapshot", async () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  const staleJob = { id: "stale-current", status: "completed", sessionId: "sess-current", logFile: path.join(jobsDir, "stale-current.log") };
+  writeJobFile(repo, staleJob.id, staleJob);
+  fs.writeFileSync(staleJob.logFile, "stale\n", "utf8");
+  saveState(repo, { config: { stopReviewGate: false }, jobs: [staleJob] });
+
+  const marker = path.join(makeTempDir(), "stale-read");
+  const release = path.join(path.dirname(marker), "release");
+  const preload = path.join(path.dirname(marker), "pause-state-read.cjs");
+  fs.writeFileSync(preload, [
+    'const fs = require("node:fs");',
+    'const original = fs.readFileSync;',
+    'let paused = false;',
+    'fs.readFileSync = function(file, ...args) {',
+    '  const value = original.call(this, file, ...args);',
+    '  if (!paused && file === process.env.CODEX_STALE_STATE_FILE) {',
+    '    paused = true; fs.writeFileSync(process.env.CODEX_STALE_MARKER, "paused");',
+    '    while (!fs.existsSync(process.env.CODEX_STALE_RELEASE)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);',
+    '  }',
+    '  return value;',
+    '};'
+  ].join("\n"), "utf8");
+  fs.writeFileSync(marker, "ready", "utf8");
+  fs.unlinkSync(marker);
+
+  const hook = runHookAsync(repo, {
+    ...process.env,
+    CODEX_COMPANION_SESSION_ID: "sess-current",
+    CODEX_STALE_STATE_FILE: path.join(stateDir, "state.json"),
+    CODEX_STALE_MARKER: marker,
+    CODEX_STALE_RELEASE: release,
+    NODE_OPTIONS: `--require ${preload}`
+  }, JSON.stringify({ hook_event_name: "SessionEnd", session_id: "sess-current", cwd: repo }), SESSION_HOOK);
+  await waitFor(() => fs.existsSync(marker));
+
+  const freshJob = { id: "fresh-other", status: "completed", sessionId: "sess-other", logFile: path.join(jobsDir, "fresh-other.log") };
+  const stateModule = path.join(PLUGIN_ROOT, "scripts", "lib", "state.mjs");
+  let writerDone = false;
+  const writer = new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["--input-type=module", "--eval", [
+      'import fs from "node:fs";',
+      `import { upsertJob, writeJobFile } from ${JSON.stringify(stateModule)};`,
+      `const job = ${JSON.stringify(freshJob)};`,
+      `writeJobFile(${JSON.stringify(repo)}, job.id, job);`,
+      'fs.writeFileSync(job.logFile, "fresh\\n", "utf8");',
+      `upsertJob(${JSON.stringify(repo)}, job);`
+    ].join("\n")], { stdio: "ignore" });
+    child.once("error", reject);
+    child.once("close", (status) => { writerDone = true; resolve(status); });
+  });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(writerDone, false);
+  fs.writeFileSync(release, "go", "utf8");
+  const result = await hook;
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(await writer, 0);
+  assert.deepEqual(listJobs(repo).map((job) => job.id), ["fresh-other"]);
+  assert.equal(fs.existsSync(resolveJobFile(repo, freshJob.id)), true);
+  assert.equal(fs.existsSync(freshJob.logFile), true);
 });
 
 test("stop hook runs a stop-time review task and blocks on findings when the review gate is enabled", () => {
@@ -2515,7 +2595,7 @@ test("stop hook blocks every matching non-reusable gate job without starting a t
     saveState(repo, {
       version: 1,
       config: { stopReviewGate: true },
-      jobs: [{ id: jobId, gateKey, sessionId, status, title: "Codex Stop Gate Review", ...(cachedResult === undefined ? {} : { result: cachedResult }) }]
+      jobs: [{ id: jobId, gateKey, sessionId, status, title: "Codex Stop Gate Review", ...(status === "running" ? { pid: process.pid } : {}), ...(cachedResult === undefined ? {} : { result: cachedResult }) }]
     });
     const beforeTurns = fs.existsSync(fakeStatePath) ? JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).nextTurnId : 1;
     const hookResult = run("node", [STOP_HOOK], { cwd: repo, env, input: JSON.stringify({ cwd: repo, session_id: sessionId, last_assistant_message: message }) });
@@ -2533,6 +2613,64 @@ test("stop hook blocks every matching non-reusable gate job without starting a t
     const afterTurns = fs.existsSync(fakeStatePath) ? JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).nextTurnId : 1;
     assert.equal(afterTurns, beforeTurns);
   }
+});
+
+test("stop hook blocks a parsed state with an invalid schema", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const stateDir = resolveStateDir(repo);
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "state.json"), JSON.stringify({ version: 1, config: {}, jobs: [] }), "utf8");
+
+  const result = run("node", [STOP_HOOK], {
+    cwd: repo,
+    input: JSON.stringify({ cwd: repo, session_id: "sess-invalid-state", last_assistant_message: "done" })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const decision = JSON.parse(result.stdout);
+  assert.equal(decision.decision, "block");
+  assert.match(decision.reason, /could not safely continue.*invalid state schema/i);
+});
+
+test("stop gate blocks when its foreground review loses the terminal claim", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "adversarial-clean");
+  initGitRepo(repo);
+  const sessionId = "sess-stop-terminal-race";
+  const message = "Clean review that loses the terminal race.";
+  const gateKey = createHash("sha256").update(`${sessionId}\0${message}`).digest("hex");
+  const jobId = `gate-${gateKey}`;
+  const terminalFile = resolveTerminalFenceFile(repo, jobId);
+  const preload = path.join(makeTempDir(), "terminal-race.cjs");
+  fs.writeFileSync(preload, [
+    'const fs = require("node:fs");',
+    'const original = fs.openSync;',
+    'let armed = true;',
+    'fs.openSync = (file, flags, ...rest) => {',
+    '  if (armed && file === process.env.CODEX_FOREGROUND_TERMINAL_FENCE && flags === "wx") {',
+    '    armed = false; fs.writeFileSync(file, JSON.stringify({ status: "cancelled", completedAt: "2026-08-19T12:01:00.000Z" }));',
+    '  }',
+    '  return original(file, flags, ...rest);',
+    '};'
+  ].join("\n"), "utf8");
+  const env = {
+    ...buildEnv(binDir),
+    CODEX_FOREGROUND_TERMINAL_FENCE: terminalFile,
+    NODE_OPTIONS: `--require ${preload}`
+  };
+  assert.equal(run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], { cwd: repo, env }).status, 0);
+
+  const result = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ cwd: repo, session_id: sessionId, last_assistant_message: message })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const decision = JSON.parse(result.stdout);
+  assert.equal(decision.decision, "block");
+  assert.match(decision.reason, new RegExp(jobId));
+  assert.doesNotMatch(result.stdout, /ALLOW:/);
 });
 
 test("stop hook without an assistant message runs fresh reviews", () => {
