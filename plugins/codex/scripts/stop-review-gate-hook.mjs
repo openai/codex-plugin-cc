@@ -227,6 +227,8 @@ try {
   main();
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${message}\n`);
-  process.exitCode = 1;
+  emitDecision({
+    decision: "block",
+    reason: `Codex stop-review gate could not safely continue: ${message}`
+  });
 }

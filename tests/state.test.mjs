@@ -5,7 +5,15 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
-import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import {
+  loadState,
+  resolveJobFile,
+  resolveJobLogFile,
+  resolveStateDir,
+  resolveStateFile,
+  saveState,
+  writeJobFile
+} from "../plugins/codex/scripts/lib/state.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -38,6 +46,44 @@ test("resolveStateDir uses CLAUDE_PLUGIN_DATA when it is provided", () => {
       process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
     }
   }
+});
+
+test("loadState rejects invalid state JSON with its absolute path and parse detail", () => {
+  const workspace = makeTempDir();
+  const stateFile = resolveStateFile(workspace);
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+  fs.writeFileSync(stateFile, "{invalid json", "utf8");
+
+  assert.throws(
+    () => loadState(workspace),
+    (error) =>
+      error instanceof Error &&
+      error.message.includes(stateFile) &&
+      error.message.startsWith("Failed to read Codex Companion state at ") &&
+      /Unexpected|Expected/.test(error.message)
+  );
+});
+
+test("state and job writes leave valid JSON without sibling temporary artifacts", () => {
+  const workspace = makeTempDir();
+  const stateFile = resolveStateFile(workspace);
+  const jobFile = writeJobFile(workspace, "job-atomic", { id: "job-atomic", status: "queued" });
+
+  saveState(workspace, {
+    config: { stopReviewGate: true },
+    jobs: [{ id: "job-atomic", status: "queued" }]
+  });
+
+  assert.equal(JSON.parse(fs.readFileSync(stateFile, "utf8")).config.stopReviewGate, true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(jobFile, "utf8")), { id: "job-atomic", status: "queued" });
+  assert.deepEqual(
+    fs.readdirSync(path.dirname(stateFile)).filter((entry) => entry.startsWith(`${path.basename(stateFile)}.`)),
+    []
+  );
+  assert.deepEqual(
+    fs.readdirSync(path.dirname(jobFile)).filter((entry) => entry.startsWith(`${path.basename(jobFile)}.`)),
+    []
+  );
 });
 
 test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", () => {

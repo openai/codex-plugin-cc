@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -56,11 +56,7 @@ export function ensureStateDir(cwd) {
 }
 
 export function loadState(cwd) {
-  const stateFile = resolveStateFile(cwd);
-  if (!fs.existsSync(stateFile)) {
-    return defaultState();
-  }
-
+  const stateFile = path.resolve(resolveStateFile(cwd));
   try {
     const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
     return {
@@ -72,8 +68,28 @@ export function loadState(cwd) {
       },
       jobs: Array.isArray(parsed.jobs) ? parsed.jobs : []
     };
-  } catch {
-    return defaultState();
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return defaultState();
+    }
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to read Codex Companion state at ${stateFile}: ${detail}`, { cause: error });
+  }
+}
+
+function writeAtomicJson(filePath, value) {
+  const temporaryFile = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  const content = `${JSON.stringify(value, null, 2)}\n`;
+  try {
+    fs.writeFileSync(temporaryFile, content, "utf8");
+    fs.renameSync(temporaryFile, filePath);
+  } catch (error) {
+    try {
+      fs.unlinkSync(temporaryFile);
+    } catch {
+      // The temporary file may not have been created or may already have been renamed.
+    }
+    throw error;
   }
 }
 
@@ -111,7 +127,7 @@ export function saveState(cwd, state) {
     removeFileIfExists(job.logFile);
   }
 
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  writeAtomicJson(resolveStateFile(cwd), nextState);
   return nextState;
 }
 
@@ -166,7 +182,7 @@ export function getConfig(cwd) {
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  writeAtomicJson(jobFile, payload);
   return jobFile;
 }
 

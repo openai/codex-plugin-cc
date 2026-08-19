@@ -2704,6 +2704,27 @@ test("stop hook blocks when Codex is unavailable and the review gate is enabled"
   assert.match(JSON.parse(blocked.stdout).reason, /not set up/i);
 });
 
+test("stop hook blocks on corrupt state instead of silently allowing", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const stateFile = path.join(resolveStateDir(repo), "state.json");
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+  fs.writeFileSync(stateFile, "{invalid json", "utf8");
+
+  const blocked = run(process.execPath, [STOP_HOOK], {
+    cwd: repo,
+    env: process.env,
+    input: JSON.stringify({ cwd: repo })
+  });
+
+  assert.equal(blocked.status, 0, blocked.stderr);
+  const payload = JSON.parse(blocked.stdout);
+  assert.equal(payload.decision, "block");
+  assert.match(payload.reason, /Failed to read Codex Companion state at/);
+  assert.match(payload.reason, new RegExp(stateFile.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(payload.reason, /Unexpected|Expected/);
+});
+
 test("stop hook runs the actual task when auth status looks stale", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
