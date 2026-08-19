@@ -1209,6 +1209,33 @@ test("terminal job reconciliation wins over late worker finalization", async () 
   assert.equal(readJobFile(resolveJobFile(workspaceRoot, job.id)).status, "failed");
 });
 
+test("removed fence claimed during completion suppresses stale runner output", async () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-remove-at-terminal", workspaceRoot, status: "queued" };
+  const jobFile = writeJobFile(workspaceRoot, job.id, job);
+  const terminalFile = resolveTerminalFenceFile(workspaceRoot, job.id);
+  const removedFile = jobFile.replace(/\.json$/, ".removed");
+  upsertJob(workspaceRoot, job);
+  const originalOpen = fs.openSync;
+  let runnerInvoked = false;
+  fs.openSync = (file, flags, ...rest) => {
+    if (file === terminalFile && flags === "wx" && !fs.existsSync(removedFile)) {
+      fs.writeFileSync(removedFile, "", "utf8");
+    }
+    return originalOpen(file, flags, ...rest);
+  };
+  try {
+    const result = await runTrackedJob(job, async () => {
+      runnerInvoked = true;
+      return { exitStatus: 0, payload: { rawOutput: "ALLOW: stale" }, rendered: "ALLOW: stale" };
+    });
+    assert.equal(result.removed, true);
+  } finally {
+    fs.openSync = originalOpen;
+  }
+  assert.equal(runnerInvoked, true);
+});
+
 test("reconciliation fails a running job with an invalid process id", () => {
   const workspaceRoot = makeTempDir();
   const job = { id: "task-invalid-pid", workspaceRoot, status: "running", pid: null };
@@ -2676,7 +2703,7 @@ test("stop hook blocks a parsed state with an invalid schema", () => {
   assert.match(decision.reason, /could not safely continue.*invalid state schema/i);
 });
 
-test("stop gate blocks when its foreground review loses the terminal claim", () => {
+test("stop gate blocks when removal wins during foreground completion", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir, "adversarial-clean");
@@ -2686,6 +2713,7 @@ test("stop gate blocks when its foreground review loses the terminal claim", () 
   const gateKey = createHash("sha256").update(`${sessionId}\0${message}`).digest("hex");
   const jobId = `gate-${gateKey}`;
   const terminalFile = resolveTerminalFenceFile(repo, jobId);
+  const removedFile = terminalFile.replace(/\.terminal\.json$/, ".removed");
   const preload = path.join(makeTempDir(), "terminal-race.cjs");
   fs.writeFileSync(preload, [
     'const fs = require("node:fs");',
@@ -2693,7 +2721,7 @@ test("stop gate blocks when its foreground review loses the terminal claim", () 
     'let armed = true;',
     'fs.openSync = (file, flags, ...rest) => {',
     '  if (armed && file === process.env.CODEX_FOREGROUND_TERMINAL_FENCE && flags === "wx") {',
-    '    armed = false; fs.writeFileSync(file, JSON.stringify({ status: "cancelled", completedAt: "2026-08-19T12:01:00.000Z" }));',
+    '    armed = false; fs.writeFileSync(process.env.CODEX_FOREGROUND_REMOVED_FENCE, "");',
     '  }',
     '  return original(file, flags, ...rest);',
     '};'
@@ -2701,6 +2729,7 @@ test("stop gate blocks when its foreground review loses the terminal claim", () 
   const env = {
     ...buildEnv(binDir),
     CODEX_FOREGROUND_TERMINAL_FENCE: terminalFile,
+    CODEX_FOREGROUND_REMOVED_FENCE: removedFile,
     NODE_OPTIONS: `--require ${preload}`
   };
   assert.equal(run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], { cwd: repo, env }).status, 0);

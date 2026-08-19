@@ -297,6 +297,10 @@ export function updateState(cwd, mutate) {
   });
 }
 
+export function isJobRemovedLocked(cwd, jobId) {
+  return withStateLock(cwd, () => fs.existsSync(resolveJobSidecarFile(cwd, jobId, ".removed")));
+}
+
 export function generateJobId(prefix = "job") {
   const random = Math.random().toString(36).slice(2, 8);
   return `${prefix}-${Date.now().toString(36)}-${random}`;

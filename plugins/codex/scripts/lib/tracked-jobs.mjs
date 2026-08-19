@@ -2,7 +2,7 @@ import fs from "node:fs";
 import process from "node:process";
 
 import { isProcessAlive } from "./process.mjs";
-import { listJobs, readJobFile, resolveJobFile, resolveJobLogFile, updateState, upsertJob, writeJobFile } from "./state.mjs";
+import { isJobRemovedLocked, listJobs, readJobFile, resolveJobFile, resolveJobLogFile, updateState, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 export const GATE_KEY_ENV = "CODEX_COMPANION_GATE_KEY";
@@ -521,6 +521,9 @@ export async function runTrackedJob(job, runner, options = {}) {
       rendered: execution.rendered
     });
     if (terminal.claimed) {
+      if (isJobRemovedLocked(job.workspaceRoot, job.id)) {
+        return removedLifecycleRecord(runningRecord);
+      }
       appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
       return execution;
     }

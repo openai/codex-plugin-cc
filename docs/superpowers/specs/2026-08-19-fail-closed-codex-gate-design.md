@@ -41,7 +41,9 @@ Make Codex Companion jobs self-heal after worker loss and make the Claude Stop r
 ### Persistence
 
 - `state.json` and per-job JSON files are written to a same-directory temporary file and atomically renamed.
+- State read-modify-write mutations use a short per-workspace filesystem lock. Dead owners are recovered; contention or invalid lock metadata fails with a clear error after five seconds instead of hanging.
 - Invalid persisted JSON is an explicit error. It must not silently reset `stopReviewGate` to `false`.
+- Removed job IDs keep a zero-byte tombstone so an arbitrarily late worker cannot reuse them. This is the deliberate correctness tradeoff for avoiding a daemon, lease, heartbeat, or attempt-token protocol.
 - No new daemon, dependency, heartbeat file, or long-lived lock is introduced. PID liveness covers the observed worker-loss failure; the existing 15-minute Stop timeout covers a live but non-returning gate review.
 
 ## Verification

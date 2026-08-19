@@ -199,6 +199,7 @@ Expected: PASS.
 
 **Interfaces:**
 - Produces: same-directory temporary write plus `renameSync` for state and job JSON.
+- Produces: bounded per-workspace serialization for state read-modify-write mutations.
 - Produces: explicit parse errors from invalid state JSON.
 
 - [ ] **Step 1: Write failing persistence tests**
@@ -213,7 +214,7 @@ Expected: `loadState` silently returns defaults and the hook emits no block deci
 
 - [ ] **Step 3: Implement atomic strict persistence**
 
-Write JSON through a unique sibling temporary file and `fs.renameSync`. On parse failure throw `Failed to read Codex Companion state at <path>: <message>` instead of returning defaults. Catch top-level Stop-hook errors and emit a block decision.
+Write JSON through a unique sibling temporary file and `fs.renameSync`. Serialize state read-modify-write mutations with an exclusive per-workspace lock, recover dead owners, and fail clearly after five seconds of contention. On parse failure throw `Failed to read Codex Companion state at <path>: <message>` instead of returning defaults. Catch top-level Stop-hook errors and emit a block decision.
 
 - [ ] **Step 4: Verify Task 4 GREEN**
 
