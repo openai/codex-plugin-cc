@@ -1220,6 +1220,17 @@ test("reconciliation fails a running job with an invalid process id", () => {
   assert.match(result.errorMessage, /invalid process id/i);
 });
 
+test("reconciliation fails a queued job without a valid creation time", () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-invalid-queued-time", workspaceRoot, status: "queued", pid: null, createdAt: "not-a-date" };
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, job);
+
+  const [result] = reconcileTrackedJobs(workspaceRoot);
+  assert.equal(result.status, "failed");
+  assert.match(result.errorMessage, /invalid creation time/i);
+});
+
 test("removed job terminal fence prevents progress and finalization from recreating it", async () => {
   const workspaceRoot = makeTempDir();
   const job = { id: "task-removed", workspaceRoot, status: "queued" };
@@ -1245,6 +1256,34 @@ test("removed job terminal fence prevents progress and finalization from recreat
 
   assert.deepEqual(listJobs(workspaceRoot), []);
   assert.equal(fs.existsSync(resolveJobFile(workspaceRoot, job.id)), false);
+});
+
+test("removal between the pre-admission check and claim prevents runner invocation", async () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-remove-before-admission", workspaceRoot, status: "queued" };
+  const jobFile = writeJobFile(workspaceRoot, job.id, job);
+  const removedFile = jobFile.replace(/\.json$/, ".removed");
+  upsertJob(workspaceRoot, job);
+  const originalExists = fs.existsSync;
+  let removalChecks = 0;
+  let invoked = false;
+  fs.existsSync = (file) => {
+    if (file === removedFile && ++removalChecks === 2) {
+      fs.writeFileSync(removedFile, "", "utf8");
+      return false;
+    }
+    return originalExists(file);
+  };
+  try {
+    const result = await runTrackedJob(job, async () => {
+      invoked = true;
+      return { exitStatus: 0 };
+    });
+    assert.equal(result.removed, true);
+  } finally {
+    fs.existsSync = originalExists;
+  }
+  assert.equal(invoked, false);
 });
 
 test("review rejects focus text because it is native-review only", () => {
@@ -2248,9 +2287,9 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   const jobsDir = path.join(stateDir, "jobs");
   fs.mkdirSync(jobsDir, { recursive: true });
 
-  const completedLog = path.join(jobsDir, "completed.log");
-  const runningLog = path.join(jobsDir, "running.log");
-  const otherSessionLog = path.join(jobsDir, "other.log");
+  const completedLog = resolveJobLogFile(repo, "review-completed");
+  const runningLog = resolveJobLogFile(repo, "review-running");
+  const otherSessionLog = resolveJobLogFile(repo, "review-other");
   const completedJobFile = path.join(jobsDir, "review-completed.json");
   const runningJobFile = path.join(jobsDir, "review-running.json");
   const otherJobFile = path.join(jobsDir, "review-other.json");
@@ -2370,7 +2409,12 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   saveState(repo, state);
   assert.deepEqual(
     fs.readdirSync(jobsDir).sort(),
-    [path.basename(otherJobFile), path.basename(otherSessionLog), "review-completed.removed", "review-running.removed"].sort()
+    [
+      path.basename(otherJobFile),
+      path.basename(otherSessionLog),
+      "review-completed.removed",
+      "review-running.removed"
+    ].sort()
   );
 });
 
@@ -2595,7 +2639,7 @@ test("stop hook blocks every matching non-reusable gate job without starting a t
     saveState(repo, {
       version: 1,
       config: { stopReviewGate: true },
-      jobs: [{ id: jobId, gateKey, sessionId, status, title: "Codex Stop Gate Review", ...(status === "running" ? { pid: process.pid } : {}), ...(cachedResult === undefined ? {} : { result: cachedResult }) }]
+      jobs: [{ id: jobId, gateKey, sessionId, status, title: "Codex Stop Gate Review", ...(status === "queued" ? { createdAt: new Date().toISOString() } : {}), ...(status === "running" ? { pid: process.pid } : {}), ...(cachedResult === undefined ? {} : { result: cachedResult }) }]
     });
     const beforeTurns = fs.existsSync(fakeStatePath) ? JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).nextTurnId : 1;
     const hookResult = run("node", [STOP_HOOK], { cwd: repo, env, input: JSON.stringify({ cwd: repo, session_id: sessionId, last_assistant_message: message }) });

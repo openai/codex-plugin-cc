@@ -2,7 +2,7 @@ import fs from "node:fs";
 import process from "node:process";
 
 import { isProcessAlive } from "./process.mjs";
-import { listJobs, readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { listJobs, readJobFile, resolveJobFile, resolveJobLogFile, updateState, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 export const GATE_KEY_ENV = "CODEX_COMPANION_GATE_KEY";
@@ -412,7 +412,11 @@ export function reconcileTrackedJobs(workspaceRoot, options = {}) {
     }
 
     const ageMs = now - Date.parse(job.createdAt ?? "");
-    if (job.status === "queued" && !Number.isFinite(job.pid) && Number.isFinite(ageMs) && ageMs >= 5000) {
+    if (job.status === "queued" && !Number.isFinite(ageMs)) {
+      const failedJob = failTrackedJob(workspaceRoot, job, "Tracked queued job has an invalid creation time.");
+      return failedJob ? [failedJob] : [];
+    }
+    if (job.status === "queued" && !Number.isFinite(job.pid) && ageMs >= 5000) {
       const failedJob = failTrackedJob(workspaceRoot, job, "Background worker did not start within 5 seconds.");
       return failedJob ? [failedJob] : [];
     }
@@ -488,8 +492,16 @@ export async function runTrackedJob(job, runner, options = {}) {
   if (terminalAfterStart) {
     return applyTerminalFence(runningRecord, terminalAfterStart);
   }
-  const admitted = claimFile(resolveAdmissionFile(job.workspaceRoot, job.id), { status: "admitted" });
+  let admitted = false;
+  updateState(job.workspaceRoot, () => {
+    if (!isJobRemoved(job.workspaceRoot, job.id)) {
+      admitted = claimFile(resolveAdmissionFile(job.workspaceRoot, job.id), { status: "admitted" });
+    }
+  });
   if (!admitted) {
+    if (isJobRemoved(job.workspaceRoot, job.id)) {
+      return removedLifecycleRecord(runningRecord);
+    }
     return applyTerminalFence(runningRecord, readAdmissionClaim(job.workspaceRoot, job.id));
   }
 

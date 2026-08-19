@@ -15,6 +15,8 @@ const MAX_JOBS = 50;
 const STATE_LOCK_FILE_NAME = ".state.lock";
 const STATE_LOCK_WAIT_MS = 5000;
 const STATE_LOCK_RETRY_MS = 20;
+const JOB_STATUSES = new Set(["queued", "running", "completed", "failed", "cancelled"]);
+const SAFE_JOB_ID = /^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 function nowIso() {
   return new Date().toISOString();
@@ -68,7 +70,7 @@ function validateState(parsed) {
     throw new Error("invalid state schema");
   }
   for (const job of parsed.jobs) {
-    if (!isObject(job) || typeof job.id !== "string" || !job.id || typeof job.status !== "string" || !job.status) {
+    if (!isObject(job) || typeof job.id !== "string" || !SAFE_JOB_ID.test(job.id) || !JOB_STATUSES.has(job.status)) {
       throw new Error("invalid job schema");
     }
   }
@@ -141,12 +143,13 @@ function reapDeadStateLock(lockFile, owner) {
   const reapFile = `${lockFile}.reap`;
   const token = randomUUID();
   if (!tryCreateStateLock(reapFile, { pid: process.pid, token, createdAt: nowIso() })) {
-    return;
+    return false;
   }
   try {
     const current = readStateLockOwner(lockFile);
     if (current.token === owner.token && current.pid === owner.pid && !isProcessAlive(current.pid)) {
       fs.unlinkSync(lockFile);
+      return true;
     }
   } catch (error) {
     if (error?.code !== "ENOENT") {
@@ -155,6 +158,7 @@ function reapDeadStateLock(lockFile, owner) {
   } finally {
     releaseStateLock(reapFile, token);
   }
+  return false;
 }
 
 function withStateLock(cwd, action) {
@@ -173,8 +177,9 @@ function withStateLock(cwd, action) {
     try {
       const owner = readStateLockOwner(lockFile);
       if (!isProcessAlive(owner.pid)) {
-        reapDeadStateLock(lockFile, owner);
-        continue;
+        if (reapDeadStateLock(lockFile, owner)) {
+          continue;
+        }
       }
     } catch (error) {
       if (error?.code === "ENOENT") {
@@ -208,9 +213,11 @@ function writeAtomicJson(filePath, value) {
 }
 
 function pruneJobs(jobs) {
-  return [...jobs]
-    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")))
-    .slice(0, MAX_JOBS);
+  const sorted = [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
+  const active = sorted.filter((job) => job.status === "queued" || job.status === "running");
+  const terminal = sorted.filter((job) => job.status !== "queued" && job.status !== "running");
+  return [...active, ...terminal.slice(0, Math.max(0, MAX_JOBS - active.length))]
+    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
 }
 
 function removeFileIfExists(filePath) {
@@ -240,26 +247,37 @@ function removeJobSidecars(cwd, jobId) {
 }
 
 function saveStateLocked(cwd, state) {
-  const previousJobs = loadState(cwd).jobs;
-  ensureStateDir(cwd);
-  const nextJobs = pruneJobs(state.jobs ?? []);
-  const nextState = {
+  const candidate = {
     version: STATE_VERSION,
     config: {
       ...defaultState().config,
       ...(state.config ?? {})
     },
+    jobs: state.jobs ?? []
+  };
+  validateState(candidate);
+  const previousJobs = loadState(cwd).jobs;
+  ensureStateDir(cwd);
+  const requestedJobs = candidate.jobs;
+  const nextJobs = pruneJobs(requestedJobs.filter((job) => !fs.existsSync(resolveJobSidecarFile(cwd, job.id, ".removed"))));
+  const nextState = {
+    version: STATE_VERSION,
+    config: candidate.config,
     jobs: nextJobs
   };
 
   const retainedIds = new Set(nextJobs.map((job) => job.id));
-  for (const job of previousJobs) {
+  const knownJobs = new Map(previousJobs.map((job) => [job.id, job]));
+  for (const job of requestedJobs) {
+    knownJobs.set(job.id, { ...knownJobs.get(job.id), ...job });
+  }
+  for (const job of knownJobs.values()) {
     if (retainedIds.has(job.id)) {
       continue;
     }
     markJobRemoved(cwd, job.id);
     removeJobFile(resolveJobFile(cwd, job.id));
-    removeFileIfExists(job.logFile);
+    removeFileIfExists(resolveJobLogFile(cwd, job.id));
     removeJobSidecars(cwd, job.id);
   }
 

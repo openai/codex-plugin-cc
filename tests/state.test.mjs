@@ -7,11 +7,13 @@ import assert from "node:assert/strict";
 import { makeTempDir } from "./helpers.mjs";
 import {
   loadState,
+  listJobs,
   resolveJobFile,
   resolveJobLogFile,
   resolveStateDir,
   resolveStateFile,
   saveState,
+  upsertJob,
   writeJobFile
 } from "../plugins/codex/scripts/lib/state.mjs";
 
@@ -106,6 +108,42 @@ test("saveState reaps a lock left by a dead owner", () => {
   assert.equal(fs.existsSync(path.join(stateDir, ".state.lock")), false);
 });
 
+test("saveState bounds waiting when a dead lock cannot acquire its reap guard", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, ".state.lock"), JSON.stringify({ pid: 999999, token: "dead-owner", createdAt: "2026-08-19T12:00:00.000Z" }), "utf8");
+  fs.writeFileSync(path.join(stateDir, ".state.lock.reap"), JSON.stringify({ pid: process.pid, token: "busy-reaper", createdAt: "2026-08-19T12:00:00.000Z" }), "utf8");
+  const originalNow = Date.now;
+  let calls = 0;
+  Date.now = () => (calls++ === 0 ? 0 : 5001);
+  try {
+    assert.throws(() => saveState(workspace, { config: { stopReviewGate: false }, jobs: [] }), /Timed out waiting for Codex Companion state lock/);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test("loadState rejects unsafe job ids", () => {
+  const workspace = makeTempDir();
+  const stateFile = resolveStateFile(workspace);
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+  fs.writeFileSync(stateFile, JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [{ id: "../escape", status: "completed" }] }), "utf8");
+  assert.throws(() => loadState(workspace), /invalid job schema/);
+});
+
+test("saveState rejects an unsafe requested job id before touching its path", () => {
+  const workspace = makeTempDir();
+  const sentinel = path.join(workspace, "sentinel");
+  fs.writeFileSync(sentinel, "keep", "utf8");
+
+  assert.throws(
+    () => saveState(workspace, { config: { stopReviewGate: false }, jobs: [{ id: "../sentinel", status: "completed" }] }),
+    /invalid job schema/
+  );
+  assert.equal(fs.readFileSync(sentinel, "utf8"), "keep");
+});
+
 test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", () => {
   const workspace = makeTempDir();
   const stateFile = resolveStateFile(workspace);
@@ -188,5 +226,46 @@ test("saveState retains a removal fence for a pruned job before it starts", () =
   const jobFile = resolveJobFile(workspace, job.id);
   assert.equal(fs.existsSync(jobFile), false);
   assert.equal(fs.existsSync(job.logFile), false);
+  assert.equal(fs.existsSync(jobFile.replace(/\.json$/, ".removed")), true);
+});
+
+test("saveState does not delete a noncanonical job log path", () => {
+  const workspace = makeTempDir();
+  const externalLog = path.join(makeTempDir(), "outside.log");
+  const job = { id: "job-external-log", status: "completed", logFile: externalLog };
+  writeJobFile(workspace, job.id, job);
+  fs.writeFileSync(externalLog, "keep\n", "utf8");
+  saveState(workspace, { config: { stopReviewGate: false }, jobs: [job] });
+
+  saveState(workspace, { config: { stopReviewGate: false }, jobs: [] });
+
+  assert.equal(fs.existsSync(externalLog), true);
+});
+
+test("saveState retains active jobs beyond the terminal history cap", () => {
+  const workspace = makeTempDir();
+  const jobs = [
+    { id: "active-old", status: "running", pid: process.pid, updatedAt: "2020-01-01T00:00:00.000Z" },
+    ...Array.from({ length: 50 }, (_, index) => ({ id: `done-${index}`, status: "completed", updatedAt: new Date(Date.UTC(2026, 0, 1, 0, index, 0)).toISOString() }))
+  ];
+  const saved = saveState(workspace, { config: { stopReviewGate: false }, jobs });
+  assert.equal(saved.jobs.length, 50);
+  assert.equal(saved.jobs.some((job) => job.id === "active-old"), true);
+});
+
+test("late publication cannot restore a job behind its removal fence", () => {
+  const workspace = makeTempDir();
+  const job = { id: "job-removed-late", status: "queued", logFile: resolveJobLogFile(workspace, "job-removed-late") };
+  const jobFile = writeJobFile(workspace, job.id, job);
+  upsertJob(workspace, job);
+  fs.writeFileSync(jobFile.replace(/\.json$/, ".started.json"), JSON.stringify({ status: "running", pid: process.pid, startedAt: new Date().toISOString() }), "utf8");
+  fs.writeFileSync(jobFile.replace(/\.json$/, ".removed"), "", "utf8");
+
+  writeJobFile(workspace, job.id, { ...job, status: "running", pid: process.pid });
+  upsertJob(workspace, { ...job, status: "running", pid: process.pid });
+
+  assert.deepEqual(listJobs(workspace), []);
+  assert.equal(fs.existsSync(jobFile), false);
+  assert.equal(fs.existsSync(jobFile.replace(/\.json$/, ".started.json")), false);
   assert.equal(fs.existsSync(jobFile.replace(/\.json$/, ".removed")), true);
 });
