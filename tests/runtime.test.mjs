@@ -1036,6 +1036,39 @@ test("terminal job fence prevents a queued worker from running", async () => {
   assert.equal(readJobFile(resolveJobFile(workspaceRoot, job.id)).status, "queued");
 });
 
+test("terminal initial claim prevents a late worker from publishing running state", async () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-initial-terminal", workspaceRoot, status: "queued", request: { prompt: "do not run" } };
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, job);
+  fs.writeFileSync(
+    resolveJobFile(workspaceRoot, job.id).replace(/\.json$/, ".started.json"),
+    JSON.stringify({ status: "failed", completedAt: "2026-08-19T12:00:00.000Z" }),
+    "utf8"
+  );
+
+  let runnerInvoked = false;
+  const result = await runTrackedJob(job, async () => {
+    runnerInvoked = true;
+    return { exitStatus: 0 };
+  });
+
+  assert.equal(runnerInvoked, false);
+  assert.equal(result.status, "failed");
+  assert.equal(readJobFile(resolveJobFile(workspaceRoot, job.id)).status, "queued");
+});
+
+test("progress updates an unindexed mutable job without making it visible", () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-unindexed-progress", workspaceRoot, status: "running" };
+  writeJobFile(workspaceRoot, job.id, job);
+
+  createJobProgressUpdater(workspaceRoot, job.id)({ phase: "investigating" });
+
+  assert.deepEqual(listJobs(workspaceRoot), []);
+  assert.equal(readJobFile(resolveJobFile(workspaceRoot, job.id)).phase, "investigating");
+});
+
 test("terminal job reconciliation wins over late worker finalization", async () => {
   const workspaceRoot = makeTempDir();
   const job = { id: "task-race", workspaceRoot, status: "queued" };
@@ -1081,11 +1114,7 @@ test("removed job terminal fence prevents progress and finalization from recreat
   });
 
   await waitFor(() => listJobs(workspaceRoot).some((candidate) => candidate.id === job.id && candidate.status === "running"));
-  fs.writeFileSync(
-    resolveTerminalFenceFile(workspaceRoot, job.id),
-    JSON.stringify({ status: "cancelled", completedAt: "2026-08-19T12:00:00.000Z" }),
-    "utf8"
-  );
+  fs.writeFileSync(resolveJobFile(workspaceRoot, job.id).replace(/\.json$/, ".removed"), "", "utf8");
   saveState(workspaceRoot, { config: { stopReviewGate: false }, jobs: [] });
   progress({ phase: "investigating" });
   releaseRunner();
@@ -1964,6 +1993,54 @@ test("cancel with a job id can still target an active job from another Claude se
   assert.equal(state.jobs[0].status, "cancelled");
 });
 
+test("cancel reports a completed first terminal outcome without killing the worker", async (t) => {
+  const workspace = makeTempDir();
+  const job = { id: "task-cancel-race", status: "running", title: "Codex Task", jobClass: "task" };
+  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+  sleeper.unref();
+  t.after(() => {
+    try {
+      process.kill(-sleeper.pid, "SIGTERM");
+    } catch {
+      process.kill(sleeper.pid, "SIGTERM");
+    }
+  });
+  const preloadFile = path.join(makeTempDir(), "complete-before-cancel-claim.cjs");
+  const jobFile = resolveJobFile(workspace, job.id);
+  const terminalFile = jobFile.replace(/\.json$/, ".terminal.json");
+  writeJobFile(workspace, job.id, { ...job, pid: sleeper.pid });
+  upsertJob(workspace, { ...job, pid: sleeper.pid });
+  fs.writeFileSync(
+    jobFile.replace(/\.json$/, ".started.json"),
+    JSON.stringify({ status: "running", pid: sleeper.pid, startedAt: "2026-08-19T12:00:00.000Z" }),
+    "utf8"
+  );
+  fs.writeFileSync(
+    preloadFile,
+    [
+      'const fs = require("node:fs");',
+      "const originalOpen = fs.openSync;",
+      "let armed = true;",
+      "fs.openSync = (file, flags, ...rest) => {",
+      "  if (armed && file === process.env.CODEX_CANCEL_RACE_FENCE && flags === \"wx\") {",
+      "    armed = false; fs.writeFileSync(file, JSON.stringify({ status: \"completed\", completedAt: \"2026-08-19T12:01:00.000Z\" }));",
+      "  }",
+      "  return originalOpen(file, flags, ...rest);",
+      "};"
+    ].join("\n"),
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "cancel", job.id, "--json"], {
+    cwd: workspace,
+    env: { ...process.env, CODEX_CANCEL_RACE_FENCE: terminalFile, NODE_OPTIONS: `--require ${preloadFile}` }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).status, "completed");
+  process.kill(sleeper.pid, 0);
+});
+
 test("cancel sends turn interrupt to the shared app-server before killing a brokered task", async () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -1987,8 +2064,7 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
 
   const stateDir = resolveStateDir(repo);
   const runningJob = await waitFor(() => {
-    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
-    const job = state.jobs.find((candidate) => candidate.id === jobId);
+    const job = readJobFile(resolveJobFile(repo, jobId));
     if (job?.status === "running" && job.threadId && job.turnId) {
       return job;
     }
@@ -2132,7 +2208,12 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   assert.equal(fs.existsSync(otherJobFile), true);
   assert.deepEqual(
     fs.readdirSync(path.dirname(otherJobFile)).sort(),
-    [path.basename(otherJobFile), path.basename(otherSessionLog), "review-running.terminal.json"].sort()
+    [
+      path.basename(otherJobFile),
+      path.basename(otherSessionLog),
+      "review-completed.removed",
+      "review-running.removed"
+    ].sort()
   );
 
   await waitFor(() => {

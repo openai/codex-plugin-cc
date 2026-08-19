@@ -128,7 +128,7 @@ The worker sets its own PID when it enters `runTrackedJob`; queued jobs receive 
 
 - [ ] **Step 4: Protect terminal transitions**
 
-Every terminal writer (reconciliation, completion/failure, cancel, and SessionEnd) claims `jobs/<id>.terminal.json` with `openSync(..., "wx")`; the first claimed status overrides stale mutable JSON. Empty/corrupt fences are failed, never overwritten. Progress/upsert and effective control-plane reads honor the fence, and SessionEnd removes mutable records only after fencing active jobs.
+Workers first claim `jobs/<id>.started.json` with `openSync(..., "wx")`; reconciliation, SessionEnd, and startup compete there before a running publication. Later terminal outcomes compete on `jobs/<id>.terminal.json`. Empty/corrupt claims fail as failed, progress never upserts the state index, and effective reads merge mutable job-file fields. SessionEnd writes a dominant empty `jobs/<id>.removed` marker before cleanup so a late mutable artifact is never visible.
 
 - [ ] **Step 5: Verify Task 2 GREEN**
 

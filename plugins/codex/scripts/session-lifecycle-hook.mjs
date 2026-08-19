@@ -14,7 +14,7 @@ import {
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
 import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
-import { terminalizeTrackedJob } from "./lib/tracked-jobs.mjs";
+import { markTrackedJobRemoved, terminalizeTrackedJob } from "./lib/tracked-jobs.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -58,6 +58,7 @@ function cleanupSessionJobs(cwd, sessionId) {
   }
 
   for (const job of removedJobs) {
+    markTrackedJobRemoved(workspaceRoot, job.id);
     const stillRunning = job.status === "queued" || job.status === "running";
     if (!stillRunning) {
       continue;

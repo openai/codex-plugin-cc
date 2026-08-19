@@ -974,16 +974,6 @@ async function handleCancel(argv) {
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
 
-  const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
-  if (interrupt.attempted) {
-    appendLogLine(
-      job.logFile,
-      interrupt.interrupted
-        ? `Requested Codex turn interrupt for ${turnId} on ${threadId}.`
-        : `Codex turn interrupt failed${interrupt.detail ? `: ${interrupt.detail}` : "."}`
-    );
-  }
-
   const completedAt = nowIso();
   const nextJob = {
     ...job,
@@ -994,13 +984,35 @@ async function handleCancel(argv) {
     errorMessage: "Cancelled by user."
   };
 
-  terminalizeTrackedJob(workspaceRoot, {
+  const terminal = terminalizeTrackedJob(workspaceRoot, {
     ...existing,
     ...nextJob
   }, {
     ...nextJob,
     cancelledAt: completedAt
   });
+  if (!terminal.claimed) {
+    const firstOutcome = terminal.job ?? job;
+    const payload = {
+      jobId: job.id,
+      status: firstOutcome.status,
+      title: job.title,
+      turnInterruptAttempted: false,
+      turnInterrupted: false
+    };
+    outputCommandResult(payload, renderCancelReport(firstOutcome), options.json);
+    return;
+  }
+
+  const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
+  if (interrupt.attempted) {
+    appendLogLine(
+      job.logFile,
+      interrupt.interrupted
+        ? `Requested Codex turn interrupt for ${turnId} on ${threadId}.`
+        : `Codex turn interrupt failed${interrupt.detail ? `: ${interrupt.detail}` : "."}`
+    );
+  }
   terminateProcessTree(job.pid ?? Number.NaN);
   appendLogLine(job.logFile, "Cancelled by user.");
 
