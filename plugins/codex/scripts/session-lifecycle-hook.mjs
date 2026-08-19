@@ -4,14 +4,9 @@ import fs from "node:fs";
 import process from "node:process";
 
 import { terminateProcessTree } from "./lib/process.mjs";
-import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
   clearBrokerSession,
-  LOG_FILE_ENV,
-  loadBrokerSession,
-  PID_FILE_ENV,
-  sendBrokerShutdown,
-  teardownBrokerSession
+  reapBrokerSessions
 } from "./lib/broker-lifecycle.mjs";
 import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
@@ -74,43 +69,25 @@ function cleanupSessionJobs(cwd, sessionId) {
   });
 }
 
-function handleSessionStart(input) {
+async function handleSessionStart(input) {
   appendEnvVar(SESSION_ID_ENV, input.session_id);
   appendEnvVar(TRANSCRIPT_PATH_ENV, input.transcript_path);
   appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
+  // GC broker session dirs left behind by brokers that have already exited
+  // (they self-shut-down when idle). Live brokers are never touched.
+  await reapBrokerSessions();
 }
 
 async function handleSessionEnd(input) {
   const cwd = input.cwd || process.cwd();
-  const brokerSession =
-    loadBrokerSession(cwd) ??
-    (process.env[BROKER_ENDPOINT_ENV]
-      ? {
-          endpoint: process.env[BROKER_ENDPOINT_ENV],
-          pidFile: process.env[PID_FILE_ENV] ?? null,
-          logFile: process.env[LOG_FILE_ENV] ?? null
-        }
-      : null);
-  const brokerEndpoint = brokerSession?.endpoint ?? null;
-  const pidFile = brokerSession?.pidFile ?? null;
-  const logFile = brokerSession?.logFile ?? null;
-  const sessionDir = brokerSession?.sessionDir ?? null;
-  const pid = brokerSession?.pid ?? null;
-
-  if (brokerEndpoint) {
-    await sendBrokerShutdown(brokerEndpoint);
-  }
-
   cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
-  teardownBrokerSession({
-    endpoint: brokerEndpoint,
-    pidFile,
-    logFile,
-    sessionDir,
-    pid,
-    killProcess: terminateProcessTree
-  });
+  // Do not shut down or kill this cwd's broker: it may be shared with a
+  // concurrent session, and it exits itself once idle (app-server-broker.mjs).
+  // Just drop this session's pointer to it.
   clearBrokerSession(cwd);
+  // GC the directories of brokers that have already exited. A live broker —
+  // including one a concurrent session is still using — is never touched.
+  await reapBrokerSessions();
 }
 
 async function main() {
@@ -118,7 +95,7 @@ async function main() {
   const eventName = process.argv[2] ?? input.hook_event_name ?? "";
 
   if (eventName === "SessionStart") {
-    handleSessionStart(input);
+    await handleSessionStart(input);
     return;
   }
 

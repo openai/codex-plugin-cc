@@ -207,3 +207,65 @@ export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessi
     }
   }
 }
+
+function readBrokerPid(sessionDir) {
+  try {
+    const pid = Number.parseInt(fs.readFileSync(path.join(sessionDir, "broker.pid"), "utf8").trim(), 10);
+    return Number.isInteger(pid) && pid > 1 ? pid : null; // reject 0/negative/NaN
+  } catch {
+    return null;
+  }
+}
+
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 1) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0); // signal 0 only checks existence
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM"; // exists but owned by another user
+  }
+}
+
+// GC leaked broker session directories. A broker is spawned per working
+// directory and reused across sessions, and it now exits itself once idle,
+// removing its own directory (see app-server-broker.mjs). This only cleans up
+// after a broker that died WITHOUT that clean exit (e.g. it was killed): its
+// directory is left behind with a now-dead PID. A live PID is never inspected or
+// signalled, so this can neither interrupt a session sharing a broker, signal an
+// unrelated process that reused a stale PID, nor race a broker that is still
+// starting up. A directory is treated as a broker session only when it holds a
+// broker.pid file, so an unrelated cxc-*-prefixed temp directory is never touched.
+export async function reapBrokerSessions({ tmpDir = os.tmpdir() } = {}) {
+  let entries;
+  try {
+    entries = fs.readdirSync(tmpDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith("cxc-")) {
+      continue;
+    }
+    const sessionDir = path.join(tmpDir, entry.name);
+    if (!fs.existsSync(path.join(sessionDir, "broker.pid"))) {
+      continue; // a broker removes its own dir on clean exit — nothing to do
+    }
+
+    const pid = readBrokerPid(sessionDir);
+    if (pid !== null && isPidAlive(pid)) {
+      continue; // live broker — leave it entirely alone (it self-exits when idle)
+    }
+
+    // The broker process is gone but left its directory behind (killed, not a
+    // clean exit). Remove the leftover; the PID is dead so nothing is signalled.
+    try {
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+    } catch {
+      // Ignore already-removed directories.
+    }
+  }
+}

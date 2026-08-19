@@ -69,7 +69,21 @@ async function main() {
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
+  let inFlightRequests = 0;
   const sockets = new Set();
+
+  // Forward a request to the app server while counting it as in-flight, so idle
+  // self-shutdown can never fire while real work is running — even if the calling
+  // client disconnected mid-request (which clears activeRequestSocket).
+  async function forwardAppRequest(method, params) {
+    inFlightRequests += 1;
+    try {
+      return await appClient.request(method, params);
+    } finally {
+      inFlightRequests -= 1;
+      scheduleIdleShutdown();
+    }
+  }
 
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
@@ -105,17 +119,56 @@ async function main() {
     }
     await appClient.close().catch(() => {});
     await new Promise((resolve) => server.close(resolve));
-    if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
-      fs.unlinkSync(listenTarget.path);
-    }
-    if (pidFile && fs.existsSync(pidFile)) {
-      fs.unlinkSync(pidFile);
+    // Remove the broker's own session directory (socket, pid file, log) so a
+    // clean exit leaves nothing behind for the reaper to GC.
+    const sessionDir = pidFile
+      ? path.dirname(pidFile)
+      : listenTarget.kind === "unix"
+        ? path.dirname(listenTarget.path)
+        : null;
+    if (sessionDir) {
+      try {
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+      } catch {
+        // Ignore an already-removed directory.
+      }
     }
   }
 
   appClient.setNotificationHandler(routeNotification);
 
+  // Idle self-shutdown: a broker is spawned per working directory and is reused
+  // across sessions, so no external actor can safely decide it is done. Instead
+  // the broker exits itself once it has had no connections and no in-flight work
+  // for CODEX_BROKER_IDLE_MS (default 30 min; <= 0 disables). Callers respawn one
+  // on demand, so exiting when idle is safe and stops brokers from accumulating.
+  const idleMs = Number.parseInt(process.env.CODEX_BROKER_IDLE_MS ?? "", 10);
+  const idleTimeoutMs = Number.isFinite(idleMs) ? idleMs : 30 * 60 * 1000;
+  let idleTimer = null;
+  function cancelIdleShutdown() {
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  }
+  function isIdle() {
+    return sockets.size === 0 && inFlightRequests === 0 && !activeRequestSocket && !activeStreamSocket;
+  }
+  function scheduleIdleShutdown() {
+    cancelIdleShutdown();
+    if (idleTimeoutMs <= 0 || !isIdle()) {
+      return;
+    }
+    idleTimer = setTimeout(() => {
+      if (isIdle()) {
+        shutdown(server).finally(() => process.exit(0));
+      }
+    }, idleTimeoutMs);
+    idleTimer.unref(); // never keep the process alive solely to fire this timer
+  }
+
   const server = net.createServer((socket) => {
+    cancelIdleShutdown();
     sockets.add(socket);
     socket.setEncoding("utf8");
     let buffer = "";
@@ -183,7 +236,7 @@ async function main() {
 
         if (allowInterruptDuringActiveStream) {
           try {
-            const result = await appClient.request(message.method, message.params ?? {});
+            const result = await forwardAppRequest(message.method, message.params ?? {});
             send(socket, { id: message.id, result });
           } catch (error) {
             send(socket, {
@@ -198,7 +251,7 @@ async function main() {
         activeRequestSocket = socket;
 
         try {
-          const result = await appClient.request(message.method, message.params ?? {});
+          const result = await forwardAppRequest(message.method, message.params ?? {});
           send(socket, { id: message.id, result });
           if (isStreaming) {
             activeStreamSocket = socket;
@@ -225,11 +278,13 @@ async function main() {
     socket.on("close", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      scheduleIdleShutdown();
     });
 
     socket.on("error", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      scheduleIdleShutdown();
     });
   });
 
@@ -243,7 +298,9 @@ async function main() {
     process.exit(0);
   });
 
-  server.listen(listenTarget.path);
+  server.listen(listenTarget.path, () => {
+    scheduleIdleShutdown(); // exit if nobody ever connects
+  });
 }
 
 main().catch((error) => {
