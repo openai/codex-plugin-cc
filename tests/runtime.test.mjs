@@ -1307,6 +1307,7 @@ test("status --wait times out cleanly when a job is still active", () => {
         id: "task-live",
         status: "running",
         title: "Codex Task",
+        pid: process.pid,
         logFile
       },
       null,
@@ -1328,6 +1329,7 @@ test("status --wait times out cleanly when a job is still active", () => {
             title: "Codex Task",
             jobClass: "task",
             summary: "Investigate flaky test",
+            pid: process.pid,
             logFile,
             createdAt: "2026-03-18T15:30:00.000Z",
             startedAt: "2026-03-18T15:30:01.000Z",
@@ -1350,6 +1352,105 @@ test("status --wait times out cleanly when a job is still active", () => {
   assert.equal(payload.job.id, "task-live");
   assert.equal(payload.job.status, "running");
   assert.equal(payload.waitTimedOut, true);
+});
+
+test("status --wait marks a dead worker as failed before timing out", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const logFile = path.join(jobsDir, "task-dead.log");
+  fs.writeFileSync(logFile, "", "utf8");
+  fs.writeFileSync(
+    path.join(jobsDir, "task-dead.json"),
+    JSON.stringify({ id: "task-dead", status: "running", title: "Codex Task", pid: 999999, logFile }, null, 2),
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "task-dead",
+            status: "running",
+            title: "Codex Task",
+            jobClass: "task",
+            pid: 999999,
+            logFile,
+            createdAt: "2026-03-18T15:30:00.000Z",
+            startedAt: "2026-03-18T15:30:01.000Z",
+            updatedAt: "2026-03-18T15:30:02.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "status", "task-dead", "--wait", "--timeout-ms", "25", "--json"], {
+    cwd: workspace
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.job.status, "failed");
+  assert.equal(payload.waitTimedOut, false);
+  assert.match(payload.job.errorMessage, /worker exited/i);
+
+  const rendered = run("node", [SCRIPT, "status", "task-dead"], { cwd: workspace });
+  assert.equal(rendered.status, 0, rendered.stderr);
+  assert.match(rendered.stdout, /Error: Background worker exited before completing the job\./);
+});
+
+test("status marks a queued job past startup grace as failed", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const logFile = path.join(jobsDir, "task-unstarted.log");
+  fs.writeFileSync(logFile, "", "utf8");
+  fs.writeFileSync(
+    path.join(jobsDir, "task-unstarted.json"),
+    JSON.stringify({ id: "task-unstarted", status: "queued", title: "Codex Task", logFile }, null, 2),
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "task-unstarted",
+            status: "queued",
+            title: "Codex Task",
+            jobClass: "task",
+            logFile,
+            createdAt: "2026-03-18T15:30:00.000Z",
+            updatedAt: "2026-03-18T15:30:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "status", "task-unstarted", "--json"], { cwd: workspace });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.job.status, "failed");
+  assert.match(payload.job.errorMessage, /did not start within 5 seconds/i);
 });
 
 test("result returns the stored output for the latest finished job by default", () => {

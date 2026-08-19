@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { isProcessAlive } from "./process.mjs";
+import { listJobs, readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
@@ -137,6 +138,41 @@ function readStoredJobOrNull(workspaceRoot, jobId) {
     return null;
   }
   return readJobFile(jobFile);
+}
+
+function failTrackedJob(workspaceRoot, job, errorMessage) {
+  const completedAt = nowIso();
+  const failedJob = {
+    ...job,
+    status: "failed",
+    phase: "failed",
+    errorMessage,
+    pid: null,
+    completedAt
+  };
+  writeJobFile(workspaceRoot, job.id, failedJob);
+  upsertJob(workspaceRoot, failedJob);
+  return failedJob;
+}
+
+export function reconcileTrackedJobs(workspaceRoot, options = {}) {
+  const now = options.now ?? Date.now();
+
+  return listJobs(workspaceRoot).map((job) => {
+    if (job.status !== "queued" && job.status !== "running") {
+      return job;
+    }
+
+    const ageMs = now - Date.parse(job.createdAt ?? "");
+    if (job.status === "queued" && !Number.isFinite(job.pid) && Number.isFinite(ageMs) && ageMs >= 5000) {
+      return failTrackedJob(workspaceRoot, job, "Background worker did not start within 5 seconds.");
+    }
+    if (Number.isFinite(job.pid) && !isProcessAlive(job.pid, { killImpl: options.killImpl })) {
+      return failTrackedJob(workspaceRoot, job, "Background worker exited before completing the job.");
+    }
+
+    return job;
+  });
 }
 
 export async function runTrackedJob(job, runner, options = {}) {

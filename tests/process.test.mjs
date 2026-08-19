@@ -1,7 +1,30 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import { isProcessAlive, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+
+test("isProcessAlive treats successful and permission-denied probes as alive", () => {
+  assert.equal(isProcessAlive(123, { killImpl() {} }), true);
+  assert.equal(
+    isProcessAlive(123, {
+      killImpl() {
+        throw Object.assign(new Error("denied"), { code: "EPERM" });
+      }
+    }),
+    true
+  );
+});
+
+test("isProcessAlive treats a missing process as dead", () => {
+  assert.equal(
+    isProcessAlive(123, {
+      killImpl() {
+        throw Object.assign(new Error("gone"), { code: "ESRCH" });
+      }
+    }),
+    false
+  );
+});
 
 test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;
