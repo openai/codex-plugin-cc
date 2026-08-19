@@ -36,7 +36,7 @@ test("runTrackedJob does not resurrect a terminal persisted job", async () => {
   assert.deepEqual(readJobFile(resolveJobFile(workspaceRoot, job.id)), terminalJob);
 });
 
-test("runTrackedJob does not recreate a removed background job", async () => {
+test("runTrackedJob returns a failed record for missing background state", async () => {
   const workspaceRoot = makeTempDir();
   const job = {
     id: "task-removed",
@@ -53,6 +53,25 @@ test("runTrackedJob does not recreate a removed background job", async () => {
   });
 
   assert.equal(runnerInvoked, false);
-  assert.equal(result, null);
+  assert.equal(result.status, "failed");
+  assert.match(result.errorMessage, /record is missing/i);
   assert.equal(fs.existsSync(jobFile), false);
+});
+
+test("runTrackedJob returns a cancelled record after removal", async () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-removed-fence", workspaceRoot, status: "queued", request: { prompt: "do not run" } };
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, job);
+  fs.writeFileSync(resolveJobFile(workspaceRoot, job.id).replace(/\.json$/, ".removed"), "", "utf8");
+
+  let runnerInvoked = false;
+  const result = await runTrackedJob(job, async () => {
+    runnerInvoked = true;
+    return { exitStatus: 0 };
+  });
+
+  assert.equal(runnerInvoked, false);
+  assert.equal(result.status, "cancelled");
+  assert.equal(result.removed, true);
 });

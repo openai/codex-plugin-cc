@@ -249,6 +249,14 @@ function applyTerminalFence(job, fence) {
   };
 }
 
+function removedLifecycleRecord(job) {
+  return { ...job, status: "cancelled", phase: "cancelled", pid: null, removed: true };
+}
+
+function missingTrackedJobRecord(job) {
+  return { ...job, status: "failed", phase: "failed", pid: null, errorMessage: "Tracked job record is missing." };
+}
+
 function applyInitialClaim(job, claim) {
   if (!claim) {
     return job;
@@ -303,7 +311,7 @@ export function readEffectiveStoredJob(workspaceRoot, jobId) {
 
 export function terminalizeTrackedJob(workspaceRoot, job, terminal) {
   if (isJobRemoved(workspaceRoot, job.id)) {
-    return { job: null, claimed: false };
+    return { job: removedLifecycleRecord(job), claimed: false };
   }
   const completedAt = terminal.completedAt ?? nowIso();
   let initial = readInitialClaim(workspaceRoot, job.id);
@@ -405,40 +413,40 @@ export function reconcileTrackedJobs(workspaceRoot, options = {}) {
 
 export async function runTrackedJob(job, runner, options = {}) {
   if (isJobRemoved(job.workspaceRoot, job.id)) {
-    return null;
+    return removedLifecycleRecord(job);
   }
   const storedJob = readStoredJobOrNull(job.workspaceRoot, job.id);
   const initial = readInitialClaim(job.workspaceRoot, job.id);
   if (initial && initial.status !== "running") {
-    return !storedJob ? null : applyTerminalFence(storedJob, initial);
+    return applyTerminalFence(storedJob ?? job, initial);
   }
   if (initial?.status === "running") {
     const terminal = readTerminalFence(job.workspaceRoot, job.id);
     if (terminal) {
-      return !storedJob ? null : applyTerminalFence(storedJob, terminal);
+      return applyTerminalFence(storedJob ?? job, terminal);
     }
     const admission = readAdmissionClaim(job.workspaceRoot, job.id);
     if (admission?.status !== "admitted") {
-      return storedJob ? applyTerminalFence(storedJob, admission) : null;
+      return applyTerminalFence(storedJob ?? job, admission);
     }
-    return storedJob ? applyInitialClaim(storedJob, initial) : null;
+    return applyInitialClaim(storedJob ?? job, initial);
   }
   const fence = readTerminalFence(job.workspaceRoot, job.id);
   if (fence) {
-    return storedJob ? applyTerminalFence(storedJob, fence) : null;
+    return applyTerminalFence(storedJob ?? job, fence);
   }
   if (storedJob && storedJob.status !== "queued") {
     return storedJob;
   }
   if (!storedJob && job.request) {
-    return null;
+    return missingTrackedJobRecord(job);
   }
 
   const startedAt = nowIso();
   const runningClaim = { status: "running", pid: process.pid, startedAt };
   if (!claimFile(resolveInitialClaimFile(job.workspaceRoot, job.id), runningClaim)) {
     const winner = readInitialClaim(job.workspaceRoot, job.id);
-    return !storedJob ? null : applyInitialClaim(storedJob, winner);
+    return applyInitialClaim(storedJob ?? job, winner);
   }
   const runningRecord = {
     ...(storedJob ?? job),
@@ -451,7 +459,7 @@ export async function runTrackedJob(job, runner, options = {}) {
   writeJobFile(job.workspaceRoot, job.id, runningRecord);
   upsertJob(job.workspaceRoot, runningRecord);
   if (isJobRemoved(job.workspaceRoot, job.id)) {
-    return null;
+    return removedLifecycleRecord(runningRecord);
   }
   const terminalAfterStart = readTerminalFence(job.workspaceRoot, job.id);
   if (terminalAfterStart) {
