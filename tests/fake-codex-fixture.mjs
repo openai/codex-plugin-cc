@@ -653,6 +653,10 @@ export function buildEnv(binDir) {
   const sep = process.platform === "win32" ? ";" : ":";
   return {
     ...process.env,
-    PATH: `${binDir}${sep}${process.env.PATH}`
+    PATH: `${binDir}${sep}${process.env.PATH}`,
+    // Brokers exit themselves when idle; without a short window here, every
+    // broker-spawning test would leave a broker + fake-codex pair running for
+    // the default 30 minutes after the suite finishes.
+    CODEX_BROKER_IDLE_MS: process.env.CODEX_BROKER_IDLE_MS ?? "30000"
   };
 }

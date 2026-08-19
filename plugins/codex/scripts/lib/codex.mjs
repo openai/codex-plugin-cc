@@ -613,16 +613,29 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
 
 async function withAppServer(cwd, fn) {
   let client = null;
+  let connectFailed = false;
   try {
-    client = await CodexAppServerClient.connect(cwd);
+    try {
+      client = await CodexAppServerClient.connect(cwd);
+    } catch (error) {
+      connectFailed = true;
+      throw error;
+    }
     const result = await fn(client);
     await client.close();
     return result;
   } catch (error) {
-    const brokerRequested = client?.transport === "broker" || Boolean(process.env[BROKER_ENDPOINT_ENV]);
+    // connect() itself throwing means fn never ran, so a direct retry is
+    // always safe regardless of the error's shape; this covers racing a
+    // broker's idle self-shutdown at every phase (socket gone: ENOENT or
+    // ECONNREFUSED; accepted then destroyed: ECONNRESET or a closed-connection
+    // error during initialize). Post-connect failures retry only on the
+    // broker-busy rejection, which the broker raises before any work runs;
+    // retrying fn after other mid-flight failures could replay side effects
+    // (e.g. a thread created before the failing request).
     const shouldRetryDirect =
-      (client?.transport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE) ||
-      (brokerRequested && (error?.code === "ENOENT" || error?.code === "ECONNREFUSED"));
+      connectFailed ||
+      (client?.transport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE);
 
     if (client) {
       await client.close().catch(() => {});
@@ -996,7 +1009,7 @@ export async function getCodexAuthStatus(cwd, options = {}) {
   }
 }
 
-export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
+export async function interruptAppServerTurn(cwd, { threadId, turnId, skipAvailabilityCheck = false }) {
   if (!threadId || !turnId) {
     return {
       attempted: false,
@@ -1006,14 +1019,20 @@ export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
     };
   }
 
-  const availability = getCodexAvailability(cwd);
-  if (!availability.available) {
-    return {
-      attempted: false,
-      interrupted: false,
-      transport: null,
-      detail: availability.detail
-    };
+  // The availability probe spawns codex synchronously (twice) and cannot be
+  // preempted by a caller's timeout race. A caller that has already verified a
+  // live broker endpoint (the SessionEnd hook) skips it: a responding broker
+  // proves the runtime exists.
+  if (!skipAvailabilityCheck) {
+    const availability = getCodexAvailability(cwd);
+    if (!availability.available) {
+      return {
+        attempted: false,
+        interrupted: false,
+        transport: null,
+        detail: availability.detail
+      };
+    }
   }
 
   let client = null;

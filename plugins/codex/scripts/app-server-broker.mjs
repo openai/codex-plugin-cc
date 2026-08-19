@@ -2,6 +2,7 @@
 
 import fs from "node:fs";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 
@@ -71,7 +72,20 @@ async function main() {
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
   let inFlightRequests = 0;
+  let shuttingDown = false;
+  let shutdownPromise = null;
+  let serverRef = null;
   const sockets = new Set();
+
+  // Bound each forwarded request so a hung app server cannot pin
+  // inFlightRequests forever, which would permanently disarm idle
+  // self-shutdown and make the broker unkillable by anything but a signal.
+  // Requests resolve at acceptance (streams ride notifications), so the
+  // default is generous; <= 0 disables the bound.
+  const requestTimeoutRaw = (process.env.CODEX_BROKER_REQUEST_TIMEOUT_MS ?? "").trim();
+  const requestTimeoutMs = /^-?\d+$/.test(requestTimeoutRaw)
+    ? Math.min(Number(requestTimeoutRaw), 2 ** 31 - 1)
+    : 10 * 60 * 1000;
 
   // Forward a request to the app server while counting it as in-flight, so idle
   // self-shutdown can never fire while real work is running, even if the calling
@@ -79,7 +93,29 @@ async function main() {
   async function forwardAppRequest(method, params) {
     inFlightRequests += 1;
     try {
-      return await appClient.request(method, params);
+      const request = appClient.request(method, params);
+      if (requestTimeoutMs <= 0) {
+        return await request;
+      }
+      return await Promise.race([
+        request,
+        new Promise((_, reject) => {
+          const timer = setTimeout(() => {
+            // The race cannot cancel the underlying request: releasing
+            // ownership while it might still execute would let a clientless
+            // turn keep running (and route its notifications to a later
+            // client). A request unanswered for this long means the app
+            // server is wedged, so terminate the whole broker instead —
+            // shutdown closes the app-server child with it, and callers
+            // respawn a fresh broker on demand.
+            reject(new Error(`Shared broker request ${method} timed out after ${requestTimeoutMs}ms; broker shutting down.`));
+            setTimeout(() => process.exit(1), 5000).unref(); // backstop if cleanup hangs
+            shutdown(serverRef).finally(() => process.exit(1));
+          }, requestTimeoutMs);
+          timer.unref();
+          request.finally(() => clearTimeout(timer)).catch(() => {});
+        })
+      ]);
     } finally {
       inFlightRequests -= 1;
       scheduleIdleShutdown();
@@ -110,11 +146,26 @@ async function main() {
         if (activeRequestSocket === target) {
           activeRequestSocket = null;
         }
+        // Releasing stream ownership can be the last activity on this broker;
+        // without rearming here an abandoned cwd would never become idle.
+        scheduleIdleShutdown();
       }
     }
   }
 
-  async function shutdown(server) {
+  // Every shutdown path shares one promise: a second caller (e.g. SIGTERM
+  // landing during an idle shutdown) awaits the same cleanup instead of
+  // returning early and letting its process.exit() abort the first caller's
+  // cleanup mid-flight.
+  function shutdown(server) {
+    if (!shutdownPromise) {
+      shuttingDown = true;
+      shutdownPromise = performShutdown(server);
+    }
+    return shutdownPromise;
+  }
+
+  async function performShutdown(server) {
     // Retire this broker's state record first, while its socket is still the
     // live one for this cwd: no replacement broker can have been spawned yet,
     // so the guarded clear cannot race a newer record, and clients probing
@@ -132,20 +183,45 @@ async function main() {
       socket.end();
     }
     await appClient.close().catch(() => {});
-    await new Promise((resolve) => server.close(resolve));
+    if (server) {
+      await new Promise((resolve) => server.close(resolve));
+    }
     // Remove the broker's own session directory (socket, pid file, log) so a
-    // clean exit leaves nothing behind for the reaper to GC.
+    // clean exit leaves nothing behind for the reaper to GC. Recursive removal
+    // is restricted to directories this plugin provably created: mkdtemp with
+    // the cxc- prefix directly under the OS temp dir. A manual invocation
+    // pointing --pid-file anywhere else (even a directory that happens to be
+    // named cxc-something) keeps its directory; only the broker's own files
+    // are unlinked there.
     const sessionDir = pidFile
       ? path.dirname(pidFile)
       : listenTarget.kind === "unix"
         ? path.dirname(listenTarget.path)
         : null;
-    if (sessionDir) {
-      try {
+    try {
+      if (sessionDir && isManagedSessionDir(sessionDir)) {
         fs.rmSync(sessionDir, { recursive: true, force: true });
-      } catch {
-        // Ignore an already-removed directory.
+      } else {
+        if (pidFile && fs.existsSync(pidFile)) {
+          fs.unlinkSync(pidFile);
+        }
+        if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
+          fs.unlinkSync(listenTarget.path);
+        }
       }
+    } catch {
+      // Ignore already-removed files or directories.
+    }
+  }
+
+  function isManagedSessionDir(dir) {
+    try {
+      return (
+        path.basename(dir).startsWith("cxc-") &&
+        fs.realpathSync(path.dirname(dir)) === fs.realpathSync(os.tmpdir())
+      );
+    } catch {
+      return false;
     }
   }
 
@@ -156,8 +232,15 @@ async function main() {
   // the broker exits itself once it has had no connections and no in-flight work
   // for CODEX_BROKER_IDLE_MS (default 30 min; <= 0 disables). Callers respawn one
   // on demand, so exiting when idle is safe and stops brokers from accumulating.
-  const idleMs = Number.parseInt(process.env.CODEX_BROKER_IDLE_MS ?? "", 10);
-  const idleTimeoutMs = Number.isFinite(idleMs) ? idleMs : 30 * 60 * 1000;
+  // Strict integer parsing: parseInt would truncate "30m" to 30ms and accept
+  // scientific notation, silently inverting an "effectively never" intent into
+  // near-instant shutdown. Malformed values fall back to the default, and the
+  // value is clamped below Node's 2^31-1 setTimeout ceiling (beyond it the
+  // timer fires after 1ms).
+  const idleRaw = (process.env.CODEX_BROKER_IDLE_MS ?? "").trim();
+  const idleTimeoutMs = /^-?\d+$/.test(idleRaw)
+    ? Math.min(Number(idleRaw), 2 ** 31 - 1)
+    : 30 * 60 * 1000;
   let idleTimer = null;
   function cancelIdleShutdown() {
     if (idleTimer) {
@@ -182,6 +265,13 @@ async function main() {
   }
 
   const server = net.createServer((socket) => {
+    if (shuttingDown) {
+      // A connection that lands between shutdown starting and server.close()
+      // taking effect would otherwise hold the close (and the process exit)
+      // open until the client goes away on its own.
+      socket.destroy();
+      return;
+    }
     cancelIdleShutdown();
     sockets.add(socket);
     socket.setEncoding("utf8");
@@ -267,7 +357,11 @@ async function main() {
         try {
           const result = await forwardAppRequest(message.method, message.params ?? {});
           send(socket, { id: message.id, result });
-          if (isStreaming) {
+          // A socket that disconnected during the await already had its
+          // ownership cleared by the close handler; assigning it here would
+          // strand a dead socket in activeStreamSocket, busy-rejecting other
+          // clients and keeping isIdle() false with no event left to clear it.
+          if (isStreaming && !socket.destroyed) {
             activeStreamSocket = socket;
             activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
           }
@@ -301,6 +395,20 @@ async function main() {
       scheduleIdleShutdown();
     });
   });
+
+  serverRef = server;
+
+  // If the codex app-server child exits or its connection is lost, this broker
+  // can never serve another request, but its socket keeps accepting: endpoint
+  // probes pass, the reaper skips the live pid, and nothing external kills
+  // brokers anymore. Exit instead; callers respawn a fresh broker on demand.
+  Promise.resolve(appClient.exitPromise)
+    .catch(() => {})
+    .then(() => {
+      if (!shuttingDown) {
+        shutdown(server).finally(() => process.exit(1));
+      }
+    });
 
   process.on("SIGTERM", async () => {
     await shutdown(server);

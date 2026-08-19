@@ -4,6 +4,7 @@ import fs from "node:fs";
 import process from "node:process";
 
 import { terminateProcessTree } from "./lib/process.mjs";
+import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import { loadBrokerSession, reapBrokerSessions, waitForBrokerEndpoint } from "./lib/broker-lifecycle.mjs";
 import { interruptAppServerTurn } from "./lib/codex.mjs";
 import { loadState, readJobFile, resolveJobFile, resolveStateFile, saveState } from "./lib/state.mjs";
@@ -84,7 +85,10 @@ async function cleanupSessionJobs(cwd, sessionId) {
   // while other jobs' interrupts are still awaited.
   let brokerAlive = false;
   if (runningJobs.length > 0) {
-    const brokerEndpoint = loadBrokerSession(cwd)?.endpoint ?? null;
+    // Same endpoint precedence as CodexAppServerClient.connect: an env-provided
+    // endpoint wins over the recorded one, so the broker probed here is the
+    // broker the interrupt below will actually reach.
+    const brokerEndpoint = process.env[BROKER_ENDPOINT_ENV] || loadBrokerSession(cwd)?.endpoint || null;
     brokerAlive = brokerEndpoint
       ? await waitForBrokerEndpoint(brokerEndpoint, 150).catch(() => false)
       : false;
@@ -100,7 +104,10 @@ async function cleanupSessionJobs(cwd, sessionId) {
           // Race the interrupt against the remaining budget; an abandoned
           // attempt is simply left behind (main exits explicitly).
           await Promise.race([
-            interruptAppServerTurn(cwd, { threadId, turnId }),
+            // skipAvailabilityCheck: the endpoint probe above proved the
+            // runtime exists, and the availability check's synchronous spawns
+            // would block the event loop, making this budget race ineffective.
+            interruptAppServerTurn(cwd, { threadId, turnId, skipAvailabilityCheck: true }),
             new Promise((resolve) => {
               setTimeout(resolve, remainingMs).unref();
             })

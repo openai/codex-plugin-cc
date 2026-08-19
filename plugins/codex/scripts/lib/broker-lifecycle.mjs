@@ -234,10 +234,14 @@ export function isPidAlive(pid) {
 // removing its own directory (see app-server-broker.mjs). This only cleans up
 // after a broker that died WITHOUT that clean exit (e.g. it was killed): its
 // directory is left behind with a now-dead PID. A live PID is never inspected or
-// signalled, so this can neither interrupt a session sharing a broker, signal an
-// unrelated process that reused a stale PID, nor race a broker that is still
-// starting up. A directory is treated as a broker session only when it holds a
-// broker.pid file, so an unrelated cxc-*-prefixed temp directory is never touched.
+// signalled, so this can neither interrupt a session sharing a broker nor signal
+// an unrelated process that reused a stale PID. A directory is treated as a
+// broker session only when it holds a READABLE broker.pid with a valid pid: no
+// pid file, or a file that is empty/unparseable (possibly a torn write from a
+// broker still starting up), means the directory is left alone rather than
+// racing the writer. The cost is that a permanently corrupt pid file leaks its
+// (tiny) directory; the alternative was deleting a live broker's socket out
+// from under it.
 export async function reapBrokerSessions({ tmpDir = os.tmpdir() } = {}) {
   let entries;
   try {
@@ -256,7 +260,10 @@ export async function reapBrokerSessions({ tmpDir = os.tmpdir() } = {}) {
     }
 
     const pid = readBrokerPid(sessionDir);
-    if (pid !== null && isPidAlive(pid)) {
+    if (pid === null) {
+      continue; // empty/unparseable pid file: possibly mid-write, leave it alone
+    }
+    if (isPidAlive(pid)) {
       continue; // live broker: leave it entirely alone (it self-exits when idle)
     }
 
