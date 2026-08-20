@@ -2036,6 +2036,58 @@ test("stop hook logs running tasks to stderr without blocking when the review ga
   assert.match(blocked.stderr, /\/codex:cancel task-live/i);
 });
 
+test("stop hook blocks for a running current-session task without starting another review", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const runningLog = path.join(jobsDir, "task-running.log");
+  fs.writeFileSync(runningLog, "running\n", "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: true },
+        jobs: [
+          {
+            id: "task-live",
+            status: "running",
+            title: "Codex Task",
+            jobClass: "task",
+            sessionId: "sess-current",
+            logFile: runningLog,
+            createdAt: "2026-03-18T15:32:00.000Z",
+            updatedAt: "2026-03-18T15:33:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const blocked = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: JSON.stringify({ cwd: repo, session_id: "sess-current" })
+  });
+
+  assert.equal(blocked.status, 0, blocked.stderr);
+  const payload = JSON.parse(blocked.stdout);
+  assert.equal(payload.decision, "block");
+  assert.match(payload.reason, /Codex task task-live is still running/i);
+
+  assert.equal(fs.existsSync(fakeStatePath), false);
+});
+
 test("stop hook allows the stop when the review gate is enabled and the stop-time review task is clean", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

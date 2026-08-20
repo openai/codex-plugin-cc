@@ -156,6 +156,11 @@ function main() {
     return;
   }
 
+  if (runningTaskNote) {
+    emitDecision({ decision: "block", reason: runningTaskNote });
+    return;
+  }
+
   const setupNote = buildSetupNote(cwd);
   if (setupNote) {
     logNote(setupNote);
