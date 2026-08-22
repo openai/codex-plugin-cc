@@ -1,15 +1,77 @@
+import fs from "node:fs";
+import path from "node:path";
 import { spawnSync } from "node:child_process";
 import process from "node:process";
 
+const DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD";
+
+/**
+ * Resolves `command` to a concrete file path on Windows, so it can be
+ * spawned with `shell: false` instead of a shell string. `spawn`/`spawnSync`
+ * never consult `PATHEXT` themselves, so a bare command that only exists as
+ * an extensionless/`.cmd` shim (e.g. an npm-installed CLI) fails with ENOENT
+ * unless something else resolves it first (#287) -- but handing
+ * `process.env.SHELL` to `shell:` as a quick fix means Node hands the whole
+ * command line to whatever that variable points at, unescaped for that
+ * shell's own quoting rules. When it happens to be PowerShell, a `>` from
+ * quoted source text is read as a redirect and creates junk files in the
+ * repo (#643). Resolving to the literal file sidesteps a caller-supplied
+ * shell entirely: Node still wraps a resolved `.cmd`/`.bat` target through
+ * cmd.exe internally when needed (hardened by the CVE-2024-27980 fix), but
+ * never asks an arbitrary shell to reinterpret a raw command string.
+ */
+export function resolveExecutablePath(command, options = {}) {
+  const platform = options.platform ?? process.platform;
+  if (platform !== "win32") {
+    return command;
+  }
+
+  const win = path.win32;
+  if (win.isAbsolute(command) || command.includes("/") || command.includes("\\")) {
+    return command;
+  }
+
+  const existsSync = options.existsSync ?? fs.existsSync;
+  const pathEnv = options.pathEnv ?? process.env.PATH ?? process.env.Path ?? "";
+  const pathExtEnv = options.pathExtEnv ?? process.env.PATHEXT ?? DEFAULT_PATHEXT;
+
+  const dirs = pathEnv.split(win.delimiter).filter(Boolean);
+  const extensions = pathExtEnv
+    .split(";")
+    .map((ext) => ext.trim())
+    .filter(Boolean);
+
+  const hasKnownExtension = extensions.some((ext) => command.toLowerCase().endsWith(ext.toLowerCase()));
+  const candidateExtensions = hasKnownExtension ? [""] : extensions;
+
+  for (const dir of dirs) {
+    for (const ext of candidateExtensions) {
+      const candidate = win.join(dir, `${command}${ext}`);
+      if (existsSync(candidate)) {
+        return candidate;
+      }
+    }
+  }
+
+  return command;
+}
+
 export function runCommand(command, args = [], options = {}) {
-  const result = spawnSync(command, args, {
+  const resolvedCommand = resolveExecutablePath(command, {
+    platform: options.platform,
+    existsSync: options.existsSync,
+    pathEnv: options.pathEnv,
+    pathExtEnv: options.pathExtEnv
+  });
+
+  const result = spawnSync(resolvedCommand, args, {
     cwd: options.cwd,
     env: options.env,
     encoding: "utf8",
     input: options.input,
     maxBuffer: options.maxBuffer,
     stdio: options.stdio ?? "pipe",
-    shell: options.shell ?? (process.platform === "win32" ? (process.env.SHELL || true) : false),
+    shell: options.shell ?? false,
     windowsHide: true
   });
 
