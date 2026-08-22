@@ -6,6 +6,29 @@ import process from "node:process";
 const DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD";
 
 /**
+ * Looks up an environment variable by name, case-insensitively. Windows
+ * environment variable names are case-insensitive, but a plain JS object
+ * (a caller-supplied `options.env`, as opposed to the running process's own
+ * `process.env`, which Node already exposes case-insensitively on win32) is
+ * not -- `spawn` builds the child's real (case-insensitive) environment
+ * block from it regardless of the casing used, so anything reading that
+ * same object needs to match by key name, not by one or two guessed
+ * casings.
+ */
+function getEnvValue(env, name) {
+  if (!env) {
+    return undefined;
+  }
+  const lowerName = name.toLowerCase();
+  for (const key of Object.keys(env)) {
+    if (key.toLowerCase() === lowerName) {
+      return env[key];
+    }
+  }
+  return undefined;
+}
+
+/**
  * Resolves `command` to a concrete file path on Windows, so its extension
  * can be inspected to decide how it needs to be spawned (see
  * buildSpawnCommand()). `spawn`/`spawnSync` never consult `PATHEXT`
@@ -20,7 +43,15 @@ const DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD";
  * directory the spawned process will actually run from, matching Node's
  * own `spawn`/`spawnSync` `cwd` option) is searched first here too, and
  * any relative PATH entry is resolved against it, to match what running
- * the same bare command from that directory would actually find.
+ * the same bare command from that directory would actually find. Unless
+ * `NoDefaultCurrentDirectoryInExePath` is present in the environment (its
+ * mere presence disables the lookup, not its value -- this is what
+ * cmd.exe/CreateProcess themselves check), in which case `cwd` is skipped
+ * entirely: this variable exists specifically so a user or enterprise
+ * policy can opt out of current-directory executable lookup to prevent a
+ * malicious file dropped into a working directory (e.g. an untrusted repo
+ * checkout) from being executed just by resolving a bare command name
+ * there.
  */
 export function resolveExecutablePath(command, options = {}) {
   const platform = options.platform ?? process.platform;
@@ -37,12 +68,13 @@ export function resolveExecutablePath(command, options = {}) {
   const cwd = options.cwd ?? process.cwd();
   const pathEnv = options.pathEnv ?? process.env.PATH ?? process.env.Path ?? "";
   const pathExtEnv = options.pathExtEnv ?? process.env.PATHEXT ?? DEFAULT_PATHEXT;
+  const skipCwdLookup = getEnvValue(options.env, "NoDefaultCurrentDirectoryInExePath") !== undefined;
 
   const pathDirs = pathEnv
     .split(win.delimiter)
     .filter(Boolean)
     .map((dir) => (win.isAbsolute(dir) ? dir : win.resolve(cwd, dir)));
-  const dirs = [cwd, ...pathDirs];
+  const dirs = skipCwdLookup ? pathDirs : [cwd, ...pathDirs];
 
   const extensions = pathExtEnv
     .split(";")
@@ -149,13 +181,14 @@ export function resolveSpawnInvocation(command, args, options = {}) {
     platform,
     existsSync: options.existsSync,
     cwd: options.cwd,
-    pathEnv: options.pathEnv ?? options.env?.PATH ?? options.env?.Path,
-    pathExtEnv: options.pathExtEnv ?? options.env?.PATHEXT ?? options.env?.Pathext
+    env: options.env,
+    pathEnv: options.pathEnv ?? getEnvValue(options.env, "PATH"),
+    pathExtEnv: options.pathExtEnv ?? getEnvValue(options.env, "PATHEXT")
   });
 
   return buildSpawnCommand(resolvedCommand, args, {
     platform,
-    comspec: options.comspec ?? options.env?.comspec ?? options.env?.ComSpec
+    comspec: options.comspec ?? getEnvValue(options.env, "comspec")
   });
 }
 

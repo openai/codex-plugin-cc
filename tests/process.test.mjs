@@ -220,6 +220,68 @@ test("resolveSpawnInvocation threads options.cwd through to prefer a cwd-local e
   assert.equal(invocation.args[3], '"C:\\project\\codex.CMD ^"app-server^""');
 });
 
+// Regression tests for the two newest findings on PR #669: cmd.exe/CreateProcess
+// respect NoDefaultCurrentDirectoryInExePath (an enterprise/user opt-out of
+// current-directory executable lookup, meant to stop a malicious file dropped
+// into a working directory -- e.g. an untrusted repo checkout -- from being
+// executed just by resolving a bare command name there) by its mere presence
+// in the environment, not its value; and Windows environment variable names
+// are case-insensitive, so a caller-supplied options.env object needs to be
+// read that way too, since spawn() itself doesn't care what casing was used.
+test("resolveExecutablePath skips the cwd search when NoDefaultCurrentDirectoryInExePath is present", () => {
+  const resolved = resolveExecutablePath("codex", {
+    platform: "win32",
+    cwd: "C:\\project",
+    pathEnv: "C:\\tools",
+    pathExtEnv: ".CMD",
+    env: { NoDefaultCurrentDirectoryInExePath: "" },
+    existsSync: fakeExistsSync(["C:\\project\\codex.cmd", "C:\\tools\\codex.cmd"])
+  });
+
+  assert.equal(resolved, "C:\\tools\\codex.CMD");
+});
+
+test("resolveExecutablePath still resolves relative PATH entries against cwd when the opt-out is set", () => {
+  const resolved = resolveExecutablePath("codex", {
+    platform: "win32",
+    cwd: "C:\\project",
+    pathEnv: "vendor\\bin",
+    pathExtEnv: ".CMD",
+    env: { NoDefaultCurrentDirectoryInExePath: "1" },
+    existsSync: fakeExistsSync(["C:\\project\\vendor\\bin\\codex.cmd"])
+  });
+
+  assert.equal(resolved, "C:\\project\\vendor\\bin\\codex.CMD");
+});
+
+test("resolveExecutablePath searches cwd normally when the opt-out is not set", () => {
+  const resolved = resolveExecutablePath("codex", {
+    platform: "win32",
+    cwd: "C:\\project",
+    pathEnv: "C:\\tools",
+    pathExtEnv: ".CMD",
+    env: {},
+    existsSync: fakeExistsSync(["C:\\project\\codex.cmd", "C:\\tools\\codex.cmd"])
+  });
+
+  assert.equal(resolved, "C:\\project\\codex.CMD");
+});
+
+test("resolveSpawnInvocation reads PATH/PATHEXT/comspec from options.env case-insensitively", () => {
+  const invocation = resolveSpawnInvocation("codex", ["app-server"], {
+    platform: "win32",
+    env: {
+      path: "C:\\childpath",
+      pathext: ".CMD",
+      COMSPEC: "C:\\child\\cmd.exe"
+    },
+    existsSync: fakeExistsSync(["C:\\childpath\\codex.CMD"])
+  });
+
+  assert.equal(invocation.command, "C:\\child\\cmd.exe");
+  assert.equal(invocation.windowsVerbatimArguments, true);
+});
+
 test("runCommand still runs a real command end to end", () => {
   const result = runCommand(process.execPath, ["--version"]);
 
