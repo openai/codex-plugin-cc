@@ -26,6 +26,11 @@ function defaultState() {
   };
 }
 
+function resolveStateRootDir() {
+  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
+  return pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
+}
+
 export function resolveStateDir(cwd) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   let canonicalWorkspaceRoot = workspaceRoot;
@@ -38,9 +43,36 @@ export function resolveStateDir(cwd) {
   const slugSource = path.basename(workspaceRoot) || "workspace";
   const slug = slugSource.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex").slice(0, 16);
-  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
-  const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
-  return path.join(stateRoot, `${slug}-${hash}`);
+  return path.join(resolveStateRootDir(), `${slug}-${hash}`);
+}
+
+export function findJobsAcrossWorkspaces(reference) {
+  const stateRoot = resolveStateRootDir();
+  if (!reference || !fs.existsSync(stateRoot)) {
+    return [];
+  }
+
+  const matches = [];
+  for (const entry of fs.readdirSync(stateRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+    const stateFile = path.join(stateRoot, entry.name, STATE_FILE_NAME);
+    if (!fs.existsSync(stateFile)) {
+      continue;
+    }
+    try {
+      const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+      for (const job of Array.isArray(state.jobs) ? state.jobs : []) {
+        if (job.id === reference || job.id?.startsWith(reference)) {
+          matches.push(job);
+        }
+      }
+    } catch {
+      // One corrupt workspace index must not hide healthy jobs elsewhere.
+    }
+  }
+  return matches;
 }
 
 export function resolveStateFile(cwd) {

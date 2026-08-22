@@ -969,6 +969,40 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
 });
 
+test("status and result recover an explicit job id from another workspace scope", async () => {
+  const repo = makeTempDir();
+  const wrongScope = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const env = buildEnv(binDir);
+
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "inspect scope recovery"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+
+  const status = run(
+    "node",
+    [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "15000", "--json"],
+    { cwd: wrongScope, env }
+  );
+  assert.equal(status.status, 0, status.stderr);
+  assert.equal(JSON.parse(status.stdout).job.status, "completed");
+
+  const result = run("node", [SCRIPT, "result", jobId, "--json"], {
+    cwd: wrongScope,
+    env
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).job.id, jobId);
+});
+
 test("review rejects focus text because it is native-review only", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -2256,4 +2290,20 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
   const payload = JSON.parse(setup.stdout);
   assert.equal(payload.sessionRuntime.mode, "shared");
   assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
+});
+
+test("CLAUDE_PROJECT_DIR scopes companion commands when --cwd is omitted", () => {
+  const targetWorkspace = makeTempDir();
+  const invocationWorkspace = makeTempDir();
+  saveBrokerSession(targetWorkspace, { endpoint: "unix:/tmp/project-broker.sock" });
+
+  const result = run("node", [SCRIPT, "status", "--json"], {
+    cwd: invocationWorkspace,
+    env: { ...process.env, CLAUDE_PROJECT_DIR: targetWorkspace }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.workspaceRoot, targetWorkspace);
+  assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/project-broker.sock");
 });
