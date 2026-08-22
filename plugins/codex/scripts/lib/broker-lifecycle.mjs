@@ -180,11 +180,19 @@ export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessi
   }
 
   if (pidFile && fs.existsSync(pidFile)) {
-    fs.unlinkSync(pidFile);
+    try {
+      fs.unlinkSync(pidFile);
+    } catch {
+      // Ignore locked or already-removed pid files during teardown.
+    }
   }
 
   if (logFile && fs.existsSync(logFile)) {
-    fs.unlinkSync(logFile);
+    try {
+      fs.unlinkSync(logFile);
+    } catch {
+      // Ignore locked or already-removed log files during teardown.
+    }
   }
 
   if (endpoint) {
