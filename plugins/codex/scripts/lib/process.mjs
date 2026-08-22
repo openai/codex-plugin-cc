@@ -12,6 +12,15 @@ const DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD";
  * themselves, so a bare command that only exists as an extensionless/`.cmd`
  * shim (e.g. an npm-installed CLI) fails with ENOENT unless something else
  * resolves it first (#287).
+ *
+ * Windows' own CreateProcess searches the current directory before PATH
+ * when given a bare command name (documented search sequence: the loading
+ * app's directory, then "the current directory for the parent process",
+ * then the system/Windows directories, then PATH) -- so `cwd` (the
+ * directory the spawned process will actually run from, matching Node's
+ * own `spawn`/`spawnSync` `cwd` option) is searched first here too, and
+ * any relative PATH entry is resolved against it, to match what running
+ * the same bare command from that directory would actually find.
  */
 export function resolveExecutablePath(command, options = {}) {
   const platform = options.platform ?? process.platform;
@@ -25,10 +34,16 @@ export function resolveExecutablePath(command, options = {}) {
   }
 
   const existsSync = options.existsSync ?? fs.existsSync;
+  const cwd = options.cwd ?? process.cwd();
   const pathEnv = options.pathEnv ?? process.env.PATH ?? process.env.Path ?? "";
   const pathExtEnv = options.pathExtEnv ?? process.env.PATHEXT ?? DEFAULT_PATHEXT;
 
-  const dirs = pathEnv.split(win.delimiter).filter(Boolean);
+  const pathDirs = pathEnv
+    .split(win.delimiter)
+    .filter(Boolean)
+    .map((dir) => (win.isAbsolute(dir) ? dir : win.resolve(cwd, dir)));
+  const dirs = [cwd, ...pathDirs];
+
   const extensions = pathExtEnv
     .split(";")
     .map((ext) => ext.trim())
@@ -124,13 +139,16 @@ export function buildSpawnCommand(resolvedCommand, args, options = {}) {
  * (the environment the child will actually run in) is consulted for
  * PATH/PATHEXT/COMSPEC when given, since resolving against the running
  * process's own environment could pick a different executable than the one
- * the child would actually see.
+ * the child would actually see. `options.cwd` (the directory the child will
+ * actually run from) is searched before PATH, matching what running the
+ * same bare command from that directory would find.
  */
 export function resolveSpawnInvocation(command, args, options = {}) {
   const platform = options.platform ?? process.platform;
   const resolvedCommand = resolveExecutablePath(command, {
     platform,
     existsSync: options.existsSync,
+    cwd: options.cwd,
     pathEnv: options.pathEnv ?? options.env?.PATH ?? options.env?.Path,
     pathExtEnv: options.pathExtEnv ?? options.env?.PATHEXT ?? options.env?.Pathext
   });

@@ -165,6 +165,61 @@ test("resolveExecutablePath falls back to the bare command when nothing on PATH 
   assert.equal(resolved, "missing-tool");
 });
 
+// Regression tests for the P2 finding on PR #669: CreateProcess's own
+// documented search sequence for a bare command name is the loading app's
+// directory, then "the current directory for the parent process", then the
+// system/Windows directories, then PATH -- so a cwd-local copy should win
+// over one on PATH, matching what running the same bare command from that
+// directory would find, instead of only ever considering PATH.
+test("resolveExecutablePath searches cwd before PATH directories", () => {
+  const resolved = resolveExecutablePath("codex", {
+    platform: "win32",
+    cwd: "C:\\project",
+    pathEnv: "C:\\tools",
+    pathExtEnv: ".CMD",
+    existsSync: fakeExistsSync(["C:\\project\\codex.cmd", "C:\\tools\\codex.cmd"])
+  });
+
+  assert.equal(resolved, "C:\\project\\codex.CMD");
+});
+
+test("resolveExecutablePath falls through to PATH when cwd has no match", () => {
+  const resolved = resolveExecutablePath("codex", {
+    platform: "win32",
+    cwd: "C:\\project",
+    pathEnv: "C:\\tools",
+    pathExtEnv: ".CMD",
+    existsSync: fakeExistsSync(["C:\\tools\\codex.cmd"])
+  });
+
+  assert.equal(resolved, "C:\\tools\\codex.CMD");
+});
+
+test("resolveExecutablePath resolves a relative PATH entry against cwd", () => {
+  const resolved = resolveExecutablePath("codex", {
+    platform: "win32",
+    cwd: "C:\\project",
+    pathEnv: "vendor\\bin",
+    pathExtEnv: ".CMD",
+    existsSync: fakeExistsSync(["C:\\project\\vendor\\bin\\codex.cmd"])
+  });
+
+  assert.equal(resolved, "C:\\project\\vendor\\bin\\codex.CMD");
+});
+
+test("resolveSpawnInvocation threads options.cwd through to prefer a cwd-local executable", () => {
+  const invocation = resolveSpawnInvocation("codex", ["app-server"], {
+    platform: "win32",
+    cwd: "C:\\project",
+    pathEnv: "C:\\tools",
+    pathExtEnv: ".CMD",
+    comspec: "cmd.exe",
+    existsSync: fakeExistsSync(["C:\\project\\codex.cmd", "C:\\tools\\codex.cmd"])
+  });
+
+  assert.equal(invocation.args[3], '"C:\\project\\codex.CMD ^"app-server^""');
+});
+
 test("runCommand still runs a real command end to end", () => {
   const result = runCommand(process.execPath, ["--version"]);
 

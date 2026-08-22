@@ -188,7 +188,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
 
   async initialize() {
     const env = this.options.env ?? process.env;
-    const invocation = resolveSpawnInvocation("codex", ["app-server"], { env });
+    const invocation = resolveSpawnInvocation("codex", ["app-server"], { env, cwd: this.cwd });
     this.proc = spawn(invocation.command, invocation.args, {
       cwd: this.cwd,
       env,
