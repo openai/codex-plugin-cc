@@ -30,6 +30,7 @@ import {
   generateJobId,
   getConfig,
   listJobs,
+  resolveJobStartGateFile,
   setConfig,
   upsertJob,
   writeJobFile
@@ -669,9 +670,12 @@ async function runForegroundCommand(job, runner, options = {}) {
   return execution;
 }
 
-function spawnDetachedTaskWorker(cwd, jobId) {
+function spawnDetachedTaskWorker(cwd, jobId, startGate) {
   const scriptPath = path.join(ROOT_DIR, "scripts", "codex-companion.mjs");
-  const child = spawn(process.execPath, [scriptPath, "task-worker", "--cwd", cwd, "--job-id", jobId], {
+  const child = spawn(process.execPath, [
+    scriptPath, "task-worker", "--cwd", cwd, "--job-id", jobId,
+    "--start-gate", startGate
+  ], {
     cwd,
     env: process.env,
     detached: true,
@@ -697,8 +701,13 @@ function enqueueBackgroundTask(cwd, job, request) {
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
 
+  const startGate = resolveJobStartGateFile(job.workspaceRoot, job.id);
   try {
-    spawnDetachedTaskWorker(cwd, job.id);
+    const child = spawnDetachedTaskWorker(cwd, job.id, startGate);
+    const launchRecord = { ...queuedRecord, pid: child.pid ?? null };
+    writeJobFile(job.workspaceRoot, job.id, launchRecord);
+    upsertJob(job.workspaceRoot, launchRecord);
+    fs.writeFileSync(startGate, "ready\n", "utf8");
   } catch (error) {
     const failedRecord = {
       ...queuedRecord,
@@ -851,7 +860,7 @@ async function handleTransfer(argv) {
 
 async function handleTaskWorker(argv) {
   const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "job-id"]
+    valueOptions: ["cwd", "job-id", "start-gate"]
   });
 
   if (!options["job-id"]) {
@@ -860,9 +869,22 @@ async function handleTaskWorker(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
+  if (options["start-gate"]) {
+    const deadline = Date.now() + 30000;
+    while (!fs.existsSync(options["start-gate"])) {
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for task ${options["job-id"]} to be registered.`);
+      }
+      await sleep(10);
+    }
+    fs.unlinkSync(options["start-gate"]);
+  }
   const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
   if (!storedJob) {
     throw new Error(`No stored job found for ${options["job-id"]}.`);
+  }
+  if (storedJob.status === "cancelled") {
+    return;
   }
 
   const request = storedJob.request;

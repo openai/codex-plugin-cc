@@ -1003,6 +1003,36 @@ test("status and result recover an explicit job id from another workspace scope"
   assert.equal(JSON.parse(result.stdout).job.id, jobId);
 });
 
+test("an immediately cancelled background task cannot restart after enqueue", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const env = buildEnv(binDir);
+
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "do not survive cancellation"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+
+  const queued = run("node", [SCRIPT, "status", jobId, "--json"], { cwd: repo, env });
+  assert.equal(queued.status, 0, queued.stderr);
+  assert.equal(Number.isInteger(JSON.parse(queued.stdout).job.pid), true);
+
+  const cancelled = run("node", [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
+  assert.equal(cancelled.status, 0, cancelled.stderr);
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+
+  const finalStatus = run("node", [SCRIPT, "status", jobId, "--json"], { cwd: repo, env });
+  assert.equal(finalStatus.status, 0, finalStatus.stderr);
+  assert.equal(JSON.parse(finalStatus.stdout).job.status, "cancelled");
+});
+
 test("review rejects focus text because it is native-review only", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
