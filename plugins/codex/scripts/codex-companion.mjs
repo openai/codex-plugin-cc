@@ -698,8 +698,9 @@ function enqueueBackgroundTask(cwd, job, request) {
     logFile,
     request
   };
+  // The job file bootstraps the gated worker, but the shared index must not
+  // expose a cancellable job until its detached process has a usable PID.
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
-  upsertJob(job.workspaceRoot, queuedRecord);
 
   const startGate = resolveJobStartGateFile(job.workspaceRoot, job.id);
   try {
