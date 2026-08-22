@@ -36,7 +36,28 @@ function appendEnvVar(name, value) {
   if (!process.env.CLAUDE_ENV_FILE || value == null || value === "") {
     return;
   }
-  fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `export ${name}=${shellEscape(value)}\n`, "utf8");
+
+  const line = `export ${name}=${shellEscape(value)}`;
+
+  let lines = [];
+
+  try {
+    lines = fs
+      .readFileSync(process.env.CLAUDE_ENV_FILE, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .filter((l) => !l.startsWith(`export ${name}=`));
+  } catch {
+    // File doesn't exist yet.
+  }
+
+  lines.push(line);
+
+  fs.writeFileSync(
+    process.env.CLAUDE_ENV_FILE,
+    lines.join("\n") + "\n",
+    "utf8"
+  );
 }
 
 function cleanupSessionJobs(cwd, sessionId) {
