@@ -8,7 +8,11 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import {
+  resolveStateDir,
+  upsertJob,
+  writeJobFile
+} from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -1029,6 +1033,52 @@ test("an immediately cancelled background task cannot restart after enqueue", as
   await new Promise((resolve) => setTimeout(resolve, 1000));
 
   const finalStatus = run("node", [SCRIPT, "status", jobId, "--json"], { cwd: repo, env });
+  assert.equal(finalStatus.status, 0, finalStatus.stderr);
+  assert.equal(JSON.parse(finalStatus.stdout).job.status, "cancelled");
+});
+
+test("cancel recovers an explicit active job from another workspace scope", () => {
+  const repo = makeTempDir();
+  const wrongScope = makeTempDir();
+  const binDir = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const env = { ...buildEnv(binDir), CLAUDE_PLUGIN_DATA: pluginDataDir };
+  const jobId = "task-cross-scope-cancel";
+  const queuedJob = {
+    id: jobId,
+    kind: "task",
+    title: "Cross-scope cancellation fixture",
+    workspaceRoot: repo,
+    jobClass: "task",
+    status: "queued",
+    phase: "queued",
+    pid: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+
+  const previousPluginData = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    writeJobFile(repo, jobId, queuedJob);
+    upsertJob(repo, queuedJob);
+  } finally {
+    if (previousPluginData == null) delete process.env.CLAUDE_PLUGIN_DATA;
+    else process.env.CLAUDE_PLUGIN_DATA = previousPluginData;
+  }
+
+  const cancelled = run("node", [SCRIPT, "cancel", jobId, "--json"], {
+    cwd: wrongScope,
+    env
+  });
+  assert.equal(cancelled.status, 0, cancelled.stderr);
+  assert.equal(JSON.parse(cancelled.stdout).status, "cancelled");
+  const finalStatus = run("node", [SCRIPT, "status", jobId, "--json"], {
+    cwd: wrongScope,
+    env
+  });
   assert.equal(finalStatus.status, 0, finalStatus.stderr);
   assert.equal(JSON.parse(finalStatus.stdout).job.status, "cancelled");
 });

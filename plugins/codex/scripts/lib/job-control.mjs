@@ -320,11 +320,19 @@ export function resolveCancelableJob(cwd, reference, options = {}) {
   const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
 
   if (reference) {
-    const selected = matchJobReference(activeJobs, reference);
-    if (!selected) {
-      throw new Error(`No active job found for "${reference}".`);
+    try {
+      const selected = matchJobReference(activeJobs, reference);
+      return { workspaceRoot, job: selected };
+    } catch (error) {
+      const crossWorkspace = findCrossWorkspaceJob(
+        reference,
+        (job) => job.status === "queued" || job.status === "running"
+      );
+      if (crossWorkspace) {
+        return crossWorkspace;
+      }
+      throw error;
     }
-    return { workspaceRoot, job: selected };
   }
 
   const sessionScopedActiveJobs = filterJobsForCurrentSession(activeJobs, options);
