@@ -14,7 +14,7 @@ import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
-import { resolveExecutablePath, terminateProcessTree } from "./process.mjs";
+import { resolveSpawnInvocation, terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
@@ -187,11 +187,14 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   }
 
   async initialize() {
-    this.proc = spawn(resolveExecutablePath("codex"), ["app-server"], {
+    const env = this.options.env ?? process.env;
+    const invocation = resolveSpawnInvocation("codex", ["app-server"], { env });
+    this.proc = spawn(invocation.command, invocation.args, {
       cwd: this.cwd,
-      env: this.options.env ?? process.env,
+      env,
       stdio: ["pipe", "pipe", "pipe"],
       shell: false,
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
       windowsHide: true
     });
 
@@ -245,11 +248,11 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       this.proc.stdin.end();
       setTimeout(() => {
         if (this.proc && !this.proc.killed && this.proc.exitCode === null) {
-          // On Windows, a resolved .cmd/.bat target still runs through
-          // cmd.exe as an intermediary (Node wraps those internally even
-          // with shell: false), so the direct child is cmd.exe, not codex
-          // itself. Use terminateProcessTree to kill the entire tree
-          // including the grandchild node process.
+          // On Windows, a .cmd-shimmed target is launched by explicitly
+          // spawning cmd.exe (see resolveSpawnInvocation()), so the direct
+          // child here is cmd.exe, not codex itself. Use
+          // terminateProcessTree to kill the entire tree including the
+          // grandchild node process.
           if (process.platform === "win32") {
             try {
               terminateProcessTree(this.proc.pid);

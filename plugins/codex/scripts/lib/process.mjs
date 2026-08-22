@@ -6,19 +6,12 @@ import process from "node:process";
 const DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD";
 
 /**
- * Resolves `command` to a concrete file path on Windows, so it can be
- * spawned with `shell: false` instead of a shell string. `spawn`/`spawnSync`
- * never consult `PATHEXT` themselves, so a bare command that only exists as
- * an extensionless/`.cmd` shim (e.g. an npm-installed CLI) fails with ENOENT
- * unless something else resolves it first (#287) -- but handing
- * `process.env.SHELL` to `shell:` as a quick fix means Node hands the whole
- * command line to whatever that variable points at, unescaped for that
- * shell's own quoting rules. When it happens to be PowerShell, a `>` from
- * quoted source text is read as a redirect and creates junk files in the
- * repo (#643). Resolving to the literal file sidesteps a caller-supplied
- * shell entirely: Node still wraps a resolved `.cmd`/`.bat` target through
- * cmd.exe internally when needed (hardened by the CVE-2024-27980 fix), but
- * never asks an arbitrary shell to reinterpret a raw command string.
+ * Resolves `command` to a concrete file path on Windows, so its extension
+ * can be inspected to decide how it needs to be spawned (see
+ * buildSpawnCommand()). `spawn`/`spawnSync` never consult `PATHEXT`
+ * themselves, so a bare command that only exists as an extensionless/`.cmd`
+ * shim (e.g. an npm-installed CLI) fails with ENOENT unless something else
+ * resolves it first (#287).
  */
 export function resolveExecutablePath(command, options = {}) {
   const platform = options.platform ?? process.platform;
@@ -56,15 +49,113 @@ export function resolveExecutablePath(command, options = {}) {
   return command;
 }
 
-export function runCommand(command, args = [], options = {}) {
+const EXECUTABLE_EXTENSION_REGEXP = /\.(?:com|exe)$/i;
+// Matches cross-spawn's own detection of an npm-generated cmd shim, which
+// wraps the real command through its own %~dp0-based cmd.exe redirection --
+// meta chars we escape once get interpreted once by that inner layer before
+// cmd.exe ever sees them, so they need a second escape pass to survive.
+const NPM_CMD_SHIM_REGEXP = /node_modules[\\/].bin[\\/][^\\/]+\.cmd$/i;
+// See http://www.robvanderwoude.com/escapechars.php
+const CMD_METACHAR_REGEXP = /([()\][%!^"`<>&|;, *?])/g;
+
+// escapeCmdCommand/escapeCmdArgument are ported from cross-spawn
+// (https://github.com/moxystudio/node-cross-spawn, MIT License, Copyright
+// (c) 2018 Made With MOXY Lda) -- the standard reference implementation for
+// safely invoking cmd.exe on Windows. escapeCmdArgument's backslash/quote
+// handling is based on https://qntm.org/cmd, cross-spawn's own cited source.
+function escapeCmdCommand(value) {
+  return value.replace(CMD_METACHAR_REGEXP, "^$1");
+}
+
+function escapeCmdArgument(value, doubleEscapeMetaChars) {
+  let arg = String(value);
+
+  // Sequence of backslashes followed by a double quote: double up all the
+  // backslashes and escape the double quote.
+  arg = arg.replace(/(?=(\\+?)?)\1"/g, '$1$1\\"');
+  // Sequence of backslashes followed by the end of the string (which will
+  // become a double quote next): double up all the backslashes.
+  arg = arg.replace(/(?=(\\+?)?)\1$/, "$1$1");
+  // All other backslashes occur literally.
+
+  arg = `"${arg}"`;
+  arg = arg.replace(CMD_METACHAR_REGEXP, "^$1");
+  if (doubleEscapeMetaChars) {
+    arg = arg.replace(CMD_METACHAR_REGEXP, "^$1");
+  }
+
+  return arg;
+}
+
+/**
+ * Given a command already resolved by resolveExecutablePath(), decides how
+ * it actually needs to be spawned on Windows and returns the
+ * { command, args, windowsVerbatimArguments } to pass to spawn/spawnSync.
+ *
+ * Node's own docs are explicit that `.bat`/`.cmd` files "are not executable
+ * on their own without a terminal" -- spawn()/spawnSync() with
+ * shell: false cannot launch them no matter what path is given, resolved
+ * or not. Anything that isn't `.exe`/`.com` must instead be launched by
+ * explicitly spawning cmd.exe (never a caller- or environment-supplied
+ * shell, which is what caused #643) with the command line escaped and
+ * quoted the way cmd.exe itself requires.
+ */
+export function buildSpawnCommand(resolvedCommand, args, options = {}) {
+  const platform = options.platform ?? process.platform;
+  if (platform !== "win32" || EXECUTABLE_EXTENSION_REGEXP.test(resolvedCommand)) {
+    return { command: resolvedCommand, args, windowsVerbatimArguments: undefined };
+  }
+
+  const needsDoubleEscapeMetaChars = NPM_CMD_SHIM_REGEXP.test(resolvedCommand);
+  const escapedCommand = escapeCmdCommand(path.win32.normalize(resolvedCommand));
+  const escapedArgs = args.map((arg) => escapeCmdArgument(arg, needsDoubleEscapeMetaChars));
+  const shellCommand = [escapedCommand, ...escapedArgs].join(" ");
+  const comspec = options.comspec || "cmd.exe";
+
+  return {
+    command: comspec,
+    args: ["/d", "/s", "/c", `"${shellCommand}"`],
+    windowsVerbatimArguments: true
+  };
+}
+
+/**
+ * Resolves `command` and decides how to spawn it, in one step. `options.env`
+ * (the environment the child will actually run in) is consulted for
+ * PATH/PATHEXT/COMSPEC when given, since resolving against the running
+ * process's own environment could pick a different executable than the one
+ * the child would actually see.
+ */
+export function resolveSpawnInvocation(command, args, options = {}) {
+  const platform = options.platform ?? process.platform;
   const resolvedCommand = resolveExecutablePath(command, {
-    platform: options.platform,
+    platform,
     existsSync: options.existsSync,
-    pathEnv: options.pathEnv,
-    pathExtEnv: options.pathExtEnv
+    pathEnv: options.pathEnv ?? options.env?.PATH ?? options.env?.Path,
+    pathExtEnv: options.pathExtEnv ?? options.env?.PATHEXT ?? options.env?.Pathext
   });
 
-  const result = spawnSync(resolvedCommand, args, {
+  return buildSpawnCommand(resolvedCommand, args, {
+    platform,
+    comspec: options.comspec ?? options.env?.comspec ?? options.env?.ComSpec
+  });
+}
+
+export function runCommand(command, args = [], options = {}) {
+  let spawnCommand = command;
+  let spawnArgs = args;
+  let windowsVerbatimArguments;
+
+  // An explicit `options.shell` asks for direct control over shell
+  // behavior; anything else goes through the safe, resolved invocation.
+  if (options.shell === undefined) {
+    const invocation = resolveSpawnInvocation(command, args, options);
+    spawnCommand = invocation.command;
+    spawnArgs = invocation.args;
+    windowsVerbatimArguments = invocation.windowsVerbatimArguments;
+  }
+
+  const result = spawnSync(spawnCommand, spawnArgs, {
     cwd: options.cwd,
     env: options.env,
     encoding: "utf8",
@@ -72,6 +163,7 @@ export function runCommand(command, args = [], options = {}) {
     maxBuffer: options.maxBuffer,
     stdio: options.stdio ?? "pipe",
     shell: options.shell ?? false,
+    windowsVerbatimArguments,
     windowsHide: true
   });
 

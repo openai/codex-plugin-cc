@@ -2,7 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import process from "node:process";
 
-import { resolveExecutablePath, runCommand, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import {
+  buildSpawnCommand,
+  resolveExecutablePath,
+  resolveSpawnInvocation,
+  runCommand,
+  terminateProcessTree
+} from "../plugins/codex/scripts/lib/process.mjs";
 
 test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;
@@ -165,4 +171,115 @@ test("runCommand still runs a real command end to end", () => {
   assert.equal(result.error, null);
   assert.equal(result.status, 0);
   assert.match(result.stdout, /^v\d+\.\d+\.\d+/);
+});
+
+// Regression tests for the P1 finding on PR #669: spawn()/spawnSync() with
+// shell: false cannot launch a .bat/.cmd file at all, resolved path or not
+// (Node's own docs: "`.bat` and `.cmd` files are not executable on their
+// own without a terminal"). A resolved path alone is not sufficient --
+// anything that isn't .exe/.com must be launched by explicitly spawning
+// cmd.exe with the command line escaped the way cmd.exe itself requires.
+test("buildSpawnCommand leaves a resolved .exe target unwrapped", () => {
+  const result = buildSpawnCommand("C:\\tools\\git.exe", ["--version"], { platform: "win32" });
+
+  assert.deepEqual(result, {
+    command: "C:\\tools\\git.exe",
+    args: ["--version"],
+    windowsVerbatimArguments: undefined
+  });
+});
+
+test("buildSpawnCommand leaves a resolved .COM target unwrapped (case-insensitive)", () => {
+  const result = buildSpawnCommand("C:\\tools\\tool.COM", ["x"], { platform: "win32" });
+
+  assert.equal(result.command, "C:\\tools\\tool.COM");
+  assert.equal(result.windowsVerbatimArguments, undefined);
+});
+
+test("buildSpawnCommand is a no-op off Windows regardless of extension", () => {
+  const result = buildSpawnCommand("codex.cmd", ["app-server"], { platform: "linux" });
+
+  assert.deepEqual(result, {
+    command: "codex.cmd",
+    args: ["app-server"],
+    windowsVerbatimArguments: undefined
+  });
+});
+
+test("buildSpawnCommand wraps a resolved .cmd target through cmd.exe with escaped arguments", () => {
+  const result = buildSpawnCommand("C:\\tools\\codex.cmd", ["app-server"], {
+    platform: "win32",
+    comspec: "cmd.exe"
+  });
+
+  assert.deepEqual(result, {
+    command: "cmd.exe",
+    args: ["/d", "/s", "/c", '"C:\\tools\\codex.cmd ^"app-server^""'],
+    windowsVerbatimArguments: true
+  });
+});
+
+test("buildSpawnCommand defaults comspec to cmd.exe when not given", () => {
+  const result = buildSpawnCommand("codex.cmd", ["app-server"], { platform: "win32" });
+
+  assert.equal(result.command, "cmd.exe");
+});
+
+test("buildSpawnCommand double-escapes meta chars for an npm node_modules/.bin cmd shim", () => {
+  const shimResult = buildSpawnCommand("C:\\proj\\node_modules\\.bin\\codex.cmd", ["--flag=a&b"], {
+    platform: "win32",
+    comspec: "cmd.exe"
+  });
+  const plainResult = buildSpawnCommand("C:\\tools\\codex.cmd", ["--flag=a&b"], {
+    platform: "win32",
+    comspec: "cmd.exe"
+  });
+
+  assert.deepEqual(shimResult.args, ["/d", "/s", "/c", '"C:\\proj\\node_modules\\.bin\\codex.cmd ^^^"--flag=a^^^&b^^^""'],);
+  assert.deepEqual(plainResult.args, ["/d", "/s", "/c", '"C:\\tools\\codex.cmd ^"--flag=a^&b^""']);
+});
+
+test("resolveSpawnInvocation resolves the executable and wraps it through cmd.exe in one step", () => {
+  const invocation = resolveSpawnInvocation("codex", ["app-server"], {
+    platform: "win32",
+    pathEnv: "C:\\tools",
+    pathExtEnv: ".COM;.EXE;.BAT;.CMD",
+    comspec: "cmd.exe",
+    existsSync: fakeExistsSync(["C:\\tools\\codex.cmd"])
+  });
+
+  assert.equal(invocation.command, "cmd.exe");
+  assert.equal(invocation.windowsVerbatimArguments, true);
+  assert.equal(invocation.args[3], '"C:\\tools\\codex.CMD ^"app-server^""');
+});
+
+test("resolveSpawnInvocation prefers options.env's PATH/PATHEXT/comspec over process.env's", () => {
+  const invocation = resolveSpawnInvocation("codex", ["app-server"], {
+    platform: "win32",
+    env: {
+      PATH: "C:\\childpath",
+      PATHEXT: ".EXE",
+      comspec: "C:\\child\\cmd.exe"
+    },
+    existsSync: fakeExistsSync(["C:\\childpath\\codex.EXE"])
+  });
+
+  assert.equal(invocation.command, "C:\\childpath\\codex.EXE");
+  assert.equal(invocation.args[0], "app-server");
+  assert.equal(invocation.windowsVerbatimArguments, undefined);
+});
+
+test("resolveSpawnInvocation uses options.env's comspec when the resolved target needs cmd.exe wrapping", () => {
+  const invocation = resolveSpawnInvocation("codex", ["app-server"], {
+    platform: "win32",
+    env: {
+      PATH: "C:\\childpath",
+      PATHEXT: ".CMD",
+      comspec: "C:\\child\\cmd.exe"
+    },
+    existsSync: fakeExistsSync(["C:\\childpath\\codex.CMD"])
+  });
+
+  assert.equal(invocation.command, "C:\\child\\cmd.exe");
+  assert.equal(invocation.windowsVerbatimArguments, true);
 });
