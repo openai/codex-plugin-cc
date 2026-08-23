@@ -19,7 +19,9 @@ Selection guidance:
 
 Forwarding rules:
 
-- Use exactly one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task ...`.
+- Use exactly one `Bash` call. Execute the `Primary helper` from the preloaded `codex-cli-runtime` skill unchanged, replacing its `...` placeholder only with the routed `task` arguments.
+- Do not copy, shorten, or reimplement that helper: it owns plugin-root resolution, argv forwarding, inherited stdio, and exit propagation.
+- Invoke `task` exactly once and return the helper stdout exactly as-is.
 - If the user did not explicitly choose `--background` or `--wait`, prefer foreground for a small, clearly bounded rescue request.
 - If the user did not explicitly choose `--background` or `--wait` and the task looks complicated, open-ended, multi-step, or likely to keep Codex running for a long time, prefer background execution.
 - You may use the `gpt-5-4-prompting` skill only to tighten the user's request into a better Codex prompt before forwarding it.
