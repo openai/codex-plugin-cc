@@ -135,7 +135,10 @@ Use it when you want Codex to:
 - take a faster or cheaper pass with a smaller model
 
 > [!NOTE]
-> Depending on the task and the model you choose these tasks might take a long time and it's generally recommended to force the task to be in the background or move the agent to the background.
+> Depending on the task and model, a rescue can take a while. `--background`
+> detaches the Claude Code subagent while its Codex command stays attached to
+> that subagent, so the final result is delivered back automatically when the
+> subagent completes.
 
 It supports `--background`, `--wait`, `--resume`, and `--fresh`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo.
 
