@@ -8,8 +8,44 @@ user-invocable: false
 
 Use this skill only inside the `codex:codex-rescue` subagent.
 
-Primary helper:
-- `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task "<raw arguments>"`
+Primary helper (put the routed arguments after the inline script):
+
+```bash
+node -e '
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const { spawnSync } = require("node:child_process");
+  const scriptFor = root => path.join(root, "scripts", "codex-companion.mjs");
+  const validRoot = root => {
+    if (!root) return false;
+    const script = scriptFor(root);
+    try {
+      if (!fs.statSync(script).isFile()) return false;
+      fs.accessSync(script, fs.constants.R_OK);
+      return true;
+    } catch { return false; }
+  };
+  let roots = validRoot(process.env.CLAUDE_PLUGIN_ROOT) ? [process.env.CLAUDE_PLUGIN_ROOT] : [];
+  if (roots.length === 0) {
+    const configDir = process.env.CLAUDE_CONFIG_DIR || (process.env.HOME && path.join(process.env.HOME, ".claude"));
+    if (!configDir) process.exit(1);
+    try {
+      const registry = JSON.parse(fs.readFileSync(path.join(configDir, "plugins", "installed_plugins.json"), "utf8"));
+      const records = registry && registry.version === 2 && registry.plugins && registry.plugins["codex@openai-codex"];
+      roots = Array.isArray(records) ? records.map(record => record && record.installPath).filter(validRoot) : [];
+    } catch { process.exit(1); }
+  }
+  if (roots.length !== 1) process.exit(1);
+  const result = spawnSync(process.execPath, [scriptFor(roots[0]), ...process.argv.slice(1)], { stdio: "inherit" });
+  process.exit(result.status === null ? 1 : result.status);
+' task ...
+```
+
+Resolver rules:
+- Keep the resolver and companion execution in the one allowed Bash call, with exactly one `task` invocation.
+- A valid, non-empty `CLAUDE_PLUGIN_ROOT` is the fast path. Otherwise read only `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/installed_plugins.json`, select the exact `codex@openai-codex` key, and require exactly one record whose `installPath` contains a readable regular `scripts/codex-companion.mjs`.
+- An unreadable or malformed registry, a missing key, or zero or multiple valid records must fail before companion execution. Never glob plugin caches or versions, and never use `eval`.
+- Keep routed arguments after the inline script. Forward them with `process.argv.slice(1)`, inherit child stdio, and propagate its exact exit status.
 
 Execution rules:
 - The rescue subagent is a forwarder, not an orchestrator. Its only job is to invoke `task` once and return that stdout unchanged.

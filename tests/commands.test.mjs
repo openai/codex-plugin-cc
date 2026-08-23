@@ -3,12 +3,37 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
+import { makeTempDir, run } from "./helpers.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 
 function read(relativePath) {
   return fs.readFileSync(path.join(PLUGIN_ROOT, relativePath), "utf8");
+}
+
+function assertRegistryResolver(source) {
+  assert.match(source, /validRoot\(process\.env\.CLAUDE_PLUGIN_ROOT\)/);
+  assert.match(source, /CLAUDE_CONFIG_DIR \|\| \(process\.env\.HOME && path\.join\(process\.env\.HOME, "\.claude"\)\)/);
+  assert.match(source, /path\.join\(configDir, "plugins", "installed_plugins\.json"\)/);
+  assert.match(source, /registry\.version === 2/);
+  assert.match(source, /registry\.plugins\["codex@openai-codex"\]/);
+  assert.match(source, /record && record\.installPath/);
+  assert.match(source, /fs\.statSync\(script\)\.isFile\(\)/);
+  assert.match(source, /fs\.accessSync\(script, fs\.constants\.R_OK\)/);
+  assert.match(source, /roots\.length !== 1/);
+  assert.match(source, /spawnSync\(process\.execPath/);
+  assert.match(source, /process\.argv\.slice\(1\)/);
+  assert.match(source, /stdio: "inherit"/);
+  assert.match(source, /result\.status === null \? 1 : result\.status/);
+  assert.doesNotMatch(source, /\.claude\/plugins\/cache|plugins\/cache\/|openai-codex\/\d+\.\d+/);
+  assert.doesNotMatch(source, /\beval\s/);
+}
+
+function firstBashBlock(source) {
+  const match = source.match(/```bash\n([\s\S]*?)\n```/);
+  assert.ok(match, "expected a bash code block");
+  return match[1];
 }
 
 test("review command uses AskUserQuestion and background Bash while staying review-only", () => {
@@ -88,6 +113,15 @@ test("rescue command absorbs continue semantics", () => {
   const agent = read("agents/codex-rescue.md");
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
   const runtimeSkill = read("skills/codex-cli-runtime/SKILL.md");
+  assertRegistryResolver(rescue);
+  assertRegistryResolver(runtimeSkill);
+  assert.equal((runtimeSkill.match(/^\s*' task \.\.\.$/gm) || []).length, 1);
+  assert.equal((rescue.match(/^' task-resume-candidate --json$/gm) || []).length, 1);
+  assert.match(rescue, /same fail-closed Node bootstrap used by the resume preflight/i);
+  assert.match(agent, /- codex-cli-runtime/);
+  assert.match(agent, /Execute the `Primary helper` from the preloaded `codex-cli-runtime` skill unchanged/i);
+  assert.match(agent, /Invoke `task` exactly once/i);
+  assert.match(runtimeSkill, /exactly one `task` invocation/i);
 
   assert.match(rescue, /The final user-visible response must be Codex's output verbatim/i);
   assert.match(rescue, /allowed-tools:\s*Bash\(node:\*\),\s*AskUserQuestion,\s*Agent/);
@@ -167,6 +201,66 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(readme, /### `\/codex:result`/);
   assert.match(readme, /### `\/codex:cancel`/);
 });
+test("rescue bootstrap resolves unset plugin root and fails closed on ambiguity", () => {
+  const temp = makeTempDir("codex-rescue-root-");
+  const configDir = path.join(temp, "config");
+  const pluginRoot = path.join(temp, "plugin root");
+  const pluginsDir = path.join(configDir, "plugins");
+  const scriptsDir = path.join(pluginRoot, "scripts");
+  const registryPath = path.join(pluginsDir, "installed_plugins.json");
+  const companionPath = path.join(scriptsDir, "codex-companion.mjs");
+  fs.mkdirSync(pluginsDir, { recursive: true });
+  fs.mkdirSync(scriptsDir, { recursive: true });
+  fs.writeFileSync(companionPath, "console.log(JSON.stringify(process.argv.slice(2)));\n");
+  const resumeBootstrap = firstBashBlock(read("commands/rescue.md"));
+  const taskBootstrap = firstBashBlock(read("skills/codex-cli-runtime/SKILL.md"))
+    .replace(/^' task \.\.\.$/m, "' task --resume-last \"prompt with spaces\"");
+  const env = { ...process.env, CLAUDE_CONFIG_DIR: configDir, CLAUDE_PLUGIN_ROOT: "" };
+
+  try {
+    fs.writeFileSync(registryPath, JSON.stringify({
+      version: 2,
+      plugins: { "codex@openai-codex": [{ installPath: pluginRoot }] }
+    }));
+    const fallback = run("/bin/bash", ["-c", resumeBootstrap], { env });
+    assert.equal(fallback.status, 0, fallback.stderr);
+    assert.equal(fallback.stdout, "[\"task-resume-candidate\",\"--json\"]\n");
+
+    const taskFallback = run("/bin/bash", ["-c", taskBootstrap], { env });
+    assert.equal(taskFallback.status, 0, taskFallback.stderr);
+    assert.equal(taskFallback.stdout, "[\"task\",\"--resume-last\",\"prompt with spaces\"]\n");
+
+    fs.writeFileSync(registryPath, JSON.stringify({
+      version: 2,
+      plugins: { "codex@openai-codex": [{ installPath: pluginRoot }, { installPath: pluginRoot }] }
+    }));
+    const ambiguous = run("/bin/bash", ["-c", resumeBootstrap], { env });
+    assert.notEqual(ambiguous.status, 0);
+    assert.equal(ambiguous.stdout, "");
+
+    fs.writeFileSync(registryPath, JSON.stringify({
+      version: 1,
+      plugins: { "codex@openai-codex": [{ installPath: pluginRoot }] }
+    }));
+    const wrongVersion = run("/bin/bash", ["-c", resumeBootstrap], { env });
+    assert.notEqual(wrongVersion.status, 0);
+    assert.equal(wrongVersion.stdout, "");
+
+    fs.writeFileSync(registryPath, "not json");
+    const malformed = run("/bin/bash", ["-c", resumeBootstrap], { env });
+    assert.notEqual(malformed.status, 0);
+    assert.equal(malformed.stdout, "");
+
+    fs.rmSync(registryPath);
+    const fastPath = run("/bin/bash", ["-c", resumeBootstrap], {
+      env: { ...env, CLAUDE_PLUGIN_ROOT: pluginRoot }
+    });
+    assert.equal(fastPath.status, 0, fastPath.stderr);
+    assert.equal(fastPath.stdout, "[\"task-resume-candidate\",\"--json\"]\n");
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
 
 test("result and cancel commands are exposed as deterministic runtime entrypoints", () => {
   const result = read("commands/result.md");
@@ -186,7 +280,7 @@ test("internal docs use task terminology for rescue runs", () => {
   const promptingSkill = read("skills/gpt-5-4-prompting/SKILL.md");
   const promptRecipes = read("skills/gpt-5-4-prompting/references/codex-prompt-recipes.md");
 
-  assert.match(runtimeSkill, /codex-companion\.mjs" task "<raw arguments>"/);
+  assert.match(runtimeSkill, /^' task \.\.\.$/m);
   assert.match(runtimeSkill, /Use `task` for every rescue request/i);
   assert.match(runtimeSkill, /task --resume-last/i);
   assert.match(promptingSkill, /Use `task` when the task is diagnosis/i);
