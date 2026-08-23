@@ -1,7 +1,7 @@
 import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
+import { findJobsAcrossWorkspaces, getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -210,6 +210,18 @@ function matchJobReference(jobs, reference, predicate = () => true) {
   throw new Error(`No job found for "${reference}". Run /codex:status to list known jobs.`);
 }
 
+function findCrossWorkspaceJob(reference, predicate = () => true) {
+  const matches = findJobsAcrossWorkspaces(reference).filter(predicate);
+  if (matches.length === 1) {
+    const job = matches[0];
+    return { workspaceRoot: job.workspaceRoot, job };
+  }
+  if (matches.length > 1) {
+    throw new Error(`Job reference "${reference}" is ambiguous across workspaces. Use the full job id.`);
+  }
+  return null;
+}
+
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
@@ -242,7 +254,19 @@ export function buildStatusSnapshot(cwd, options = {}) {
 export function buildSingleJobSnapshot(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
-  const selected = matchJobReference(jobs, reference);
+  let selected;
+  try {
+    selected = matchJobReference(jobs, reference);
+  } catch (error) {
+    const crossWorkspace = findCrossWorkspaceJob(reference);
+    if (!crossWorkspace) {
+      throw error;
+    }
+    return {
+      workspaceRoot: crossWorkspace.workspaceRoot,
+      job: enrichJob(crossWorkspace.job, { maxProgressLines: options.maxProgressLines })
+    };
+  }
   if (!selected) {
     throw new Error(`No job found for "${reference}". Run /codex:status to inspect known jobs.`);
   }
@@ -256,11 +280,23 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
 export function resolveResultJob(cwd, reference) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const jobs = sortJobsNewestFirst(reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot)));
-  const selected = matchJobReference(
-    jobs,
-    reference,
-    (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled"
-  );
+  let selected;
+  try {
+    selected = matchJobReference(
+      jobs,
+      reference,
+      (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled"
+    );
+  } catch (error) {
+    const crossWorkspace = findCrossWorkspaceJob(
+      reference,
+      (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled"
+    );
+    if (crossWorkspace) {
+      return crossWorkspace;
+    }
+    throw error;
+  }
 
   if (selected) {
     return { workspaceRoot, job: selected };
@@ -284,11 +320,19 @@ export function resolveCancelableJob(cwd, reference, options = {}) {
   const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
 
   if (reference) {
-    const selected = matchJobReference(activeJobs, reference);
-    if (!selected) {
-      throw new Error(`No active job found for "${reference}".`);
+    try {
+      const selected = matchJobReference(activeJobs, reference);
+      return { workspaceRoot, job: selected };
+    } catch (error) {
+      const crossWorkspace = findCrossWorkspaceJob(
+        reference,
+        (job) => job.status === "queued" || job.status === "running"
+      );
+      if (crossWorkspace) {
+        return crossWorkspace;
+      }
+      throw error;
     }
-    return { workspaceRoot, job: selected };
   }
 
   const sessionScopedActiveJobs = filterJobsForCurrentSession(activeJobs, options);

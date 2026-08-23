@@ -8,7 +8,11 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import {
+  resolveStateDir,
+  upsertJob,
+  writeJobFile
+} from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -969,6 +973,116 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
 });
 
+test("status and result recover an explicit job id from another workspace scope", async () => {
+  const repo = makeTempDir();
+  const wrongScope = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const env = buildEnv(binDir);
+
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "inspect scope recovery"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+
+  const status = run(
+    "node",
+    [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "15000", "--json"],
+    { cwd: wrongScope, env }
+  );
+  assert.equal(status.status, 0, status.stderr);
+  assert.equal(JSON.parse(status.stdout).job.status, "completed");
+
+  const result = run("node", [SCRIPT, "result", jobId, "--json"], {
+    cwd: wrongScope,
+    env
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).job.id, jobId);
+});
+
+test("an immediately cancelled background task cannot restart after enqueue", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const env = buildEnv(binDir);
+
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "do not survive cancellation"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+
+  const queued = run("node", [SCRIPT, "status", jobId, "--json"], { cwd: repo, env });
+  assert.equal(queued.status, 0, queued.stderr);
+  assert.equal(Number.isInteger(JSON.parse(queued.stdout).job.pid), true);
+
+  const cancelled = run("node", [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
+  assert.equal(cancelled.status, 0, cancelled.stderr);
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+
+  const finalStatus = run("node", [SCRIPT, "status", jobId, "--json"], { cwd: repo, env });
+  assert.equal(finalStatus.status, 0, finalStatus.stderr);
+  assert.equal(JSON.parse(finalStatus.stdout).job.status, "cancelled");
+});
+
+test("cancel recovers an explicit active job from another workspace scope", () => {
+  const repo = makeTempDir();
+  const wrongScope = makeTempDir();
+  const binDir = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const env = { ...buildEnv(binDir), CLAUDE_PLUGIN_DATA: pluginDataDir };
+  const jobId = "task-cross-scope-cancel";
+  const queuedJob = {
+    id: jobId,
+    kind: "task",
+    title: "Cross-scope cancellation fixture",
+    workspaceRoot: repo,
+    jobClass: "task",
+    status: "queued",
+    phase: "queued",
+    pid: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+
+  const previousPluginData = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    writeJobFile(repo, jobId, queuedJob);
+    upsertJob(repo, queuedJob);
+  } finally {
+    if (previousPluginData == null) delete process.env.CLAUDE_PLUGIN_DATA;
+    else process.env.CLAUDE_PLUGIN_DATA = previousPluginData;
+  }
+
+  const cancelled = run("node", [SCRIPT, "cancel", jobId, "--json"], {
+    cwd: wrongScope,
+    env
+  });
+  assert.equal(cancelled.status, 0, cancelled.stderr);
+  assert.equal(JSON.parse(cancelled.stdout).status, "cancelled");
+  const finalStatus = run("node", [SCRIPT, "status", jobId, "--json"], {
+    cwd: wrongScope,
+    env
+  });
+  assert.equal(finalStatus.status, 0, finalStatus.stderr);
+  assert.equal(JSON.parse(finalStatus.stdout).job.status, "cancelled");
+});
+
 test("review rejects focus text because it is native-review only", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -1801,6 +1915,70 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
+test("cross-workspace cancel interrupts the owning workspace broker", async () => {
+  const repo = makeTempDir();
+  const wrongScope = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "interruptible-slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = buildEnv(binDir);
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "interrupt the owning broker"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+  const stateDir = resolveStateDir(repo);
+
+  const runningJob = await waitFor(() => {
+    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+    const job = state.jobs.find((candidate) => candidate.id === jobId);
+    return job?.status === "running" && job.threadId && job.turnId ? job : null;
+  }, { timeoutMs: 15000 });
+
+  // This test isolates broker routing from process-tree termination. The
+  // existing same-workspace cancellation test covers the PID kill path.
+  const stateFile = path.join(stateDir, "state.json");
+  const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  state.jobs = state.jobs.map((job) => job.id === jobId ? { ...job, pid: null } : job);
+  fs.writeFileSync(stateFile, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  const jobFile = path.join(stateDir, "jobs", `${jobId}.json`);
+  const stored = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  fs.writeFileSync(jobFile, `${JSON.stringify({ ...stored, pid: null }, null, 2)}\n`, "utf8");
+
+  const cancelResult = run("node", [SCRIPT, "cancel", jobId, "--json"], {
+    cwd: wrongScope,
+    env
+  });
+  assert.equal(cancelResult.status, 0, cancelResult.stderr);
+  const payload = JSON.parse(cancelResult.stdout);
+  assert.equal(payload.status, "cancelled");
+  assert.equal(payload.turnInterruptAttempted, true);
+  assert.equal(payload.turnInterrupted, true);
+
+  await waitFor(() => {
+    const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+    return fakeState.lastInterrupt ?? null;
+  });
+  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.deepEqual(fakeState.lastInterrupt, {
+    threadId: runningJob.threadId,
+    turnId: runningJob.turnId
+  });
+
+  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+  assert.equal(cleanup.status, 0, cleanup.stderr);
+});
+
 test("session end fully cleans up jobs for the ending session", async (t) => {
   const repo = makeTempDir();
   initGitRepo(repo);
@@ -2256,4 +2434,20 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
   const payload = JSON.parse(setup.stdout);
   assert.equal(payload.sessionRuntime.mode, "shared");
   assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
+});
+
+test("CLAUDE_PROJECT_DIR scopes companion commands when --cwd is omitted", () => {
+  const targetWorkspace = makeTempDir();
+  const invocationWorkspace = makeTempDir();
+  saveBrokerSession(targetWorkspace, { endpoint: "unix:/tmp/project-broker.sock" });
+
+  const result = run("node", [SCRIPT, "status", "--json"], {
+    cwd: invocationWorkspace,
+    env: { ...process.env, CLAUDE_PROJECT_DIR: targetWorkspace }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.workspaceRoot, targetWorkspace);
+  assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/project-broker.sock");
 });

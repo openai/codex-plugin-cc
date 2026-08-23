@@ -30,6 +30,7 @@ import {
   generateJobId,
   getConfig,
   listJobs,
+  resolveJobStartGateFile,
   setConfig,
   upsertJob,
   writeJobFile
@@ -149,7 +150,8 @@ function parseCommandInput(argv, config = {}) {
 }
 
 function resolveCommandCwd(options = {}) {
-  return options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
+  const requestedCwd = options.cwd ?? process.env.CLAUDE_PROJECT_DIR;
+  return requestedCwd ? path.resolve(process.cwd(), requestedCwd) : process.cwd();
 }
 
 function resolveCommandWorkspace(options = {}) {
@@ -668,9 +670,12 @@ async function runForegroundCommand(job, runner, options = {}) {
   return execution;
 }
 
-function spawnDetachedTaskWorker(cwd, jobId) {
+function spawnDetachedTaskWorker(cwd, jobId, startGate) {
   const scriptPath = path.join(ROOT_DIR, "scripts", "codex-companion.mjs");
-  const child = spawn(process.execPath, [scriptPath, "task-worker", "--cwd", cwd, "--job-id", jobId], {
+  const child = spawn(process.execPath, [
+    scriptPath, "task-worker", "--cwd", cwd, "--job-id", jobId,
+    "--start-gate", startGate
+  ], {
     cwd,
     env: process.env,
     detached: true,
@@ -685,17 +690,36 @@ function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
     request
   };
+  // The job file bootstraps the gated worker, but the shared index must not
+  // expose a cancellable job until its detached process has a usable PID.
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
-  upsertJob(job.workspaceRoot, queuedRecord);
+
+  const startGate = resolveJobStartGateFile(job.workspaceRoot, job.id);
+  try {
+    const child = spawnDetachedTaskWorker(cwd, job.id, startGate);
+    const launchRecord = { ...queuedRecord, pid: child.pid ?? null };
+    writeJobFile(job.workspaceRoot, job.id, launchRecord);
+    upsertJob(job.workspaceRoot, launchRecord);
+    fs.writeFileSync(startGate, "ready\n", "utf8");
+  } catch (error) {
+    const failedRecord = {
+      ...queuedRecord,
+      status: "failed",
+      phase: "failed",
+      errorMessage: error instanceof Error ? error.message : String(error)
+    };
+    writeJobFile(job.workspaceRoot, job.id, failedRecord);
+    upsertJob(job.workspaceRoot, failedRecord);
+    throw error;
+  }
 
   return {
     payload: {
@@ -837,7 +861,7 @@ async function handleTransfer(argv) {
 
 async function handleTaskWorker(argv) {
   const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "job-id"]
+    valueOptions: ["cwd", "job-id", "start-gate"]
   });
 
   if (!options["job-id"]) {
@@ -846,9 +870,22 @@ async function handleTaskWorker(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
+  if (options["start-gate"]) {
+    const deadline = Date.now() + 30000;
+    while (!fs.existsSync(options["start-gate"])) {
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for task ${options["job-id"]} to be registered.`);
+      }
+      await sleep(10);
+    }
+    fs.unlinkSync(options["start-gate"]);
+  }
   const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
   if (!storedJob) {
     throw new Error(`No stored job found for ${options["job-id"]}.`);
+  }
+  if (storedJob.status === "cancelled") {
+    return;
   }
 
   const request = storedJob.request;
@@ -973,7 +1010,7 @@ async function handleCancel(argv) {
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
 
-  const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
+  const interrupt = await interruptAppServerTurn(workspaceRoot, { threadId, turnId });
   if (interrupt.attempted) {
     appendLogLine(
       job.logFile,
