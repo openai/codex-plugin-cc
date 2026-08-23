@@ -66,12 +66,12 @@ function measureCombinedGitOutputBytes(cwd, argSets, maxBytes) {
   return totalBytes;
 }
 
-function buildBranchComparison(cwd, baseRef) {
-  const mergeBase = gitChecked(cwd, ["merge-base", "HEAD", baseRef]).stdout.trim();
+function buildBranchComparison(cwd, baseCommit) {
+  const mergeBase = gitChecked(cwd, ["merge-base", "HEAD", baseCommit]).stdout.trim();
   return {
     mergeBase,
     commitRange: `${mergeBase}..HEAD`,
-    reviewRange: `${baseRef}...HEAD`
+    reviewRange: `${baseCommit}...HEAD`
   };
 }
 
@@ -91,12 +91,15 @@ export function getRepoRoot(cwd) {
   return gitChecked(cwd, ["rev-parse", "--show-toplevel"]).stdout.trim();
 }
 
-export function detectDefaultBranch(cwd) {
+function detectDefaultBranchTarget(cwd) {
   const symbolic = git(cwd, ["symbolic-ref", "refs/remotes/origin/HEAD"]);
   if (symbolic.status === 0) {
     const remoteHead = symbolic.stdout.trim();
     if (remoteHead.startsWith("refs/remotes/origin/")) {
-      return remoteHead.replace("refs/remotes/origin/", "");
+      return {
+        baseRef: remoteHead.replace("refs/remotes/origin/", ""),
+        commitRef: remoteHead
+      };
     }
   }
 
@@ -104,15 +107,19 @@ export function detectDefaultBranch(cwd) {
   for (const candidate of candidates) {
     const local = git(cwd, ["show-ref", "--verify", "--quiet", `refs/heads/${candidate}`]);
     if (local.status === 0) {
-      return candidate;
+      return { baseRef: candidate, commitRef: candidate };
     }
     const remote = git(cwd, ["show-ref", "--verify", "--quiet", `refs/remotes/origin/${candidate}`]);
     if (remote.status === 0) {
-      return `origin/${candidate}`;
+      return { baseRef: `origin/${candidate}`, commitRef: `refs/remotes/origin/${candidate}` };
     }
   }
 
   throw new Error("Unable to detect the repository default branch. Pass --base <ref> or use --scope working-tree.");
+}
+
+export function detectDefaultBranch(cwd) {
+  return detectDefaultBranchTarget(cwd).baseRef;
 }
 
 export function getCurrentBranch(cwd) {
@@ -132,22 +139,44 @@ export function getWorkingTreeState(cwd) {
   };
 }
 
+function ensureCommitRef(cwd, baseRef) {
+  const resolved = git(cwd, ["rev-parse", "--verify", "--quiet", "--end-of-options", baseRef]);
+  if (resolved.error) {
+    throw resolved.error;
+  }
+  if (resolved.status !== 0) {
+    throw new Error(`base ${baseRef} not found in this repository`);
+  }
+
+  const commit = git(cwd, ["rev-parse", "--verify", "--quiet", "--end-of-options", `${resolved.stdout.trim()}^{commit}`]);
+  if (commit.error) {
+    throw commit.error;
+  }
+  if (commit.status !== 0) {
+    throw new Error(`base ${baseRef} not found in this repository`);
+  }
+  return commit.stdout.trim();
+}
+
 export function resolveReviewTarget(cwd, options = {}) {
   ensureGitRepository(cwd);
 
   const requestedScope = options.scope ?? "auto";
   const baseRef = options.base ?? null;
-  const state = getWorkingTreeState(cwd);
   const supportedScopes = new Set(["auto", "working-tree", "branch"]);
 
   if (baseRef) {
+    const baseCommit = ensureCommitRef(cwd, baseRef);
     return {
       mode: "branch",
       label: `branch diff against ${baseRef}`,
       baseRef,
+      baseCommit,
       explicit: true
     };
   }
+
+  const state = getWorkingTreeState(cwd);
 
   if (requestedScope === "working-tree") {
     return {
@@ -164,11 +193,14 @@ export function resolveReviewTarget(cwd, options = {}) {
   }
 
   if (requestedScope === "branch") {
-    const detectedBase = detectDefaultBranch(cwd);
+    const detected = detectDefaultBranchTarget(cwd);
+    const baseCommit = ensureCommitRef(cwd, detected.commitRef);
     return {
       mode: "branch",
-      label: `branch diff against ${detectedBase}`,
-      baseRef: detectedBase,
+      label: `branch diff against ${detected.baseRef}`,
+      baseRef: detected.baseRef,
+      baseCommit,
+      nativeBaseRef: detected.baseRef.startsWith("-") ? baseCommit : detected.commitRef,
       explicit: true
     };
   }
@@ -181,11 +213,14 @@ export function resolveReviewTarget(cwd, options = {}) {
     };
   }
 
-  const detectedBase = detectDefaultBranch(cwd);
+  const detected = detectDefaultBranchTarget(cwd);
+  const baseCommit = ensureCommitRef(cwd, detected.commitRef);
   return {
     mode: "branch",
-    label: `branch diff against ${detectedBase}`,
-    baseRef: detectedBase,
+    label: `branch diff against ${detected.baseRef}`,
+    baseRef: detected.baseRef,
+    baseCommit,
+    nativeBaseRef: detected.baseRef.startsWith("-") ? baseCommit : detected.commitRef,
     explicit: false
   };
 }
@@ -261,7 +296,7 @@ function collectWorkingTreeContext(cwd, state, options = {}) {
 
 function collectBranchContext(cwd, baseRef, options = {}) {
   const includeDiff = options.includeDiff !== false;
-  const comparison = options.comparison ?? buildBranchComparison(cwd, baseRef);
+  const comparison = options.comparison ?? buildBranchComparison(cwd, ensureCommitRef(cwd, baseRef));
   const currentBranch = getCurrentBranch(cwd);
   const changedFiles = gitChecked(cwd, ["diff", "--name-only", comparison.commitRange]).stdout.trim().split("\n").filter(Boolean);
   const logOutput = gitChecked(cwd, ["log", "--oneline", "--decorate", comparison.commitRange]).stdout.trim();
@@ -322,7 +357,8 @@ export function collectReviewContext(cwd, target, options = {}) {
         diffBytes <= maxInlineDiffBytes);
     details = collectWorkingTreeContext(repoRoot, state, { includeDiff });
   } else {
-    const comparison = buildBranchComparison(repoRoot, target.baseRef);
+    const baseCommit = target.baseCommit ?? ensureCommitRef(repoRoot, target.baseRef);
+    const comparison = buildBranchComparison(repoRoot, baseCommit);
     const fileCount = gitChecked(repoRoot, ["diff", "--name-only", comparison.commitRange]).stdout.trim().split("\n").filter(Boolean).length;
     diffBytes = measureGitOutputBytes(
       repoRoot,

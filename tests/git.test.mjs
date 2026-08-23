@@ -84,6 +84,75 @@ test("resolveReviewTarget honors explicit base overrides", () => {
   assert.equal(target.baseRef, "main");
 });
 
+test("resolveReviewTarget accepts commit-message searches as explicit bases", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('base');\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "release baseline"], { cwd, shell: false });
+  const baseCommit = run("git", ["rev-parse", "HEAD"], { cwd, shell: false }).stdout.trim();
+  run("git", ["checkout", "-b", "feature/test"], { cwd });
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('feature');\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "feature"], { cwd });
+
+  const baseRef = ":/release baseline";
+  const target = resolveReviewTarget(cwd, { base: baseRef });
+  const context = collectReviewContext(cwd, target);
+
+  assert.equal(target.mode, "branch");
+  assert.equal(target.baseRef, baseRef);
+  assert.equal(target.baseCommit, baseCommit);
+  assert.equal(context.comparison.mergeBase, baseCommit);
+  assert.equal(context.comparison.reviewRange, `${baseCommit}...HEAD`);
+  assert.deepEqual(context.changedFiles, ["app.js"]);
+  assert.match(context.summary, /against :\/release baseline/);
+  assert.match(context.content, /-console\.log\('base'\);/);
+  assert.match(context.content, /\+console\.log\('feature'\);/);
+});
+
+test("collectReviewContext uses the canonical commit for dash-leading explicit bases", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('base');\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "base"], { cwd });
+  const baseCommit = run("git", ["rev-parse", "HEAD"], { cwd, shell: false }).stdout.trim();
+  run("git", ["update-ref", "refs/heads/-release-baseline", baseCommit], { cwd, shell: false });
+  run("git", ["checkout", "-b", "feature/test"], { cwd });
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('feature');\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "feature"], { cwd });
+
+  const baseRef = "-release-baseline";
+  const target = resolveReviewTarget(cwd, { base: baseRef });
+  const context = collectReviewContext(cwd, target);
+
+  assert.equal(target.baseRef, baseRef);
+  assert.equal(target.baseCommit, baseCommit);
+  assert.equal(context.comparison.mergeBase, baseCommit);
+  assert.equal(context.comparison.reviewRange, `${baseCommit}...HEAD`);
+  assert.deepEqual(context.changedFiles, ["app.js"]);
+  assert.match(context.summary, /against -release-baseline/);
+});
+
+test("resolveReviewTarget rejects missing or non-commit explicit bases", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v1');\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+
+  assert.throws(
+    () => resolveReviewTarget(cwd, { base: "missing-base" }),
+    /base missing-base not found in this repository/
+  );
+  assert.throws(
+    () => resolveReviewTarget(cwd, { base: "HEAD:app.js" }),
+    /base HEAD:app.js not found in this repository/
+  );
+});
+
 test("resolveReviewTarget requires an explicit base when no default branch can be inferred", () => {
   const cwd = makeTempDir();
   initGitRepo(cwd);
