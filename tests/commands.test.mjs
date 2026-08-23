@@ -210,6 +210,13 @@ test("hooks keep session-end cleanup and stop gating enabled", () => {
   assert.match(source, /session-lifecycle-hook\.mjs/);
 });
 
+test("session start hook allows enough time to restore session state", () => {
+  const hooks = JSON.parse(read("hooks/hooks.json"));
+  const sessionStartHook = hooks.hooks.SessionStart[0].hooks[0];
+
+  assert.equal(sessionStartHook.timeout, 60);
+});
+
 test("setup command can offer Codex install and still points users to codex login", () => {
   const setup = read("commands/setup.md");
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
