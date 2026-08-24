@@ -53,3 +53,31 @@ test("terminateProcessTree treats missing Windows processes as already stopped",
   assert.equal(outcome.result.status, 128);
   assert.match(outcome.result.stdout, /not found/i);
 });
+
+test("terminateProcessTree throws on a genuine Windows taskkill failure, not just a missing-process one", () => {
+  // A partial `taskkill /T` tree-kill failure (Windows refusing to kill a
+  // subset of grandchild processes) does not match the "already gone"
+  // regex, so it must still surface as a thrown error here -- callers like
+  // handleCancel are responsible for deciding whether that's fatal to them,
+  // not terminateProcessTree itself.
+  assert.throws(
+    () =>
+      terminateProcessTree(1234, {
+        platform: "win32",
+        runCommandImpl(command, args) {
+          return {
+            command,
+            args,
+            status: 128,
+            signal: null,
+            stdout: "",
+            stderr:
+              "ERROR: The process with PID 25692 (child process of PID 27196) could not be terminated.\n" +
+              "Reason: This operation is not supported.",
+            error: null
+          };
+        }
+      }),
+    /could not be terminated/i
+  );
+});
