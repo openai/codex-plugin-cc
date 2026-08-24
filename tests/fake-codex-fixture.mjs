@@ -9,6 +9,7 @@ export function installFakeCodex(binDir, behavior = "review-ok") {
   const scriptPath = path.join(binDir, "codex");
   const source = `#!/usr/bin/env node
 const fs = require("node:fs");
+const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 const path = require("node:path");
 const readline = require("node:readline");
@@ -272,7 +273,11 @@ if (args[0] !== "app-server") {
 }
 const bootState = loadState();
 bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
+bootState.pid = process.pid;
 saveState(bootState);
+if (BEHAVIOR === "broker-fails-then-exit-before-turn-start-response" && bootState.appServerStarts === 1) {
+  process.exit(1);
+}
 
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
@@ -288,7 +293,46 @@ rl.on("line", (line) => {
       case "initialize":
         state.capabilities = message.params.capabilities || null;
         saveState(state);
+        if (BEHAVIOR === "null-on-initialize") {
+          process.stdout.write("null\\n");
+          setTimeout(() => process.exit(0), 20);
+          break;
+        }
+        if (BEHAVIOR === "malformed-on-initialize") {
+          process.on("SIGTERM", () => setTimeout(() => process.exit(0), 100));
+          setInterval(() => {}, 1000);
+          process.stdout.write("not-json\\n");
+          break;
+        }
+        if (BEHAVIOR === "uncooperative-tree-on-initialize") {
+          const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+          state.descendantPid = descendant.pid;
+          saveState(state);
+          process.on("SIGTERM", () => {});
+          setInterval(() => {}, 1000);
+          process.stdout.write("not-json\\n");
+          break;
+        }
+        if (BEHAVIOR === "silent-on-initialize") {
+          process.on("SIGTERM", () => setTimeout(() => process.exit(0), 100));
+          setInterval(() => {}, 1000);
+          break;
+        }
+        if (BEHAVIOR === "stdout-eof-on-initialize") {
+          process.on("SIGTERM", () => setTimeout(() => process.exit(0), 100));
+          setInterval(() => {}, 1000);
+          fs.closeSync(1);
+          break;
+        }
         send({ id: message.id, result: { userAgent: "fake-codex-app-server" } });
+        if (BEHAVIOR === "stdin-eof-after-initialize") {
+          process.on("SIGTERM", () => setTimeout(() => process.exit(0), 100));
+          setInterval(() => {}, 1000);
+          fs.closeSync(0);
+        }
+        if (BEHAVIOR === "exit-after-initialize") {
+          setTimeout(() => process.exit(0), 20);
+        }
         break;
 
       case "initialized":
@@ -452,7 +496,18 @@ rl.on("line", (line) => {
 	          prompt
 	        };
 	        saveState(state);
+	        if (
+	          BEHAVIOR === "exit-before-turn-start-response" ||
+	          BEHAVIOR === "broker-fails-then-exit-before-turn-start-response"
+	        ) {
+	          process.exit(0);
+	        }
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
+
+        if (BEHAVIOR === "exit-during-turn") {
+          setTimeout(() => process.exit(0), 20);
+          break;
+        }
 
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)
@@ -636,6 +691,11 @@ rl.on("line", (line) => {
     }
   } catch (error) {
     send({ id: message.id, error: { code: -32000, message: error.message } });
+  }
+});
+rl.on("close", () => {
+  if (BEHAVIOR === "slow-clean-exit") {
+    setTimeout(() => process.exit(0), 250);
   }
 });
 `;

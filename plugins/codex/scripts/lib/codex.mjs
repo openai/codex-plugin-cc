@@ -307,6 +307,7 @@ function createTurnCaptureState(threadId, options = {}) {
     resolveCompletion = resolve;
     rejectCompletion = reject;
   });
+  void completion.catch(() => {});
 
   return {
     threadId,
@@ -368,6 +369,15 @@ function completeTurn(state, turn = null, options = {}) {
   }
 
   state.resolveCompletion(state);
+}
+
+function failTurn(state, error) {
+  if (state.completed) {
+    return;
+  }
+  clearCompletionTimer(state);
+  state.completed = true;
+  state.rejectCompletion(error);
 }
 
 function scheduleInferredCompletion(state) {
@@ -559,6 +569,7 @@ function applyTurnNotification(state, message) {
 async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
+  const removeTerminalListener = client.onTerminal((error) => failTurn(state, error));
 
   client.setNotificationHandler((message) => {
     if (!state.turnId) {
@@ -606,6 +617,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     return await state.completion;
   } finally {
     clearCompletionTimer(state);
+    removeTerminalListener();
     client.setNotificationHandler(previousHandler ?? null);
   }
 }
