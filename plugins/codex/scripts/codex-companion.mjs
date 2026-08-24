@@ -40,7 +40,8 @@ import {
   readStoredJob,
   resolveCancelableJob,
   resolveResultJob,
-  sortJobsNewestFirst
+  sortJobsNewestFirst,
+  wasCancellationConfirmed
 } from "./lib/job-control.mjs";
 import {
   appendLogLine,
@@ -983,19 +984,33 @@ async function handleCancel(argv) {
     );
   }
 
+  let terminationOutcomeKnown = true;
   try {
     terminateProcessTree(job.pid ?? Number.NaN);
   } catch (error) {
     // terminateProcessTree already treats "process already gone" as
-    // best-effort/non-fatal; a partial `taskkill /T` tree-kill failure
-    // (e.g. Windows refusing to kill a subset of grandchild processes)
-    // deserves the same treatment rather than aborting the cancel before
-    // the job's on-disk status is ever updated, leaving it stuck at
-    // "running"/"finalizing" forever even though the turn interrupt above
-    // already succeeded.
+    // best-effort/non-fatal (it doesn't throw for that case), so reaching
+    // this catch means the outcome is genuinely unknown -- e.g. a partial
+    // `taskkill /T` tree-kill failure (Windows refusing to kill a subset of
+    // grandchild processes). That's still not fatal to the cancel attempt
+    // itself when the turn interrupt above already succeeded (Codex has
+    // already stopped acting on this turn either way), but if the interrupt
+    // *also* didn't succeed, nothing here has actually proven the worker
+    // stopped -- reporting "cancelled" and clearing pid in that case would
+    // let a write-capable task keep modifying the workspace unsupervised,
+    // and its later completion could overwrite the fabricated cancelled
+    // status.
     const detail = error instanceof Error ? error.message : String(error);
     appendLogLine(job.logFile, `Process tree termination failed (continuing cancel): ${detail}`);
+    terminationOutcomeKnown = false;
   }
+
+  if (!wasCancellationConfirmed(interrupt, terminationOutcomeKnown)) {
+    throw new Error(
+      `Could not confirm job ${job.id} was stopped: the turn interrupt did not succeed and process tree termination failed. The job's status was left unchanged rather than reporting a cancellation that may not have happened.`
+    );
+  }
+
   appendLogLine(job.logFile, "Cancelled by user.");
 
   const completedAt = nowIso();

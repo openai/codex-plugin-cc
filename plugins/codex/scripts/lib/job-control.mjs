@@ -306,3 +306,22 @@ export function resolveCancelableJob(cwd, reference, options = {}) {
 
   throw new Error("No active Codex jobs to cancel.");
 }
+
+/**
+ * Whether a cancel attempt actually stopped the job's work, and it's safe
+ * to record the job as cancelled and clear its pid.
+ *
+ * A successful turn interrupt is sufficient on its own -- Codex has already
+ * stopped acting on this turn regardless of what process-tree termination
+ * does afterward. Otherwise, termination must have completed without an
+ * unexpected throw: terminateProcessTree() already treats "process already
+ * gone" as non-fatal without throwing, so a throw here means the outcome is
+ * genuinely unknown, not just "already stopped." Reporting cancellation
+ * confirmed in that case (interrupt didn't succeed, and termination outcome
+ * is unknown) would let a write-capable task keep modifying the workspace
+ * unsupervised, with its later completion able to overwrite the fabricated
+ * cancelled status.
+ */
+export function wasCancellationConfirmed(interrupt, terminationOutcomeKnown) {
+  return Boolean(interrupt?.interrupted) || Boolean(terminationOutcomeKnown);
+}
