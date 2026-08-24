@@ -177,6 +177,11 @@ test("resolveExecutablePath searches cwd before PATH directories", () => {
     cwd: "C:\\project",
     pathEnv: "C:\\tools",
     pathExtEnv: ".CMD",
+    // Explicit empty env: this test exercises cwd-search ordering, not the
+    // NoDefaultCurrentDirectoryInExePath opt-out, so it must not fall
+    // through to the real process.env -- some hosts (e.g. WSL, which
+    // inherits some Windows env vars via interop) genuinely have this set.
+    env: {},
     existsSync: fakeExistsSync(["C:\\project\\codex.cmd", "C:\\tools\\codex.cmd"])
   });
 
@@ -189,6 +194,7 @@ test("resolveExecutablePath falls through to PATH when cwd has no match", () => 
     cwd: "C:\\project",
     pathEnv: "C:\\tools",
     pathExtEnv: ".CMD",
+    env: {},
     existsSync: fakeExistsSync(["C:\\tools\\codex.cmd"])
   });
 
@@ -201,6 +207,7 @@ test("resolveExecutablePath resolves a relative PATH entry against cwd", () => {
     cwd: "C:\\project",
     pathEnv: "vendor\\bin",
     pathExtEnv: ".CMD",
+    env: {},
     existsSync: fakeExistsSync(["C:\\project\\vendor\\bin\\codex.cmd"])
   });
 
@@ -214,6 +221,8 @@ test("resolveSpawnInvocation threads options.cwd through to prefer a cwd-local e
     pathEnv: "C:\\tools",
     pathExtEnv: ".CMD",
     comspec: "cmd.exe",
+    // See the note on the resolveExecutablePath cwd-ordering test above.
+    env: {},
     existsSync: fakeExistsSync(["C:\\project\\codex.cmd", "C:\\tools\\codex.cmd"])
   });
 
@@ -239,6 +248,34 @@ test("resolveExecutablePath skips the cwd search when NoDefaultCurrentDirectoryI
   });
 
   assert.equal(resolved, "C:\\tools\\codex.CMD");
+});
+
+// Regression test for a 4th Codex Review finding on PR #669: the real
+// production preflight (codex.mjs's binaryAvailable("codex", ..., { cwd })
+// calls) never passes options.env at all, so the opt-out check needs to
+// fall back to the real process.env the same way the adjacent PATH/PATHEXT
+// lookups already do -- checking only options.env silently never sees the
+// opt-out on the actual call path that matters.
+test("resolveExecutablePath honors NoDefaultCurrentDirectoryInExePath from process.env when options.env is not given", () => {
+  const previous = process.env.NoDefaultCurrentDirectoryInExePath;
+  process.env.NoDefaultCurrentDirectoryInExePath = "1";
+  try {
+    const resolved = resolveExecutablePath("codex", {
+      platform: "win32",
+      cwd: "C:\\project",
+      pathEnv: "C:\\tools",
+      pathExtEnv: ".CMD",
+      existsSync: fakeExistsSync(["C:\\project\\codex.cmd", "C:\\tools\\codex.cmd"])
+    });
+
+    assert.equal(resolved, "C:\\tools\\codex.CMD");
+  } finally {
+    if (previous === undefined) {
+      delete process.env.NoDefaultCurrentDirectoryInExePath;
+    } else {
+      process.env.NoDefaultCurrentDirectoryInExePath = previous;
+    }
+  }
 });
 
 test("resolveExecutablePath still resolves relative PATH entries against cwd when the opt-out is set", () => {

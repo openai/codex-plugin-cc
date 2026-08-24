@@ -68,7 +68,7 @@ export function resolveExecutablePath(command, options = {}) {
   const cwd = options.cwd ?? process.cwd();
   const pathEnv = options.pathEnv ?? process.env.PATH ?? process.env.Path ?? "";
   const pathExtEnv = options.pathExtEnv ?? process.env.PATHEXT ?? DEFAULT_PATHEXT;
-  const skipCwdLookup = getEnvValue(options.env, "NoDefaultCurrentDirectoryInExePath") !== undefined;
+  const skipCwdLookup = getEnvValue(options.env ?? process.env, "NoDefaultCurrentDirectoryInExePath") !== undefined;
 
   const pathDirs = pathEnv
     .split(win.delimiter)
