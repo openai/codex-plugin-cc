@@ -11,6 +11,42 @@ import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 
+// A broker outlives the client that spawned it: nothing in the protocol tells it the
+// client is gone for good, so without this it stays resident forever holding its socket
+// dir. Idle shutdown is decided BY THE BROKER because it is the only party that can see
+// whether it is serving anyone -- an external sweep cannot, and racing one is unsafe.
+const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+const IDLE_TIMEOUT_ENV = "CODEX_COMPANION_BROKER_IDLE_MS";
+// setTimeout() overflows above 2^31-1 ms: it warns and then fires after 1ms, so an
+// over-large timeout would shut the broker down almost immediately -- the exact opposite
+// of what was asked for. Reject instead, so the mistake is visible at startup.
+const MAX_IDLE_TIMEOUT_MS = 2147483647;
+
+function resolveIdleTimeoutMs(rawOption, env = {}) {
+  const raw = rawOption ?? env[IDLE_TIMEOUT_ENV];
+  // Trim before the emptiness test: Number("  ") is 0, so a blank or whitespace-only
+  // value would otherwise DISABLE idle shutdown silently. Explicit "0" is the only
+  // way to turn it off; anything blank falls back to the default.
+  const text = raw === undefined || raw === null ? "" : String(raw).trim();
+  if (text === "") {
+    return DEFAULT_IDLE_TIMEOUT_MS;
+  }
+  const parsed = Number(text);
+  // Reject rather than silently falling back: a typo'd timeout that quietly became
+  // "never expire" would reintroduce the exact leak this exists to close.
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(
+      `Invalid idle timeout ${JSON.stringify(text)}: expected a non-negative number of milliseconds.`
+    );
+  }
+  if (parsed > MAX_IDLE_TIMEOUT_MS) {
+    throw new Error(
+      `Invalid idle timeout ${JSON.stringify(text)}: must be at most ${MAX_IDLE_TIMEOUT_MS} ms (Node timer limit).`
+    );
+  }
+  return parsed;
+}
+
 function buildStreamThreadIds(method, params, result) {
   const threadIds = new Set();
   if (params?.threadId) {
@@ -48,11 +84,13 @@ function writePidFile(pidFile) {
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (subcommand !== "serve") {
-    throw new Error("Usage: node scripts/app-server-broker.mjs serve --endpoint <value> [--cwd <path>] [--pid-file <path>]");
+    throw new Error(
+      "Usage: node scripts/app-server-broker.mjs serve --endpoint <value> [--cwd <path>] [--pid-file <path>] [--idle-timeout <ms>]"
+    );
   }
 
   const { options } = parseArgs(argv, {
-    valueOptions: ["cwd", "pid-file", "endpoint"]
+    valueOptions: ["cwd", "pid-file", "endpoint", "idle-timeout"]
   });
 
   if (!options.endpoint) {
@@ -63,6 +101,7 @@ async function main() {
   const endpoint = String(options.endpoint);
   const listenTarget = parseBrokerEndpoint(endpoint);
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
+  const idleTimeoutMs = resolveIdleTimeoutMs(options["idle-timeout"], process.env);
   writePidFile(pidFile);
 
   const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
@@ -70,6 +109,61 @@ async function main() {
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
   const sockets = new Set();
+  let idleTimer = null;
+
+  // Ownership can outlive its socket: a client can disconnect while its streaming request
+  // is still awaiting a response, and the response then assigns the already-closed socket
+  // to activeStreamSocket. Release it at every point where ownership is inspected, rather
+  // than teaching one check to tolerate it -- the idle check, the notification target and
+  // the busy guard must never disagree about whether the broker is in use. A stale owner
+  // that only the idle check ignored would leave the broker rejecting every new client
+  // with BROKER_BUSY while a connected client also kept it from ever shutting down.
+  function releaseDeadOwnership() {
+    if (activeRequestSocket !== null && activeRequestSocket.destroyed) {
+      activeRequestSocket = null;
+    }
+    if (activeStreamSocket !== null && activeStreamSocket.destroyed) {
+      activeStreamSocket = null;
+      activeStreamThreadIds = null;
+    }
+  }
+
+  // Idle means nobody is connected AND nothing is in flight. Holding an open socket is
+  // enough to keep the broker alive, so a long streaming turn can never be cut short.
+  function isIdle() {
+    return sockets.size === 0 && activeRequestSocket === null && activeStreamSocket === null;
+  }
+
+  function disarmIdleTimer() {
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  }
+
+  function armIdleTimer() {
+    disarmIdleTimer();
+    releaseDeadOwnership();
+    if (idleTimeoutMs <= 0 || !isIdle()) {
+      return;
+    }
+    idleTimer = setTimeout(() => {
+      idleTimer = null;
+      releaseDeadOwnership();
+      // Re-check at fire time: a client may have connected while the timer was pending.
+      if (!isIdle()) {
+        armIdleTimer();
+        return;
+      }
+      void shutdown(server).then(
+        () => process.exit(0),
+        () => process.exit(0)
+      );
+    }, idleTimeoutMs);
+    // The listening server keeps the event loop alive; the timer must not do so itself,
+    // or a broker with idle shutdown disabled could never exit cleanly.
+    idleTimer.unref();
+  }
 
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
@@ -82,6 +176,7 @@ async function main() {
   }
 
   function routeNotification(message) {
+    releaseDeadOwnership();
     const target = activeRequestSocket ?? activeStreamSocket;
     if (!target) {
       return;
@@ -95,16 +190,24 @@ async function main() {
         if (activeRequestSocket === target) {
           activeRequestSocket = null;
         }
+        // The socket that owned this stream may already be gone, in which case no close
+        // handler will fire again -- schedule here or the broker never idles out.
+        armIdleTimer();
       }
     }
   }
 
   async function shutdown(server) {
+    // Stop accepting FIRST. server.close() stops listening immediately and resolves once
+    // existing connections drain. Tearing down the app server first would leave the
+    // endpoint accepting throughout that await, so ensureBrokerSession's readiness probe
+    // could connect, judge a shutting-down broker "ready", and then lose the connection.
+    const closed = new Promise((resolve) => server.close(resolve));
     for (const socket of sockets) {
       socket.end();
     }
+    await closed;
     await appClient.close().catch(() => {});
-    await new Promise((resolve) => server.close(resolve));
     if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
       fs.unlinkSync(listenTarget.path);
     }
@@ -116,6 +219,8 @@ async function main() {
   appClient.setNotificationHandler(routeNotification);
 
   const server = net.createServer((socket) => {
+    disarmIdleTimer();
+    releaseDeadOwnership();
     sockets.add(socket);
     socket.setEncoding("utf8");
     let buffer = "";
@@ -167,6 +272,7 @@ async function main() {
           continue;
         }
 
+        releaseDeadOwnership();
         const allowInterruptDuringActiveStream =
           isInterruptRequest(message) && activeStreamSocket && activeStreamSocket !== socket && !activeRequestSocket;
 
@@ -207,6 +313,7 @@ async function main() {
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
           }
+          armIdleTimer();
         } catch (error) {
           send(socket, {
             id: message.id,
@@ -218,6 +325,7 @@ async function main() {
           if (activeStreamSocket === socket && !isStreaming) {
             activeStreamSocket = null;
           }
+          armIdleTimer();
         }
       }
     });
@@ -225,11 +333,13 @@ async function main() {
     socket.on("close", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      armIdleTimer();
     });
 
     socket.on("error", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      armIdleTimer();
     });
   });
 
@@ -243,7 +353,9 @@ async function main() {
     process.exit(0);
   });
 
-  server.listen(listenTarget.path);
+  server.listen(listenTarget.path, () => {
+    armIdleTimer();
+  });
 }
 
 main().catch((error) => {
