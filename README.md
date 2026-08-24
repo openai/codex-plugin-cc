@@ -107,6 +107,8 @@ It can be used to pressure-test assumptions, tradeoffs, failure modes, and wheth
 It uses the same review target selection as `/codex:review`, including `--base <ref>` for branch review.
 It also supports `--wait` and `--background`. Unlike `/codex:review`, it can take extra focus text after the flags.
 
+It accepts `--model` and `--effort` as runtime-selection flags, the same as `/codex:task`. Leave them unset unless you explicitly want a specific model or reasoning effort.
+
 Use it when you want:
 
 - a review before shipping that challenges the direction, not just the code details
@@ -119,6 +121,7 @@ Examples:
 /codex:adversarial-review
 /codex:adversarial-review --base main challenge whether this was the right caching and retry design
 /codex:adversarial-review --background look for race conditions and question the chosen approach
+/codex:adversarial-review --effort xhigh --base main scrutinise the auth changes
 ```
 
 This command is read-only. It does not fix code.

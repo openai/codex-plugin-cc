@@ -49,7 +49,8 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /```bash/);
   assert.match(source, /```typescript/);
   assert.match(source, /adversarial-review "\$ARGUMENTS"/);
-  assert.match(source, /\[--scope auto\|working-tree\|branch\] \[focus \.\.\.\]/);
+  assert.match(source, /\[--scope auto\|working-tree\|branch\]/);
+  assert.match(source, /\[--effort <none\|minimal\|low\|medium\|high\|xhigh>\] \[focus \.\.\.\]/);
   assert.match(source, /run_in_background:\s*true/);
   assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" adversarial-review "\$ARGUMENTS"`/);
   assert.match(source, /description:\s*"Codex adversarial review"/);
@@ -222,4 +223,31 @@ test("setup command can offer Codex install and still points users to codex logi
   assert.match(readme, /offer to install Codex for you/i);
   assert.match(readme, /\/codex:setup --enable-review-gate/);
   assert.match(readme, /\/codex:setup --disable-review-gate/);
+});
+
+test("adversarial-review documents and parses --model and --effort", () => {
+  const companion = read("scripts/codex-companion.mjs");
+  // The review path must parse both runtime-selection flags, not just --model.
+  assert.match(
+    companion,
+    /valueOptions: \["base", "scope", "model", "cwd", "effort"\]/,
+    "handleReviewCommand must accept --effort"
+  );
+  // ...and thread effort through to the turn, or parsing it changes nothing.
+  assert.match(companion, /effort: normalizeReasoningEffort\(options\.effort\)/);
+  assert.match(companion, /effort: request\.effort,\n\s*sandbox: "read-only"/);
+  // The usage advertises --model <model|spark>, so the review path must resolve the alias
+  // the same way the task path does. Forwarding options.model raw sends the literal
+  // "spark" to turn/start instead of gpt-5.3-codex-spark.
+  assert.match(
+    companion,
+    /model: normalizeRequestedModel\(options\.model\),\n\s*effort: normalizeReasoningEffort\(options\.effort\)/,
+    "handleReviewCommand must normalize --model, not forward it raw"
+  );
+
+  const usage = companion.match(/adversarial-review \[[^\n"]*/)?.[0] ?? "";
+  assert.match(usage, /--effort <none\|minimal\|low\|medium\|high\|xhigh>/);
+
+  const cmd = read("commands/adversarial-review.md");
+  assert.match(cmd, /--effort <none\|minimal\|low\|medium\|high\|xhigh>/);
 });

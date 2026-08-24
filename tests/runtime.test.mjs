@@ -784,6 +784,32 @@ test("task forwards model selection and reasoning effort to app-server turn/star
   assert.equal(fakeState.lastTurnStart.effort, "low");
 });
 
+test("adversarial review forwards model selection and reasoning effort to app-server turn/start", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0];\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0].id;\n");
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--model", "spark", "--effort", "low"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  // The usage advertises --model <model|spark>. Forwarding options.model unchanged sends
+  // the literal "spark" to turn/start instead of the resolved alias, the way the task
+  // path already resolves it.
+  assert.equal(fakeState.lastTurnStart.model, "gpt-5.3-codex-spark");
+  assert.equal(fakeState.lastTurnStart.effort, "low");
+});
+
 test("task logs reasoning summaries and assistant messages to the job log", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -987,6 +1013,29 @@ test("review rejects focus text because it is native-review only", () => {
   assert.equal(result.status > 0, true);
   assert.match(result.stderr, /does not support custom focus text/i);
   assert.match(result.stderr, /\/codex:adversarial-review focus on auth/i);
+});
+
+test("review rejects --effort because the native reviewer cannot honour it", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  // handleReviewCommand is shared with the native `review` subcommand, which never
+  // forwards effort. Parsing the flag without rejecting it would silently run the review
+  // at the configured default instead of the requested effort.
+  const result = run("node", [SCRIPT, "review", "--effort", "high"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status > 0, true, result.stdout);
+  assert.match(result.stderr, /does not support `--effort`/i);
+  assert.match(result.stderr, /\/codex:adversarial-review --effort high/i);
 });
 
 test("review rejects staged-only scope because it is native-review only", () => {
