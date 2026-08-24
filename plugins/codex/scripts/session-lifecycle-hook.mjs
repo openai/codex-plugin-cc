@@ -13,7 +13,7 @@ import {
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
+import { loadState, saveState } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -45,11 +45,10 @@ function cleanupSessionJobs(cwd, sessionId) {
   }
 
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const stateFile = resolveStateFile(workspaceRoot);
-  if (!fs.existsSync(stateFile)) {
-    return;
-  }
-
+  // loadState() is candidate-aware and already returns an empty job list
+  // when nothing exists in any root; a raw existsSync() against just the
+  // primary candidate would miss a session whose jobs only live in the
+  // fallback root.
   const state = loadState(workspaceRoot);
   const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
   if (removedJobs.length === 0) {

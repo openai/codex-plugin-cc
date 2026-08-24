@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { loadState, resolveStateDir, saveState } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -2256,4 +2256,50 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
   const payload = JSON.parse(setup.stdout);
   assert.equal(payload.sessionRuntime.mode, "shared");
   assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
+});
+
+// Caught in review: cleanupSessionJobs() checked only resolveStateFile()'s
+// (the primary candidate's) existence before deciding whether to look for
+// jobs to clean up -- but loadState() is candidate-aware, so a session
+// whose jobs live only in the fallback root (e.g. started without
+// CLAUDE_PLUGIN_DATA, with SessionEnd later running with it set, flipping
+// which root is primary) would be silently skipped: the early check saw no
+// primary file and returned before loadState() was ever called.
+test("SessionEnd cleans up a session's jobs even when they exist only in the fallback root", () => {
+  const workspace = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const previousPluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
+
+  try {
+    delete process.env.CLAUDE_PLUGIN_DATA;
+    saveState(workspace, {
+      config: {},
+      jobs: [{ id: "job-fallback-only", sessionId: "sess-under-test", status: "completed", updatedAt: "2026-08-19T00:00:00.000Z" }]
+    });
+
+    const env = { ...process.env, CLAUDE_PLUGIN_DATA: pluginDataDir };
+    const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: workspace,
+      env,
+      input: JSON.stringify({
+        hook_event_name: "SessionEnd",
+        cwd: workspace,
+        session_id: "sess-under-test"
+      })
+    });
+    assert.equal(cleanup.status, 0, cleanup.stderr);
+
+    process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+    const state = loadState(workspace);
+    assert.equal(
+      state.jobs.some((job) => job.id === "job-fallback-only"),
+      false
+    );
+  } finally {
+    if (previousPluginDataDir == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
+    }
+  }
 });

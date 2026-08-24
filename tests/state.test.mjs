@@ -123,6 +123,44 @@ test("loadState merges jobs from every candidate root instead of only the first 
   }
 });
 
+// Caught in review: config (like jobs) can genuinely differ across roots --
+// e.g. `/codex:setup --enable-review-gate` running without CLAUDE_PLUGIN_DATA
+// writes stopReviewGate to the fallback root, which a later invocation with
+// CLAUDE_PLUGIN_DATA set (a different primary) would never see if only the
+// primary candidate's config were read. Unlike the sibling test above (only
+// one root has state.json, so "primary" trivially picks the only candidate
+// available either way), this exercises the actual bug: *both* roots have
+// state, and the non-primary one is the one with the flag enabled.
+test("loadState merges config across roots, preferring an enabled boolean over a stale disabled one", () => {
+  const workspace = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const previousPluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
+
+  try {
+    delete process.env.CLAUDE_PLUGIN_DATA;
+    writeStateFileDirectly(resolveStateDir(workspace), {
+      config: { stopReviewGate: true },
+      jobs: []
+    });
+
+    process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+    writeStateFileDirectly(resolveStateDir(workspace), {
+      config: { stopReviewGate: false },
+      jobs: []
+    });
+
+    const state = loadState(workspace);
+
+    assert.equal(state.config.stopReviewGate, true);
+  } finally {
+    if (previousPluginDataDir == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
+    }
+  }
+});
+
 // Caught in review: merging reads across roots (the previous test) isn't
 // enough on its own -- saveState() only ever wrote the new job list to the
 // current primary root, so a job that originated in a *different* root and

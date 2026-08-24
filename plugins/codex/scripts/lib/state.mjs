@@ -124,14 +124,30 @@ export function loadState(cwd) {
     }
   }
 
+  // Like jobs, config can genuinely differ across roots depending on which
+  // invocation wrote it -- e.g. `/codex:setup --enable-review-gate` running
+  // without CLAUDE_PLUGIN_DATA writes stopReviewGate to the fallback root,
+  // which a later invocation with CLAUDE_PLUGIN_DATA set would never see if
+  // only the primary candidate's config were read. A boolean flag here is
+  // an opt-in toward stricter/safer behavior, so any candidate setting it
+  // true wins over a stale false elsewhere -- reconciling by "primary wins"
+  // could silently downgrade an explicitly-enabled gate.
+  const mergedConfig = { ...defaultState().config };
+  for (const parsed of parsedCandidates) {
+    for (const [key, value] of Object.entries(parsed.config ?? {})) {
+      if (typeof value === "boolean") {
+        mergedConfig[key] = mergedConfig[key] === true || value === true;
+      } else if (mergedConfig[key] === undefined) {
+        mergedConfig[key] = value;
+      }
+    }
+  }
+
   const [primary] = parsedCandidates;
   return {
     ...defaultState(),
     ...primary,
-    config: {
-      ...defaultState().config,
-      ...(primary.config ?? {})
-    },
+    config: mergedConfig,
     jobs: [...jobsById.values()]
   };
 }
