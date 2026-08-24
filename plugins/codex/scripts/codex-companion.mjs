@@ -72,20 +72,102 @@ const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "hi
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
-function printUsage() {
-  console.log(
-    [
-      "Usage:",
-      "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
-      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
-      "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
-      "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
-      "  node scripts/codex-companion.mjs result [job-id] [--json]",
-      "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
-    ].join("\n")
-  );
+const USAGE_LINES = new Map([
+  ["setup", "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]"],
+  ["review", "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]"],
+  ["adversarial-review", "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]"],
+  ["task", "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]"],
+  ["transfer", "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]"],
+  ["status", "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]"],
+  ["result", "  node scripts/codex-companion.mjs result [job-id] [--json]"],
+  ["cancel", "  node scripts/codex-companion.mjs cancel [job-id] [--json]"]
+]);
+
+// A help request must never become a dispatch. Every subcommand parser treats an
+// unrecognised token as a positional, so `adversarial-review --help` was joined into the
+// review's focus text and ran a full review -- minutes of wall clock and a model turn,
+// for someone who asked what the flags were.
+// positionalsAreFreeForm marks the subcommands whose positionals are arbitrary user
+// prose, which is the only case where a leftover positional should block a help request:
+// there, a --help token may be something the user meant literally. It is a predicate over
+// the parsed options rather than a flag, because for task it depends on whether
+// --prompt-file displaced the positional. Everything else -- a structured job id, or a
+// positional the handler discards -- must let help win.
+const REVIEW_PARSE_OPTIONS = {
+  valueOptions: ["base", "scope", "model", "cwd"],
+  booleanOptions: ["json", "background", "wait"],
+  aliasMap: { m: "model" }
+};
+
+// One schema per subcommand, read by BOTH the handler and help detection. Keeping a
+// separate hand-maintained list for help detection is what broke it: an option the help
+// parser did not know (`--wait`) became a positional, help was not detected, and the real
+// parser then consumed the option and reviewed `--help` as focus text. Any option added
+// here is automatically known to both, so the two can never disagree again.
+const COMMAND_OPTION_SCHEMAS = new Map([
+  ["setup", { valueOptions: ["cwd"], booleanOptions: ["json", "enable-review-gate", "disable-review-gate"] }],
+  // Same parsing, different positional semantics. adversarial-review takes focus text, so
+  // a --help token there may be prose. Native review rejects ALL focus text in
+  // validateNativeReviewRequest, so it has no free-form use and help can win over any
+  // positional -- otherwise `review "--scope working-tree focus --help"` answers a help
+  // request with a confusing complaint about custom focus text.
+  ["review", REVIEW_PARSE_OPTIONS],
+  ["adversarial-review", { ...REVIEW_PARSE_OPTIONS, positionalsAreFreeForm: () => true }],
+  [
+    "task",
+    {
+      valueOptions: ["model", "effort", "cwd", "prompt-file"],
+      booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+      aliasMap: { m: "model" },
+      // Only when the positional is actually the prompt. readTaskPrompt returns the file
+      // unconditionally when --prompt-file is given, so a positional alongside it is
+      // discarded -- there is no literal prompt text to protect, and suppressing help
+      // over it starts a real turn for someone who asked what the flags were.
+      positionalsAreFreeForm: (options) => !options["prompt-file"]
+    }
+  ],
+  ["transfer", { valueOptions: ["cwd", "source"], booleanOptions: ["json"] }],
+  ["status", { valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"], booleanOptions: ["json", "all", "wait"] }],
+  ["result", { valueOptions: ["cwd"], booleanOptions: ["json"] }],
+  ["cancel", { valueOptions: ["cwd"], booleanOptions: ["json"] }]
+]);
+
+// Parse with the subcommand's real schema, then treat it as help only when the flag is
+// present AND nothing else was asked for. Scanning tokens cannot work here: argv is
+// normalized first, so focus text is split into tokens too, and a scan would match
+// `adversarial-review "why does --help start a review"` and make that review impossible
+// to run. Parsing also gets `--` right for free -- anything after it is a positional, so
+// a literal `--help` in focus text stays focus text.
+function isHelpRequest(subcommand, argv) {
+  const schema = COMMAND_OPTION_SCHEMAS.get(subcommand);
+  if (!schema) {
+    return false;
+  }
+  // Detect through parseCommandInput, not parseArgs: the handlers reach the parser that
+  // way, so this inherits the shared `-C` alias and the argv normalization instead of
+  // restating them. Calling parseArgs directly is what missed `-C <dir> --help` -- the
+  // alias was unknown here, so the flag and its value became positionals, help was not
+  // detected, and the handler then dispatched with --help left as input.
+  const { options, positionals } = parseCommandInput(argv, {
+    ...schema,
+    booleanOptions: [...(schema.booleanOptions ?? []), "help"],
+    aliasMap: { ...(schema.aliasMap ?? {}), h: "help" }
+  });
+  if (options.help !== true) {
+    return false;
+  }
+  // A positional only blocks help when it is genuinely free-form input the user may have
+  // meant literally. Where it is a structured job id (`cancel "job-1 --help"`), or where
+  // the handler discards it anyway (`task --prompt-file f.txt ignored`), it is not a
+  // reason to dispatch.
+  const freeForm =
+    typeof schema.positionalsAreFreeForm === "function" && schema.positionalsAreFreeForm(options);
+  return !freeForm || positionals.length === 0;
+}
+
+function printUsage(subcommand) {
+  const line = subcommand ? USAGE_LINES.get(subcommand) : null;
+  console.log(["Usage:", ...(line ? [line] : USAGE_LINES.values())].join("\n"));
 }
 
 function outputResult(value, asJson) {
@@ -214,8 +296,7 @@ async function buildSetupReport(cwd, actionsTaken = []) {
 
 async function handleSetup(argv) {
   const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
-    booleanOptions: ["json", "enable-review-gate", "disable-review-gate"]
+    ...COMMAND_OPTION_SCHEMAS.get("setup")
   });
 
   if (options["enable-review-gate"] && options["disable-review-gate"]) {
@@ -711,11 +792,7 @@ function enqueueBackgroundTask(cwd, job, request) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
-    booleanOptions: ["json", "background", "wait"],
-    aliasMap: {
-      m: "model"
-    }
+    ...REVIEW_PARSE_OPTIONS
   });
 
   const cwd = resolveCommandCwd(options);
@@ -761,11 +838,7 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
-    aliasMap: {
-      m: "model"
-    }
+    ...COMMAND_OPTION_SCHEMAS.get("task")
   });
 
   const cwd = resolveCommandCwd(options);
@@ -824,8 +897,7 @@ async function handleTask(argv) {
 
 async function handleTransfer(argv) {
   const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "source"],
-    booleanOptions: ["json"]
+    ...COMMAND_OPTION_SCHEMAS.get("transfer")
   });
 
   const cwd = resolveCommandCwd(options);
@@ -882,8 +954,7 @@ async function handleTaskWorker(argv) {
 
 async function handleStatus(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
-    booleanOptions: ["json", "all", "wait"]
+    ...COMMAND_OPTION_SCHEMAS.get("status")
   });
 
   const cwd = resolveCommandCwd(options);
@@ -909,8 +980,7 @@ async function handleStatus(argv) {
 
 function handleResult(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
-    booleanOptions: ["json"]
+    ...COMMAND_OPTION_SCHEMAS.get("result")
   });
 
   const cwd = resolveCommandCwd(options);
@@ -962,8 +1032,7 @@ function handleTaskResumeCandidate(argv) {
 
 async function handleCancel(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
-    booleanOptions: ["json"]
+    ...COMMAND_OPTION_SCHEMAS.get("cancel")
   });
 
   const cwd = resolveCommandCwd(options);
@@ -1023,8 +1092,18 @@ async function handleCancel(argv) {
 
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
-  if (!subcommand || subcommand === "help" || subcommand === "--help") {
+  if (!subcommand || subcommand === "help" || subcommand === "--help" || subcommand === "-h") {
     printUsage();
+    return;
+  }
+
+  // Normalize first. The plugin commands pass "$ARGUMENTS" as ONE quoted argument, so
+  // `/codex:adversarial-review --base main --help` arrives here as a single string and a
+  // raw token comparison misses the flag -- the handler would then split it itself and
+  // start a full review with --help as focus text, which is exactly what this prevents.
+  // Checked before the switch, so help can never reach a handler that would dispatch.
+  if (USAGE_LINES.has(subcommand) && isHelpRequest(subcommand, argv)) {
+    printUsage(subcommand);
     return;
   }
 

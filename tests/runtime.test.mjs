@@ -969,6 +969,312 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
 });
 
+test("adversarial-review --help prints usage without dispatching a review", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--help"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^Usage:/);
+  assert.match(result.stdout, /adversarial-review \[--wait\|--background\]/);
+
+  // The point of the change: an unrecognised flag used to become focus text, so asking
+  // for help started a real review. Nothing may reach the model.
+  const state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, "utf8")) : {};
+  assert.equal(state.lastTurnStart ?? null, null, "a help request started a Codex turn");
+});
+
+test("help is detected when the plugin passes all arguments as one string", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  // The plugin commands invoke the companion with "$ARGUMENTS" as a SINGLE quoted
+  // argument, so this is the shape real usage takes. Comparing raw tokens misses the
+  // flag here, and the handler then splits the string itself and reviews with --help as
+  // focus text.
+  const result = run("node", [SCRIPT, "adversarial-review", "--base main --help"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^Usage:/);
+  const state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, "utf8")) : {};
+  assert.equal(state.lastTurnStart ?? null, null, "a help request started a Codex turn");
+});
+
+test("task honours help when --prompt-file makes the positional irrelevant", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "prompt.txt"), "the real prompt\n");
+
+  // readTaskPrompt returns the file unconditionally when --prompt-file is set, so the
+  // positional is discarded. Treating it as protected prompt text suppressed help and
+  // started a real turn using prompt.txt.
+  const result = run("node", [SCRIPT, "task", "--prompt-file prompt.txt ignored --help"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^Usage:/);
+  const state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, "utf8")) : {};
+  assert.equal(state.lastTurnStart ?? null, null, "a help request started a Codex turn");
+});
+
+test("task still protects a literal prompt that mentions --help", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  // Without --prompt-file the positional IS the prompt, so it must still block help.
+  const result = run("node", [SCRIPT, "task", "explain what --help prints"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(/^Usage:/.test(result.stdout), false, "a literal prompt printed usage");
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.ok(state.lastTurnStart, "the task never started");
+  assert.match(state.lastTurnStart.prompt, /what --help prints/);
+});
+
+test("native review honours help even when a positional is present", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  // Native review rejects all focus text in validateNativeReviewRequest, so unlike
+  // adversarial-review it has no free-form positional use. Sharing the free-form
+  // classification made a help request answered with a complaint about focus text.
+  const result = run("node", [SCRIPT, "review", "--scope working-tree focus --help"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^Usage:/);
+  assert.equal(/custom focus text/.test(result.stderr), false, "help was answered with the focus-text error");
+  const state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, "utf8")) : {};
+  assert.equal(state.lastTurnStart ?? null, null, "a help request started a Codex turn");
+});
+
+test("cancel with a job id and --help prints usage without cancelling the job", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "task-live",
+            kind: "task",
+            kindLabel: "task",
+            status: "running",
+            title: "Codex Task",
+            jobClass: "task",
+            summary: "A job that must survive a help request",
+            createdAt: "2026-03-18T15:30:00.000Z",
+            updatedAt: "2026-03-18T15:30:03.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  // cancel takes a structured job id, not free-form text, so a leftover positional is no
+  // reason to dispatch. Applying the free-form rule here made `cancel "task-live --help"`
+  // cancel task-live instead of explaining the command.
+  const result = run("node", [SCRIPT, "cancel", "task-live --help"], { cwd: workspace });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^Usage:/);
+
+  const after = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(after.jobs[0].status, "running", "a help request cancelled the job");
+});
+
+test("help is detected when combined with the shared -C alias", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  // -C is injected by parseCommandInput, not by any subcommand schema. Detecting help
+  // with a bare parseArgs call misses it, so -C and its value become positionals, the
+  // no-focus-text rule fails, and the handler dispatches with --help still in the input.
+  const result = run("node", [SCRIPT, "adversarial-review", `-C ${repo} --help`], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^Usage:/);
+  const state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, "utf8")) : {};
+  assert.equal(state.lastTurnStart ?? null, null, "a help request started a Codex turn");
+});
+
+test("help is detected when it follows another recognized flag", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  // Help detection must parse with the subcommand's real schema. A separate list would
+  // not know --wait, which would land in positionals, defeat the no-focus-text rule, and
+  // let the real parser consume --wait and review "--help" as focus text.
+  const result = run("node", [SCRIPT, "adversarial-review", "--wait --help"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^Usage:/);
+  const state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, "utf8")) : {};
+  assert.equal(state.lastTurnStart ?? null, null, "a help request started a Codex turn");
+});
+
+test("a quoted focus argument keeps its help-looking words as focus text", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0];\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0].id;\n");
+
+  const result = run("node", [SCRIPT, "adversarial-review", "review --help handling"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(/^Usage:/.test(result.stdout), false, "a focused review printed usage instead");
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.ok(state.lastTurnStart, "the review never started");
+  assert.match(state.lastTurnStart.prompt, /handling/);
+});
+
+test("focus text containing --help is reviewed, not swallowed as a help request", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0];\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0].id;\n");
+
+  // Normalization splits focus text into tokens, so a token scan would see --help here and
+  // make this review impossible to run. Help means the flag AND nothing else asked for.
+  const result = run("node", [SCRIPT, "adversarial-review", "why does --help start a review"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(/^Usage:/.test(result.stdout), false, "focus text containing --help printed usage");
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.ok(state.lastTurnStart, "the review never started");
+  assert.match(state.lastTurnStart.prompt, /start a review/);
+});
+
+test("focus text mentioning help still runs the review", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0];\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0].id;\n");
+
+  // Because argv is normalized before the check, a bare "help" token appears in ordinary
+  // focus text. Matching it would silently swap the user's review for a usage dump.
+  const result = run("node", [SCRIPT, "adversarial-review", "review the help system"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(/^Usage:/.test(result.stdout), false, "focus text containing 'help' printed usage");
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.ok(state.lastTurnStart, "the review never started");
+  assert.match(state.lastTurnStart.prompt, /help system/);
+});
+
+test("subcommand help accepts -h and prints only that subcommand", () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+
+  const result = run("node", [SCRIPT, "task", "-h"], { cwd: makeTempDir(), env: buildEnv(binDir) });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /codex-companion\.mjs task \[--background\]/);
+  // Scoped, not the whole usage block.
+  assert.equal(/adversarial-review/.test(result.stdout), false, "task -h printed other subcommands");
+});
+
 test("review rejects focus text because it is native-review only", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
