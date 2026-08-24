@@ -72,6 +72,7 @@ function buildAccountReadResult() {
       return { account: null, requiresOpenaiAuth: true };
     case "provider-no-auth":
     case "env-key-provider":
+    case "orcarouter-provider":
       return { account: null, requiresOpenaiAuth: false };
     case "api-key-account-only":
       return { account: { type: "apiKey" }, requiresOpenaiAuth: true };
@@ -98,6 +99,21 @@ function buildConfigReadResult() {
             "openai-custom": {
               name: "OpenAI custom",
               env_key: "OPENAI_API_KEY",
+              requires_openai_auth: false
+            }
+          }
+        },
+        origins: {}
+      };
+    case "orcarouter-provider":
+      return {
+        config: {
+          model_provider: "orcarouter",
+          model_providers: {
+            orcarouter: {
+              name: "OrcaRouter",
+              base_url: "https://api.orcarouter.ai/v1",
+              env_key: "ORCAROUTER_API_KEY",
               requires_openai_auth: false
             }
           }
