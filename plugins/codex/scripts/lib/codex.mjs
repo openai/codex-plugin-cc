@@ -43,6 +43,7 @@ import { readJsonFile } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
+import { getCodexPassthroughArgs } from "./args.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
@@ -884,12 +885,13 @@ async function getCodexAuthStatusFromClient(client, cwd) {
 }
 
 export function getCodexAvailability(cwd) {
-  const versionStatus = binaryAvailable("codex", ["--version"], { cwd });
+  const passthroughArgs = getCodexPassthroughArgs();
+  const versionStatus = binaryAvailable("codex", [...passthroughArgs, "--version"], { cwd });
   if (!versionStatus.available) {
     return versionStatus;
   }
 
-  const appServerStatus = binaryAvailable("codex", ["app-server", "--help"], { cwd });
+  const appServerStatus = binaryAvailable("codex", [...passthroughArgs, "app-server", "--help"], { cwd });
   if (!appServerStatus.available) {
     return {
       available: false,
