@@ -318,3 +318,19 @@ Yes. If you already use Codex, the plugin picks up the same [configuration](#com
 Yes. Because the plugin uses your local Codex CLI, your existing sign-in method and config still apply.
 
 If you need to point the built-in OpenAI provider at a different endpoint, set `openai_base_url` in your [Codex config](https://developers.openai.com/codex/config-advanced/#config-and-state-locations).
+
+### Can I use another model provider?
+
+Yes. The plugin reflects the active provider from your Codex config, so you can route Codex through any provider Codex supports by defining it under `[model_providers]`. For example, to use [OrcaRouter](https://www.orcarouter.ai), an OpenAI-compatible AI gateway, add this to your `~/.codex/config.toml`:
+
+```toml
+model = "anthropic/claude-sonnet-5"
+model_provider = "orcarouter"
+
+[model_providers.orcarouter]
+name = "OrcaRouter"
+base_url = "https://api.orcarouter.ai/v1"
+env_key = "ORCAROUTER_API_KEY"
+```
+
+After that, `/codex:setup` and `/codex:status` show `OrcaRouter` as the active provider.

@@ -758,7 +758,8 @@ function buildResultStatus(turnState) {
 const BUILTIN_PROVIDER_LABELS = new Map([
   ["openai", "OpenAI"],
   ["ollama", "Ollama"],
-  ["lmstudio", "LM Studio"]
+  ["lmstudio", "LM Studio"],
+  ["orcarouter", "OrcaRouter"]
 ]);
 
 function normalizeProviderId(value) {
