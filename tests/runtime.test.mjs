@@ -1979,6 +1979,19 @@ test("stop hook runs a stop-time review task and blocks on findings when the rev
   assert.match(status.stdout, /Codex Stop Gate Review/);
 });
 
+test("stop hook blocks when hook input is malformed JSON", () => {
+  const blocked = run(process.execPath, [STOP_HOOK], {
+    cwd: ROOT,
+    input: "{not-json"
+  });
+
+  assert.equal(blocked.status, 0, blocked.stderr);
+  assert.deepEqual(JSON.parse(blocked.stdout), {
+    decision: "block",
+    reason: "The stop review gate could not read or parse hook input; refusing to fail open."
+  });
+});
+
 test("stop hook logs running tasks to stderr without blocking when the review gate is disabled", () => {
   const repo = makeTempDir();
   initGitRepo(repo);

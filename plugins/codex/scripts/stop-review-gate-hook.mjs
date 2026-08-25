@@ -140,7 +140,16 @@ function runStopReview(cwd, input = {}) {
 }
 
 function main() {
-  const input = readHookInput();
+  let input;
+  try {
+    input = readHookInput();
+  } catch {
+    emitDecision({
+      decision: "block",
+      reason: "The stop review gate could not read or parse hook input; refusing to fail open."
+    });
+    return;
+  }
   const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
