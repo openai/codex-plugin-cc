@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "packageId",
+    "status",
+    "summary",
+    "claims",
+    "evidence",
+    "changedFiles",
+    "verification",
+    "residualRisks",
+    "confidence",
+    "followUpRequests"
+  ],
+  "properties": {
+    "packageId": {
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "completed",
+        "partial",
+        "blocked",
+        "failed"
+      ]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "claims": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "evidence": {
+      "type": "array"
+    },
+    "changedFiles": {
+      "type": "array",
+      "maxItems": 0
+    },
+    "verification": {
+      "type": "object"
+    },
+    "residualRisks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "followUpRequests": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

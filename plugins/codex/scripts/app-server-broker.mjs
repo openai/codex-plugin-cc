@@ -158,6 +158,13 @@ async function main() {
         }
 
         if (message.id !== undefined && message.method === "broker/shutdown") {
+          if (activeRequestSocket || activeStreamSocket) {
+            send(socket, {
+              id: message.id,
+              error: buildJsonRpcError(BROKER_BUSY_RPC_CODE, "Shared Codex broker is busy.")
+            });
+            continue;
+          }
           send(socket, { id: message.id, result: {} });
           await shutdown(server);
           process.exit(0);

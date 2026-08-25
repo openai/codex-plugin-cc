@@ -1,0 +1,43 @@
+name: Export Phase 2 Source
+
+on:
+  push:
+    branches:
+      - feat/claude-native-multi-codex-phase-2
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Upload source tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase2-source
+          path: |
+            .
+            !.git
+            !node_modules
+          include-hidden-files: true
+          retention-days: 1
+
+      - name: Install current Codex CLI
+        run: npm install -g @openai/codex
+
+      - name: Generate App Server types
+        run: npm run prebuild
+
+      - name: Upload generated App Server types
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase2-app-server-types
+          path: plugins/codex/.generated/app-server-types
+          include-hidden-files: true
+          retention-days: 1

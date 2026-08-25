@@ -13,7 +13,9 @@ export function createBrokerEndpoint(sessionDir, platform = process.platform) {
     return `pipe:\\\\.\\pipe\\${pipeName}`;
   }
 
-  return `unix:${path.join(sessionDir, "broker.sock")}`;
+  // Honor the requested target platform instead of the host running the test
+  // or packaging step. This keeps Unix endpoints slash-based on Windows CI.
+  return `unix:${path.posix.join(String(sessionDir).replace(/\\/g, "/"), "broker.sock")}`;
 }
 
 export function parseBrokerEndpoint(endpoint) {

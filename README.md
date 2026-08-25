@@ -2,8 +2,7 @@
 
 Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex.
 
-This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
-they already have.
+This fork tracks the OpenAI plugin while adding the GPT-5.6 runtime and prompting updates needed to use Sol, Terra, and Luna reliably from Claude Code.
 
 <video src="./docs/plugin-demo.webm" controls muted playsinline autoplay></video>
 
@@ -12,19 +11,22 @@ they already have.
 - `/codex:review` for a normal read-only Codex review
 - `/codex:adversarial-review` for a steerable challenge review
 - `/codex:rescue`, `/codex:transfer`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work, hand off sessions, and manage background jobs
+- GPT-5.6 model/effort validation through the current Codex model catalog
+- version-neutral `codex-prompting` guidance instead of a generation-pinned rescue skill
 
 ## Requirements
 
 - **ChatGPT subscription (incl. Free) or OpenAI API key.**
   - Usage will contribute to your Codex usage limits. [Learn more](https://developers.openai.com/codex/pricing).
 - **Node.js 18.18 or later**
+- **Codex CLI 0.144.0 or later for GPT-5.6**
 
 ## Install
 
-Add the marketplace in Claude Code:
+Add this fork as a marketplace in Claude Code:
 
 ```bash
-/plugin marketplace add openai/codex-plugin-cc
+/plugin marketplace add eureka-pd/codex-plugin-cc
 ```
 
 Install the plugin:
@@ -72,6 +74,18 @@ One simple first run is:
 /codex:result
 ```
 
+## GPT-5.6 model policy
+
+GPT-5.6 uses three durable capability tiers. Treat `Sol > Terra > Luna` as the base capability ordering:
+
+- `gpt-5.6-sol`: frontier capability for the hardest coding, diagnosis, and adversarial review work
+- `gpt-5.6-terra`: balanced intelligence and cost for everyday implementation and review
+- `gpt-5.6-luna`: fastest, lowest-cost tier for bounded or high-volume work
+
+Reasoning effort is a separate inference-budget dimension. A higher effort on a lower tier can improve realized performance for a task, but it does not reverse the underlying tier ordering. The plugin leaves model and effort unset unless you select them, so your Codex configuration remains authoritative.
+
+The companion accepts `none`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra` as transport values and asks the current Codex model catalog to validate the selected combination. Availability can vary by model, Codex version, account, and plan.
+
 ## Usage
 
 ### `/codex:review`
@@ -86,7 +100,7 @@ Use it when you want:
 - a review of your current uncommitted changes
 - a review of your branch compared to a base branch like `main`
 
-Use `--base <ref>` for branch review. It also supports `--wait` and `--background`. It is not steerable and does not take custom focus text. Use [`/codex:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
+Use `--base <ref>` for branch review. It also supports `--wait`, `--background`, `--model`, and `--effort`. It is not steerable and does not take custom focus text. Use [`/codex:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
 
 Examples:
 
@@ -94,6 +108,7 @@ Examples:
 /codex:review
 /codex:review --base main
 /codex:review --background
+/codex:review --model gpt-5.6-sol --effort max
 ```
 
 This command is read-only and will not perform any changes. When run in the background you can use [`/codex:status`](#codexstatus) to check on the progress and [`/codex:cancel`](#codexcancel) to cancel the ongoing task.
@@ -105,7 +120,7 @@ Runs a **steerable** review that questions the chosen implementation and design.
 It can be used to pressure-test assumptions, tradeoffs, failure modes, and whether a different approach would have been safer or simpler.
 
 It uses the same review target selection as `/codex:review`, including `--base <ref>` for branch review.
-It also supports `--wait` and `--background`. Unlike `/codex:review`, it can take extra focus text after the flags.
+It also supports `--wait`, `--background`, `--model`, and `--effort`. Unlike `/codex:review`, it can take extra focus text after the flags.
 
 Use it when you want:
 
@@ -119,6 +134,7 @@ Examples:
 /codex:adversarial-review
 /codex:adversarial-review --base main challenge whether this was the right caching and retry design
 /codex:adversarial-review --background look for race conditions and question the chosen approach
+/codex:adversarial-review --model gpt-5.6-sol --effort max challenge the retry design
 ```
 
 This command is read-only. It does not fix code.
@@ -145,10 +161,12 @@ Examples:
 /codex:rescue investigate why the tests started failing
 /codex:rescue fix the failing test with the smallest safe patch
 /codex:rescue --resume apply the top fix from the last run
-/codex:rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
+/codex:rescue --model gpt-5.6-terra --effort medium investigate the flaky integration test
+/codex:rescue --model gpt-5.6-luna --effort low handle a bounded high-volume task
 /codex:rescue --model spark fix the issue quickly
 /codex:rescue --background investigate the regression
 ```
+
 
 You can also just ask for a task to be delegated to Codex:
 
@@ -159,7 +177,9 @@ Ask Codex to redesign the database connection to be more resilient.
 **Notes:**
 
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
-- if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
+- if you say `spark`, the plugin maps that to `gpt-5.6-luna`
+- reasoning efforts are `none`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`; the current Codex model catalog validates explicit combinations
+- model names are otherwise passed through, so custom providers and newly released models are not blocked by a plugin allowlist
 - follow-up rescue requests can continue the latest Codex task in the repo
 
 ### `/codex:transfer`
@@ -270,12 +290,13 @@ The Codex plugin wraps the [Codex app server](https://developers.openai.com/code
 
 ### Common Configurations
 
-If you want to change the default reasoning effort or the default model that gets used by the plugin, you can define that inside your user-level or project-level `config.toml`. For example to always use `gpt-5.4-mini` on `high` for a specific project you can add the following to a `.codex/config.toml` file at the root of the directory you started Claude in:
+If you want to change the default reasoning effort or model used by the plugin, define it in your user-level or project-level `config.toml`. For example, to use Terra at high effort for a specific project, add this to `.codex/config.toml` at the root of the directory where Claude Code starts:
 
 ```toml
-model = "gpt-5.4-mini"
+model = "gpt-5.6-terra"
 model_reasoning_effort = "high"
 ```
+
 
 Your configuration will be picked up based on:
 
@@ -318,3 +339,25 @@ Yes. If you already use Codex, the plugin picks up the same [configuration](#com
 Yes. Because the plugin uses your local Codex CLI, your existing sign-in method and config still apply.
 
 If you need to point the built-in OpenAI provider at a different endpoint, set `openai_base_url` in your [Codex config](https://developers.openai.com/codex/config-advanced/#config-and-state-locations).
+
+## Claude-Native Multi-Codex Orchestration — Read-only Phase 1
+
+`/codex:orchestrate <task>` lets Claude Root decompose a repository investigation into independent read-only Codex Root packages, schedule them through a bounded worker pool, and persist package evidence and results.
+
+```bash
+/codex:orchestrate investigate the cache regression and independently challenge the concurrency assumptions
+/codex:status orch-...
+/codex:result orch-...
+/codex:cancel orch-...
+```
+
+Automatic entry is disabled by default:
+
+```bash
+/codex:setup --enable-orchestration
+/codex:setup --disable-orchestration
+```
+
+The default workspace pool size is 3 and may be configured from 1–8. The default plugin-wide top-level Root limit is 8 and the active Codex limit, including observed native children, is 12. Model routing follows `Sol > Terra > Luna`, with reasoning effort as a separate dimension.
+
+Phase 1 is read-only: package results must report no changed files. Writer worktrees, integration branches, and automatic Git integration are Phase 2.

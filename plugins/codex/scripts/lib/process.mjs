@@ -54,6 +54,28 @@ function looksLikeMissingProcessMessage(text) {
   return /not found|no running instance|cannot find|does not exist|no such process/i.test(text);
 }
 
+function terminateDirectly(pid, killImpl, taskkillResult = null) {
+  try {
+    killImpl(pid, "SIGTERM");
+    return {
+      attempted: true,
+      delivered: true,
+      method: "kill",
+      ...(taskkillResult ? { result: taskkillResult } : {})
+    };
+  } catch (error) {
+    if (error?.code === "ESRCH") {
+      return {
+        attempted: true,
+        delivered: false,
+        method: "kill",
+        ...(taskkillResult ? { result: taskkillResult } : {})
+      };
+    }
+    throw error;
+  }
+}
+
 export function terminateProcessTree(pid, options = {}) {
   if (!Number.isFinite(pid)) {
     return { attempted: false, delivered: false, method: null };
@@ -78,23 +100,15 @@ export function terminateProcessTree(pid, options = {}) {
       return { attempted: true, delivered: false, method: "taskkill", result };
     }
 
-    if (result.error?.code === "ENOENT") {
-      try {
-        killImpl(pid);
-        return { attempted: true, delivered: true, method: "kill" };
-      } catch (error) {
-        if (error?.code === "ESRCH") {
-          return { attempted: true, delivered: false, method: "kill" };
-        }
-        throw error;
-      }
-    }
-
-    if (result.error) {
+    if (result.error && result.error.code !== "ENOENT") {
       throw result.error;
     }
 
-    throw new Error(formatCommandFailure(result));
+    // Windows taskkill can report a partial tree failure even after the root
+    // process is terminated, especially for console-wrapper children. A direct
+    // process kill is the reliable best-effort fallback and must not turn a
+    // successful cancellation into a command failure.
+    return terminateDirectly(pid, killImpl, result);
   }
 
   try {

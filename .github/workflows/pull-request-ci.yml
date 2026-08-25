@@ -8,9 +8,13 @@ permissions:
 
 jobs:
   ci:
-    name: CI
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    name: CI (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
 
     steps:
       - name: Check out repository
@@ -27,6 +31,9 @@ jobs:
 
       - name: Install Codex CLI
         run: npm install -g @openai/codex
+
+      - name: Verify version metadata
+        run: npm run check-version
 
       - name: Run test suite
         run: npm test

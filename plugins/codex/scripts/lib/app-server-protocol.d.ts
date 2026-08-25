@@ -8,6 +8,8 @@ import type {
 import type {
   ExternalAgentConfigImportParams,
   ExternalAgentConfigImportResponse,
+  ConfigReadParams,
+  ConfigReadResponse,
   ReviewStartParams,
   ReviewStartResponse,
   ReviewTarget,
@@ -15,6 +17,8 @@ import type {
   ThreadItem,
   ThreadListParams,
   ThreadListResponse,
+  ModelListParams,
+  ModelListResponse,
   ThreadResumeParams as RawThreadResumeParams,
   ThreadResumeResponse,
   ThreadSetNameParams,
@@ -58,11 +62,13 @@ export interface CodexAppServerClientOptions {
 
 export interface AppServerMethodMap {
   initialize: { params: InitializeParams; result: InitializeResponse };
+  "config/read": { params: ConfigReadParams; result: ConfigReadResponse };
   "externalAgentConfig/import": { params: ExternalAgentConfigImportParams; result: ExternalAgentConfigImportResponse };
   "thread/start": { params: ThreadStartParams; result: ThreadStartResponse };
   "thread/resume": { params: ThreadResumeParams; result: ThreadResumeResponse };
   "thread/name/set": { params: ThreadSetNameParams; result: ThreadSetNameResponse };
   "thread/list": { params: ThreadListParams; result: ThreadListResponse };
+  "model/list": { params: ModelListParams; result: ModelListResponse };
   "review/start": { params: ReviewStartParams; result: ReviewStartResponse };
   "turn/start": { params: TurnStartParams; result: TurnStartResponse };
   "turn/interrupt": { params: TurnInterruptParams; result: TurnInterruptResponse };
