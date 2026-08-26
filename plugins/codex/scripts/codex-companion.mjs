@@ -969,8 +969,12 @@ function handleResult(argv) {
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
-  const { workspaceRoot, job } = resolveResultJob(cwd, reference);
-  const storedJob = readStoredJob(workspaceRoot, job.id);
+  const { job } = resolveResultJob(cwd, reference);
+  // Render from the OVERLAID record (resolveResultJob returns it via listJobs), NOT a raw
+  // readStoredJob: a cancel marker strips result/rendered, so a job that completed and was
+  // then cancel-marked must not leak its output here. The overlay is the single source of
+  // truth for what a cancelled job exposes.
+  const storedJob = job;
   const payload = {
     job,
     storedJob
@@ -1053,7 +1057,15 @@ async function handleCancel(argv) {
   // stale pid risks signalling an unrelated process that reused it. If it's null, the
   // worker will honor the marker on its own post-pid re-check.
   const killPid = readJobPid(workspaceRoot, job.id);
-  terminateProcessTree(killPid ?? Number.NaN);
+  // Best-effort: a termination failure must NOT abort the command and leave the job
+  // marked-cancelled-but-live with no way to retry. resolveCancelableJob works off the RAW
+  // record, so re-running cancel still finds a marked job whose worker is raw-queued/running
+  // and re-attempts the kill.
+  try {
+    terminateProcessTree(killPid ?? Number.NaN);
+  } catch (error) {
+    appendLogLine(job.logFile, `Termination failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
   appendLogLine(job.logFile, "Cancelled by user.");
 
   const completedAt = nowIso();

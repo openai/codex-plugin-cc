@@ -20,9 +20,7 @@ import {
   markJobCancelled,
   markSessionEnded,
   readAllJobsRaw,
-  readJobPid,
-  resolveJobsDir,
-  resolveStateFile
+  readJobPid
 } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
@@ -93,22 +91,25 @@ export function cleanupSessionJobs(cwd, sessionId) {
   }
 
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  if (!fs.existsSync(resolveStateFile(workspaceRoot)) && !fs.existsSync(resolveJobsDir(workspaceRoot))) {
-    return;
-  }
+  let sessionMarkerFailed = false;
+  const jobMarkerFailed = new Set();
 
-  // 1. Publish the session-ended marker FIRST, BEFORE scanning. This is what makes the
-  // scan race-free against a task being enqueued concurrently: if a worker slips past
-  // its own marker checks (reads them before this marker exists), then it must have
-  // published its pid before this marker, hence before the scan below -- so the scan
-  // sees its record and kills it. Either the worker honors the marker, or we find and
-  // kill it. It also refuses any later enqueue for this session. This marker is
-  // load-bearing: if it cannot be written (e.g. ENOSPC/EACCES), surface the failure
-  // loudly rather than silently proceeding as if the session were cleanly closed. We
-  // still run the per-job kill below so live workers are stopped regardless.
+  // 1. Publish the session-ended marker FIRST -- before ANY existence check or scan.
+  // A `!existsSync(state) return` optimization here would be a correctness hole: when
+  // SessionEnd races the very FIRST background launch in a workspace, both paths can be
+  // absent at that check, so cleanup would return without writing the marker and the
+  // launcher's worker would then run after the session ended. Writing the marker first
+  // (it ensures the state dir) closes that race and makes the scan below race-free: if a
+  // worker slips past its own marker checks (reads them before this marker exists), it
+  // must have published its pid before this marker -- hence before the scan -- so the
+  // scan sees its record and kills it. Either the worker honors the marker, or we find
+  // and kill it; it also refuses any later enqueue for this session. Load-bearing: if it
+  // cannot be written (ENOSPC/EACCES), surface the failure loudly rather than silently
+  // proceeding as if the session were cleanly closed; the per-job kill below still runs.
   try {
     markSessionEnded(workspaceRoot, sessionId);
   } catch (err) {
+    sessionMarkerFailed = true;
     process.stderr.write(`codex: failed to publish session-ended marker for ${sessionId}: ${err instanceof Error ? err.message : String(err)}\n`);
   }
 
@@ -127,7 +128,7 @@ export function cleanupSessionJobs(cwd, sessionId) {
   // worker that publishes its pid concurrently sees the marker on its post-pid re-check
   // and self-aborts (the pid-less startup window is safe: no pid to kill, marker stands).
   for (const job of active) {
-    try { markJobCancelled(workspaceRoot, job.id, "Session ended."); } catch {}
+    try { markJobCancelled(workspaceRoot, job.id, "Session ended."); } catch { jobMarkerFailed.add(job.id); }
   }
 
   // 4. Only NOW read each active job's pid (raw, AFTER its marker exists) and terminate
@@ -168,6 +169,17 @@ export function cleanupSessionJobs(cwd, sessionId) {
   for (const job of jobs) {
     if (keepMarker.has(job.id)) continue;
     deleteJobFiles(workspaceRoot, job);
+  }
+
+  // 6. Fail loud if a LOAD-BEARING marker could not be written. Best-effort scanning and
+  // killing above still ran, but without the session-ended marker (or the cancel marker of
+  // a job we KEPT because a worker may still be booting) we cannot claim the session was
+  // cleanly closed: a task racing enqueue, or that kept booting worker, could still run.
+  // A non-zero exit surfaces that to the hook runner rather than reporting success.
+  const keptWithFailedMarker = [...keepMarker].some((id) => jobMarkerFailed.has(id));
+  if (sessionMarkerFailed || keptWithFailedMarker) {
+    process.exitCode = 1;
+    process.stderr.write(`codex: session cleanup for ${sessionId} could not durably publish a required marker\n`);
   }
 }
 

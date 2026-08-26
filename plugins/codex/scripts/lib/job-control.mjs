@@ -1,12 +1,23 @@
 import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
+import { getConfig, isJobCancelled, isSessionEnded, listJobs, readAllJobsRaw, readJobFile, resolveJobFile } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
 export const DEFAULT_MAX_PROGRESS_LINES = 4;
+
+// True while pid exists and could still execute code (EPERM = alive but not ours).
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === "EPERM";
+  }
+}
 
 export function sortJobsNewestFirst(jobs) {
   return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
@@ -282,8 +293,24 @@ export function resolveResultJob(cwd, reference) {
 
 export function resolveCancelableJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
-  const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
+  // Work off RAW records (so a failed-kill retry can still see the true running state),
+  // but classify cancellability precisely so a job that was already cancelled cannot
+  // shadow a genuinely active one:
+  //  - unmarked queued/running  -> cancellable (normal case);
+  //  - MARKED + running + LIVE pid -> cancellable (a previous kill threw; retry it);
+  //  - MARKED + running with a dead pid (killed, died before writing a terminal record),
+  //    or MARKED + queued/pid-less -> NOT cancellable (the marker is already authoritative
+  //    and the worker must honor it; re-selecting it would shadow other active jobs).
+  const jobs = sortJobsNewestFirst(readAllJobsRaw(workspaceRoot));
+  const activeJobs = jobs.filter((job) => {
+    if (job.status !== "queued" && job.status !== "running") return false;
+    // A job is logically cancelled by EITHER its own cancel marker OR its session's
+    // ended marker (both are authoritative in the read overlay). Only a marked job that
+    // is still running with a live pid stays targetable (to retry a kill that threw).
+    const marked = isJobCancelled(workspaceRoot, job.id) || isSessionEnded(workspaceRoot, job.sessionId);
+    if (!marked) return true;
+    return job.status === "running" && isPidAlive(job.pid);
+  });
 
   if (reference) {
     const selected = matchJobReference(activeJobs, reference);

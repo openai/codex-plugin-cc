@@ -216,13 +216,18 @@ function pidAlive(pid) {
 }
 
 // ---------------------------------------------------------------------------
-// Legacy migration: older installs kept a jobs[] index array in state.json. Materialize
-// each index entry as its per-job file, then rewrite state.json config-only. The write
-// is CREATE-EXCLUSIVE: if a per-job file already exists it is the authoritative record
-// and migration must never overwrite it -- otherwise migration would be a second writer
-// racing a live worker (a stale index entry could clobber a freshly published `running`
-// or `completed`). Since cleanup now migrates too, this can run in a hook process
-// concurrently with workers, so create-only is required, not merely tidy.
+// Legacy migration: older installs kept a jobs[] index array in state.json, with some
+// fields (startedAt, completedAt, summary, threadId, ...) living only in that index.
+// Materialize each index entry as its per-job file, then rewrite state.json config-only.
+// - No per-job file yet: create it exclusively (claim).
+// - A per-job file exists AND has no live worker (isEvictable: terminal, or dead pid):
+//   fold the index-only fields IN (payload wins on conflicts), so a finished job keeps
+//   its summary/threadId/duration. This is safe precisely because no worker can be
+//   writing that record.
+// - A per-job file exists for a LIVE/booting job (queued pid-less, or running with a
+//   live pid): leave it untouched -- a worker owns it, and legacy index metadata for an
+//   active job is stale/minimal anyway. This is what keeps migration from racing a
+//   worker (it now runs in the session hook too).
 // Idempotent; after the first run state.json has no jobs array and this no-ops.
 // ---------------------------------------------------------------------------
 
@@ -240,7 +245,19 @@ function migrateLegacyState(cwd) {
   ensureStateDir(cwd);
   for (const job of parsed.jobs) {
     if (!job || !isValidJobId(job.id)) continue;
-    createJsonExclusive(resolveJobFile(cwd, job.id), job); // never overwrite a live record
+    // `readJobRecord` is the RAW on-disk payload (NOT the cancel/session overlay), so
+    // isEvictable() classifies the record by its true status: a marked-but-still-running
+    // record still reads `running` here and is correctly treated as owned, not terminal.
+    // The evictable set (raw terminal, or raw running with an ESRCH-dead pid) has no
+    // process that can still write it -- there is no reclaimer of a dead-pid job in this
+    // design -- so folding index metadata in cannot lose a live/booting worker's write.
+    const existing = readJobRecord(cwd, job.id);
+    if (existing == null) {
+      createJsonExclusive(resolveJobFile(cwd, job.id), job);
+    } else if (isEvictable(existing)) {
+      atomicWriteJson(resolveJobFile(cwd, job.id), { ...job, ...existing }); // add index-only fields; payload wins
+    }
+    // else: a live/booting worker owns the record -> leave it alone
   }
   try {
     atomicWriteJson(stateFile, {
@@ -311,36 +328,55 @@ export function readJobPid(cwd, jobId) {
 //    (queued/running) jobs -- a genuinely finished job keeps its terminal outcome.
 // Completion payload (result/rendered) is dropped so a cancelled job never exposes a
 // half-result. Side-effect free.
-function overlayJob(job, cancelledIds, endedNames) {
+function overlayJob(job, cancelledMeta, endedNames) {
   if (!job || typeof job.id !== "string" || job.status === "cancelled") return job;
-  const byCancel = cancelledIds.has(job.id);
+  const byCancel = cancelledMeta.has(job.id);
   const bySession =
     !byCancel && job.sessionId != null &&
     endedNames.has(sessionEndedBasename(job.sessionId)) &&
     !TERMINAL_STATUSES.has(job.status);
   if (!byCancel && !bySession) return job;
+  // Surface the marker's own metadata (best-effort; marker EXISTENCE is authoritative
+  // even if its JSON was unreadable) so a cancel that killed the worker before it could
+  // publish a terminal record still shows a reason and timestamps.
+  const meta = (byCancel ? cancelledMeta.get(job.id) : null) ?? {};
+  const at = typeof meta.at === "string" ? meta.at : null;
   const { result, rendered, ...rest } = job;
-  return { ...rest, status: "cancelled", phase: "cancelled", pid: null };
+  return {
+    ...rest,
+    status: "cancelled",
+    phase: "cancelled",
+    pid: null,
+    errorMessage: rest.errorMessage ?? (typeof meta.reason === "string" ? meta.reason : rest.errorMessage),
+    cancelledAt: rest.cancelledAt ?? at ?? undefined,
+    completedAt: rest.completedAt ?? at ?? undefined
+  };
 }
 
 // Scan the jobs dir ONCE: return the raw records plus the marker sets. Robust to
 // concurrent create/delete/rename: a name that vanished mid-scan (ENOENT) or a record
-// captured mid-write (parse-guarded) is skipped.
+// captured mid-write (parse-guarded) is skipped. `cancelledIds` is a Map id -> marker
+// metadata ({reason, at}, or {} if the marker existed but was unparseable).
 function scanJobsDir(cwd) {
+  const dir = resolveJobsDir(cwd);
   let names;
   try {
-    names = fs.readdirSync(resolveJobsDir(cwd));
+    names = fs.readdirSync(dir);
   } catch {
-    return { jobs: [], cancelledIds: new Set(), endedNames: new Set() };
+    return { jobs: [], cancelledIds: new Map(), endedNames: new Set() };
   }
-  const cancelledIds = new Set();
+  const cancelledIds = new Map();
   const endedNames = new Set();
   for (const name of names) {
-    if (name.endsWith(".cancelled")) cancelledIds.add(name.slice(0, -".cancelled".length));
-    else if (name.startsWith("session-") && name.endsWith(".ended")) endedNames.add(name);
+    if (name.endsWith(".cancelled")) {
+      let meta = {};
+      try { meta = JSON.parse(fs.readFileSync(path.join(dir, name), "utf8")); } catch {}
+      cancelledIds.set(name.slice(0, -".cancelled".length), meta);
+    } else if (name.startsWith("session-") && name.endsWith(".ended")) {
+      endedNames.add(name);
+    }
   }
   const jobs = [];
-  const dir = resolveJobsDir(cwd);
   for (const name of names) {
     if (!isJobFileName(name)) continue;
     try {

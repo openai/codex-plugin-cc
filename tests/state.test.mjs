@@ -232,3 +232,71 @@ test("readJobPid returns the raw record pid (not overlaid) so a canceller can ki
   assert.equal(readJobPid(workspace, "j"), 4321, "raw pid survives the overlay");
   assert.equal(listJobs(workspace).find((e) => e.id === "j").pid, null, "overlay hides the pid from readers");
 });
+
+test("legacy migration folds index-only metadata into an existing FINISHED per-job file", () => {
+  const workspace = makeTempDir();
+  // A finished per-job payload already exists but lacks the index-only fields.
+  writeJobFile(workspace, "review-done", { id: "review-done", status: "completed", title: "Review" });
+  fs.writeFileSync(
+    resolveStateFile(workspace),
+    JSON.stringify({
+      version: 1,
+      config: { stopReviewGate: false },
+      jobs: [
+        {
+          id: "review-done",
+          status: "completed",
+          title: "Review",
+          summary: "found 2 issues",
+          threadId: "thr_abc",
+          startedAt: "2026-01-01T00:00:00.000Z",
+          completedAt: "2026-01-01T00:01:00.000Z"
+        }
+      ]
+    }, null, 2)
+  );
+
+  const job = listJobs(workspace).find((entry) => entry.id === "review-done");
+  assert.equal(job.status, "completed");
+  assert.equal(job.summary, "found 2 issues", "index-only summary is merged in, not lost");
+  assert.equal(job.threadId, "thr_abc", "index-only threadId is merged in");
+  assert.equal(job.startedAt, "2026-01-01T00:00:00.000Z");
+  assert.equal(job.completedAt, "2026-01-01T00:01:00.000Z");
+});
+
+test("legacy migration does NOT overwrite a LIVE (running, live-pid) per-job file", () => {
+  const workspace = makeTempDir();
+  // A running job owned by THIS (alive) process; its worker is the sole writer.
+  writeJobFile(workspace, "live", { id: "live", status: "running", pid: process.pid, phase: "thinking" });
+  fs.writeFileSync(
+    resolveStateFile(workspace),
+    JSON.stringify({
+      version: 1,
+      config: {},
+      jobs: [{ id: "live", status: "queued", phase: "queued", summary: "stale index" }]
+    }, null, 2)
+  );
+
+  const job = listJobs(workspace).find((entry) => entry.id === "live");
+  assert.equal(job.status, "running", "a live worker's record is never reverted by a stale index");
+  assert.equal(job.phase, "thinking");
+});
+
+test("cancel overlay strips result/rendered and surfaces the marker's reason + timestamp", () => {
+  const workspace = makeTempDir();
+  // A job that finished (has result/rendered) and is THEN cancel-marked.
+  upsertJob(workspace, {
+    id: "j",
+    status: "completed",
+    result: { codex: { stdout: "secret output" } },
+    rendered: "full rendered output"
+  });
+  assert.equal(markJobCancelled(workspace, "j", "Cancelled by user."), true);
+
+  const job = listJobs(workspace).find((entry) => entry.id === "j");
+  assert.equal(job.status, "cancelled");
+  assert.equal(job.result, undefined, "result payload is stripped from a cancelled job");
+  assert.equal(job.rendered, undefined, "rendered output is stripped from a cancelled job");
+  assert.equal(job.errorMessage, "Cancelled by user.", "marker reason surfaces as errorMessage");
+  assert.ok(job.cancelledAt, "marker timestamp surfaces as cancelledAt");
+});
