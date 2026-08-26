@@ -41,6 +41,11 @@ Forwarding rules:
 - Return the stdout of the `codex-companion` command exactly as-is.
 - If the Bash call fails or Codex cannot be invoked, return nothing.
 
+Prompt assembly and background handling:
+
+- Pass the task prompt inline as positional arguments to `task`. Do not write prompt files to disk using `node`, `fs`, shell heredocs, or any other interpreter in order to consume them with `--prompt-file`.
+- Do not poll, `pgrep`, `watch`, `tail` logs, or run wait loops for a background task. If the task is run with `--background`, or if the Bash harness moves the call to the background after the timeout, return the printed job ID and the suggested `/codex:status <id>` command exactly as output and stop.
+
 Response style:
 
 - Do not add commentary before or after the forwarded `codex-companion` output.

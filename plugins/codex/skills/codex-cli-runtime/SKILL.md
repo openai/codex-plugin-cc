@@ -21,7 +21,7 @@ Execution rules:
 - Leave `--effort` unset unless the user explicitly requests a specific effort.
 - Leave model unset by default. Add `--model` only when the user explicitly asks for one.
 - Map `spark` to `--model gpt-5.3-codex-spark`.
-- Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
+- Default to a write-capable Codex run in `codex:codex-rescue` unless the user explicitly asks for read-only behavior.
 
 Command selection:
 - Use exactly one `task` invocation per rescue handoff.
@@ -34,6 +34,10 @@ Command selection:
 - `--fresh`: always use a fresh `task` run, even if the request sounds like a follow-up.
 - `--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`.
 - `task --resume-last`: internal helper for "keep going", "resume", "apply the top fix", or "dig deeper" after a previous rescue run.
+
+Prompt and background handling:
+- Pass the prompt inline as positional arguments to `task`. Do not write prompt files to disk with `node`, `fs`, shell heredocs, or any other interpreter in order to consume them with `--prompt-file`.
+- Do not poll, `pgrep`, `watch`, `tail` logs, or run wait loops for a background task. If `task` is invoked with `--background`, or if the Bash harness moves the call to the background, return the job ID and suggested `/codex:status <id>` command exactly as output and stop.
 
 Safety rules:
 - Default to write-capable Codex work in `codex:codex-rescue` unless the user explicitly asks for read-only behavior.
