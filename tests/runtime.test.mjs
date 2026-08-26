@@ -784,6 +784,50 @@ test("task forwards model selection and reasoning effort to app-server turn/star
   assert.equal(fakeState.lastTurnStart.effort, "low");
 });
 
+test("review resolves model aliases the same way task does", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 1;\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 2;\n");
+
+  const result = run("node", [SCRIPT, "review", "--model", "spark"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastThreadStart.model, "gpt-5.3-codex-spark");
+});
+
+test("adversarial review resolves model aliases the same way task does", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 1;\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 2;\n");
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--model", "spark"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastThreadStart.model, "gpt-5.3-codex-spark");
+});
+
 test("task logs reasoning summaries and assistant messages to the job log", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

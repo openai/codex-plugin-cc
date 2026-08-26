@@ -720,6 +720,7 @@ async function handleReviewCommand(argv, config) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
+  const model = normalizeRequestedModel(options.model);
   const focusText = positionals.join(" ").trim();
   const target = resolveReviewTarget(cwd, {
     base: options.base,
@@ -743,7 +744,7 @@ async function handleReviewCommand(argv, config) {
         cwd,
         base: options.base,
         scope: options.scope,
-        model: options.model,
+        model,
         focusText,
         reviewName: config.reviewName,
         onProgress: progress
