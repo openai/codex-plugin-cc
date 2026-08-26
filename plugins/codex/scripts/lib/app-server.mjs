@@ -333,7 +333,7 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
   }
 }
 
-function resolveDisableBroker(options) {
+export function resolveDisableBroker(options) {
   if (options.disableBroker !== undefined) {
     return Boolean(options.disableBroker);
   }
