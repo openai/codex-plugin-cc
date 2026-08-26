@@ -4,8 +4,14 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { spawn } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
 import { makeTempDir } from "./helpers.mjs";
 import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const STATE_URL = pathToFileURL(path.join(ROOT, "plugins", "codex", "scripts", "lib", "state.mjs")).href;
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -102,4 +108,36 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
       .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
       .sort()
   );
+});
+
+test("updateState serializes concurrent job writes without losing records", async () => {
+  const workspace = makeTempDir();
+  const jobCount = 12;
+  const worker =
+    `import { upsertJob } from ${JSON.stringify(STATE_URL)};\n` +
+    "const [cwd, id] = process.argv.slice(1);\n" +
+    "upsertJob(cwd, { id, status: \"queued\", jobClass: \"task\", summary: id });\n";
+
+  await Promise.all(
+    Array.from({ length: jobCount }, (_, index) =>
+      new Promise((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          ["--input-type=module", "-e", worker, workspace, `job-${index}`],
+          { stdio: "ignore" }
+        );
+        child.on("exit", (code) =>
+          code === 0 ? resolve() : reject(new Error(`worker ${index} exited ${code}`))
+        );
+      })
+    )
+  );
+
+  const saved = JSON.parse(fs.readFileSync(resolveStateFile(workspace), "utf8"));
+  const trackedIds = new Set(saved.jobs.map((job) => job.id));
+  const missing = Array.from({ length: jobCount }, (_, index) => `job-${index}`).filter(
+    (id) => !trackedIds.has(id)
+  );
+
+  assert.deepEqual(missing, [], "every concurrently launched job must be tracked");
 });

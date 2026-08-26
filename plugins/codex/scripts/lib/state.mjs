@@ -111,14 +111,58 @@ export function saveState(cwd, state) {
     removeFileIfExists(job.logFile);
   }
 
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  const stateFile = resolveStateFile(cwd);
+  const tmpFile = `${stateFile}.${process.pid}.tmp`;
+  fs.writeFileSync(tmpFile, `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  fs.renameSync(tmpFile, stateFile); // atomic replace; readers never see a partial file
   return nextState;
 }
 
+// Blocking sleep for a sync context (no busy-wait) via Atomics.wait.
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// Cross-process lock around the state.json read-modify-write. Without it,
+// concurrent `task --background` launches each read the same base state, add
+// only their own job, and clobber siblings on write (and saveState's prune
+// then deletes the "orphan" job files). Serializing the RMW fixes both.
+function withStateLock(cwd, fn) {
+  ensureStateDir(cwd);
+  const lockFile = path.join(resolveStateDir(cwd), "state.lock");
+  const deadline = Date.now() + 15000;
+  let fd;
+  for (;;) {
+    try {
+      fd = fs.openSync(lockFile, "wx"); // O_CREAT | O_EXCL
+      break;
+    } catch (err) {
+      if (err.code !== "EEXIST") throw err;
+      // Steal a stale lock left by a crashed process.
+      try {
+        if (Date.now() - fs.statSync(lockFile).mtimeMs > 10000) {
+          fs.unlinkSync(lockFile);
+          continue;
+        }
+      } catch {}
+      if (Date.now() > deadline) throw new Error("Timed out acquiring Codex state lock");
+      sleepSync(20 + Math.floor(Math.random() * 30)); // jittered backoff
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    try { fs.closeSync(fd); } catch {}
+    try { fs.unlinkSync(lockFile); } catch {}
+  }
+}
+
 export function updateState(cwd, mutate) {
-  const state = loadState(cwd);
-  mutate(state);
-  return saveState(cwd, state);
+  return withStateLock(cwd, () => {
+    const state = loadState(cwd);
+    mutate(state);
+    return saveState(cwd, state);
+  });
 }
 
 export function generateJobId(prefix = "job") {
