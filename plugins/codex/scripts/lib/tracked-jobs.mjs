@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { isJobCancelled, isSessionEnded, readJobFile, resolveJobFile, resolveJobLogFile, upsertJob } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
@@ -143,41 +143,48 @@ export async function runTrackedJob(job, runner, options = {}) {
     pid: process.pid,
     logFile: options.logFile ?? job.logFile ?? null
   };
-  writeJobFile(job.workspaceRoot, job.id, runningRecord);
+  // Cancel handshake (the linearizable half). We PUBLISH our pid first, THEN re-check
+  // the cancel marker. Cancellation does the mirror: create the marker first, THEN read
+  // the pid. Because each side writes its flag before reading the other's, at least one
+  // side always observes the other -- so either the canceller finds our pid and kills
+  // us, or we find the marker here and abort. No orphan worker, no lost cancellation.
   upsertJob(job.workspaceRoot, runningRecord);
+  if (isJobCancelled(job.workspaceRoot, job.id) || isSessionEnded(job.workspaceRoot, job.sessionId)) {
+    appendLogLine(options.logFile ?? job.logFile ?? null, "Job cancelled before start; not starting.");
+    upsertJob(job.workspaceRoot, { id: job.id, status: "cancelled", phase: "cancelled", pid: null, completedAt: nowIso() });
+    return { aborted: true, status: "cancelled" };
+  }
 
   try {
     const execution = await runner();
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
-    writeJobFile(job.workspaceRoot, job.id, {
+    upsertJob(job.workspaceRoot, {
       ...runningRecord,
       status: completionStatus,
       threadId: execution.threadId ?? null,
       turnId: execution.turnId ?? null,
+      summary: execution.summary,
       pid: null,
       phase: completionStatus === "completed" ? "done" : "failed",
       completedAt,
       result: execution.payload,
       rendered: execution.rendered
     });
-    upsertJob(job.workspaceRoot, {
-      id: job.id,
-      status: completionStatus,
-      threadId: execution.threadId ?? null,
-      turnId: execution.turnId ?? null,
-      summary: execution.summary,
-      phase: completionStatus === "completed" ? "done" : "failed",
-      pid: null,
-      completedAt
-    });
-    appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
+    // Guard the final log append: the terminal record is already published, so a logging
+    // failure must NOT fall into the catch below and write a second (failed) lifecycle
+    // record over it. The terminal upsertJob above is the worker's last record write.
+    try {
+      appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
+    } catch {
+      // logging is best-effort; never revert a published terminal state
+    }
     return execution;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
     const completedAt = nowIso();
-    writeJobFile(job.workspaceRoot, job.id, {
+    upsertJob(job.workspaceRoot, {
       ...existing,
       status: "failed",
       phase: "failed",
@@ -185,14 +192,6 @@ export async function runTrackedJob(job, runner, options = {}) {
       pid: null,
       completedAt,
       logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
-    });
-    upsertJob(job.workspaceRoot, {
-      id: job.id,
-      status: "failed",
-      phase: "failed",
-      pid: null,
-      errorMessage,
-      completedAt
     });
     throw error;
   }

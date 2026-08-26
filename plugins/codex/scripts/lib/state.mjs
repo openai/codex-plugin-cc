@@ -11,8 +11,11 @@ const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
-const QUEUED_GRACE_MS = 60000; // a pid-less queued record stuck longer than this is a crashed enqueuer
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+
+export function isTerminalStatus(status) {
+  return TERMINAL_STATUSES.has(status);
+}
 
 // A job id becomes a filename, so reject anything that could escape the jobs dir.
 function isValidJobId(id) {
@@ -76,6 +79,67 @@ export function resolveJobFile(cwd, jobId) {
   return path.join(resolveJobsDir(cwd), `${jobId}.json`);
 }
 
+// Cancellation is expressed as a SEPARATE, immutable marker file, never by mutating
+// the worker-owned record. `<id>.cancelled` is created atomically (O_EXCL) and never
+// overwritten, so a cancellation can never be lost to a racing record write. Readers
+// overlay it (a record with a live marker reads as cancelled) and the worker honors
+// it. This is the compare-and-swap primitive the mutable-record design lacked.
+export function resolveJobCancelFile(cwd, jobId) {
+  ensureStateDir(cwd);
+  return path.join(resolveJobsDir(cwd), `${jobId}.cancelled`);
+}
+
+// A per-session "ended" marker (also immutable, atomic-create). It closes the window
+// where a task is enqueued AFTER session cleanup's one-shot directory scan: enqueue
+// refuses, and a worker started in that window aborts, because both consult it.
+// Hash (not sanitize) the session id into the marker filename, so distinct ids like
+// "a/b" and "a-b" cannot collide onto the same marker.
+function sessionEndedBasename(sessionId) {
+  const hash = createHash("sha256").update(String(sessionId)).digest("hex").slice(0, 32);
+  return `session-${hash}.ended`;
+}
+
+export function resolveSessionEndedFile(cwd, sessionId) {
+  ensureStateDir(cwd);
+  return path.join(resolveJobsDir(cwd), sessionEndedBasename(sessionId));
+}
+
+// Create `file` atomically iff absent (wx). Returns true if we created it, false if it
+// already existed. Any other error propagates. Used for the immutable markers.
+function createMarkerFile(file, payload) {
+  try {
+    fs.writeFileSync(file, `${JSON.stringify({ ...payload, at: nowIso() }, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+    return true;
+  } catch (err) {
+    if (err.code === "EEXIST") return false; // already marked; idempotent
+    throw err;
+  }
+}
+
+export function markJobCancelled(cwd, jobId, reason) {
+  if (!isValidJobId(jobId)) return false;
+  return createMarkerFile(resolveJobCancelFile(cwd, jobId), { reason: reason ?? "Cancelled." });
+}
+
+export function isJobCancelled(cwd, jobId) {
+  if (!isValidJobId(jobId)) return false;
+  return fs.existsSync(resolveJobCancelFile(cwd, jobId));
+}
+
+export function markSessionEnded(cwd, sessionId) {
+  if (!sessionId) return false;
+  return createMarkerFile(resolveSessionEndedFile(cwd, sessionId), { sessionId: String(sessionId) });
+}
+
+export function isSessionEnded(cwd, sessionId) {
+  if (!sessionId) return false;
+  try {
+    return fs.existsSync(resolveSessionEndedFile(cwd, sessionId));
+  } catch {
+    return false;
+  }
+}
+
 export function generateJobId(prefix = "job") {
   const random = Math.random().toString(36).slice(2, 8);
   return `${prefix}-${Date.now().toString(36)}-${random}`;
@@ -103,6 +167,40 @@ function atomicWriteJson(file, value) {
   }
 }
 
+// Atomically create `file` iff it does not already exist, and return true; return false
+// if it exists. Uses temp + hardlink (link fails with EEXIST if the target exists) so the
+// published file is never torn. This is the single-writer CLAIM primitive: the first
+// caller to create a job record owns it; a second caller (a duplicate id, a double worker
+// launch, a racing migrator) gets false and must not proceed as owner.
+function createJsonExclusive(file, value) {
+  const tmp = uniqueTmp(file);
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    try {
+      fs.linkSync(tmp, file);
+      return true;
+    } catch (err) {
+      if (err.code === "EEXIST") return false;
+      throw err;
+    }
+  } finally {
+    try { fs.unlinkSync(tmp); } catch {}
+  }
+}
+
+// Claim job <id>'s record for the first time. Returns true on success, false if the
+// record already exists (another enqueuer/worker owns it -- caller must not proceed).
+export function claimJobRecord(cwd, jobId, payload) {
+  ensureStateDir(cwd);
+  const now = nowIso();
+  return createJsonExclusive(resolveJobFile(cwd, jobId), {
+    ...payload,
+    id: jobId,
+    createdAt: payload.createdAt ?? now,
+    updatedAt: now
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Liveness (used only to keep pruning from evicting a live job)
 // ---------------------------------------------------------------------------
@@ -118,12 +216,13 @@ function pidAlive(pid) {
 }
 
 // ---------------------------------------------------------------------------
-// Legacy migration: older installs kept a jobs[] index array in state.json, with
-// some fields (startedAt, completedAt, summary, ...) living only in that index
-// and others only in the jobs/<id>.json payload. Fold each index entry INTO its
-// per-job file so the single record has both, then rewrite state.json config-only.
-// The merge is additive: an existing payload wins on conflicting keys (it is the
-// authoritative/newer record) and the index only fills in keys the payload lacks.
+// Legacy migration: older installs kept a jobs[] index array in state.json. Materialize
+// each index entry as its per-job file, then rewrite state.json config-only. The write
+// is CREATE-EXCLUSIVE: if a per-job file already exists it is the authoritative record
+// and migration must never overwrite it -- otherwise migration would be a second writer
+// racing a live worker (a stale index entry could clobber a freshly published `running`
+// or `completed`). Since cleanup now migrates too, this can run in a hook process
+// concurrently with workers, so create-only is required, not merely tidy.
 // Idempotent; after the first run state.json has no jobs array and this no-ops.
 // ---------------------------------------------------------------------------
 
@@ -141,8 +240,7 @@ function migrateLegacyState(cwd) {
   ensureStateDir(cwd);
   for (const job of parsed.jobs) {
     if (!job || !isValidJobId(job.id)) continue;
-    const existing = readJobRecord(cwd, job.id);
-    atomicWriteJson(resolveJobFile(cwd, job.id), { ...job, ...(existing ?? {}) });
+    createJsonExclusive(resolveJobFile(cwd, job.id), job); // never overwrite a live record
   }
   try {
     atomicWriteJson(stateFile, {
@@ -196,15 +294,50 @@ function readJobRecord(cwd, jobId) {
   }
 }
 
-// Read every job record. Robust to concurrent create/delete/rename: a name that
-// vanished mid-scan (ENOENT) or a record captured mid-write (never happens with
-// atomic rename, but parse-guarded anyway) is simply skipped.
-function readAllJobs(cwd) {
+// The RAW (non-overlaid) pid currently on the record, or null. A canceller reads this
+// AFTER creating the cancel marker (never before), so the marker/pid handshake holds:
+// if the worker had already published its pid, we see it here and kill it; if not, the
+// worker will see our marker on its post-pid re-check and self-abort.
+export function readJobPid(cwd, jobId) {
+  const pid = readJobRecord(cwd, jobId)?.pid;
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+// Overlay the immutable markers onto a record so a caller observes a cancellation
+// atomically with the record and can never see a cancelled job as live:
+//  - a `<id>.cancelled` marker forces cancelled, authoritatively ("marked => cancelled,
+//    full stop", overriding even a raced completion);
+//  - a `session-<hash>.ended` marker forces cancelled for that session's still-LIVE
+//    (queued/running) jobs -- a genuinely finished job keeps its terminal outcome.
+// Completion payload (result/rendered) is dropped so a cancelled job never exposes a
+// half-result. Side-effect free.
+function overlayJob(job, cancelledIds, endedNames) {
+  if (!job || typeof job.id !== "string" || job.status === "cancelled") return job;
+  const byCancel = cancelledIds.has(job.id);
+  const bySession =
+    !byCancel && job.sessionId != null &&
+    endedNames.has(sessionEndedBasename(job.sessionId)) &&
+    !TERMINAL_STATUSES.has(job.status);
+  if (!byCancel && !bySession) return job;
+  const { result, rendered, ...rest } = job;
+  return { ...rest, status: "cancelled", phase: "cancelled", pid: null };
+}
+
+// Scan the jobs dir ONCE: return the raw records plus the marker sets. Robust to
+// concurrent create/delete/rename: a name that vanished mid-scan (ENOENT) or a record
+// captured mid-write (parse-guarded) is skipped.
+function scanJobsDir(cwd) {
   let names;
   try {
     names = fs.readdirSync(resolveJobsDir(cwd));
   } catch {
-    return []; // jobs dir not created yet
+    return { jobs: [], cancelledIds: new Set(), endedNames: new Set() };
+  }
+  const cancelledIds = new Set();
+  const endedNames = new Set();
+  for (const name of names) {
+    if (name.endsWith(".cancelled")) cancelledIds.add(name.slice(0, -".cancelled".length));
+    else if (name.startsWith("session-") && name.endsWith(".ended")) endedNames.add(name);
   }
   const jobs = [];
   const dir = resolveJobsDir(cwd);
@@ -216,27 +349,59 @@ function readAllJobs(cwd) {
       // deleted mid-scan or unparseable -> skip
     }
   }
-  return jobs;
+  return { jobs, cancelledIds, endedNames };
 }
 
-// A record is reclaimable only if it is terminal, or a non-terminal job whose
-// owner is provably gone. A just-queued job (no pid yet) is PENDING, not dead, so
-// it must not be evicted -- except as a liveness backstop if it has been stuck far
-// longer than a normal queue->spawn transition (a crashed enqueuer).
+// The marker-overlaid view -- what every consumer (status/cancel/result/session cleanup)
+// should see.
+function readAllJobs(cwd) {
+  const { jobs, cancelledIds, endedNames } = scanJobsDir(cwd);
+  return jobs.map((job) => overlayJob(job, cancelledIds, endedNames));
+}
+
+// A record is reclaimable ONLY if it is terminal, or a running job whose owner pid is
+// provably dead. A pid-less non-terminal job (queued, no pid published yet) is NEVER
+// age-evicted: a worker could still be booting -- even paused for a long time by machine
+// sleep, load, or a debugger -- and prune's re-check + unlink is a non-atomic
+// check-then-act, so age-evicting such a record races the worker's `running` publish and
+// (worse) can strand its cancel tombstone. Leaving an abandoned queued record until it
+// turns terminal or its worker publishes+dies is the safe choice (a rare, bounded leak).
 function isEvictable(job) {
   if (typeof job.id !== "string") return false;
   if (TERMINAL_STATUSES.has(job.status)) return true;
   if (Number.isInteger(job.pid) && job.pid > 0) return !pidAlive(job.pid);
-  return Date.now() - Date.parse(job.updatedAt ?? "") > QUEUED_GRACE_MS;
+  return false; // pid-less non-terminal -> a worker may still be booting; never age-evict
+}
+
+// Remove a job's record, its cancel marker, and both its recorded and conventional
+// logs. Returns true if the record was removed (or was already gone).
+export function deleteJobFiles(cwd, job) {
+  let gone = false;
+  try {
+    fs.unlinkSync(resolveJobFile(cwd, job.id));
+    gone = true;
+  } catch (err) {
+    gone = err.code === "ENOENT"; // already removed by another actor -> counts
+  }
+  if (!gone) return false; // couldn't remove (e.g. EACCES)
+  try { fs.unlinkSync(resolveJobCancelFile(cwd, job.id)); } catch {}
+  if (typeof job.logFile === "string") { try { fs.unlinkSync(job.logFile); } catch {} }
+  try { fs.unlinkSync(resolveJobLogFile(cwd, job.id)); } catch {}
+  return true;
 }
 
 // Keep the newest MAX_JOBS records; evict the oldest reclaimable ones so a live
 // queued/running job is never made undiscoverable (which would break
-// status/cancel/session cleanup). Deletes the payload, its recorded log, and the
-// conventional log. Idempotent under concurrency; re-checks each candidate right
-// before deleting so a job that transitioned to live since the scan is spared.
+// status/cancel/session cleanup). Eviction is decided on the RAW record, NOT the cancel
+// overlay: a job that merely carries a cancel marker but whose raw record is still
+// queued/running is NOT evictable while a worker could still be booting (a pid-less
+// queued record only ages out after QUEUED_GRACE_MS; a booting worker boots in seconds
+// and honors the marker long before then). Deleting the record+marker of such a job
+// would let the booting worker re-create it unmarked -- the resurrection this avoids.
+// Session-ended markers are intentionally NOT GC'd here: a safe generation-aware sweep
+// is out of scope, and one tiny empty file per session is a negligible, race-free leak.
 function pruneJobs(cwd) {
-  const jobs = readAllJobs(cwd);
+  const jobs = scanJobsDir(cwd).jobs; // RAW records
   const overflow = jobs.length - MAX_JOBS;
   if (overflow <= 0) return;
   const evictable = jobs
@@ -245,19 +410,9 @@ function pruneJobs(cwd) {
   let removed = 0;
   for (const job of evictable) {
     if (removed >= overflow) break;
-    const current = readJobRecord(cwd, job.id);
-    if (current && !isEvictable(current)) continue; // became live/pending since scan
-    let gone = false;
-    try {
-      fs.unlinkSync(resolveJobFile(cwd, job.id));
-      gone = true;
-    } catch (err) {
-      gone = err.code === "ENOENT"; // already removed by another pruner -> counts
-    }
-    if (!gone) continue; // couldn't remove (e.g. EACCES) -> don't count against overflow
-    if (typeof job.logFile === "string") { try { fs.unlinkSync(job.logFile); } catch {} }
-    try { fs.unlinkSync(resolveJobLogFile(cwd, job.id)); } catch {}
-    removed += 1;
+    const current = readJobRecord(cwd, job.id); // RAW re-check
+    if (current && !isEvictable(current)) continue; // became live/pending since scan -> spare
+    if (deleteJobFiles(cwd, job)) removed += 1;
   }
 }
 
@@ -265,6 +420,12 @@ function pruneJobs(cwd) {
 // single write path for both a full record and an incremental patch; merging
 // (rather than overwriting) means a field written by one call site is never lost
 // by a later call that omits it (e.g. a `summary` added after the payload write).
+//
+// The record has a SINGLE writer -- the worker owns queued->running->terminal (the
+// enqueue's pre-spawn queued write happens-before the worker exists). Cancellation
+// does NOT write here; it uses the immutable `<id>.cancelled` marker instead. So there
+// is no concurrent read-modify-write on this file and a plain additive merge is safe:
+// no cross-process lost update is possible. Returns the published record.
 function mergeJobRecord(cwd, jobId, patch) {
   ensureStateDir(cwd);
   const existing = readJobRecord(cwd, jobId) ?? {};
@@ -297,4 +458,13 @@ export function readJobFile(jobFile) {
 export function listJobs(cwd) {
   migrateLegacyState(cwd);
   return readAllJobs(cwd);
+}
+
+// The RAW records (no marker overlay), but still migrated from any legacy state.json
+// jobs[] index so a fresh install and an upgraded one look the same. Session cleanup
+// needs this: having just written the session-ended marker, the overlaid view would
+// hide the very jobs it must kill.
+export function readAllJobsRaw(cwd) {
+  migrateLegacyState(cwd);
+  return scanJobsDir(cwd).jobs;
 }

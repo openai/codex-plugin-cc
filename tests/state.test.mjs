@@ -10,7 +10,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { makeTempDir } from "./helpers.mjs";
 import {
   ensureStateDir,
+  isJobCancelled,
+  isSessionEnded,
   listJobs,
+  markJobCancelled,
+  markSessionEnded,
+  readJobPid,
   resolveJobFile,
   resolveJobLogFile,
   resolveStateDir,
@@ -150,4 +155,80 @@ test("legacy state.json jobs[] array migrates to per-job files on read", () => {
   const rewritten = JSON.parse(fs.readFileSync(resolveStateFile(workspace), "utf8"));
   assert.equal(Array.isArray(rewritten.jobs), false);
   assert.equal(rewritten.config.stopReviewGate, true);
+});
+
+test("a no-status patch (e.g. a progress update) leaves status untouched", () => {
+  const workspace = makeTempDir();
+  upsertJob(workspace, { id: "j", status: "running", pid: 42 });
+  upsertJob(workspace, { id: "j", phase: "thinking" });
+
+  const job = listJobs(workspace).find((entry) => entry.id === "j");
+  assert.equal(job.status, "running");
+  assert.equal(job.phase, "thinking");
+});
+
+test("a cancel marker overlays as cancelled and cannot be resurrected by a later running write", () => {
+  const workspace = makeTempDir();
+  upsertJob(workspace, { id: "j", status: "queued", pid: null });
+  assert.equal(markJobCancelled(workspace, "j", "test"), true, "marker created");
+
+  // A racing worker publishes running AFTER the marker (the record itself says running):
+  upsertJob(workspace, { id: "j", status: "running", pid: 99, phase: "starting" });
+
+  const job = listJobs(workspace).find((entry) => entry.id === "j");
+  assert.equal(job.status, "cancelled", "the immutable marker overlays the record");
+  assert.equal(job.pid, null, "an overlaid-cancelled job exposes no live pid");
+  assert.equal(isJobCancelled(workspace, "j"), true);
+});
+
+test("the cancel marker is immutable: a second mark is a no-op, not an error", () => {
+  const workspace = makeTempDir();
+  upsertJob(workspace, { id: "j", status: "running", pid: 1 });
+  assert.equal(markJobCancelled(workspace, "j", "first"), true);
+  assert.equal(markJobCancelled(workspace, "j", "second"), false, "already marked -> false, no throw");
+});
+
+test("a completion that lands after a cancel marker still reads as cancelled", () => {
+  const workspace = makeTempDir();
+  upsertJob(workspace, { id: "j", status: "running", pid: 5 });
+  markJobCancelled(workspace, "j", "cancelled by user");
+  upsertJob(workspace, { id: "j", status: "completed", summary: "done" });
+
+  const job = listJobs(workspace).find((entry) => entry.id === "j");
+  assert.equal(job.status, "cancelled", "cancellation wins over a later completion via the overlay");
+});
+
+test("normal forward transitions still advance (queued -> running -> completed)", () => {
+  const workspace = makeTempDir();
+  upsertJob(workspace, { id: "j", status: "queued", pid: null });
+  upsertJob(workspace, { id: "j", status: "running", pid: 7 });
+  const done = upsertJob(workspace, { id: "j", status: "completed" });
+  assert.equal(done.status, "completed");
+});
+
+test("a no-status progress patch advances phase without touching status", () => {
+  const workspace = makeTempDir();
+  upsertJob(workspace, { id: "j", status: "running", pid: 7, phase: "starting" });
+  const after = upsertJob(workspace, { id: "j", phase: "thinking" });
+  assert.equal(after.status, "running");
+  assert.equal(after.phase, "thinking", "phase update must not be dropped");
+});
+
+test("session-ended marker is create-once and observable", () => {
+  const workspace = makeTempDir();
+  assert.equal(isSessionEnded(workspace, "s1"), false);
+  assert.equal(markSessionEnded(workspace, "s1"), true, "first mark creates it");
+  assert.equal(markSessionEnded(workspace, "s1"), false, "second mark is a no-op");
+  assert.equal(isSessionEnded(workspace, "s1"), true);
+  assert.equal(isSessionEnded(workspace, "s2"), false, "unrelated session is unaffected");
+});
+
+test("readJobPid returns the raw record pid (not overlaid) so a canceller can kill after marking", () => {
+  const workspace = makeTempDir();
+  upsertJob(workspace, { id: "j", status: "running", pid: 4321 });
+  assert.equal(readJobPid(workspace, "j"), 4321);
+  // After marking, listJobs overlays pid:null, but the RAW pid is still readable to kill.
+  markJobCancelled(workspace, "j", "test");
+  assert.equal(readJobPid(workspace, "j"), 4321, "raw pid survives the overlay");
+  assert.equal(listJobs(workspace).find((e) => e.id === "j").pid, null, "overlay hides the pid from readers");
 });

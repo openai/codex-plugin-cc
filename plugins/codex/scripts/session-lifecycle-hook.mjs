@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 
 import { terminateProcessTree } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
@@ -14,9 +16,11 @@ import {
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
 import {
-  listJobs,
-  resolveJobFile,
-  resolveJobLogFile,
+  deleteJobFiles,
+  markJobCancelled,
+  markSessionEnded,
+  readAllJobsRaw,
+  readJobPid,
   resolveJobsDir,
   resolveStateFile
 } from "./lib/state.mjs";
@@ -54,6 +58,22 @@ function pidAlive(pid) {
   }
 }
 
+// A pid that is still RUNNABLE (can execute code), as opposed to a zombie/defunct that
+// `kill(pid, 0)` still reports as existing but which can never resurrect a record. Used
+// only to decide whether to DELETE a job's record. It must FAIL SAFE: any uncertainty
+// returns true (keep the record+tombstone), because wrongly classifying a live worker as
+// non-runnable would delete a tombstone the worker could still overwrite. Only a
+// conclusive `ps` result reporting a zombie state returns false.
+function pidRunnable(pid) {
+  if (!pidAlive(pid)) return false; // ESRCH => definitely gone
+  const out = spawnSync("ps", ["-o", "state=", "-p", String(pid)], { encoding: "utf8" });
+  // Treat launch failure / non-zero exit / no output / read error as UNCERTAIN -> runnable.
+  if (out.error || out.status !== 0) return true;
+  const state = (out.stdout ?? "").trim();
+  if (state === "") return true; // ambiguous (some ps print nothing transiently) -> keep
+  return state[0].toUpperCase() !== "Z"; // conclusive Z/Z+ zombie -> not runnable
+}
+
 // Block (bounded) until every pid has exited, or capMs elapses. Workers install no
 // SIGTERM handler so they normally die within a few ms; the cap prevents a hang.
 function waitForExit(pids, capMs) {
@@ -67,7 +87,7 @@ function waitForExit(pids, capMs) {
   }
 }
 
-function cleanupSessionJobs(cwd, sessionId) {
+export function cleanupSessionJobs(cwd, sessionId) {
   if (!cwd || !sessionId) {
     return;
   }
@@ -77,32 +97,53 @@ function cleanupSessionJobs(cwd, sessionId) {
     return;
   }
 
-  // Job state is one file per job with no shared lock, so cleanup needs no locked
-  // read-modify-write. Terminate this session's live workers FIRST, wait briefly
-  // for them to actually exit, THEN delete their records -- so a still-dying worker
-  // cannot re-create a record we just removed.
-  const isRunning = (job) => job.status === "queued" || job.status === "running";
+  // 1. Publish the session-ended marker FIRST, BEFORE scanning. This is what makes the
+  // scan race-free against a task being enqueued concurrently: if a worker slips past
+  // its own marker checks (reads them before this marker exists), then it must have
+  // published its pid before this marker, hence before the scan below -- so the scan
+  // sees its record and kills it. Either the worker honors the marker, or we find and
+  // kill it. It also refuses any later enqueue for this session. This marker is
+  // load-bearing: if it cannot be written (e.g. ENOSPC/EACCES), surface the failure
+  // loudly rather than silently proceeding as if the session were cleanly closed. We
+  // still run the per-job kill below so live workers are stopped regardless.
+  try {
+    markSessionEnded(workspaceRoot, sessionId);
+  } catch (err) {
+    process.stderr.write(`codex: failed to publish session-ended marker for ${sessionId}: ${err instanceof Error ? err.message : String(err)}\n`);
+  }
+
+  // 2. Scan the RAW records (not the overlaid view -- the marker we just wrote would
+  // otherwise hide this session's active jobs from us).
+  const isActive = (job) => job.status === "queued" || job.status === "running";
   let jobs = [];
   try {
-    jobs = listJobs(workspaceRoot).filter((job) => job.sessionId === sessionId);
+    jobs = readAllJobsRaw(workspaceRoot).filter((job) => typeof job.id === "string" && job.sessionId === sessionId);
   } catch {
     return;
   }
+  const active = jobs.filter(isActive);
 
-  const pids = [];
-  for (const job of jobs) {
-    if (!isRunning(job)) continue;
-    const pid = job.pid;
-    if (Number.isInteger(pid) && pid > 0) pids.push(pid);
+  // 3. Publish a per-job cancel marker for each active job BEFORE reading its pid, so a
+  // worker that publishes its pid concurrently sees the marker on its post-pid re-check
+  // and self-aborts (the pid-less startup window is safe: no pid to kill, marker stands).
+  for (const job of active) {
+    try { markJobCancelled(workspaceRoot, job.id, "Session ended."); } catch {}
+  }
+
+  // 4. Only NOW read each active job's pid (raw, AFTER its marker exists) and terminate
+  // it, escalating to SIGKILL. Reading the pid after the marker is what makes the
+  // handshake hold: a worker that publishes its pid after this read still sees the marker
+  // on its own re-check and self-aborts.
+  const pidByJob = new Map(active.map((job) => [job.id, readJobPid(workspaceRoot, job.id)]));
+  const pids = [...pidByJob.values()].filter((pid) => pid != null);
+  for (const pid of pids) {
     try {
-      terminateProcessTree(pid ?? Number.NaN);
+      terminateProcessTree(pid);
     } catch {
       // Ignore teardown failures during session shutdown.
     }
   }
   waitForExit(pids, 2000);
-  // Escalate to SIGKILL for any worker that ignored SIGTERM, so it cannot survive
-  // to re-create a record we are about to delete, then give it a moment to die.
   const survivors = pids.filter(pidAlive);
   for (const pid of survivors) {
     try { process.kill(pid, "SIGKILL"); } catch {}
@@ -111,15 +152,22 @@ function cleanupSessionJobs(cwd, sessionId) {
     waitForExit(survivors, 500);
   }
 
+  // 5. Delete records, EXCEPT those we cannot prove are worker-free: an active job for
+  // which we found NO pid (a worker may still be booting), or one whose pid is STILL
+  // alive after SIGKILL (an unkillable/stuck worker). Those are left as record + marker
+  // (overlay => cancelled; prune GCs once the raw record ages out or turns terminal);
+  // the booting worker honors the marker and aborts. Everything else -- a job we killed
+  // and confirmed gone, or an already-finished job -- is safe to remove; deleteJobFiles
+  // removes the record, its cancel marker, and its logs together.
+  const stillRunnable = new Set(pids.filter(pidRunnable)); // excludes zombies (dead, unreaped)
+  const keepMarker = new Set(
+    active
+      .filter((job) => pidByJob.get(job.id) == null || stillRunnable.has(pidByJob.get(job.id)))
+      .map((job) => job.id)
+  );
   for (const job of jobs) {
-    if (typeof job.id !== "string") continue;
-    try { fs.unlinkSync(resolveJobFile(workspaceRoot, job.id)); } catch {}
-    // Remove the log at its recorded path (which need not be jobs/<id>.log) as
-    // well as the conventional path, so no orphan log survives cleanup.
-    if (typeof job.logFile === "string") {
-      try { fs.unlinkSync(job.logFile); } catch {}
-    }
-    try { fs.unlinkSync(resolveJobLogFile(workspaceRoot, job.id)); } catch {}
+    if (keepMarker.has(job.id)) continue;
+    deleteJobFiles(workspaceRoot, job);
   }
 }
 
@@ -176,7 +224,20 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-  process.exit(1);
-});
+// Only run the hook when executed directly (node session-lifecycle-hook.mjs <event>);
+// importing the module (e.g. from tests) must not read stdin or run a lifecycle event.
+function isDirectRun() {
+  if (!process.argv[1]) return false;
+  try {
+    return fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectRun()) {
+  main().catch((error) => {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exit(1);
+  });
+}

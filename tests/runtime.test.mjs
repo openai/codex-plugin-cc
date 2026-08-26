@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { listJobs, resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 // Jobs are stored one file per job under <stateDir>/jobs/<id>.json (no shared
 // index array). Read them back newest-first, the way the CLI lists them.
@@ -1444,6 +1444,7 @@ test("result without a job id prefers the latest finished job from the current C
         id: "review-current",
         status: "completed",
         title: "Codex Review",
+        sessionId: "sess-current",
         threadId: "thr_current",
         result: {
           codex: {
@@ -1464,6 +1465,7 @@ test("result without a job id prefers the latest finished job from the current C
         id: "review-other",
         status: "completed",
         title: "Codex Review",
+        sessionId: "sess-other",
         threadId: "thr_other",
         result: {
           codex: {
@@ -1581,22 +1583,10 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
   });
 
   const logFile = path.join(jobsDir, "task-live.log");
-  const jobFile = path.join(jobsDir, "task-live.json");
   fs.writeFileSync(logFile, "[2026-03-18T15:30:00.000Z] Starting Codex Task.\n", "utf8");
-  fs.writeFileSync(
-    jobFile,
-    JSON.stringify(
-      {
-        id: "task-live",
-        status: "running",
-        title: "Codex Task",
-        logFile
-      },
-      null,
-      2
-    ),
-    "utf8"
-  );
+  // The task-live.json record (with its pid) is materialized from the legacy state.json
+  // jobs[] index by migration; do NOT pre-write a bare file, which create-exclusive
+  // migration would skip, leaving the record without its pid.
   fs.writeFileSync(
     path.join(stateDir, "state.json"),
     `${JSON.stringify(
@@ -1640,13 +1630,13 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
     }
   });
 
-  const state = { jobs: jobsFromStateDir(stateDir) };
-  const cancelled = state.jobs.find((job) => job.id === "task-live");
+  // Cancellation is recorded via an immutable marker + read overlay (not a racy record
+  // write), so the observable state (what listJobs returns) is cancelled and the marker
+  // file exists.
+  const cancelled = listJobs(workspace).find((job) => job.id === "task-live");
   assert.equal(cancelled.status, "cancelled");
   assert.equal(cancelled.pid, null);
-
-  const stored = JSON.parse(fs.readFileSync(jobFile, "utf8"));
-  assert.equal(stored.status, "cancelled");
+  assert.equal(fs.existsSync(path.join(jobsDir, "task-live.cancelled")), true, "cancel marker published");
   assert.match(fs.readFileSync(logFile, "utf8"), /Cancelled by user/);
 });
 
@@ -1749,8 +1739,7 @@ test("cancel with a job id can still target an active job from another Claude se
   assert.equal(cancel.status, 0, cancel.stderr);
   assert.equal(JSON.parse(cancel.stdout).jobId, "task-other");
 
-  const state = { jobs: jobsFromStateDir(stateDir) };
-  assert.equal(state.jobs[0].status, "cancelled");
+  assert.equal(listJobs(workspace).find((job) => job.id === "task-other").status, "cancelled");
 });
 
 test("cancel sends turn interrupt to the shared app-server before killing a brokered task", async () => {
@@ -1837,8 +1826,9 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   fs.writeFileSync(completedLog, "completed\n", "utf8");
   fs.writeFileSync(runningLog, "running\n", "utf8");
   fs.writeFileSync(otherSessionLog, "other\n", "utf8");
-  fs.writeFileSync(completedJobFile, JSON.stringify({ id: "review-completed" }, null, 2), "utf8");
-  fs.writeFileSync(otherJobFile, JSON.stringify({ id: "review-other" }, null, 2), "utf8");
+  // The per-job .json records are materialized from the legacy state.json jobs[] index
+  // below by migration; we deliberately do NOT pre-write bare {id} files, because
+  // migration is now create-exclusive and would skip (not enrich) an existing file.
 
   const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
     cwd: repo,
@@ -1846,7 +1836,6 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
     stdio: "ignore"
   });
   sleeper.unref();
-  fs.writeFileSync(runningJobFile, JSON.stringify({ id: "review-running" }, null, 2), "utf8");
 
   t.after(() => {
     try {
@@ -1919,8 +1908,14 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   assert.equal(result.status, 0, result.stderr);
   assert.equal(fs.existsSync(otherSessionLog), true);
   assert.equal(fs.existsSync(otherJobFile), true);
+  // The ending session's jobs (and their logs) are removed; the other session's job is
+  // untouched. Session end also drops an immutable `session-<hash>.ended` marker that
+  // refuses/aborts a task raced in after this cleanup scan.
+  const remaining = fs.readdirSync(path.dirname(otherJobFile)).sort();
+  const sessionMarkers = remaining.filter((n) => n.startsWith("session-") && n.endsWith(".ended"));
+  assert.equal(sessionMarkers.length, 1, "one session-ended marker was written");
   assert.deepEqual(
-    fs.readdirSync(path.dirname(otherJobFile)).sort(),
+    remaining.filter((n) => !n.startsWith("session-")),
     [path.basename(otherJobFile), path.basename(otherSessionLog)].sort()
   );
 

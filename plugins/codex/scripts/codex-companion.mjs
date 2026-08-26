@@ -27,11 +27,15 @@ import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
+  claimJobRecord,
   generateJobId,
   getConfig,
+  isJobCancelled,
+  isSessionEnded,
   listJobs,
+  markJobCancelled,
+  readJobPid,
   setConfig,
-  upsertJob,
   writeJobFile
 } from "./lib/state.mjs";
 import {
@@ -682,11 +686,20 @@ function spawnDetachedTaskWorker(cwd, jobId) {
 }
 
 function enqueueBackgroundTask(cwd, job, request) {
+  // Refuse to enqueue into a session that has already ended: otherwise a task launched
+  // after session cleanup's one-shot scan would be neither tombstoned nor terminated.
+  if (isSessionEnded(job.workspaceRoot, job.sessionId)) {
+    throw new Error("This session has ended; cannot launch a new background task.");
+  }
+
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  // Publish the queued record BEFORE spawning the worker, so a fast worker always
-  // finds its job (previously it could start and fail with "No stored job found").
+  // CLAIM the queued record BEFORE spawning the worker, with an atomic create (never an
+  // overwrite). This both makes the record findable by a fast worker AND enforces
+  // single-writer ownership: if the id already exists (an astronomically unlikely
+  // duplicate from generateJobId, or a double launch), we refuse rather than spawn a
+  // second worker onto the same record.
   const queuedRecord = {
     ...job,
     status: "queued",
@@ -695,11 +708,12 @@ function enqueueBackgroundTask(cwd, job, request) {
     logFile,
     request
   };
-  writeJobFile(job.workspaceRoot, job.id, queuedRecord);
+  if (!claimJobRecord(job.workspaceRoot, job.id, queuedRecord)) {
+    throw new Error(`Job id ${job.id} already exists; refusing to launch a duplicate worker.`);
+  }
 
-  let child;
   try {
-    child = spawnDetachedTaskWorker(cwd, job.id);
+    spawnDetachedTaskWorker(cwd, job.id);
   } catch (error) {
     // Spawn failed synchronously: mark the record failed so it does not linger as
     // a pending job.
@@ -712,11 +726,12 @@ function enqueueBackgroundTask(cwd, job, request) {
     throw error;
   }
 
-  // Record only the child's pid (a pid-only patch, not a stale full snapshot), so
-  // a cancel/cleanup arriving before the worker publishes "running" can still
-  // terminate it. The worker owns every subsequent lifecycle transition; this
-  // merges into whatever the worker has already published without reverting it.
-  upsertJob(job.workspaceRoot, { id: job.id, pid: child.pid ?? null });
+  // The worker owns the record from here: it publishes `running` with its own pid as
+  // its first act (see runTrackedJob). The parent deliberately does NOT patch the pid
+  // in, so the per-job record has a SINGLE writer -- no concurrent read-modify-write,
+  // hence no lost update. A cancel/session-end arriving before the worker publishes
+  // `running` is honored by the immutable cancel/session-ended markers, which the
+  // worker consults at startup and again right after it publishes its pid.
 
   return {
     payload: {
@@ -872,9 +887,21 @@ async function handleTaskWorker(argv) {
     throw new Error(`No stored job found for ${options["job-id"]}.`);
   }
 
-  // Honor a cancellation that landed during our startup window (before we could
-  // publish a pid): if the record is already cancelled, do not start the task.
-  if (storedJob.status === "cancelled") {
+  // Honor a cancellation or a session end that landed during our startup window
+  // (before we could publish a pid): the immutable cancel marker and the session-ended
+  // marker are the durable, race-free signals, so consult them (not just the record,
+  // which a stale reader could have missed). We are the single writer, so record a
+  // cancelled terminal state before returning (keeps the raw record truthful; the marker
+  // overlay would show cancelled regardless). runTrackedJob re-checks the markers again
+  // after it publishes our pid, closing the rest of the window.
+  if (storedJob.status === "cancelled" || isJobCancelled(workspaceRoot, options["job-id"]) || isSessionEnded(workspaceRoot, storedJob.sessionId)) {
+    writeJobFile(workspaceRoot, options["job-id"], {
+      ...storedJob,
+      status: "cancelled",
+      phase: "cancelled",
+      pid: null,
+      completedAt: nowIso()
+    });
     return;
   }
 
@@ -1010,7 +1037,23 @@ async function handleCancel(argv) {
     );
   }
 
-  terminateProcessTree(job.pid ?? Number.NaN);
+  // Publish the immutable cancel marker BEFORE terminating, so a worker that publishes
+  // its pid concurrently is guaranteed to see the marker on its post-pid re-check and
+  // self-abort (the mirror of runTrackedJob's handshake). The marker is the RACE-SAFE
+  // authority: readers overlay it, so even if a worker writes `running`/`completed`
+  // after this, the job still reads as cancelled and can never be resurrected.
+  //
+  // Ordering is load-bearing: create the marker FIRST, THEN read the pid to kill. The
+  // worker does the mirror (publish pid, then read marker), so at least one side always
+  // observes the other -- we kill the worker, or it self-aborts. Reading a stale pid
+  // from before the marker would let a worker slip through both checks.
+  markJobCancelled(workspaceRoot, job.id, "Cancelled by user.");
+  // Read the pid FRESH, after the marker. No fallback to the pre-marker snapshot pid: a
+  // fresh null means the worker either never published or already exited, and killing a
+  // stale pid risks signalling an unrelated process that reused it. If it's null, the
+  // worker will honor the marker on its own post-pid re-check.
+  const killPid = readJobPid(workspaceRoot, job.id);
+  terminateProcessTree(killPid ?? Number.NaN);
   appendLogLine(job.logFile, "Cancelled by user.");
 
   const completedAt = nowIso();
@@ -1023,19 +1066,10 @@ async function handleCancel(argv) {
     errorMessage: "Cancelled by user."
   };
 
-  writeJobFile(workspaceRoot, job.id, {
-    ...existing,
-    ...nextJob,
-    cancelledAt: completedAt
-  });
-  upsertJob(workspaceRoot, {
-    id: job.id,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    errorMessage: "Cancelled by user.",
-    completedAt
-  });
+  // We deliberately do NOT write the record here. The marker is the authority: every
+  // read overlays it to cancelled, and the worker (the record's single writer) records
+  // the terminal cancelled state when it observes the marker. A cancel-command record
+  // write would reintroduce a second writer racing the worker.
 
   const payload = {
     jobId: job.id,
