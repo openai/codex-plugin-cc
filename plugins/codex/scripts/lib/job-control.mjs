@@ -181,11 +181,13 @@ export function enrichJob(job, options = {}) {
 }
 
 export function readStoredJob(workspaceRoot, jobId) {
-  const jobFile = resolveJobFile(workspaceRoot, jobId);
-  if (!fs.existsSync(jobFile)) {
+  // Guarded read: the per-job file can be pruned or session-cleaned between the
+  // existence check and the read, so treat any read/parse failure as "absent".
+  try {
+    return readJobFile(resolveJobFile(workspaceRoot, jobId));
+  } catch {
     return null;
   }
-  return readJobFile(jobFile);
 }
 
 function matchJobReference(jobs, reference, predicate = () => true) {

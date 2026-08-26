@@ -8,7 +8,16 @@ import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { makeTempDir } from "./helpers.mjs";
-import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import {
+  ensureStateDir,
+  listJobs,
+  resolveJobFile,
+  resolveJobLogFile,
+  resolveStateDir,
+  resolveStateFile,
+  upsertJob,
+  writeJobFile
+} from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const STATE_URL = pathToFileURL(path.join(ROOT, "plugins", "codex", "scripts", "lib", "state.mjs")).href;
@@ -46,141 +55,99 @@ test("resolveStateDir uses CLAUDE_PLUGIN_DATA when it is provided", () => {
   }
 });
 
-test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", () => {
+test("upsertJob merges a patch into a job's record without dropping fields", () => {
   const workspace = makeTempDir();
-  const stateFile = resolveStateFile(workspace);
-  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+  writeJobFile(workspace, "j1", { id: "j1", status: "running", sessionId: "s1", pid: 123 });
+  upsertJob(workspace, { id: "j1", status: "completed", summary: "done" });
 
-  const jobs = Array.from({ length: 51 }, (_, index) => {
-    const jobId = `job-${index}`;
-    const updatedAt = new Date(Date.UTC(2026, 0, 1, 0, index, 0)).toISOString();
-    const logFile = resolveJobLogFile(workspace, jobId);
-    const jobFile = resolveJobFile(workspace, jobId);
-    fs.writeFileSync(logFile, `log ${jobId}\n`, "utf8");
-    fs.writeFileSync(jobFile, JSON.stringify({ id: jobId, status: "completed" }, null, 2), "utf8");
-    return {
-      id: jobId,
-      status: "completed",
-      logFile,
-      updatedAt,
-      createdAt: updatedAt
-    };
-  });
+  const job = listJobs(workspace).find((entry) => entry.id === "j1");
+  assert.equal(job.status, "completed");
+  assert.equal(job.summary, "done");
+  assert.equal(job.sessionId, "s1"); // field from the earlier write is preserved
+  assert.ok(job.createdAt);
+  assert.ok(job.updatedAt);
+});
 
+test("concurrent upserts of different jobs never lose a record (no lock)", async () => {
+  const workspace = makeTempDir();
+  const jobCount = 16;
+  const worker =
+    `import { upsertJob } from ${JSON.stringify(STATE_URL)};\n` +
+    "const [cwd, id] = process.argv.slice(1);\n" +
+    "upsertJob(cwd, { id, status: \"queued\", jobClass: \"task\", summary: id });\n";
+
+  await Promise.all(
+    Array.from({ length: jobCount }, (_, index) =>
+      new Promise((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          ["--input-type=module", "-e", worker, workspace, `job-${index}`],
+          { stdio: "ignore" }
+        );
+        child.on("exit", (code) =>
+          code === 0 ? resolve() : reject(new Error(`worker ${index} exited ${code}`))
+        );
+      })
+    )
+  );
+
+  const ids = new Set(listJobs(workspace).map((job) => job.id));
+  const missing = Array.from({ length: jobCount }, (_, index) => `job-${index}`).filter(
+    (id) => !ids.has(id)
+  );
+  assert.deepEqual(missing, [], "every concurrently launched job must be present");
+});
+
+test("prune evicts oldest terminal jobs but keeps live and non-terminal ones over the cap", () => {
+  const workspace = makeTempDir();
+  ensureStateDir(workspace);
+
+  // 50 old terminal jobs (completed), staggered updatedAt so ordering is defined.
+  for (let i = 0; i < 50; i += 1) {
+    const id = `done-${String(i).padStart(2, "0")}`;
+    const ts = new Date(Date.UTC(2026, 0, 1, 0, i, 0)).toISOString();
+    fs.writeFileSync(resolveJobFile(workspace, id), JSON.stringify({ id, status: "completed", updatedAt: ts, createdAt: ts }));
+    fs.writeFileSync(resolveJobLogFile(workspace, id), `log ${id}\n`);
+  }
+  // A running job owned by THIS (alive) process, with the oldest timestamp of all.
+  const liveTs = new Date(Date.UTC(2025, 0, 1)).toISOString();
   fs.writeFileSync(
-    stateFile,
-    `${JSON.stringify(
-      {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
+    resolveJobFile(workspace, "live"),
+    JSON.stringify({ id: "live", status: "running", pid: process.pid, updatedAt: liveTs, createdAt: liveTs })
   );
 
-  saveState(workspace, {
+  // 52 files now (> MAX_JOBS=50). One more write triggers prune (overflow 2).
+  upsertJob(workspace, { id: "trigger", status: "completed" });
+
+  const ids = new Set(listJobs(workspace).map((job) => job.id));
+  assert.equal(ids.has("live"), true, "a live running job must never be pruned, even as the oldest");
+  // The two oldest *terminal* jobs are evicted (done-00, done-01), payload + log.
+  assert.equal(ids.has("done-00"), false);
+  assert.equal(ids.has("done-01"), false);
+  assert.equal(fs.existsSync(resolveJobLogFile(workspace, "done-00")), false, "evicted job's log is removed too");
+  assert.equal(ids.has("done-02"), true, "newer terminal jobs are kept");
+});
+
+test("legacy state.json jobs[] array migrates to per-job files on read", () => {
+  const workspace = makeTempDir();
+  ensureStateDir(workspace);
+  const legacy = {
     version: 1,
-    config: { stopReviewGate: false },
-    jobs
-  });
+    config: { stopReviewGate: true },
+    jobs: [
+      { id: "old-a", status: "completed", sessionId: "s", updatedAt: "2026-01-01T00:00:00.000Z" },
+      { id: "old-b", status: "failed", sessionId: "s", updatedAt: "2026-01-01T00:01:00.000Z" }
+    ]
+  };
+  fs.writeFileSync(resolveStateFile(workspace), JSON.stringify(legacy, null, 2));
 
-  const prunedJobFile = resolveJobFile(workspace, "job-0");
-  const prunedLogFile = resolveJobLogFile(workspace, "job-0");
-  const retainedJobFile = resolveJobFile(workspace, "job-50");
-  const retainedLogFile = resolveJobLogFile(workspace, "job-50");
-  const jobsDir = path.dirname(prunedJobFile);
+  const ids = new Set(listJobs(workspace).map((job) => job.id));
+  assert.equal(ids.has("old-a"), true);
+  assert.equal(ids.has("old-b"), true);
+  assert.equal(fs.existsSync(resolveJobFile(workspace, "old-a")), true, "legacy entry materialized as a per-job file");
 
-  assert.equal(fs.existsSync(retainedJobFile), true);
-  assert.equal(fs.existsSync(retainedLogFile), true);
-
-  const savedState = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-  assert.equal(savedState.jobs.length, 50);
-  assert.deepEqual(
-    savedState.jobs.map((job) => job.id),
-    Array.from({ length: 50 }, (_, index) => `job-${50 - index}`)
-  );
-  assert.deepEqual(
-    fs.readdirSync(jobsDir).sort(),
-    Array.from({ length: 50 }, (_, index) => `job-${index + 1}`)
-      .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
-      .sort()
-  );
-});
-
-test("updateState serializes concurrent job writes without losing records", async () => {
-  const workspace = makeTempDir();
-  const jobCount = 12;
-  const worker =
-    `import { upsertJob } from ${JSON.stringify(STATE_URL)};\n` +
-    "const [cwd, id] = process.argv.slice(1);\n" +
-    "upsertJob(cwd, { id, status: \"queued\", jobClass: \"task\", summary: id });\n";
-
-  await Promise.all(
-    Array.from({ length: jobCount }, (_, index) =>
-      new Promise((resolve, reject) => {
-        const child = spawn(
-          process.execPath,
-          ["--input-type=module", "-e", worker, workspace, `job-${index}`],
-          { stdio: "ignore" }
-        );
-        child.on("exit", (code) =>
-          code === 0 ? resolve() : reject(new Error(`worker ${index} exited ${code}`))
-        );
-      })
-    )
-  );
-
-  const saved = JSON.parse(fs.readFileSync(resolveStateFile(workspace), "utf8"));
-  const trackedIds = new Set(saved.jobs.map((job) => job.id));
-  const missing = Array.from({ length: jobCount }, (_, index) => `job-${index}`).filter(
-    (id) => !trackedIds.has(id)
-  );
-
-  assert.deepEqual(missing, [], "every concurrently launched job must be tracked");
-});
-
-test("updateState reclaims a stale lock without losing records under concurrency", async () => {
-  const workspace = makeTempDir();
-
-  // Simulate a crashed holder: a lock file older than the 10s stale threshold.
-  const stateDir = resolveStateDir(workspace);
-  fs.mkdirSync(stateDir, { recursive: true });
-  const lockFile = path.join(stateDir, "state.lock");
-  // Stamp a dead PID as the owner ("<pid>.<startTag>.<time>.<rand>") so the
-  // instance-liveness reclaim path fires: process.kill on this high, almost-
-  // certainly-dead PID throws ESRCH, so the lock is treated as abandoned.
-  fs.writeFileSync(lockFile, "2147483646.0.dead.owner");
-
-  const jobCount = 10;
-  const worker =
-    `import { upsertJob } from ${JSON.stringify(STATE_URL)};\n` +
-    "const [cwd, id] = process.argv.slice(1);\n" +
-    "upsertJob(cwd, { id, status: \"queued\", jobClass: \"task\", summary: id });\n";
-
-  await Promise.all(
-    Array.from({ length: jobCount }, (_, index) =>
-      new Promise((resolve, reject) => {
-        const child = spawn(
-          process.execPath,
-          ["--input-type=module", "-e", worker, workspace, `job-${index}`],
-          { stdio: "ignore" }
-        );
-        child.on("exit", (code) =>
-          code === 0 ? resolve() : reject(new Error(`worker ${index} exited ${code}`))
-        );
-      })
-    )
-  );
-
-  const saved = JSON.parse(fs.readFileSync(resolveStateFile(workspace), "utf8"));
-  const trackedIds = new Set(saved.jobs.map((job) => job.id));
-  const missing = Array.from({ length: jobCount }, (_, index) => `job-${index}`).filter(
-    (id) => !trackedIds.has(id)
-  );
-
-  assert.deepEqual(missing, [], "stale-lock reclaim must not drop concurrent job records");
-  assert.equal(fs.existsSync(lockFile), false, "lock file should be released after all writers finish");
+  // state.json is rewritten config-only (no jobs array left to re-migrate/resurrect).
+  const rewritten = JSON.parse(fs.readFileSync(resolveStateFile(workspace), "utf8"));
+  assert.equal(Array.isArray(rewritten.jobs), false);
+  assert.equal(rewritten.config.stopReviewGate, true);
 });

@@ -99,18 +99,11 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       return;
     }
 
+    // upsertJob merges the patch into the single per-job record atomically, so the
+    // former re-read + full-snapshot writeJobFile is not only redundant now but
+    // unsafe: passing a stale snapshot could resurrect a concurrently cancelled or
+    // completed job back to "running".
     upsertJob(workspaceRoot, patch);
-
-    const jobFile = resolveJobFile(workspaceRoot, jobId);
-    if (!fs.existsSync(jobFile)) {
-      return;
-    }
-
-    const storedJob = readJobFile(jobFile);
-    writeJobFile(workspaceRoot, jobId, {
-      ...storedJob,
-      ...patch
-    });
   };
 }
 
@@ -132,11 +125,13 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
 }
 
 function readStoredJobOrNull(workspaceRoot, jobId) {
-  const jobFile = resolveJobFile(workspaceRoot, jobId);
-  if (!fs.existsSync(jobFile)) {
+  // Guarded read: the per-job file can be pruned or session-cleaned between an
+  // existence check and the read, so treat any read/parse failure as "absent".
+  try {
+    return readJobFile(resolveJobFile(workspaceRoot, jobId));
+  } catch {
     return null;
   }
-  return readJobFile(jobFile);
 }
 
 export async function runTrackedJob(job, runner, options = {}) {

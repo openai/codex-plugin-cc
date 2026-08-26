@@ -685,17 +685,38 @@ function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
+  // Publish the queued record BEFORE spawning the worker, so a fast worker always
+  // finds its job (previously it could start and fail with "No stored job found").
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
     request
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
-  upsertJob(job.workspaceRoot, queuedRecord);
+
+  let child;
+  try {
+    child = spawnDetachedTaskWorker(cwd, job.id);
+  } catch (error) {
+    // Spawn failed synchronously: mark the record failed so it does not linger as
+    // a pending job.
+    writeJobFile(job.workspaceRoot, job.id, {
+      ...queuedRecord,
+      status: "failed",
+      phase: "failed",
+      errorMessage: error instanceof Error ? error.message : String(error)
+    });
+    throw error;
+  }
+
+  // Record only the child's pid (a pid-only patch, not a stale full snapshot), so
+  // a cancel/cleanup arriving before the worker publishes "running" can still
+  // terminate it. The worker owns every subsequent lifecycle transition; this
+  // merges into whatever the worker has already published without reverting it.
+  upsertJob(job.workspaceRoot, { id: job.id, pid: child.pid ?? null });
 
   return {
     payload: {
@@ -849,6 +870,12 @@ async function handleTaskWorker(argv) {
   const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
   if (!storedJob) {
     throw new Error(`No stored job found for ${options["job-id"]}.`);
+  }
+
+  // Honor a cancellation that landed during our startup window (before we could
+  // publish a pid): if the record is already cancelled, do not start the task.
+  if (storedJob.status === "cancelled") {
+    return;
   }
 
   const request = storedJob.request;

@@ -13,7 +13,13 @@ import {
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveStateFile, updateState } from "./lib/state.mjs";
+import {
+  listJobs,
+  resolveJobFile,
+  resolveJobLogFile,
+  resolveJobsDir,
+  resolveStateFile
+} from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -39,59 +45,81 @@ function appendEnvVar(name, value) {
   fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `export ${name}=${shellEscape(value)}\n`, "utf8");
 }
 
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === "EPERM";
+  }
+}
+
+// Block (bounded) until every pid has exited, or capMs elapses. Workers install no
+// SIGTERM handler so they normally die within a few ms; the cap prevents a hang.
+function waitForExit(pids, capMs) {
+  const deadline = Date.now() + capMs;
+  let remaining = pids.slice();
+  while (remaining.length > 0 && Date.now() < deadline) {
+    remaining = remaining.filter(pidAlive);
+    if (remaining.length > 0) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+  }
+}
+
 function cleanupSessionJobs(cwd, sessionId) {
   if (!cwd || !sessionId) {
     return;
   }
 
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const stateFile = resolveStateFile(workspaceRoot);
-  if (!fs.existsSync(stateFile)) {
+  if (!fs.existsSync(resolveStateFile(workspaceRoot)) && !fs.existsSync(resolveJobsDir(workspaceRoot))) {
     return;
   }
 
-  // Drop this session's jobs through the locked read-modify-write so a concurrent
-  // upsertJob (task launch) can't be clobbered by a stale snapshot, and capture
-  // which running jobs to terminate. Process teardown runs in `finally`, after the
-  // lock is released, so a failed state write (e.g. the 15s lock-acquire timeout)
-  // can never leak this session's processes, and never aborts the rest of session
-  // shutdown (broker teardown) -- session cleanup is best-effort.
+  // Job state is one file per job with no shared lock, so cleanup needs no locked
+  // read-modify-write. Terminate this session's live workers FIRST, wait briefly
+  // for them to actually exit, THEN delete their records -- so a still-dying worker
+  // cannot re-create a record we just removed.
   const isRunning = (job) => job.status === "queued" || job.status === "running";
-  const toTerminate = [];
+  let jobs = [];
   try {
-    updateState(workspaceRoot, (state) => {
-      for (const job of state.jobs) {
-        if (job.sessionId === sessionId && isRunning(job)) {
-          toTerminate.push(job.pid ?? Number.NaN);
-        }
-      }
-      state.jobs = state.jobs.filter((job) => job.sessionId !== sessionId);
-    });
+    jobs = listJobs(workspaceRoot).filter((job) => job.sessionId === sessionId);
   } catch {
-    // The locked update failed (e.g. lock-acquire timeout). Still identify this
-    // session's processes so we can tear them down -- via a best-effort unlocked
-    // read only. We deliberately do NOT write state here: an unlocked save is the
-    // very clobber this lock prevents; the stale records are removed on a later
-    // locked pass.
-    if (toTerminate.length === 0) {
-      try {
-        for (const job of loadState(workspaceRoot).jobs) {
-          if (job.sessionId === sessionId && isRunning(job)) {
-            toTerminate.push(job.pid ?? Number.NaN);
-          }
-        }
-      } catch {
-        // Nothing more we can do; fall through to whatever we collected.
-      }
+    return;
+  }
+
+  const pids = [];
+  for (const job of jobs) {
+    if (!isRunning(job)) continue;
+    const pid = job.pid;
+    if (Number.isInteger(pid) && pid > 0) pids.push(pid);
+    try {
+      terminateProcessTree(pid ?? Number.NaN);
+    } catch {
+      // Ignore teardown failures during session shutdown.
     }
-  } finally {
-    for (const pid of toTerminate) {
-      try {
-        terminateProcessTree(pid);
-      } catch {
-        // Ignore teardown failures during session shutdown.
-      }
+  }
+  waitForExit(pids, 2000);
+  // Escalate to SIGKILL for any worker that ignored SIGTERM, so it cannot survive
+  // to re-create a record we are about to delete, then give it a moment to die.
+  const survivors = pids.filter(pidAlive);
+  for (const pid of survivors) {
+    try { process.kill(pid, "SIGKILL"); } catch {}
+  }
+  if (survivors.length > 0) {
+    waitForExit(survivors, 500);
+  }
+
+  for (const job of jobs) {
+    if (typeof job.id !== "string") continue;
+    try { fs.unlinkSync(resolveJobFile(workspaceRoot, job.id)); } catch {}
+    // Remove the log at its recorded path (which need not be jobs/<id>.log) as
+    // well as the conventional path, so no orphan log survives cleanup.
+    if (typeof job.logFile === "string") {
+      try { fs.unlinkSync(job.logFile); } catch {}
     }
+    try { fs.unlinkSync(resolveJobLogFile(workspaceRoot, job.id)); } catch {}
   }
 }
 
