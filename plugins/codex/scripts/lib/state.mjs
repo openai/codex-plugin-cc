@@ -123,6 +123,103 @@ function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+// Absolute-backstop timeout. A lock is normally reclaimed the instant its owner's
+// PID is dead; this only forces reclaim of a lock whose PID still looks alive, to
+// preserve liveness in the rare case a dead owner's PID was recycled by an
+// unrelated live process. It is deliberately far longer than any real critical
+// section (a state.json read-modify-write is milliseconds), so a genuinely live
+// holder is never reclaimed by it -- only one wedged/suspended past 10 minutes,
+// which is indistinguishable from dead.
+const LOCK_BACKSTOP_MS = 600000;
+
+// Lock files live under a per-workspace OS temp dir (see resolveStateDir), i.e. a
+// single host, so a PID read from a lock refers to a process on this machine and
+// process.kill(pid, 0) is a valid liveness probe.
+function ownerAlive(id) {
+  const pid = Number.parseInt(String(id).split(".")[0], 10);
+  if (!Number.isInteger(pid) || pid <= 0) return false; // empty/garbled => not a live owner
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === "EPERM"; // exists but not ours (still alive); ESRCH => dead
+  }
+}
+
+function isAbandoned(id, mtimeMs) {
+  if (!ownerAlive(id)) return true;                    // dead owner -> reclaimable
+  return Date.now() - mtimeMs > LOCK_BACKSTOP_MS;      // else only the far backstop
+}
+
+// Publish a lock atomically: write the owner id into a unique temp file, then
+// hard-link it onto the fixed path. linkSync is atomic and fails EEXIST if the
+// path is already held, exactly like O_EXCL -- but unlike open()+write() the file
+// has its full content the instant it appears at the path, so a concurrent reader
+// can never observe an empty lock and mistake a just-created live lock for an
+// abandoned one. Returns true if claimed, false if already held.
+function claimLock(lockFile, ownerId) {
+  const tmp = `${lockFile}.tmp.${ownerId}`;
+  fs.writeFileSync(tmp, ownerId);
+  try {
+    fs.linkSync(tmp, lockFile);
+    return true;
+  } catch (err) {
+    if (err.code === "EEXIST") return false;
+    throw err;
+  } finally {
+    try { fs.unlinkSync(tmp); } catch {}
+  }
+}
+
+// Reclaim a lock only when its owner is gone, never a live one.
+//
+// Gated on PID liveness: a live owner -- even one working slowly or briefly
+// frozen -- keeps a live PID and is never reclaimed, so this can only ever remove
+// a lock whose owner is truly dead. A dead owner can neither release nor recreate
+// its lock, and no other process can claim the path while it still exists, so
+// removing it here cannot race a freshly acquired lock. (The earlier mtime-only
+// reclaim was unsafe precisely because it could fire against a live owner and
+// unlink a lock another process had recreated in the meantime.)
+//
+// Removal is serialized through a second reclaim lock so two reclaimers can't
+// both act; that lock is atomically published, PID-stamped, only cleared when its
+// holder is dead, and released only by its own owner.
+function reclaimIfAbandoned(lockFile, reclaimFile, selfId) {
+  let content, st;
+  try {
+    content = fs.readFileSync(lockFile, "utf8");
+    st = fs.statSync(lockFile);
+  } catch {
+    return; // already gone
+  }
+  if (!isAbandoned(content, st.mtimeMs)) return; // live owner -> wait, don't touch
+  if (!claimLock(reclaimFile, selfId)) {
+    try {
+      // A reclaim lock whose own holder died is safe to drop; a live one is left
+      // alone (its PID is alive, so this never removes a reclaim in progress).
+      const rc = fs.readFileSync(reclaimFile, "utf8");
+      const rst = fs.statSync(reclaimFile);
+      if (isAbandoned(rc, rst.mtimeMs)) fs.unlinkSync(reclaimFile);
+    } catch {}
+    return;
+  }
+  try {
+    // Re-verify under the reclaim lock. The owner is still gone (a dead PID cannot
+    // come back), and the path can't have been re-claimed while it exists, so
+    // unlinking here cannot delete a live lock.
+    const c2 = fs.readFileSync(lockFile, "utf8");
+    const s2 = fs.statSync(lockFile);
+    if (isAbandoned(c2, s2.mtimeMs)) fs.unlinkSync(lockFile);
+  } catch {
+    // lock vanished between checks -- fine, nothing to reclaim
+  } finally {
+    // Release the reclaim lock only if it is still ours.
+    try {
+      if (fs.readFileSync(reclaimFile, "utf8") === selfId) fs.unlinkSync(reclaimFile);
+    } catch {}
+  }
+}
+
 // Cross-process lock around the state.json read-modify-write. Without it,
 // concurrent `task --background` launches each read the same base state, add
 // only their own job, and clobber siblings on write (and saveState's prune
@@ -130,42 +227,23 @@ function sleepSync(ms) {
 function withStateLock(cwd, fn) {
   ensureStateDir(cwd);
   const lockFile = path.join(resolveStateDir(cwd), "state.lock");
-  // Unique per acquisition: stamped into the lock so only the true owner ever
-  // removes it, and so a reclaimer's scratch path can't collide.
-  const ownerId = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const reclaimFile = `${lockFile}.reclaim`;
+  // "<pid>.<time>.<rand>": the PID lets other processes probe our liveness; the
+  // full string is stamped into the lock so only the true owner removes it.
+  const ownerId = `${process.pid}.${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 8)}`;
   const deadline = Date.now() + 15000;
   for (;;) {
-    try {
-      const fd = fs.openSync(lockFile, "wx"); // O_CREAT | O_EXCL
-      fs.writeSync(fd, ownerId);
-      fs.closeSync(fd);
-      break;
-    } catch (err) {
-      if (err.code !== "EEXIST") throw err;
-      // Reclaim a stale lock left by a crashed process. Do it atomically:
-      // rename() has exactly-one-winner semantics, so if several launches race
-      // to reclaim the same stale lock, only one succeeds and the losers get
-      // ENOENT and fall back to re-contending on open(O_EXCL). Never unlink the
-      // lock pathname directly here -- by the time we did, it could already be a
-      // fresh lock held by another process (the P2 the reviewer flagged).
-      try {
-        if (Date.now() - fs.statSync(lockFile).mtimeMs > 10000) {
-          const scratch = `${lockFile}.stale.${ownerId}`;
-          fs.renameSync(lockFile, scratch); // only one racer wins this
-          fs.unlinkSync(scratch);
-          continue;
-        }
-      } catch {}
-      if (Date.now() > deadline) throw new Error("Timed out acquiring Codex state lock");
-      sleepSync(20 + Math.floor(Math.random() * 30)); // jittered backoff
-    }
+    if (claimLock(lockFile, ownerId)) break;
+    reclaimIfAbandoned(lockFile, reclaimFile, ownerId);
+    if (Date.now() > deadline) throw new Error("Timed out acquiring Codex state lock");
+    sleepSync(20 + Math.floor(Math.random() * 30)); // jittered backoff
   }
   try {
     return fn();
   } finally {
-    // Only remove the lock if we still own it: if fn() ever outran the stale
-    // timeout and another process reclaimed the lock, its contents no longer
-    // match ownerId and we must not delete the lock it now holds.
+    // Only remove the lock if we still own it: if we were ever reclaimed (e.g.
+    // frozen past the fallback timeout), the contents no longer match ownerId and
+    // we must not delete the lock another process now holds.
     try {
       if (fs.readFileSync(lockFile, "utf8") === ownerId) fs.unlinkSync(lockFile);
     } catch {}
