@@ -5,7 +5,11 @@ disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---
 
-!`node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" status "$ARGUMENTS"`
+Run the Codex status command with the Bash tool (the `allowed-tools` frontmatter above permits it), then format the output as described below:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" status "$ARGUMENTS"
+```
 
 If the user did not pass a job ID:
 - Render the command output as a single Markdown table for the current and past runs in this session.
