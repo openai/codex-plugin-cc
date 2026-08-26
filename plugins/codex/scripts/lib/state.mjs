@@ -165,6 +165,31 @@ function processStartToken(pid) {
   return null;
 }
 
+// A process that has exited but not yet been reaped by its parent is a zombie:
+// process.kill(pid, 0) still succeeds and its start token is unchanged, so it
+// would otherwise look like a live owner forever. Detect it so its lock is
+// reclaimed instead of blocking every writer until the parent reaps it.
+function isZombie(pid) {
+  if (process.platform === "linux") {
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      // state (field 3) is the first token after the last ')'.
+      return stat.slice(stat.lastIndexOf(")") + 2).split(/\s+/)[0] === "Z";
+    } catch {
+      return false;
+    }
+  }
+  try {
+    const r = spawnSync("/bin/ps", ["-o", "state=", "-p", String(pid)], {
+      encoding: "utf8",
+      env: { ...process.env, LC_ALL: "C" },
+    });
+    return r.status === 0 && (r.stdout || "").trim().startsWith("Z");
+  } catch {
+    return false;
+  }
+}
+
 // The lock owner is identified as "<pid>.<startTokenHex>.<time>.<rand>". Compute
 // the current process's identity once per acquisition.
 function selfOwnerId() {
@@ -190,6 +215,7 @@ function isAbandoned(id) {
     alive = err.code === "EPERM"; // exists but not ours (still alive); ESRCH => dead
   }
   if (!alive) return true; // owner process is gone
+  if (isZombie(pid)) return true; // exited but unreaped -> effectively gone
   // PID is alive. Only declare it abandoned if we can PROVE it is a different
   // instance. If the owner's stamp is unverifiable ("0"), or we can't read the
   // current start token, treat the live PID as the same instance and do NOT
@@ -243,9 +269,9 @@ function claimLock(lockFile, ownerId) {
 // adjacent syscalls with no subprocess in it; isAbandoned (which may spawn `ps`)
 // runs only *before* the re-read. Closing it completely needs an atomic
 // conditional-delete / OS advisory lock (flock), which Node's fs builtins do not
-// expose. The failure mode is bounded -- a losing contender times out within the
-// 15s acquire deadline (an error, not silent corruption) -- never a permanent
-// deadlock, since a dead owner is always reclaimable on the next pass.
+// expose. Within that ~2-syscall window the worst case is a brief overlap (two
+// writers) or a losing contender that errors out at the 15s acquire deadline;
+// never a permanent deadlock, since a dead owner is always reclaimable next pass.
 function reclaimIfAbandoned(lockFile, selfId) {
   let seen;
   try {

@@ -13,7 +13,7 @@ import {
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
+import { loadState, resolveStateFile, updateState } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -50,28 +50,49 @@ function cleanupSessionJobs(cwd, sessionId) {
     return;
   }
 
-  const state = loadState(workspaceRoot);
-  const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
-  if (removedJobs.length === 0) {
-    return;
-  }
-
-  for (const job of removedJobs) {
-    const stillRunning = job.status === "queued" || job.status === "running";
-    if (!stillRunning) {
-      continue;
+  // Drop this session's jobs through the locked read-modify-write so a concurrent
+  // upsertJob (task launch) can't be clobbered by a stale snapshot, and capture
+  // which running jobs to terminate. Process teardown runs in `finally`, after the
+  // lock is released, so a failed state write (e.g. the 15s lock-acquire timeout)
+  // can never leak this session's processes, and never aborts the rest of session
+  // shutdown (broker teardown) -- session cleanup is best-effort.
+  const isRunning = (job) => job.status === "queued" || job.status === "running";
+  const toTerminate = [];
+  try {
+    updateState(workspaceRoot, (state) => {
+      for (const job of state.jobs) {
+        if (job.sessionId === sessionId && isRunning(job)) {
+          toTerminate.push(job.pid ?? Number.NaN);
+        }
+      }
+      state.jobs = state.jobs.filter((job) => job.sessionId !== sessionId);
+    });
+  } catch {
+    // The locked update failed (e.g. lock-acquire timeout). Still identify this
+    // session's processes so we can tear them down -- via a best-effort unlocked
+    // read only. We deliberately do NOT write state here: an unlocked save is the
+    // very clobber this lock prevents; the stale records are removed on a later
+    // locked pass.
+    if (toTerminate.length === 0) {
+      try {
+        for (const job of loadState(workspaceRoot).jobs) {
+          if (job.sessionId === sessionId && isRunning(job)) {
+            toTerminate.push(job.pid ?? Number.NaN);
+          }
+        }
+      } catch {
+        // Nothing more we can do; fall through to whatever we collected.
+      }
     }
-    try {
-      terminateProcessTree(job.pid ?? Number.NaN);
-    } catch {
-      // Ignore teardown failures during session shutdown.
+  } finally {
+    for (const pid of toTerminate) {
+      try {
+        terminateProcessTree(pid);
+      } catch {
+        // Ignore teardown failures during session shutdown.
+      }
     }
   }
-
-  saveState(workspaceRoot, {
-    ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
-  });
 }
 
 function handleSessionStart(input) {
