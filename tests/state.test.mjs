@@ -149,12 +149,10 @@ test("updateState reclaims a stale lock without losing records under concurrency
   const stateDir = resolveStateDir(workspace);
   fs.mkdirSync(stateDir, { recursive: true });
   const lockFile = path.join(stateDir, "state.lock");
-  // Stamp a dead PID as the owner so the liveness-based reclaim path fires. PID 1
-  // reused is possible but never dead; use a high, almost-certainly-dead PID and
-  // also backdate the mtime so the coarse fallback covers any PID-reuse fluke.
-  fs.writeFileSync(lockFile, "2147483646.dead.owner");
-  const stale = new Date(Date.now() - 120_000);
-  fs.utimesSync(lockFile, stale, stale);
+  // Stamp a dead PID as the owner ("<pid>.<startTag>.<time>.<rand>") so the
+  // instance-liveness reclaim path fires: process.kill on this high, almost-
+  // certainly-dead PID throws ESRCH, so the lock is treated as abandoned.
+  fs.writeFileSync(lockFile, "2147483646.0.dead.owner");
 
   const jobCount = 10;
   const worker =
