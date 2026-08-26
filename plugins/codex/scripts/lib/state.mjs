@@ -130,18 +130,29 @@ function sleepSync(ms) {
 function withStateLock(cwd, fn) {
   ensureStateDir(cwd);
   const lockFile = path.join(resolveStateDir(cwd), "state.lock");
+  // Unique per acquisition: stamped into the lock so only the true owner ever
+  // removes it, and so a reclaimer's scratch path can't collide.
+  const ownerId = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   const deadline = Date.now() + 15000;
-  let fd;
   for (;;) {
     try {
-      fd = fs.openSync(lockFile, "wx"); // O_CREAT | O_EXCL
+      const fd = fs.openSync(lockFile, "wx"); // O_CREAT | O_EXCL
+      fs.writeSync(fd, ownerId);
+      fs.closeSync(fd);
       break;
     } catch (err) {
       if (err.code !== "EEXIST") throw err;
-      // Steal a stale lock left by a crashed process.
+      // Reclaim a stale lock left by a crashed process. Do it atomically:
+      // rename() has exactly-one-winner semantics, so if several launches race
+      // to reclaim the same stale lock, only one succeeds and the losers get
+      // ENOENT and fall back to re-contending on open(O_EXCL). Never unlink the
+      // lock pathname directly here -- by the time we did, it could already be a
+      // fresh lock held by another process (the P2 the reviewer flagged).
       try {
         if (Date.now() - fs.statSync(lockFile).mtimeMs > 10000) {
-          fs.unlinkSync(lockFile);
+          const scratch = `${lockFile}.stale.${ownerId}`;
+          fs.renameSync(lockFile, scratch); // only one racer wins this
+          fs.unlinkSync(scratch);
           continue;
         }
       } catch {}
@@ -152,8 +163,12 @@ function withStateLock(cwd, fn) {
   try {
     return fn();
   } finally {
-    try { fs.closeSync(fd); } catch {}
-    try { fs.unlinkSync(lockFile); } catch {}
+    // Only remove the lock if we still own it: if fn() ever outran the stale
+    // timeout and another process reclaimed the lock, its contents no longer
+    // match ownerId and we must not delete the lock it now holds.
+    try {
+      if (fs.readFileSync(lockFile, "utf8") === ownerId) fs.unlinkSync(lockFile);
+    } catch {}
   }
 }
 

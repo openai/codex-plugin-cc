@@ -141,3 +141,45 @@ test("updateState serializes concurrent job writes without losing records", asyn
 
   assert.deepEqual(missing, [], "every concurrently launched job must be tracked");
 });
+
+test("updateState reclaims a stale lock without losing records under concurrency", async () => {
+  const workspace = makeTempDir();
+
+  // Simulate a crashed holder: a lock file older than the 10s stale threshold.
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(stateDir, { recursive: true });
+  const lockFile = path.join(stateDir, "state.lock");
+  fs.writeFileSync(lockFile, "dead-owner");
+  const stale = new Date(Date.now() - 60_000);
+  fs.utimesSync(lockFile, stale, stale);
+
+  const jobCount = 10;
+  const worker =
+    `import { upsertJob } from ${JSON.stringify(STATE_URL)};\n` +
+    "const [cwd, id] = process.argv.slice(1);\n" +
+    "upsertJob(cwd, { id, status: \"queued\", jobClass: \"task\", summary: id });\n";
+
+  await Promise.all(
+    Array.from({ length: jobCount }, (_, index) =>
+      new Promise((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          ["--input-type=module", "-e", worker, workspace, `job-${index}`],
+          { stdio: "ignore" }
+        );
+        child.on("exit", (code) =>
+          code === 0 ? resolve() : reject(new Error(`worker ${index} exited ${code}`))
+        );
+      })
+    )
+  );
+
+  const saved = JSON.parse(fs.readFileSync(resolveStateFile(workspace), "utf8"));
+  const trackedIds = new Set(saved.jobs.map((job) => job.id));
+  const missing = Array.from({ length: jobCount }, (_, index) => `job-${index}`).filter(
+    (id) => !trackedIds.has(id)
+  );
+
+  assert.deepEqual(missing, [], "stale-lock reclaim must not drop concurrent job records");
+  assert.equal(fs.existsSync(lockFile), false, "lock file should be released after all writers finish");
+});
