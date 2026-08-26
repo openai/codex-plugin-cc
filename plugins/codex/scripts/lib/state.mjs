@@ -259,13 +259,29 @@ function migrateLegacyState(cwd) {
     }
     // else: a live/booting worker owns the record -> leave it alone
   }
+  // Rewrite state.json config-only to drop the legacy `jobs` array. Re-read the CURRENT
+  // state fresh rather than reusing the snapshot parsed at the top, so a config committed
+  // by a concurrent setConfig while we migrated per-job files is preserved. If the re-read
+  // FAILS, do NOT rewrite from the stale snapshot (that could revert a concurrent config
+  // update or a rewrite another migrator already did) -- migration is idempotent and
+  // re-runs next time. (A residual TOCTOU between this re-read and the rename remains; it
+  // is the accepted no-CAS class and is much smaller than the pre-read window.)
+  let current;
+  try {
+    current = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  } catch {
+    return; // couldn't re-read -> leave state.json as-is; retry on the next migration
+  }
+  if (!Array.isArray(current.jobs) || current.jobs.length === 0) {
+    return; // another migrator already dropped the jobs array -> nothing to do
+  }
   try {
     atomicWriteJson(stateFile, {
       version: STATE_VERSION,
-      config: { stopReviewGate: false, ...(parsed.config ?? {}) }
+      config: { stopReviewGate: false, ...(current.config ?? {}) }
     });
   } catch {
-    // A concurrent migrator may have already rewritten it; harmless.
+    // A concurrent migrator may have rewritten it between our re-read and here; harmless.
   }
 }
 
@@ -320,28 +336,39 @@ export function readJobPid(cwd, jobId) {
   return Number.isInteger(pid) && pid > 0 ? pid : null;
 }
 
+// Read job <id>'s cancel marker: its parsed content ({reason, at}), `{}` if the marker
+// exists but is unreadable/non-object (existence is authoritative), or null if there is
+// no marker. A marker whose content parses to a non-object (e.g. literal `null`) must NOT
+// be mistaken for "absent" -- normalize it to `{}`.
+function readCancelMarker(cwd, jobId) {
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(resolveJobCancelFile(cwd, jobId), "utf8"));
+  } catch (err) {
+    return err.code === "ENOENT" ? null : {}; // absent vs present-but-unreadable
+  }
+  return parsed && typeof parsed === "object" ? parsed : {};
+}
+
 // Overlay the immutable markers onto a record so a caller observes a cancellation
 // atomically with the record and can never see a cancelled job as live:
-//  - a `<id>.cancelled` marker forces cancelled, authoritatively ("marked => cancelled,
-//    full stop", overriding even a raced completion);
+//  - a `<id>.cancelled` marker forces cancelled, authoritatively (overriding even a
+//    raced completion, and applying even if the raw record already says cancelled so its
+//    stripping/metadata are always enforced);
 //  - a `session-<hash>.ended` marker forces cancelled for that session's still-LIVE
 //    (queued/running) jobs -- a genuinely finished job keeps its terminal outcome.
-// Completion payload (result/rendered) is dropped so a cancelled job never exposes a
-// half-result. Side-effect free.
-function overlayJob(job, cancelledMeta, endedNames) {
-  if (!job || typeof job.id !== "string" || job.status === "cancelled") return job;
-  const byCancel = cancelledMeta.has(job.id);
-  const bySession =
-    !byCancel && job.sessionId != null &&
-    endedNames.has(sessionEndedBasename(job.sessionId)) &&
-    !TERMINAL_STATUSES.has(job.status);
-  if (!byCancel && !bySession) return job;
-  // Surface the marker's own metadata (best-effort; marker EXISTENCE is authoritative
-  // even if its JSON was unreadable) so a cancel that killed the worker before it could
-  // publish a terminal record still shows a reason and timestamps.
-  const meta = (byCancel ? cancelledMeta.get(job.id) : null) ?? {};
+// The completion payload (result/rendered/summary) is dropped so a cancelled job never
+// exposes any model-generated output. `cancelMeta` MUST be read AFTER the record (see
+// readAllJobs) so the marker/record observation is coherent: cancel/cleanup always
+// publish the marker BEFORE the worker's terminal write, so any record carrying that
+// write is observed together with its marker. Side-effect free.
+function overlayJob(job, cancelMeta, sessionEnded) {
+  if (!job || typeof job.id !== "string") return job;
+  const marked = cancelMeta != null;
+  if (!marked && !sessionEnded) return job;
+  const meta = cancelMeta ?? {};
   const at = typeof meta.at === "string" ? meta.at : null;
-  const { result, rendered, ...rest } = job;
+  const { result, rendered, summary, ...rest } = job;
   return {
     ...rest,
     status: "cancelled",
@@ -353,46 +380,52 @@ function overlayJob(job, cancelledMeta, endedNames) {
   };
 }
 
-// Scan the jobs dir ONCE: return the raw records plus the marker sets. Robust to
-// concurrent create/delete/rename: a name that vanished mid-scan (ENOENT) or a record
-// captured mid-write (parse-guarded) is skipped. `cancelledIds` is a Map id -> marker
-// metadata ({reason, at}, or {} if the marker existed but was unparseable).
-function scanJobsDir(cwd) {
+// Read every RAW job record. `readdirSync` failing with ENOENT means the dir does not
+// exist yet -> genuinely empty; ANY OTHER error (EACCES/EIO/...) is a real, load-bearing
+// scan failure and MUST propagate rather than masquerade as "no jobs" (session cleanup
+// relies on this to not silently skip live workers). A record file that vanished or is
+// mid-write (parse error) is skipped -- that is a per-file transient, not a scan failure.
+function scanRawJobs(cwd) {
   const dir = resolveJobsDir(cwd);
   let names;
   try {
     names = fs.readdirSync(dir);
-  } catch {
-    return { jobs: [], cancelledIds: new Map(), endedNames: new Set() };
-  }
-  const cancelledIds = new Map();
-  const endedNames = new Set();
-  for (const name of names) {
-    if (name.endsWith(".cancelled")) {
-      let meta = {};
-      try { meta = JSON.parse(fs.readFileSync(path.join(dir, name), "utf8")); } catch {}
-      cancelledIds.set(name.slice(0, -".cancelled".length), meta);
-    } else if (name.startsWith("session-") && name.endsWith(".ended")) {
-      endedNames.add(name);
-    }
+  } catch (err) {
+    if (err.code === "ENOENT") return [];
+    throw err;
   }
   const jobs = [];
   for (const name of names) {
     if (!isJobFileName(name)) continue;
+    let raw;
     try {
-      jobs.push(JSON.parse(fs.readFileSync(path.join(dir, name), "utf8")));
+      raw = fs.readFileSync(path.join(dir, name), "utf8");
+    } catch (err) {
+      if (err.code === "ENOENT") continue; // vanished between readdir and read -> skip
+      throw err; // EACCES/EIO on a record we can SEE is a real scan failure -> propagate
+    }
+    try {
+      jobs.push(JSON.parse(raw));
     } catch {
-      // deleted mid-scan or unparseable -> skip
+      // torn/unparseable record -> skip (a transient, not a scan failure)
     }
   }
-  return { jobs, cancelledIds, endedNames };
+  return jobs;
 }
 
 // The marker-overlaid view -- what every consumer (status/cancel/result/session cleanup)
-// should see.
+// should see. Each record's markers are read AFTER the record itself (not from a stale
+// directory snapshot), so a marker published between the directory listing and the record
+// read is still observed.
 function readAllJobs(cwd) {
-  const { jobs, cancelledIds, endedNames } = scanJobsDir(cwd);
-  return jobs.map((job) => overlayJob(job, cancelledIds, endedNames));
+  return scanRawJobs(cwd).map((job) => {
+    if (!job || typeof job.id !== "string") return job;
+    const cancelMeta = readCancelMarker(cwd, job.id);
+    const sessionEnded =
+      cancelMeta == null && job.sessionId != null &&
+      !TERMINAL_STATUSES.has(job.status) && isSessionEnded(cwd, job.sessionId);
+    return overlayJob(job, cancelMeta, sessionEnded);
+  });
 }
 
 // A record is reclaimable ONLY if it is terminal, or a running job whose owner pid is
@@ -437,18 +470,20 @@ export function deleteJobFiles(cwd, job) {
 // Session-ended markers are intentionally NOT GC'd here: a safe generation-aware sweep
 // is out of scope, and one tiny empty file per session is a negligible, race-free leak.
 function pruneJobs(cwd) {
-  const jobs = scanJobsDir(cwd).jobs; // RAW records
-  const overflow = jobs.length - MAX_JOBS;
-  if (overflow <= 0) return;
-  const evictable = jobs
-    .filter(isEvictable)
-    .sort((a, b) => String(a.updatedAt ?? "").localeCompare(String(b.updatedAt ?? "")));
-  let removed = 0;
-  for (const job of evictable) {
-    if (removed >= overflow) break;
+  const jobs = scanRawJobs(cwd); // RAW records
+  if (jobs.length <= MAX_JOBS) return;
+  // Protect the newest MAX_JOBS: a record is a candidate for eviction ONLY if it falls
+  // OUTSIDE that window. Otherwise, when the cap is exceeded entirely by non-evictable
+  // records (e.g. 50 queued pid-less jobs) and one more job just completed, we would
+  // evict that fresh completion -- the only evictable record -- and lose its output.
+  // The cap is soft: a non-evictable (live/booting) record beyond the window is kept
+  // rather than a recent one. Every evictable record outside the window is removed.
+  const byNewest = [...jobs].sort((a, b) => String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? "")));
+  const candidates = byNewest.slice(MAX_JOBS).filter(isEvictable); // everything beyond the newest MAX_JOBS
+  for (const job of candidates) {
     const current = readJobRecord(cwd, job.id); // RAW re-check
     if (current && !isEvictable(current)) continue; // became live/pending since scan -> spare
-    if (deleteJobFiles(cwd, job)) removed += 1;
+    deleteJobFiles(cwd, job);
   }
 }
 
@@ -474,7 +509,15 @@ function mergeJobRecord(cwd, jobId, patch) {
     updatedAt: now
   };
   atomicWriteJson(resolveJobFile(cwd, jobId), record);
-  pruneJobs(cwd);
+  // Prune is best-effort GC that runs AFTER the record above is already committed. It must
+  // never throw back into the caller: a prune-scan failure (e.g. EACCES/EIO) must not be
+  // mistaken for a failure of this already-published write (which, in runTrackedJob, would
+  // overwrite a committed `completed` with `failed`).
+  try {
+    pruneJobs(cwd);
+  } catch {
+    // GC failure is non-fatal; the cap is soft and the next write retries prune.
+  }
   return record;
 }
 
@@ -502,5 +545,5 @@ export function listJobs(cwd) {
 // hide the very jobs it must kill.
 export function readAllJobsRaw(cwd) {
   migrateLegacyState(cwd);
-  return scanJobsDir(cwd).jobs;
+  return scanRawJobs(cwd);
 }

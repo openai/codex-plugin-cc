@@ -308,13 +308,16 @@ function filterJobsForCurrentClaudeSession(jobs) {
 }
 
 function findLatestResumableTaskJob(jobs) {
+  // Only a COMPLETED or FAILED task is resumable. A CANCELLED task must NOT be -- the user
+  // explicitly stopped it, and (because the overlay keeps threadId while marking the job
+  // cancelled) treating "any non-active" as resumable would let a freshly cancelled task
+  // shadow an older genuinely-finished one and resume the wrong Codex thread.
   return (
     jobs.find(
       (job) =>
         job.jobClass === "task" &&
         job.threadId &&
-        job.status !== "queued" &&
-        job.status !== "running"
+        (job.status === "completed" || job.status === "failed")
     ) ?? null
   );
 }

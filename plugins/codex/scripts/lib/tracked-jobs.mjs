@@ -159,6 +159,16 @@ export async function runTrackedJob(job, runner, options = {}) {
     const execution = await runner();
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
+    // Append the final-output log FIRST, then publish the terminal record LAST, so the
+    // terminal write is the worker's last filesystem touch of this job. Otherwise session
+    // cleanup, seeing the terminal record, could delete the log and have this append
+    // recreate an orphan log afterward. The append is best-effort (its own try/catch) so a
+    // logging failure never falls into the lifecycle catch and writes a `failed` record.
+    try {
+      appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
+    } catch {
+      // logging is best-effort; must not affect the published lifecycle state
+    }
     upsertJob(job.workspaceRoot, {
       ...runningRecord,
       status: completionStatus,
@@ -171,14 +181,6 @@ export async function runTrackedJob(job, runner, options = {}) {
       result: execution.payload,
       rendered: execution.rendered
     });
-    // Guard the final log append: the terminal record is already published, so a logging
-    // failure must NOT fall into the catch below and write a second (failed) lifecycle
-    // record over it. The terminal upsertJob above is the worker's last record write.
-    try {
-      appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
-    } catch {
-      // logging is best-effort; never revert a published terminal state
-    }
     return execution;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);

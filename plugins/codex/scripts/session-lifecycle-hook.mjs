@@ -114,12 +114,16 @@ export function cleanupSessionJobs(cwd, sessionId) {
   }
 
   // 2. Scan the RAW records (not the overlaid view -- the marker we just wrote would
-  // otherwise hide this session's active jobs from us).
+  // otherwise hide this session's active jobs from us). A scan failure here (EACCES/EIO;
+  // an absent dir returns [] rather than throwing) is load-bearing: we may be leaving a
+  // live worker unscanned/unkilled, so fail LOUD rather than silently returning success.
   const isActive = (job) => job.status === "queued" || job.status === "running";
-  let jobs = [];
+  let jobs;
   try {
     jobs = readAllJobsRaw(workspaceRoot).filter((job) => typeof job.id === "string" && job.sessionId === sessionId);
-  } catch {
+  } catch (err) {
+    process.exitCode = 1;
+    process.stderr.write(`codex: session cleanup for ${sessionId} could not scan jobs: ${err instanceof Error ? err.message : String(err)}\n`);
     return;
   }
   const active = jobs.filter(isActive);

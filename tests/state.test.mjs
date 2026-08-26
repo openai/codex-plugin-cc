@@ -126,11 +126,32 @@ test("prune evicts oldest terminal jobs but keeps live and non-terminal ones ove
 
   const ids = new Set(listJobs(workspace).map((job) => job.id));
   assert.equal(ids.has("live"), true, "a live running job must never be pruned, even as the oldest");
-  // The two oldest *terminal* jobs are evicted (done-00, done-01), payload + log.
-  assert.equal(ids.has("done-00"), false);
-  assert.equal(ids.has("done-01"), false);
+  // Only records OUTSIDE the newest MAX_JOBS window are eviction candidates. With 52
+  // records the two oldest are `done-00` and `live`; `done-00` (terminal) is evicted,
+  // `live` (non-evictable) is kept -> the cap stays soft at 51. `done-01` is inside the
+  // protected newest-50 window, so it survives.
+  assert.equal(ids.has("done-00"), false, "the oldest terminal job (outside the window) is evicted");
   assert.equal(fs.existsSync(resolveJobLogFile(workspace, "done-00")), false, "evicted job's log is removed too");
+  assert.equal(ids.has("done-01"), true, "a job inside the newest-MAX_JOBS window is protected");
   assert.equal(ids.has("done-02"), true, "newer terminal jobs are kept");
+});
+
+test("prune never evicts a just-completed job when the cap is full of non-evictable jobs", () => {
+  const workspace = makeTempDir();
+  ensureStateDir(workspace);
+  // MAX_JOBS (50) queued, pid-less jobs -> all non-evictable.
+  for (let i = 0; i < 50; i += 1) {
+    const id = `q-${String(i).padStart(2, "0")}`;
+    const ts = new Date(Date.UTC(2026, 0, 1, 0, i, 0)).toISOString();
+    fs.writeFileSync(resolveJobFile(workspace, id), JSON.stringify({ id, status: "queued", pid: null, updatedAt: ts, createdAt: ts }));
+  }
+  // A 51st job completes with full output; its write triggers prune.
+  upsertJob(workspace, { id: "fresh", status: "completed", result: { codex: { stdout: "important" } } });
+
+  const job = listJobs(workspace).find((entry) => entry.id === "fresh");
+  assert.ok(job, "the just-completed job is the ONLY evictable record but must not be pruned");
+  assert.equal(job.status, "completed");
+  assert.equal(fs.existsSync(resolveJobFile(workspace, "fresh")), true);
 });
 
 test("legacy state.json jobs[] array migrates to per-job files on read", () => {
