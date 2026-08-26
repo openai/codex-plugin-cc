@@ -20,6 +20,7 @@ const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.m
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
 
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
+export const BROKER_DISABLE_ENV = "CODEX_COMPANION_APP_SERVER_DISABLE_BROKER";
 export const BROKER_BUSY_RPC_CODE = -32001;
 
 /** @type {ClientInfo} */
@@ -332,10 +333,23 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
   }
 }
 
+function resolveDisableBroker(options) {
+  if (options.disableBroker !== undefined) {
+    return Boolean(options.disableBroker);
+  }
+  const raw = options.env?.[BROKER_DISABLE_ENV] ?? process.env[BROKER_DISABLE_ENV] ?? null;
+  if (raw === null || raw === undefined) {
+    return false;
+  }
+  const normalized = String(raw).trim().toLowerCase();
+  return normalized === "true" || normalized === "1" || normalized === "yes";
+}
+
 export class CodexAppServerClient {
   static async connect(cwd, options = {}) {
+    const disableBroker = resolveDisableBroker(options);
     let brokerEndpoint = null;
-    if (!options.disableBroker) {
+    if (!disableBroker) {
       brokerEndpoint = options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
       if (!brokerEndpoint && options.reuseExistingBroker) {
         brokerEndpoint = loadBrokerSession(cwd)?.endpoint ?? null;
