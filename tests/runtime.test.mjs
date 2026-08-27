@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { initGitRepo, makeTempDir as makeUntrackedTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
@@ -15,6 +15,33 @@ const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
+const testTempDirs = new Set();
+
+function makeTempDir(prefix) {
+  const tempDir = makeUntrackedTempDir(prefix);
+  testTempDirs.add(tempDir);
+  return tempDir;
+}
+
+test.afterEach(() => {
+  const failures = [];
+  for (const tempDir of testTempDirs) {
+    if (loadBrokerSession(tempDir)) {
+      const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+        cwd: tempDir,
+        input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: tempDir })
+      });
+      if (cleanup.status !== 0) {
+        failures.push(`${tempDir}: ${cleanup.stderr || `exit ${cleanup.status}`}`);
+        continue;
+      }
+    }
+    // helpers.mjs removes registered fixtures only when the test process exits
+    // successfully; failed runs retain them for diagnosis after brokers stop.
+  }
+  testTempDirs.clear();
+  assert.deepEqual(failures, [], `runtime test cleanup failed:\n${failures.join("\n")}`);
+});
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   const start = Date.now();
