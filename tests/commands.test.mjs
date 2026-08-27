@@ -187,7 +187,7 @@ test("transfer, result, and cancel commands are exposed as deterministic runtime
   assert.match(resultHandling, /if Codex was never successfully invoked, do not generate a substitute answer at all/i);
 });
 
-test("rescue agent forbids node-based prompt writes and pgrep background wait loops", () => {
+test("rescue agent forbids unsafe prompt writes, wait loops, and harness job-ID assumptions", () => {
   const agent = read("agents/codex-rescue.md");
   const runtimeSkill = read("skills/codex-cli-runtime/SKILL.md");
 
@@ -195,9 +195,13 @@ test("rescue agent forbids node-based prompt writes and pgrep background wait lo
   assert.match(agent, /node[^\n]*fs/i);
   assert.match(agent, /Do not poll.*pgrep/i);
   assert.match(agent, /return the printed job ID/i);
+  assert.match(agent, /task \[runtime options\] -- "<prompt>"/);
+  assert.match(agent, /do not invent a job ID or suggest a `\/codex:status` command for it/i);
   assert.match(runtimeSkill, /Do not write prompt files to disk/i);
   assert.match(runtimeSkill, /Do not poll.*pgrep/i);
   assert.match(runtimeSkill, /return the job ID and suggested/i);
+  assert.match(runtimeSkill, /task \[runtime options\] -- "<prompt>"/);
+  assert.match(runtimeSkill, /do not invent a job ID or suggest a `\/codex:status` command for it/i);
 });
 
 test("internal docs use task terminology for rescue runs", () => {

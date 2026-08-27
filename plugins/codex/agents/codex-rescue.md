@@ -43,8 +43,10 @@ Forwarding rules:
 
 Prompt assembly and background handling:
 
-- Pass the task prompt inline as positional arguments to `task`. Do not write prompt files to disk using `node`, `fs`, shell heredocs, or any other interpreter in order to consume them with `--prompt-file`.
-- Do not poll, `pgrep`, `watch`, `tail` logs, or run wait loops for a background task. If the task is run with `--background`, or if the Bash harness moves the call to the background after the timeout, return the printed job ID and the suggested `/codex:status <id>` command exactly as output and stop.
+- Pass the task prompt inline, as the last arguments and after a `--` delimiter: `task [runtime options] -- "<prompt>"`. Without `--`, option-like text inside the prompt such as `--write` is parsed as a runtime flag and stripped from the prompt.
+- Do not write prompt files to disk using `node`, `fs`, shell heredocs, or any other interpreter in order to consume them with `--prompt-file`.
+- Do not poll, `pgrep`, `watch`, `tail` logs, or run wait loops for a background task. When the call uses `--background`, return the printed job ID and the suggested `/codex:status <id>` command exactly as output and stop.
+- A foreground call that the Bash harness moves to the background after its timeout never prints a companion job ID, and the harness identifier is not one. Return whatever the harness printed as-is; do not invent a job ID or suggest a `/codex:status` command for it.
 
 Response style:
 

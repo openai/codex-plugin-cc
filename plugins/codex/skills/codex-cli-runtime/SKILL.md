@@ -9,7 +9,7 @@ user-invocable: false
 Use this skill only inside the `codex:codex-rescue` subagent.
 
 Primary helper:
-- `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task "<raw arguments>"`
+- `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task [runtime options] -- "<prompt>"`
 
 Execution rules:
 - The rescue subagent is a forwarder, not an orchestrator. Its only job is to invoke `task` once and return that stdout unchanged.
@@ -36,8 +36,10 @@ Command selection:
 - `task --resume-last`: internal helper for "keep going", "resume", "apply the top fix", or "dig deeper" after a previous rescue run.
 
 Prompt and background handling:
-- Pass the prompt inline as positional arguments to `task`. Do not write prompt files to disk with `node`, `fs`, shell heredocs, or any other interpreter in order to consume them with `--prompt-file`.
-- Do not poll, `pgrep`, `watch`, `tail` logs, or run wait loops for a background task. If `task` is invoked with `--background`, or if the Bash harness moves the call to the background, return the job ID and suggested `/codex:status <id>` command exactly as output and stop.
+- Pass the prompt inline, as the last arguments and after a `--` delimiter: `task [runtime options] -- "<prompt>"`. Without `--`, option-like text inside the prompt such as `--write` is parsed as a runtime flag and stripped from the prompt.
+- Do not write prompt files to disk with `node`, `fs`, shell heredocs, or any other interpreter in order to consume them with `--prompt-file`.
+- Do not poll, `pgrep`, `watch`, `tail` logs, or run wait loops for a background task. When `task` is invoked with `--background`, return the job ID and suggested `/codex:status <id>` command exactly as output and stop.
+- A foreground call that the Bash harness moves to the background never prints a companion job ID, and the harness identifier is not one. Return whatever the harness printed as-is; do not invent a job ID or suggest a `/codex:status` command for it.
 
 Safety rules:
 - Default to write-capable Codex work in `codex:codex-rescue` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
