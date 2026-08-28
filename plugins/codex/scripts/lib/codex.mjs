@@ -390,7 +390,12 @@ function scheduleInferredCompletion(state) {
     }
     completeTurn(state, null, { inferred: true });
   }, 250);
-  state.completionTimer.unref?.();
+  // Intentionally referenced: this timer is the only thing that resolves
+  // state.completion on the inferred-completion path. If it is unref'd it stops
+  // holding the event loop open, so once the app-server socket closes the loop
+  // can drain while `await state.completion` is still pending -- node then exits
+  // 0 without writing anything. The timer is bounded at 250ms and is always
+  // cleared, so keeping it referenced cannot delay or hang shutdown.
 }
 
 function belongsToTurn(state, message) {
