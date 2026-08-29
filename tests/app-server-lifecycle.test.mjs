@@ -6,7 +6,7 @@ import test from "node:test";
 
 import { CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { makeTempDir } from "./helpers.mjs";
+import { makeTempDir, processIsAlive } from "./helpers.mjs";
 
 function settleWithin(promise, timeoutMs = 250) {
   let timer;
@@ -19,16 +19,6 @@ function settleWithin(promise, timeoutMs = 250) {
       timer = setTimeout(() => resolve({ status: "timeout" }), timeoutMs);
     })
   ]).finally(() => clearTimeout(timer));
-}
-
-function processIsAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    if (error?.code === "ESRCH") return false;
-    throw error;
-  }
 }
 
 test("a request made after the app-server child exits rejects instead of hanging", async () => {
@@ -63,6 +53,24 @@ test("a JSON null protocol line rejects initialization instead of crashing the h
   );
 });
 
+test("a startup exit preserves its code and stderr when stdout closes first", async () => {
+  const binDir = makeTempDir("codex-plugin-startup-exit-");
+  installFakeCodex(binDir, "startup-exit-after-stdout-eof");
+
+  await assert.rejects(
+    CodexAppServerClient.connect(binDir, {
+      disableBroker: true,
+      env: buildEnv(binDir)
+    }),
+    (error) => {
+      assert.match(error.message, /exit 17/i);
+      assert.match(error.message, /fake codex startup failure/i);
+      assert.doesNotMatch(error.message, /stdout closed before/i);
+      return true;
+    }
+  );
+});
+
 test("protocol EOF rejects initialization and reaps the live child", { skip: process.platform === "win32" }, async () => {
   const binDir = makeTempDir("codex-plugin-stdout-eof-");
   const statePath = path.join(binDir, "fake-codex-state.json");
@@ -75,7 +83,7 @@ test("protocol EOF rejects initialization and reaps the live child", { skip: pro
         disableBroker: true,
         env: buildEnv(binDir)
       }),
-      2000
+      3000
     );
     pid = JSON.parse(fs.readFileSync(statePath, "utf8")).pid;
 
@@ -162,12 +170,11 @@ test("initialization failure reaps the owned app-server child before rejecting",
   }
 });
 
-test("forced teardown reaps an uncooperative launcher and its descendant", { skip: process.platform === "win32" }, async () => {
+test("forced teardown reaps an uncooperative app-server", { skip: process.platform === "win32" }, async () => {
   const binDir = makeTempDir("codex-plugin-force-reap-");
   const statePath = path.join(binDir, "fake-codex-state.json");
-  installFakeCodex(binDir, "uncooperative-tree-on-initialize");
-  let launcherPid = null;
-  let descendantPid = null;
+  installFakeCodex(binDir, "uncooperative-on-initialize");
+  let pid = null;
 
   try {
     const outcome = await settleWithin(
@@ -178,18 +185,14 @@ test("forced teardown reaps an uncooperative launcher and its descendant", { ski
       3000
     );
     const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
-    launcherPid = state.pid;
-    descendantPid = state.descendantPid;
+    pid = state.pid;
 
     assert.equal(outcome.status, "rejected");
     assert.match(outcome.reason.message, /failed to parse/i);
-    assert.equal(processIsAlive(launcherPid), false);
-    assert.equal(processIsAlive(descendantPid), false);
+    assert.equal(processIsAlive(pid), false);
   } finally {
-    for (const pid of [launcherPid, descendantPid]) {
-      if (pid && processIsAlive(pid)) {
-        process.kill(pid, "SIGKILL");
-      }
+    if (pid && processIsAlive(pid)) {
+      process.kill(pid, "SIGKILL");
     }
   }
 });

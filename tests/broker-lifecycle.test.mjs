@@ -4,17 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { ensureBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { makeTempDir, writeExecutable } from "./helpers.mjs";
-
-function processIsAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    if (error?.code === "ESRCH") return false;
-    throw error;
-  }
-}
+import { makeTempDir, processIsAlive, writeExecutable } from "./helpers.mjs";
 
 test("failed broker readiness terminates the detached broker", async () => {
   const cwd = makeTempDir("codex-plugin-broker-timeout-");

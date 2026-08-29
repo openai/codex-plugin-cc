@@ -24,6 +24,7 @@ export const BROKER_BUSY_RPC_CODE = -32001;
 
 const CHILD_STDIN_GRACE_MS = 1000;
 const CHILD_TERMINATION_GRACE_MS = 1000;
+const CHILD_EXIT_DIAGNOSTIC_GRACE_MS = 250;
 const APP_SERVER_INITIALIZE_TIMEOUT_MS = 15000;
 const BROKER_SOCKET_CLOSE_GRACE_MS = 1000;
 
@@ -260,7 +261,6 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       env: this.options.env ?? process.env,
       stdio: ["pipe", "pipe", "pipe"],
       shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
-      detached: process.platform !== "win32",
       windowsHide: true
     });
 
@@ -279,16 +279,22 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     });
 
     this.proc.stdout.on("end", () => {
-      if (!this.terminalCause) {
-        this.transitionToTerminal(createProtocolError("codex app-server stdout closed before the connection ended."));
-      }
+      // Child close follows stream EOF for ordinary process exits and carries
+      // the exit status after stderr has drained.
+      const diagnosticTimer = setTimeout(() => {
+        if (!this.terminalCause) {
+          this.transitionToTerminal(createProtocolError("codex app-server stdout closed before the connection ended."));
+        }
+      }, CHILD_EXIT_DIAGNOSTIC_GRACE_MS);
+      diagnosticTimer.unref?.();
+      this.proc.once("close", () => clearTimeout(diagnosticTimer));
     });
 
     this.proc.on("error", (error) => {
       this.transitionToTerminal(error);
     });
 
-    this.proc.on("exit", (code, signal) => {
+    this.proc.on("close", (code, signal) => {
       const stderr = this.stderr.trim();
       const detail =
         code === 0

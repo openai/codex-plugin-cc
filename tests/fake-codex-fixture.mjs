@@ -298,20 +298,28 @@ rl.on("line", (line) => {
           setTimeout(() => process.exit(0), 20);
           break;
         }
+        if (BEHAVIOR === "startup-exit-after-stdout-eof") {
+          fs.writeSync(2, "fake codex startup failure\\n");
+          fs.closeSync(1);
+          setTimeout(() => process.exit(17), 20);
+          break;
+        }
         if (BEHAVIOR === "malformed-on-initialize") {
           process.on("SIGTERM", () => setTimeout(() => process.exit(0), 100));
           setInterval(() => {}, 1000);
           process.stdout.write("not-json\\n");
           break;
         }
-        if (BEHAVIOR === "uncooperative-tree-on-initialize") {
-          const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-          state.descendantPid = descendant.pid;
-          saveState(state);
+        if (BEHAVIOR === "uncooperative-on-initialize") {
           process.on("SIGTERM", () => {});
           setInterval(() => {}, 1000);
           process.stdout.write("not-json\\n");
           break;
+        }
+        if (BEHAVIOR === "spawn-tree-after-initialize") {
+          const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+          state.descendantPid = descendant.pid;
+          saveState(state);
         }
         if (BEHAVIOR === "silent-on-initialize") {
           process.on("SIGTERM", () => setTimeout(() => process.exit(0), 100));
