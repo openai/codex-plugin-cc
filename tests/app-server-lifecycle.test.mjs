@@ -106,9 +106,16 @@ test("a broken app-server stdin becomes the single terminal cause", { skip: proc
   });
 
   try {
+    const requestOutcomePromise = settleWithin(
+      Promise.resolve().then(() => client.request("account/read", { refreshToken: false })),
+      2000
+    );
     const outcome = await settleWithin(client.terminalPromise, 2000);
+    const requestOutcome = await requestOutcomePromise;
     assert.equal(outcome.status, "fulfilled");
     assert.match(client.terminalCause.message, /EPIPE|broken pipe|write/i);
+    assert.equal(requestOutcome.status, "rejected");
+    assert.equal(requestOutcome.reason, client.terminalCause);
     assert.throws(() => client.request("account/read", {}), (error) => error === client.terminalCause);
   } finally {
     await client.close();

@@ -332,12 +332,14 @@ rl.on("line", (line) => {
           fs.closeSync(1);
           break;
         }
-        send({ id: message.id, result: { userAgent: "fake-codex-app-server" } });
         if (BEHAVIOR === "stdin-eof-after-initialize") {
           process.on("SIGTERM", () => setTimeout(() => process.exit(0), 100));
           setInterval(() => {}, 1000);
+          fs.writeSync(1, JSON.stringify({ id: message.id, result: { userAgent: "fake-codex-app-server" } }) + "\\n");
           fs.closeSync(0);
+          break;
         }
+        send({ id: message.id, result: { userAgent: "fake-codex-app-server" } });
         if (BEHAVIOR === "exit-after-initialize") {
           setTimeout(() => process.exit(0), 20);
         }
