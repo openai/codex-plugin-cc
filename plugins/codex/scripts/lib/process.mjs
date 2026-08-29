@@ -62,6 +62,7 @@ export function terminateProcessTree(pid, options = {}) {
   const platform = options.platform ?? process.platform;
   const runCommandImpl = options.runCommandImpl ?? runCommand;
   const killImpl = options.killImpl ?? process.kill.bind(process);
+  const signal = options.signal ?? "SIGTERM";
 
   if (platform === "win32") {
     const result = runCommandImpl("taskkill", ["/PID", String(pid), "/T", "/F"], {
@@ -98,22 +99,18 @@ export function terminateProcessTree(pid, options = {}) {
   }
 
   try {
-    killImpl(-pid, "SIGTERM");
+    killImpl(-pid, signal);
     return { attempted: true, delivered: true, method: "process-group" };
-  } catch (error) {
-    if (error?.code !== "ESRCH") {
-      try {
-        killImpl(pid, "SIGTERM");
-        return { attempted: true, delivered: true, method: "process" };
-      } catch (innerError) {
-        if (innerError?.code === "ESRCH") {
-          return { attempted: true, delivered: false, method: "process" };
-        }
-        throw innerError;
+  } catch {
+    try {
+      killImpl(pid, signal);
+      return { attempted: true, delivered: true, method: "process" };
+    } catch (error) {
+      if (error?.code === "ESRCH") {
+        return { attempted: true, delivered: false, method: "process" };
       }
+      throw error;
     }
-
-    return { attempted: true, delivered: false, method: "process-group" };
   }
 }
 

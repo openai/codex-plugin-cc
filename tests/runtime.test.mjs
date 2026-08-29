@@ -3,11 +3,14 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import net from "node:net";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
-import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { initGitRepo, makeTempDir, processIsAlive, run } from "./helpers.mjs";
+import { parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
+import { ensureBrokerSession, loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -191,6 +194,173 @@ test("task runs without auth preflight so Codex can refresh an expired session",
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Handled the requested task/);
+});
+
+test("Codex death terminates the broker and a later command starts a fresh broker", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "exit-during-turn");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const env = buildEnv(binDir);
+
+  try {
+    const result = run("node", [SCRIPT, "task", "observe connection loss"], {
+      cwd: repo,
+      env,
+      timeout: 5000
+    });
+
+    assert.equal(result.error, undefined, result.error?.message);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /app-server.*(closed|exited)|connection.*closed/i);
+
+    const firstSession = loadBrokerSession(repo);
+    assert.ok(firstSession);
+    const firstEndpoint = parseBrokerEndpoint(firstSession.endpoint);
+    await waitFor(
+      () => !processIsAlive(firstSession.pid) && (firstEndpoint.kind !== "unix" || !fs.existsSync(firstEndpoint.path)),
+      { timeoutMs: 3000 }
+    );
+
+    const secondResult = run("node", [SCRIPT, "task", "start after connection loss"], {
+      cwd: repo,
+      env,
+      timeout: 5000
+    });
+    assert.equal(secondResult.error, undefined, secondResult.error?.message);
+    assert.notEqual(secondResult.status, 0);
+
+    const secondSession = loadBrokerSession(repo);
+    assert.ok(secondSession);
+    assert.notEqual(secondSession.pid, firstSession.pid);
+    const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+    assert.equal(fakeState.appServerStarts, 2);
+  } finally {
+    run("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo,
+      env,
+      input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo }),
+      timeout: 2000
+    });
+  }
+});
+
+test("connection loss before turn/start responds without an unhandled rejection", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "broker-fails-then-exit-before-turn-start-response");
+  initGitRepo(repo);
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: path.join(binDir, "plugin-data")
+  };
+  const runner = path.join(binDir, "run-turn.mjs");
+  fs.writeFileSync(
+    runner,
+    [
+      `const { runAppServerTurn } = await import(${JSON.stringify(path.join(PLUGIN_ROOT, "scripts", "lib", "codex.mjs"))});`,
+      "const unhandled = [];",
+      'process.on("unhandledRejection", (error) => unhandled.push(error?.message ?? String(error)));',
+      "let caught = null;",
+      'try { await runAppServerTurn(process.argv[2], { prompt: "observe early connection loss" }); } catch (error) { caught = error.message; }',
+      "await new Promise((resolve) => setTimeout(resolve, 100));",
+      'process.stdout.write(JSON.stringify({ caught, unhandled }) + "\\n");'
+    ].join("\n")
+  );
+
+  try {
+    const result = run("node", [runner, repo], {
+      cwd: repo,
+      env,
+      timeout: 5000
+    });
+
+    assert.equal(result.error, undefined, result.error?.message);
+    assert.equal(result.status, 0, result.stderr);
+    const outcome = JSON.parse(result.stdout);
+    assert.match(outcome.caught, /app-server.*(closed|exited)|connection.*closed/i);
+    assert.deepEqual(outcome.unhandled, []);
+  } finally {
+    run("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo,
+      env,
+      input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo }),
+      timeout: 5000
+    });
+  }
+});
+
+test("force-killing the broker process group also terminates Codex and its descendants", { skip: process.platform === "win32" }, async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "spawn-tree-after-initialize");
+  initGitRepo(repo);
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: path.join(binDir, "plugin-data")
+  };
+  const pids = [];
+
+  try {
+    const session = await ensureBrokerSession(repo, { env });
+    assert.ok(session);
+    const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+    pids.push(session.pid, fakeState.pid, fakeState.descendantPid);
+    assert.ok(pids.every(Number.isFinite));
+
+    const outcome = terminateProcessTree(session.pid, { signal: "SIGKILL" });
+    assert.equal(outcome.method, "process-group");
+    await waitFor(() => pids.every((pid) => !processIsAlive(pid)), { timeoutMs: 3000 });
+  } finally {
+    for (const pid of pids) {
+      if (Number.isFinite(pid) && processIsAlive(pid)) {
+        process.kill(pid, "SIGKILL");
+      }
+    }
+    run("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo,
+      env,
+      input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo }),
+      timeout: 5000
+    });
+  }
+});
+
+test("Codex death shuts down the broker with a half-open client", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: path.join(binDir, "plugin-data")
+  };
+  const session = await ensureBrokerSession(repo, { env });
+  assert.ok(session);
+  const target = parseBrokerEndpoint(session.endpoint);
+  const socket = net.createConnection({ path: target.path, allowHalfOpen: true });
+  await new Promise((resolve, reject) => {
+    socket.once("connect", resolve);
+    socket.once("error", reject);
+  });
+  socket.on("end", () => {});
+
+  try {
+    const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+    process.kill(fakeState.pid, "SIGKILL");
+    await waitFor(() => !processIsAlive(session.pid), { timeoutMs: 3000 });
+  } finally {
+    socket.destroy();
+    run("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo,
+      env,
+      input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo }),
+      timeout: 5000
+    });
+  }
 });
 
 test("transfer delegates the current Claude session directly to native import", () => {

@@ -53,3 +53,40 @@ test("terminateProcessTree treats missing Windows processes as already stopped",
   assert.equal(outcome.result.status, 128);
   assert.match(outcome.result.stdout, /not found/i);
 });
+
+test("terminateProcessTree falls back to the POSIX process when no process group exists", () => {
+  const calls = [];
+  const outcome = terminateProcessTree(1234, {
+    platform: "darwin",
+    killImpl(pid, signal) {
+      calls.push({ pid, signal });
+      if (pid === -1234) {
+        const error = new Error("no such process group");
+        error.code = "ESRCH";
+        throw error;
+      }
+    }
+  });
+
+  assert.deepEqual(calls, [
+    { pid: -1234, signal: "SIGTERM" },
+    { pid: 1234, signal: "SIGTERM" }
+  ]);
+  assert.equal(outcome.delivered, true);
+  assert.equal(outcome.method, "process");
+});
+
+test("terminateProcessTree forwards a forced POSIX signal to the process group", () => {
+  const calls = [];
+  const outcome = terminateProcessTree(1234, {
+    platform: "linux",
+    signal: "SIGKILL",
+    killImpl(pid, signal) {
+      calls.push({ pid, signal });
+    }
+  });
+
+  assert.deepEqual(calls, [{ pid: -1234, signal: "SIGKILL" }]);
+  assert.equal(outcome.delivered, true);
+  assert.equal(outcome.method, "process-group");
+});

@@ -12,12 +12,36 @@ export function writeExecutable(filePath, source) {
   fs.writeFileSync(filePath, source, { encoding: "utf8", mode: 0o755 });
 }
 
+export function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    throw error;
+  }
+
+  if (process.platform === "linux") {
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const commandEnd = stat.lastIndexOf(")");
+      const state = stat.slice(commandEnd + 2, commandEnd + 3);
+      return state !== "Z" && state !== "X";
+    } catch (error) {
+      if (error?.code === "ENOENT") return false;
+      throw error;
+    }
+  }
+
+  return true;
+}
+
 export function run(command, args, options = {}) {
   return spawnSync(command, args, {
     cwd: options.cwd,
     env: options.env,
     encoding: "utf8",
     input: options.input,
+    timeout: options.timeout,
     shell: options.shell ?? (process.platform === "win32" && !path.isAbsolute(command)),
     windowsHide: true
   });

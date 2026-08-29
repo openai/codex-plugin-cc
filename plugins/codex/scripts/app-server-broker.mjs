@@ -70,6 +70,7 @@ async function main() {
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
   const sockets = new Set();
+  let shutdownPromise = null;
 
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
@@ -99,18 +100,25 @@ async function main() {
     }
   }
 
-  async function shutdown(server) {
-    for (const socket of sockets) {
-      socket.end();
+  function shutdown(server) {
+    if (shutdownPromise) {
+      return shutdownPromise;
     }
-    await appClient.close().catch(() => {});
-    await new Promise((resolve) => server.close(resolve));
-    if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
-      fs.unlinkSync(listenTarget.path);
-    }
-    if (pidFile && fs.existsSync(pidFile)) {
-      fs.unlinkSync(pidFile);
-    }
+    shutdownPromise = Promise.resolve().then(async () => {
+      const serverClosed = new Promise((resolve) => server.close(resolve));
+      for (const socket of sockets) {
+        socket.destroy();
+      }
+      await appClient.close().catch(() => {});
+      await serverClosed;
+      if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
+        fs.unlinkSync(listenTarget.path);
+      }
+      if (pidFile && fs.existsSync(pidFile)) {
+        fs.unlinkSync(pidFile);
+      }
+    });
+    return shutdownPromise;
   }
 
   appClient.setNotificationHandler(routeNotification);
@@ -231,6 +239,10 @@ async function main() {
       sockets.delete(socket);
       clearSocketOwnership(socket);
     });
+  });
+
+  appClient.onTerminal(() => {
+    void shutdown(server).finally(() => process.exit(1));
   });
 
   process.on("SIGTERM", async () => {
