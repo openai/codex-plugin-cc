@@ -195,12 +195,14 @@ test("rescue agent forbids unsafe prompt writes, wait loops, and harness job-ID 
   assert.match(agent, /node[^\n]*fs/i);
   assert.match(agent, /Do not poll.*pgrep/i);
   assert.match(agent, /return the printed job ID/i);
-  assert.match(agent, /task \[runtime options\] -- "<prompt>"/);
+  assert.match(agent, /task \[runtime options\] -- '<prompt>'/);
+  assert.match(agent, /escape every embedded single quote as `'\\''`.*Never wrap the prompt in double quotes/i);
   assert.match(agent, /do not invent a job ID or suggest a `\/codex:status` command for it/i);
   assert.match(runtimeSkill, /Do not write prompt files to disk/i);
   assert.match(runtimeSkill, /Do not poll.*pgrep/i);
   assert.match(runtimeSkill, /return the job ID and suggested/i);
-  assert.match(runtimeSkill, /task \[runtime options\] -- "<prompt>"/);
+  assert.match(runtimeSkill, /task \[runtime options\] -- '<prompt>'/);
+  assert.match(runtimeSkill, /escape every embedded single quote as `'\\''`.*Never wrap the prompt in double quotes/i);
   assert.match(runtimeSkill, /do not invent a job ID or suggest a `\/codex:status` command for it/i);
 });
 
