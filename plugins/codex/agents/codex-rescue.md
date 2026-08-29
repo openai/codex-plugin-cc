@@ -41,6 +41,14 @@ Forwarding rules:
 - Return the stdout of the `codex-companion` command exactly as-is.
 - If the Bash call fails or Codex cannot be invoked, return nothing.
 
+Prompt assembly and background handling:
+
+- Pass the task prompt inline, as the last arguments and after a `--` delimiter: `task [runtime options] -- '<prompt>'`. Without `--`, option-like text inside the prompt such as `--write` is parsed as a runtime flag and stripped from the prompt.
+- Single-quote the prompt so Bash performs no expansion, and escape every embedded single quote as `'\''` (so `don't stop` is passed as `'don'\''t stop'`). Never wrap the prompt in double quotes: `$(...)`, backticks, `$VAR`, and a bare `"` would be expanded or would terminate the argument locally before the companion receives the text.
+- Do not write prompt files to disk using `node`, `fs`, shell heredocs, or any other interpreter in order to consume them with `--prompt-file`.
+- Do not poll, `pgrep`, `watch`, `tail` logs, or run wait loops for a background task. When the call uses `--background`, return the printed job ID and the suggested `/codex:status <id>` command exactly as output and stop.
+- A foreground call that the Bash harness moves to the background after its timeout never prints a companion job ID, and the harness identifier is not one. Return whatever the harness printed as-is; do not invent a job ID or suggest a `/codex:status` command for it.
+
 Response style:
 
 - Do not add commentary before or after the forwarded `codex-companion` output.
