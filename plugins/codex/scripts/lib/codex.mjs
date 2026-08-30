@@ -658,24 +658,103 @@ function sourceContentSha256(sourcePath) {
   return crypto.createHash("sha256").update(fs.readFileSync(sourcePath)).digest("hex");
 }
 
+function normalizeImportPath(value) {
+  if (typeof value !== "string" || value === "") {
+    return null;
+  }
+  // Codex records ledger/notification paths via Rust's fs::canonicalize, which on
+  // Windows emits verbatim extended-length paths (\\?\C:\... or \\?\UNC\...). Node's
+  // fs.realpathSync (and .native) never produce that prefix, so a raw === comparison
+  // can never match on Windows. Strip the prefix on both sides, and compare
+  // case-insensitively there where the filesystem is case-insensitive.
+  const stripped = value.replace(/^\\\\\?\\UNC\\/, "\\\\").replace(/^\\\\\?\\/, "");
+  const normalized = path.normalize(stripped);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function importCompletionSuccesses(completion) {
+  const results = Array.isArray(completion?.itemTypeResults) ? completion.itemTypeResults : [];
+  return results.flatMap((result) => (Array.isArray(result?.successes) ? result.successes : []));
+}
+
+function importedThreadIdFromCompletion(completion, sourcePath) {
+  // The completion notification carries the authoritative result: successes[].target
+  // is the imported thread id. Preferring it avoids the ledger round-trip, including
+  // the race where the ledger write lags the completed notification.
+  const wantedSource = normalizeImportPath(sourcePath);
+  let fallbackTarget = null;
+  for (const success of importCompletionSuccesses(completion)) {
+    const target = typeof success?.target === "string" ? success.target : null;
+    if (!target) {
+      continue;
+    }
+    if (wantedSource && normalizeImportPath(success?.source) === wantedSource) {
+      return target;
+    }
+    fallbackTarget ??= target;
+  }
+  return fallbackTarget;
+}
+
+function importFailureDetails(completion) {
+  const results = Array.isArray(completion?.itemTypeResults) ? completion.itemTypeResults : [];
+  const messages = [];
+  for (const result of results) {
+    const failures = Array.isArray(result?.failures) ? result.failures : [];
+    for (const failure of failures) {
+      const reason =
+        (typeof failure?.error === "string" && failure.error) ||
+        (typeof failure?.message === "string" && failure.message) ||
+        (typeof failure?.reason === "string" && failure.reason) ||
+        null;
+      if (reason) {
+        messages.push(reason);
+      }
+    }
+  }
+  return messages.length ? messages.join("\n") : null;
+}
+
+function safeRealpath(sourcePath) {
+  try {
+    return fs.realpathSync(sourcePath);
+  } catch {
+    return sourcePath;
+  }
+}
+
+function tryComputeContentSha256(sourcePath) {
+  try {
+    return sourceContentSha256(sourcePath);
+  } catch {
+    return null;
+  }
+}
+
 function importedThreadIdForSource(sourcePath) {
   const ledgerPath = path.join(resolveCodexHome(), "external_agent_session_imports.json");
   if (!fs.existsSync(ledgerPath)) {
     return null;
   }
   const ledger = readJsonFile(ledgerPath);
-  const canonicalSource = fs.realpathSync(sourcePath);
-  const contentSha256 = sourceContentSha256(canonicalSource);
+  const realSource = safeRealpath(sourcePath);
+  const wantedSource = normalizeImportPath(realSource);
+  const contentSha256 = tryComputeContentSha256(realSource);
   const records = Array.isArray(ledger?.records) ? ledger.records : [];
-  const match = records
-    .filter(
-      (record) =>
-        record?.source_path === canonicalSource &&
-        record?.content_sha256 === contentSha256 &&
-        typeof record?.imported_thread_id === "string"
-    )
-    .at(-1);
-  return match?.imported_thread_id ?? null;
+  const candidates = records.filter(
+    (record) =>
+      typeof record?.imported_thread_id === "string" &&
+      wantedSource != null &&
+      normalizeImportPath(record?.source_path) === wantedSource
+  );
+  // The live Claude transcript keeps growing while Codex imports it, so the hash
+  // recomputed here usually no longer matches the imported snapshot. Prefer a hash
+  // match when one exists, but do not require it.
+  const preferred =
+    (contentSha256 &&
+      candidates.filter((record) => record?.content_sha256 === contentSha256).at(-1)) ||
+    candidates.at(-1);
+  return preferred?.imported_thread_id ?? null;
 }
 
 function externalAgentSessionMigration(sourcePath, cwd) {
@@ -711,7 +790,7 @@ async function requestExternalAgentSessionImport(client, params) {
 
   client.setNotificationHandler((message) => {
     if (message.method === EXTERNAL_AGENT_IMPORT_COMPLETED) {
-      resolveCompleted();
+      resolveCompleted(message.params ?? null);
       return;
     }
     previousHandler?.(message);
@@ -722,7 +801,7 @@ async function requestExternalAgentSessionImport(client, params) {
 
   try {
     await client.request("externalAgentConfig/import", params);
-    await completed;
+    return await completed;
   } finally {
     clearTimeout(timeout);
     client.setNotificationHandler(previousHandler ?? null);
@@ -1066,8 +1145,12 @@ export async function importExternalAgentSession(cwd, options = {}) {
 
   return withDirectAppServer(cwd, async (client) => {
     emitProgress(options.onProgress, "Importing Claude session into Codex.", "transferring");
+    let completion = null;
     try {
-      await requestExternalAgentSessionImport(client, externalAgentSessionMigration(options.sourcePath, cwd));
+      completion = await requestExternalAgentSessionImport(
+        client,
+        externalAgentSessionMigration(options.sourcePath, cwd)
+      );
     } catch (error) {
       if (error?.rpcCode === -32601) {
         throw new Error(
@@ -1077,11 +1160,16 @@ export async function importExternalAgentSession(cwd, options = {}) {
       }
       throw error;
     }
-    const threadId = importedThreadIdForSource(options.sourcePath);
+    const threadId =
+      importedThreadIdFromCompletion(completion, options.sourcePath) ??
+      importedThreadIdForSource(options.sourcePath);
     if (!threadId) {
-      const stderr = cleanCodexStderr(client.stderr);
+      const details = [importFailureDetails(completion), cleanCodexStderr(client.stderr)].filter(Boolean);
       throw new Error(
-        `Codex reported that the Claude import completed, but did not record an imported thread.${stderr ? `\n${stderr}` : " Check the Codex app-server logs for the underlying import error."}`
+        [
+          "Codex reported that the Claude import completed, but did not record an imported thread.",
+          ...(details.length ? details : ["Check the Codex app-server logs for the underlying import error."])
+        ].join("\n")
       );
     }
     emitProgress(options.onProgress, `Claude session imported (${threadId}).`, "completed", { threadId });
@@ -1216,4 +1304,10 @@ export function readOutputSchema(schemaPath) {
   return readJsonFile(schemaPath);
 }
 
-export { DEFAULT_CONTINUE_PROMPT, TASK_THREAD_PREFIX };
+export {
+  DEFAULT_CONTINUE_PROMPT,
+  TASK_THREAD_PREFIX,
+  normalizeImportPath,
+  importedThreadIdFromCompletion,
+  importFailureDetails
+};
