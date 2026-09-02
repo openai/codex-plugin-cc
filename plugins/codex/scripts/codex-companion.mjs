@@ -6,7 +6,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
+import { parseArgs, splitRawArgumentString, splitRawArgumentStringWithSpans } from "./lib/args.mjs";
 import {
     buildPersistentTaskThreadName,
     DEFAULT_CONTINUE_PROMPT,
@@ -138,8 +138,60 @@ function normalizeArgv(argv) {
   return argv;
 }
 
+function normalizeAdversarialReviewArgv(argv) {
+  if (argv.length !== 1) return argv;
+
+  const [raw] = argv;
+  if (!raw || !raw.trim()) return [];
+
+  const tokens = splitRawArgumentStringWithSpans(raw);
+  const normalized = [];
+  const valueOptions = new Set(["base", "scope", "model", "cwd"]);
+  const booleanOptions = new Set(["json", "background", "wait"]);
+  const aliasMap = { C: "cwd", m: "model" };
+
+  for (let index = 0; index < tokens.length;) {
+    const token = tokens[index];
+    if (token.value === "--") {
+      const focusStart = tokens[index + 1]?.start;
+      if (focusStart !== undefined) normalized.push("--", raw.slice(focusStart));
+      return normalized;
+    }
+
+    let key = null;
+    let hasInlineValue = false;
+    if (token.value.startsWith("--")) {
+      const [rawKey, inlineValue] = token.value.slice(2).split("=", 2);
+      key = aliasMap[rawKey] ?? rawKey;
+      hasInlineValue = inlineValue !== undefined;
+    } else if (token.value.startsWith("-") && token.value !== "-") {
+      key = aliasMap[token.value.slice(1)] ?? token.value.slice(1);
+    }
+
+    if (booleanOptions.has(key)) {
+      normalized.push(token.value);
+      index += 1;
+      continue;
+    }
+    if (valueOptions.has(key)) {
+      normalized.push(token.value);
+      index += 1;
+      if (!hasInlineValue && index < tokens.length) {
+        normalized.push(tokens[index].value);
+        index += 1;
+      }
+      continue;
+    }
+
+    normalized.push(raw.slice(token.start));
+    return normalized;
+  }
+  return normalized;
+}
+
 function parseCommandInput(argv, config = {}) {
-  return parseArgs(normalizeArgv(argv), {
+  const argvNormalizer = config.argvNormalizer ?? normalizeArgv;
+  return parseArgs(argvNormalizer(argv), {
     ...config,
     aliasMap: {
       C: "cwd",
@@ -715,7 +767,10 @@ async function handleReviewCommand(argv, config) {
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
       m: "model"
-    }
+    },
+    ...(config.opaqueFocus
+      ? { argvNormalizer: normalizeAdversarialReviewArgv, stopAtFirstPositional: true }
+      : {})
   });
 
   const cwd = resolveCommandCwd(options);
@@ -1037,7 +1092,8 @@ async function main() {
       break;
     case "adversarial-review":
       await handleReviewCommand(argv, {
-        reviewName: "Adversarial Review"
+        reviewName: "Adversarial Review",
+        opaqueFocus: true
       });
       break;
     case "task":

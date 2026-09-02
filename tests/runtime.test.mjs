@@ -386,6 +386,47 @@ test("adversarial review renders structured findings over app-server turn/start"
   assert.match(result.stdout, /Missing empty-state guard/);
 });
 
+test("adversarial review keeps long option examples in a single focus argument", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  const focus = "Review the build script command build_v6_artifact.py --variant v6.2 --model pm_v6_2";
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  const result = run("node", [SCRIPT, "adversarial-review", focus], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.model, null);
+  assert.match(fakeState.lastTurnStart.prompt, new RegExp(focus.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
+test("adversarial review preserves backslashes, quotes, and whitespace in focus text", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  const focus = 'Review C:\\temp\\foo and keep "quoted  spacing" exactly';
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  const result = run("node", [SCRIPT, "adversarial-review", focus], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(result.status, 0, result.stderr);
+  const prompt = JSON.parse(fs.readFileSync(statePath, "utf8")).lastTurnStart.prompt;
+  assert.match(prompt, new RegExp(focus.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
 test("adversarial review accepts the same base-branch targeting as review", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
