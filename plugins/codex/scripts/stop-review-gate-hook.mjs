@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { getCodexAvailability } from "./lib/codex.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { getConfig, listJobs } from "./lib/state.mjs";
+import { formatStopReviewProcessFailure, parseStopReviewPayload } from "./lib/stop-review-output.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
 import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
@@ -66,35 +67,6 @@ function buildSetupNote(cwd) {
   return `Codex is not set up for the review gate.${detail} Run /codex:setup.`;
 }
 
-function parseStopReviewOutput(rawOutput) {
-  const text = String(rawOutput ?? "").trim();
-  if (!text) {
-    return {
-      ok: false,
-      reason:
-        "The stop-time Codex review task returned no final output. Run /codex:review --wait manually or bypass the gate."
-    };
-  }
-
-  const firstLine = text.split(/\r?\n/, 1)[0].trim();
-  if (firstLine.startsWith("ALLOW:")) {
-    return { ok: true, reason: null };
-  }
-  if (firstLine.startsWith("BLOCK:")) {
-    const reason = firstLine.slice("BLOCK:".length).trim() || text;
-    return {
-      ok: false,
-      reason: `Codex stop-time review found issues that still need fixes before ending the session: ${reason}`
-    };
-  }
-
-  return {
-    ok: false,
-    reason:
-      "The stop-time Codex review task returned an unexpected answer. Run /codex:review --wait manually or bypass the gate."
-  };
-}
-
 function runStopReview(cwd, input = {}) {
   const scriptPath = path.join(SCRIPT_DIR, "codex-companion.mjs");
   const prompt = buildStopReviewPrompt(input);
@@ -118,25 +90,13 @@ function runStopReview(cwd, input = {}) {
   }
 
   if (result.status !== 0) {
-    const detail = String(result.stderr || result.stdout || "").trim();
     return {
       ok: false,
-      reason: detail
-        ? `The stop-time Codex review task failed: ${detail}`
-        : "The stop-time Codex review task failed. Run /codex:review --wait manually or bypass the gate."
+      reason: formatStopReviewProcessFailure(result)
     };
   }
 
-  try {
-    const payload = JSON.parse(result.stdout);
-    return parseStopReviewOutput(payload?.rawOutput);
-  } catch {
-    return {
-      ok: false,
-      reason:
-        "The stop-time Codex review task returned invalid JSON. Run /codex:review --wait manually or bypass the gate."
-    };
-  }
+  return parseStopReviewPayload(result.stdout);
 }
 
 function main() {
