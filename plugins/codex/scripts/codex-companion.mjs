@@ -23,6 +23,7 @@ import {
   } from "./lib/codex.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
+import { readTaskPromptInput } from "./lib/task-prompt.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
@@ -79,7 +80,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [--prompt-file <path> [--prompt-file-sha256 <hex>]] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -485,6 +486,7 @@ async function executeTaskRun(request) {
   const result = await runAppServerTurn(workspaceRoot, {
     resumeThreadId,
     prompt: request.prompt,
+    preservePromptWhitespace: request.promptSource === "file",
     defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
     model: request.model,
     effort: request.effort,
@@ -513,7 +515,8 @@ async function executeTaskRun(request) {
     threadId: result.threadId,
     rawOutput,
     touchedFiles: result.touchedFiles,
-    reasoningSummary: result.reasoningSummary
+    reasoningSummary: result.reasoningSummary,
+    ...(request.promptFileSha256 ? { promptFileSha256: request.promptFileSha256 } : {})
   };
 
   return {
@@ -601,12 +604,14 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, prompt, promptSource, promptFileSha256 = null, write, resumeLast, jobId }) {
   return {
     cwd,
     model,
     effort,
     prompt,
+    promptSource,
+    ...(promptFileSha256 ? { promptFileSha256 } : {}),
     write,
     resumeLast,
     jobId
@@ -638,15 +643,6 @@ async function executeTransfer(cwd, options = {}) {
     payload,
     rendered: renderTransferResult(payload)
   };
-}
-
-function readTaskPrompt(cwd, options, positionals) {
-  if (options["prompt-file"]) {
-    return fs.readFileSync(path.resolve(cwd, options["prompt-file"]), "utf8");
-  }
-
-  const positionalPrompt = positionals.join(" ");
-  return positionalPrompt || readStdinIfPiped();
 }
 
 function requireTaskRequest(prompt, resumeLast) {
@@ -761,7 +757,7 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "prompt-file-sha256"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
     aliasMap: {
       m: "model"
@@ -772,7 +768,8 @@ async function handleTask(argv) {
   const workspaceRoot = resolveCommandWorkspace(options);
   const model = normalizeRequestedModel(options.model);
   const effort = normalizeReasoningEffort(options.effort);
-  const prompt = readTaskPrompt(cwd, options, positionals);
+  const promptInput = readTaskPromptInput(cwd, options, positionals, readStdinIfPiped);
+  const prompt = promptInput.text;
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
   const fresh = Boolean(options.fresh);
@@ -795,6 +792,8 @@ async function handleTask(argv) {
       model,
       effort,
       prompt,
+      promptSource: promptInput.source,
+      promptFileSha256: promptInput.sha256,
       write,
       resumeLast,
       jobId: job.id
@@ -813,6 +812,8 @@ async function handleTask(argv) {
         model,
         effort,
         prompt,
+        promptSource: promptInput.source,
+        promptFileSha256: promptInput.sha256,
         write,
         resumeLast,
         jobId: job.id,

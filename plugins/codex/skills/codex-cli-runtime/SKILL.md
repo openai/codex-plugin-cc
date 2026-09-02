@@ -33,6 +33,7 @@ Command selection:
 - `--resume`: always use `task --resume-last`, even if the request text is ambiguous.
 - `--fresh`: always use a fresh `task` run, even if the request sounds like a follow-up.
 - `--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`.
+- `--prompt-file-sha256 <hex>`: when using `--prompt-file`, pass the caller-supplied SHA-256 to bind the approved file bytes to the verbatim decoded text Codex receives. The JSON receipt is `promptFileSha256`. Never invent or recompute an expected digest on the caller's behalf after handoff.
 - `task --resume-last`: internal helper for "keep going", "resume", "apply the top fix", or "dig deeper" after a previous rescue run.
 
 Safety rules:

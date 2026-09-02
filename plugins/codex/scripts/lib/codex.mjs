@@ -1124,7 +1124,14 @@ export async function runAppServerTurn(cwd, options = {}) {
       threadId
     });
 
-    const prompt = options.prompt?.trim() || options.defaultPrompt || "";
+    const suppliedPrompt = typeof options.prompt === "string" ? options.prompt : "";
+    const normalizedPrompt = suppliedPrompt.trim();
+    if (options.preservePromptWhitespace && !normalizedPrompt) {
+      throw new Error("A prompt is required for this Codex run.");
+    }
+    const prompt = options.preservePromptWhitespace
+      ? suppliedPrompt
+      : normalizedPrompt || options.defaultPrompt || "";
     if (!prompt) {
       throw new Error("A prompt is required for this Codex run.");
     }

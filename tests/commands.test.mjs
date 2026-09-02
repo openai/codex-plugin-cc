@@ -151,6 +151,9 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only/i);
   assert.match(runtimeSkill, /Strip it before calling `task`/i);
   assert.match(runtimeSkill, /`--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`/i);
+  assert.match(runtimeSkill, /`--prompt-file-sha256 <hex>`/i);
+  assert.match(runtimeSkill, /bind the approved file bytes to the verbatim decoded text Codex receives/i);
+  assert.match(runtimeSkill, /JSON receipt is `promptFileSha256`/i);
   assert.match(runtimeSkill, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
   assert.match(runtimeSkill, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
   assert.match(readme, /`codex:codex-rescue` subagent/i);

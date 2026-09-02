@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -2256,4 +2257,127 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
   const payload = JSON.parse(setup.stdout);
   assert.equal(payload.sessionRuntime.mode, "shared");
   assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
+});
+
+
+test("task verifies prompt-file bytes and sends their decoded text verbatim", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const prompt = "  Inspect $HOME, `backticks`, and the exact newline.  \n";
+  const promptFile = path.join(repo, "prompt.txt");
+  fs.writeFileSync(promptFile, prompt, "utf8");
+  const digest = crypto.createHash("sha256").update(Buffer.from(prompt, "utf8")).digest("hex");
+
+  const result = run(
+    "node",
+    [SCRIPT, "task", "--json", "--prompt-file", promptFile, "--prompt-file-sha256", digest],
+    { cwd: repo, env: buildEnv(binDir) }
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.promptFileSha256, digest);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.lastTurnStart.prompt, prompt);
+  const stateDir = resolveStateDir(repo);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const stored = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${state.jobs[0].id}.json`), "utf8"));
+  assert.equal(stored.result.promptFileSha256, digest);
+});
+
+test("task keeps stdin prompt normalization separate from verbatim prompt files", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: "  stdin prompt with boundary whitespace  \n"
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.lastTurnStart.prompt, "stdin prompt with boundary whitespace");
+});
+
+test("task rejects a prompt-file digest mismatch before creating a job", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const approved = Buffer.from("approved prompt", "utf8");
+  const promptFile = path.join(repo, "prompt.txt");
+  fs.writeFileSync(promptFile, "substituted prompt", "utf8");
+  const digest = crypto.createHash("sha256").update(approved).digest("hex");
+  const stateDir = resolveStateDir(repo);
+
+  const result = run(
+    "node",
+    [SCRIPT, "task", "--json", "--prompt-file", promptFile, "--prompt-file-sha256", digest],
+    { cwd: repo }
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Prompt file SHA-256 mismatch/);
+  assert.equal(fs.existsSync(path.join(stateDir, "state.json")), false);
+  assert.equal(fs.existsSync(path.join(stateDir, "jobs")), false);
+});
+
+test("background prompt-file task persists the actual SHA-256 and exact prompt", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const prompt = "  Background prompt with $ and `literal` bytes.  \n";
+  const promptFile = path.join(repo, "prompt.txt");
+  fs.writeFileSync(promptFile, prompt, "utf8");
+  const digest = crypto.createHash("sha256").update(Buffer.from(prompt, "utf8")).digest("hex");
+  const env = buildEnv(binDir);
+
+  const launched = run(
+    "node",
+    [SCRIPT, "task", "--background", "--json", "--prompt-file", promptFile],
+    { cwd: repo, env }
+  );
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+  const stateDir = resolveStateDir(repo);
+
+  const stored = await waitFor(() => {
+    const jobFile = path.join(stateDir, "jobs", `${jobId}.json`);
+    if (!fs.existsSync(jobFile)) return null;
+    const value = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+    return value.request?.promptFileSha256 ? value : null;
+  });
+  assert.equal(stored.request.promptFileSha256, digest);
+  assert.equal(stored.request.prompt, prompt);
+  assert.equal(stored.request.promptSource, "file");
+
+  const waited = run(
+    "node",
+    [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "15000", "--json"],
+    { cwd: repo, env }
+  );
+  assert.equal(waited.status, 0, waited.stderr);
+  assert.equal(JSON.parse(waited.stdout).job.status, "completed");
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.lastTurnStart.prompt, prompt);
+
+  const result = run("node", [SCRIPT, "result", jobId, "--json"], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).storedJob.result.promptFileSha256, digest);
 });
