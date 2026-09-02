@@ -381,14 +381,16 @@ async function executeReviewRun(request) {
         status: result.status,
         stderr: result.stderr,
         stdout: result.reviewText,
-        reasoning: result.reasoningSummary
+        reasoning: result.reasoningSummary,
+        ...(result.status !== 0 && result.error ? { error: result.error } : {})
       }
     };
     const rendered = renderNativeReviewResult(
       {
         status: result.status,
         stdout: result.reviewText,
-        stderr: result.stderr
+        stderr: result.stderr,
+        error: result.error
       },
       { reviewLabel: reviewName, targetLabel: target.label, reasoningSummary: result.reasoningSummary }
     );
@@ -437,7 +439,8 @@ async function executeReviewRun(request) {
     result: parsed.parsed,
     rawOutput: parsed.rawOutput,
     parseError: parsed.parseError,
-    reasoningSummary: result.reasoningSummary
+    reasoningSummary: result.reasoningSummary,
+    ...(result.status !== 0 && result.error ? { error: result.error } : {})
   };
 
   return {
@@ -513,7 +516,8 @@ async function executeTaskRun(request) {
     threadId: result.threadId,
     rawOutput,
     touchedFiles: result.touchedFiles,
-    reasoningSummary: result.reasoningSummary
+    reasoningSummary: result.reasoningSummary,
+    ...(result.status !== 0 && result.error ? { error: result.error } : {})
   };
 
   return {

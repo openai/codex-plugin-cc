@@ -2257,3 +2257,146 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
   assert.equal(payload.sessionRuntime.mode, "shared");
   assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
 });
+
+test("task terminates when app-server emits a non-retryable turn error", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "terminal-error");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "trigger terminal error"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    timeout: 5000
+  });
+
+  assert.equal(result.signal, null, `task timed out: ${result.stderr}`);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /git merge-base rejected a tree object/);
+  assert.match(result.stdout, /git merge-base rejected a tree object/);
+
+  const stateDir = resolveStateDir(repo);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(state.jobs[0].status, "failed");
+  assert.equal(state.jobs[0].phase, "failed");
+  assert.ok(state.jobs[0].completedAt);
+  const stored = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${state.jobs[0].id}.json`), "utf8"));
+  assert.equal(stored.result.status, 1);
+  assert.equal(stored.result.error.message, "git merge-base rejected a tree object");
+  assert.match(stored.rendered, /git merge-base rejected a tree object/);
+});
+
+for (const behavior of ["terminal-error-buffered", "terminal-error-then-completed"]) {
+  test(`task preserves terminal failure for ${behavior}`, () => {
+    const repo = makeTempDir();
+    const binDir = makeTempDir();
+    installFakeCodex(binDir, behavior);
+    initGitRepo(repo);
+    fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+    run("git", ["add", "README.md"], { cwd: repo });
+    run("git", ["commit", "-m", "init"], { cwd: repo });
+
+    const result = run("node", [SCRIPT, "task", "trigger terminal error"], {
+      cwd: repo,
+      env: buildEnv(binDir),
+      timeout: 5000
+    });
+
+    assert.equal(result.signal, null, `task timed out: ${result.stderr}`);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stdout, /git merge-base rejected a tree object/);
+  });
+}
+
+test("task continues after a retryable turn error", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "retryable-error");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "retry the turn"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    timeout: 5000
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "Recovered after retry.\n");
+  assert.match(result.stderr, /git merge-base rejected a tree object/);
+});
+
+test("task ignores an error notification for an unrelated thread", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "unrelated-error");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "ignore unrelated error"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    timeout: 5000
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Handled the requested task/);
+  assert.doesNotMatch(result.stderr, /git merge-base rejected a tree object/);
+});
+
+test("review terminates and renders a non-retryable app-server error", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "terminal-review-error");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  const result = run("node", [SCRIPT, "review", "--scope", "working-tree"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    timeout: 5000
+  });
+
+  assert.equal(result.signal, null, `review timed out: ${result.stderr}`);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /git merge-base rejected a tree object/);
+  assert.match(result.stdout, /git merge-base rejected a tree object/);
+
+  const stateDir = resolveStateDir(repo);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(state.jobs[0].status, "failed");
+  const stored = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${state.jobs[0].id}.json`), "utf8"));
+  assert.equal(stored.result.codex.error.message, "git merge-base rejected a tree object");
+});
+
+test("task does not let a tracked subagent error overwrite the root turn result", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "tracked-subagent-error");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "keep the root turn authoritative"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    timeout: 5000
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Handled the requested task/);
+  const stateDir = resolveStateDir(repo);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(state.jobs[0].status, "completed");
+});

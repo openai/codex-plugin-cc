@@ -413,6 +413,24 @@ rl.on("line", (line) => {
         }
         const turnId = nextTurnId(state);
         send({ id: message.id, result: { turn: buildTurn(turnId), reviewThreadId: reviewThread.id } });
+        if (BEHAVIOR === "terminal-review-error") {
+          send({ method: "turn/started", params: { threadId: reviewThread.id, turn: buildTurn(turnId) } });
+          send({
+            method: "error",
+            params: {
+              threadId: reviewThread.id,
+              turnId,
+              error: {
+                message: "git merge-base rejected a tree object",
+                codexErrorInfo: null,
+                additionalDetails: "error: object is a tree, not a commit",
+                misalignment: null
+              },
+              willRetry: false
+            }
+          });
+          break;
+        }
         emitTurnCompleted(reviewThread.id, turnId, [
           {
             started: { type: "enteredReviewMode", id: turnId, review: "current changes" }
@@ -452,7 +470,51 @@ rl.on("line", (line) => {
 	          prompt
 	        };
 	        saveState(state);
+
+        const terminalError = {
+          message: "git merge-base rejected a tree object",
+          codexErrorInfo: null,
+          additionalDetails: "error: object is a tree, not a commit",
+          misalignment: null
+        };
+        if (BEHAVIOR === "terminal-error-buffered") {
+          send({ method: "error", params: { threadId: thread.id, turnId, error: terminalError, willRetry: false } });
+          send({ id: message.id, result: { turn: buildTurn(turnId) } });
+          break;
+        }
+
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
+
+        if (BEHAVIOR === "terminal-error" || BEHAVIOR === "terminal-error-then-completed") {
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+          send({ method: "error", params: { threadId: thread.id, turnId, error: terminalError, willRetry: false } });
+          if (BEHAVIOR === "terminal-error-then-completed") {
+            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+          }
+          break;
+        }
+
+        if (BEHAVIOR === "retryable-error") {
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+          send({ method: "error", params: { threadId: thread.id, turnId, error: terminalError, willRetry: true } });
+          emitTurnCompleted(thread.id, turnId, [{
+            completed: { type: "agentMessage", id: "msg_" + turnId, text: "Recovered after retry.", phase: "final_answer" }
+          }]);
+          break;
+        }
+
+        if (BEHAVIOR === "unrelated-error") {
+          send({ method: "error", params: { threadId: "unrelated_thread", turnId: "unrelated_turn", error: terminalError, willRetry: false } });
+        }
+
+        if (BEHAVIOR === "tracked-subagent-error") {
+          const subThread = nextThread(state, thread.cwd, true);
+          const subTurnId = nextTurnId(state);
+          send({ method: "thread/started", params: { thread: { ...buildThread(subThread), agentNickname: "error-probe" } } });
+          send({ method: "turn/started", params: { threadId: subThread.id, turn: buildTurn(subTurnId) } });
+          send({ method: "error", params: { threadId: subThread.id, turnId: subTurnId, error: terminalError, willRetry: false } });
+          send({ method: "turn/completed", params: { threadId: subThread.id, turn: buildTurn(subTurnId, "failed", terminalError) } });
+        }
 
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)

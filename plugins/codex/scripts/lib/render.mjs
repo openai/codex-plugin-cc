@@ -288,6 +288,7 @@ export function renderReviewResult(parsedResult, meta) {
 export function renderNativeReviewResult(result, meta) {
   const stdout = result.stdout.trim();
   const stderr = result.stderr.trim();
+  const errorMessage = String(result.error?.message ?? "").trim();
   const lines = [
     `# Codex ${meta.reviewLabel}`,
     "",
@@ -299,6 +300,8 @@ export function renderNativeReviewResult(result, meta) {
     lines.push(stdout);
   } else if (result.status === 0) {
     lines.push("Codex review completed without any stdout output.");
+  } else if (errorMessage) {
+    lines.push(errorMessage);
   } else {
     lines.push("Codex review failed.");
   }

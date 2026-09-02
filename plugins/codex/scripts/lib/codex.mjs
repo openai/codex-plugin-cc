@@ -370,6 +370,31 @@ function completeTurn(state, turn = null, options = {}) {
   state.resolveCompletion(state);
 }
 
+function failTurn(state, error) {
+  if (state.completed) {
+    return;
+  }
+
+  state.error = error;
+  completeTurn(state, {
+    id: state.turnId ?? "error-turn",
+    items: [],
+    itemsView: "full",
+    status: "failed",
+    error,
+    startedAt: null,
+    completedAt: Math.floor(Date.now() / 1000),
+    durationMs: null
+  });
+}
+
+function formatTurnError(error) {
+  if (typeof error?.message === "string" && error.message.trim()) {
+    return error.message.trim();
+  }
+  return String(error ?? "Unknown Codex error").trim();
+}
+
 function scheduleInferredCompletion(state) {
   if (state.completed || state.finalTurn || !state.finalAnswerSeen) {
     return;
@@ -534,10 +559,26 @@ function applyTurnNotification(state, message) {
         emitProgress(state.onProgress, update?.message, update?.phase ?? null);
       }
       break;
-    case "error":
-      state.error = message.params.error;
-      emitProgress(state.onProgress, `Codex error: ${message.params.error.message}`, "failed");
+    case "error": {
+      const error = message.params.error;
+      const messageThreadId = message.params.threadId ?? null;
+      if (messageThreadId !== state.threadId) {
+        const sourceLabel = labelForThread(state, messageThreadId);
+        emitProgress(
+          state.onProgress,
+          `${sourceLabel ? `Subagent ${sourceLabel}` : "Subagent"} error: ${formatTurnError(error)}`,
+          "investigating"
+        );
+        break;
+      }
+
+      state.error = error;
+      emitProgress(state.onProgress, `Codex error: ${formatTurnError(error)}`, message.params.willRetry ? "running" : "failed");
+      if (!message.params.willRetry) {
+        failTurn(state, error);
+      }
       break;
+    }
     case "turn/completed":
       if ((message.params.threadId ?? null) !== state.threadId) {
         state.activeSubagentTurns.delete(message.params.threadId);
