@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { createBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
@@ -15,6 +16,7 @@ const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
+const FAKE_AUTH_BROKER = path.join(ROOT, "tests", "fake-auth-broker.mjs");
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   const start = Date.now();
@@ -27,6 +29,147 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   }
   throw new Error("Timed out waiting for condition.");
 }
+
+async function startFakeAuthBroker(t, mode = "busy") {
+  const sessionDir = makeTempDir("codex-plugin-auth-broker-");
+  const endpoint = createBrokerEndpoint(sessionDir);
+  const statePath = path.join(sessionDir, "state.json");
+  const child = spawn(
+    process.execPath,
+    [FAKE_AUTH_BROKER, "--endpoint", endpoint, "--state", statePath, "--mode", mode],
+    { stdio: "ignore", windowsHide: true }
+  );
+
+  t.after(() => {
+    if (child.exitCode === null) {
+      child.kill("SIGTERM");
+    }
+  });
+
+  await waitFor(() => {
+    if (!fs.existsSync(statePath)) {
+      return false;
+    }
+    try {
+      return JSON.parse(fs.readFileSync(statePath, "utf8")).ready;
+    } catch {
+      return false;
+    }
+  });
+
+  return { endpoint, statePath };
+}
+
+test("setup falls back directly when the shared broker is busy", async (t) => {
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  const broker = await startFakeAuthBroker(t);
+
+  const result = run("node", [SCRIPT, "setup", "--json"], {
+    cwd: ROOT,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_COMPANION_APP_SERVER_ENDPOINT: broker.endpoint
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ready, true);
+  assert.equal(payload.auth.loggedIn, true);
+  assert.equal(payload.auth.detail, "ChatGPT login active for test@example.com");
+  assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts, 1);
+});
+
+test("setup preserves a direct logged-out response after a busy broker fallback", async (t) => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "logged-out");
+  const broker = await startFakeAuthBroker(t);
+
+  const result = run("node", [SCRIPT, "setup", "--json"], {
+    cwd: ROOT,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_COMPANION_APP_SERVER_ENDPOINT: broker.endpoint
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ready, false);
+  assert.equal(payload.auth.loggedIn, false);
+  assert.equal(payload.auth.detail, "OpenAI requires OpenAI authentication");
+});
+
+test("setup falls back directly when the requested broker endpoint is stale", () => {
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  const sessionDir = makeTempDir("codex-plugin-stale-auth-broker-");
+  installFakeCodex(binDir);
+
+  const result = run("node", [SCRIPT, "setup", "--json"], {
+    cwd: ROOT,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_COMPANION_APP_SERVER_ENDPOINT: createBrokerEndpoint(sessionDir)
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ready, true);
+  assert.equal(payload.auth.loggedIn, true);
+  assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).appServerStarts, 1);
+});
+
+test("setup does not retry a non-retryable broker auth failure", async (t) => {
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  const broker = await startFakeAuthBroker(t, "error");
+
+  const result = run("node", [SCRIPT, "setup", "--json"], {
+    cwd: ROOT,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_COMPANION_APP_SERVER_ENDPOINT: broker.endpoint
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ready, false);
+  assert.equal(payload.auth.loggedIn, false);
+  assert.equal(payload.auth.detail, "Broker auth request failed.");
+  assert.equal(fs.existsSync(fakeStatePath), false);
+});
+
+test("setup reports a direct auth failure and closes both fallback clients", async (t) => {
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "config-read-fails");
+  const broker = await startFakeAuthBroker(t);
+
+  const result = run("node", [SCRIPT, "setup", "--json"], {
+    cwd: ROOT,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_COMPANION_APP_SERVER_ENDPOINT: broker.endpoint
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ready, false);
+  assert.equal(payload.auth.loggedIn, false);
+  assert.equal(payload.auth.detail, "config/read failed for cwd");
+
+  await waitFor(() => JSON.parse(fs.readFileSync(broker.statePath, "utf8")).closedConnections === 1);
+  const directState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.equal(directState.appServerStarts, 1);
+  assert.equal(directState.appServerExits, 1);
+});
 
 test("setup reports ready when fake codex is installed and authenticated", () => {
   const binDir = makeTempDir();

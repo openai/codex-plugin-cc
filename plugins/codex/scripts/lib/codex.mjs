@@ -610,6 +610,14 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   }
 }
 
+function shouldRetryDirectAppServer(error, { client = null, brokerRequested = false } = {}) {
+  const brokerAttempted = client?.transport === "broker" || brokerRequested;
+  return (
+    brokerAttempted &&
+    (error?.rpcCode === BROKER_BUSY_RPC_CODE || error?.code === "ENOENT" || error?.code === "ECONNREFUSED")
+  );
+}
+
 async function withAppServer(cwd, fn) {
   let client = null;
   try {
@@ -619,9 +627,7 @@ async function withAppServer(cwd, fn) {
     return result;
   } catch (error) {
     const brokerRequested = client?.transport === "broker" || Boolean(process.env[BROKER_ENDPOINT_ENV]);
-    const shouldRetryDirect =
-      (client?.transport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE) ||
-      (brokerRequested && (error?.code === "ENOENT" || error?.code === "ECONNREFUSED"));
+    const shouldRetryDirect = shouldRetryDirectAppServer(error, { client, brokerRequested });
 
     if (client) {
       await client.close().catch(() => {});
@@ -866,21 +872,21 @@ function buildAppServerAuthStatus(accountResponse, configResponse) {
 }
 
 async function getCodexAuthStatusFromClient(client, cwd) {
-  try {
-    const accountResponse = await client.request("account/read", { refreshToken: false });
-    const configResponse = await client.request("config/read", {
-      includeLayers: false,
-      cwd
-    });
+  const accountResponse = await client.request("account/read", { refreshToken: false });
+  const configResponse = await client.request("config/read", {
+    includeLayers: false,
+    cwd
+  });
 
-    return buildAppServerAuthStatus(accountResponse, configResponse);
-  } catch (error) {
-    return buildAuthStatus({
-      loggedIn: false,
-      detail: error instanceof Error ? error.message : String(error),
-      source: "app-server"
-    });
-  }
+  return buildAppServerAuthStatus(accountResponse, configResponse);
+}
+
+function buildUnavailableAuthStatus(error) {
+  return buildAuthStatus({
+    loggedIn: false,
+    detail: error instanceof Error ? error.message : String(error),
+    source: "app-server"
+  });
 }
 
 export function getCodexAvailability(cwd) {
@@ -937,6 +943,8 @@ export async function getCodexAuthStatus(cwd, options = {}) {
     };
   }
 
+  const configuredBrokerEndpoint = options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
+  const brokerRequested = Boolean(configuredBrokerEndpoint || loadBrokerSession(cwd)?.endpoint);
   let client = null;
   try {
     client = await CodexAppServerClient.connect(cwd, {
@@ -945,11 +953,25 @@ export async function getCodexAuthStatus(cwd, options = {}) {
     });
     return await getCodexAuthStatusFromClient(client, cwd);
   } catch (error) {
-    return buildAuthStatus({
-      loggedIn: false,
-      detail: error instanceof Error ? error.message : String(error),
-      source: "app-server"
-    });
+    const shouldRetryDirect = shouldRetryDirectAppServer(error, { client, brokerRequested });
+    if (client) {
+      await client.close().catch(() => {});
+      client = null;
+    }
+
+    if (!shouldRetryDirect) {
+      return buildUnavailableAuthStatus(error);
+    }
+
+    try {
+      client = await CodexAppServerClient.connect(cwd, {
+        env: options.env,
+        disableBroker: true
+      });
+      return await getCodexAuthStatusFromClient(client, cwd);
+    } catch (directError) {
+      return buildUnavailableAuthStatus(directError);
+    }
   } finally {
     if (client) {
       await client.close().catch(() => {});

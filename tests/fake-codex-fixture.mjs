@@ -19,7 +19,7 @@ const readline = require("node:readline");
 
 	function loadState() {
 	  if (!fs.existsSync(STATE_PATH)) {
-	    return { nextThreadId: 1, nextTurnId: 1, appServerStarts: 0, threads: [], capabilities: null, lastInterrupt: null };
+	    return { nextThreadId: 1, nextTurnId: 1, appServerStarts: 0, appServerExits: 0, threads: [], capabilities: null, lastInterrupt: null };
 	  }
 	  return JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
 	}
@@ -275,6 +275,11 @@ bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
 saveState(bootState);
 
 const rl = readline.createInterface({ input: process.stdin });
+rl.on("close", () => {
+  const state = loadState();
+  state.appServerExits = (state.appServerExits || 0) + 1;
+  saveState(state);
+});
 rl.on("line", (line) => {
   if (!line.trim()) {
     return;
