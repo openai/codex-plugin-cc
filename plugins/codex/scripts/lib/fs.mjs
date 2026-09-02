@@ -32,9 +32,52 @@ export function isProbablyText(buffer) {
   return true;
 }
 
-export function readStdinIfPiped() {
-  if (process.stdin.isTTY) {
+const stdinRetryWaitArray = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+const STDIN_CHUNK_SIZE = 64 * 1024;
+
+function waitForStdinRetry(delayMs) {
+  Atomics.wait(stdinRetryWaitArray, 0, 0, delayMs);
+}
+
+function isTransientReadError(error) {
+  return error?.code === "EAGAIN" || error?.code === "EWOULDBLOCK";
+}
+
+export function readStdinIfPiped({
+  stdin = process.stdin,
+  readSync = fs.readSync,
+  waitForRetry = waitForStdinRetry,
+  initialRetryDelayMs = 10,
+  maxRetryDelayMs = 500,
+  chunkSize = STDIN_CHUNK_SIZE
+} = {}) {
+  if (stdin.isTTY) {
     return "";
   }
-  return fs.readFileSync(0, "utf8");
+
+  try {
+    Reflect.get(stdin, "_handle")?.setBlocking?.(true);
+  } catch {
+    // Some stdin handle types do not support changing blocking mode.
+  }
+
+  const chunks = [];
+  let retryDelayMs = initialRetryDelayMs;
+  while (true) {
+    const chunk = Buffer.allocUnsafe(chunkSize);
+    try {
+      const bytesRead = readSync(0, chunk, 0, chunk.length, null);
+      if (bytesRead === 0) {
+        return Buffer.concat(chunks).toString("utf8");
+      }
+      chunks.push(chunk.subarray(0, bytesRead));
+      retryDelayMs = initialRetryDelayMs;
+    } catch (error) {
+      if (!isTransientReadError(error)) {
+        throw error;
+      }
+      waitForRetry(retryDelayMs);
+      retryDelayMs = Math.min(retryDelayMs * 2, maxRetryDelayMs);
+    }
+  }
 }
