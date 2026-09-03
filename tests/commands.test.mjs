@@ -103,6 +103,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.doesNotMatch(rescue, /^context:\s*fork\b/m);
   assert.match(rescue, /--background\|--wait/);
   assert.match(rescue, /--resume\|--fresh/);
+  assert.match(rescue, /--thread <id>/);
   assert.match(rescue, /--model <model\|spark>/);
   assert.match(rescue, /--effort <none\|minimal\|low\|medium\|high\|xhigh>/);
   assert.match(rescue, /task-resume-candidate --json/);
@@ -113,6 +114,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /default to foreground/i);
   assert.match(rescue, /Do not forward them to `task`/i);
   assert.match(rescue, /`--model` and `--effort` are runtime-selection flags/i);
+  assert.match(rescue, /`--thread <id>` is a routing flag/i);
   assert.match(rescue, /Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort/i);
   assert.match(rescue, /If they ask for `spark`, map it to `gpt-5\.3-codex-spark`/i);
   assert.match(rescue, /If the request includes `--resume`, do not ask whether to continue/i);
@@ -123,9 +125,10 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /Return the Codex companion stdout verbatim to the user/i);
   assert.match(rescue, /Do not paraphrase, summarize, rewrite, or add commentary before or after it/i);
   assert.match(rescue, /return that command's stdout as-is/i);
-  assert.match(rescue, /Leave `--resume` and `--fresh` in the forwarded request/i);
+  assert.match(rescue, /Leave `--thread <id>`, `--resume`, and `--fresh` in the forwarded request/i);
   assert.match(agent, /--resume/);
   assert.match(agent, /--fresh/);
+  assert.match(agent, /--thread <id>/);
   assert.match(agent, /thin forwarding wrapper/i);
   assert.match(agent, /prefer foreground for a small, clearly bounded rescue request/i);
   assert.match(agent, /If the user did not explicitly choose `--background` or `--wait` and the task looks complicated, open-ended, multi-step, or likely to keep Codex running for a long time, prefer background execution/i);
@@ -195,6 +198,7 @@ test("internal docs use task terminology for rescue runs", () => {
   assert.match(runtimeSkill, /codex-companion\.mjs" task "<raw arguments>"/);
   assert.match(runtimeSkill, /Use `task` for every rescue request/i);
   assert.match(runtimeSkill, /task --resume-last/i);
+  assert.match(runtimeSkill, /task --thread <id>/i);
   assert.match(promptingSkill, /Use `task` when the task is diagnosis/i);
   assert.match(promptRecipes, /Codex task prompts/i);
   assert.match(promptRecipes, /Use these as starting templates for Codex task prompts/i);
