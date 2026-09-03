@@ -33,12 +33,6 @@ Install the plugin:
 /plugin install codex@openai-codex
 ```
 
-Reload plugins:
-
-```bash
-/reload-plugins
-```
-
 Then run:
 
 ```bash
