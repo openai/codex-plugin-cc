@@ -32,8 +32,9 @@ Forwarding rules:
 - If the user asks for a concrete model name such as `gpt-5.4-mini`, pass it through with `--model`.
 - Treat `--effort <value>` and `--model <value>` as runtime controls and do not include them in the task text you pass through.
 - Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
-- Treat `--thread <id>`, `--resume`, and `--fresh` as routing controls and do not include them in the task text you pass through.
+- Treat `--thread <id>`, `--allow-other-repo`, `--resume`, and `--fresh` as routing controls and do not include them in the task text you pass through.
 - `--thread <id>` means pass it through to `task` and do not add `--resume-last`.
+- `--allow-other-repo` means pass it through with `--thread <id>` only when the user explicitly supplied it.
 - `--resume` means add `--resume-last`.
 - `--fresh` means do not add `--resume-last`.
 - If the user is clearly asking to continue prior Codex work in this repository, such as "continue", "keep going", "resume", "apply the top fix", or "dig deeper", add `--resume-last` unless `--thread` or `--fresh` is present.

@@ -79,7 +79,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--thread <id>|--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--thread <id>|--resume-last|--resume|--fresh] [--allow-other-repo] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -355,6 +355,16 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   return findLatestTaskThread(workspaceRoot);
 }
 
+function requireTrackedThreadForWorkspace(workspaceRoot, threadId) {
+  if (listJobs(workspaceRoot).some((job) => job.threadId === threadId)) {
+    return;
+  }
+
+  throw new Error(
+    `Thread ${threadId} is not tracked for this repository. Pass --allow-other-repo to resume a thread from another repository or one created outside this plugin.`
+  );
+}
+
 async function executeReviewRun(request) {
   ensureCodexAvailable(request.cwd);
   ensureGitRepository(request.cwd);
@@ -461,6 +471,9 @@ async function executeReviewRun(request) {
 async function executeTaskRun(request) {
   const workspaceRoot = resolveWorkspaceRoot(request.cwd);
   ensureCodexAvailable(request.cwd);
+  if (request.resumeThreadId && !request.allowOtherRepo) {
+    requireTrackedThreadForWorkspace(workspaceRoot, request.resumeThreadId);
+  }
 
   const taskMetadata = buildTaskRunMetadata({
     prompt: request.prompt,
@@ -601,7 +614,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, resumeThreadId, jobId }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, resumeThreadId, allowOtherRepo, jobId }) {
   return {
     cwd,
     model,
@@ -610,6 +623,7 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, resum
     write,
     resumeLast,
     resumeThreadId,
+    allowOtherRepo,
     jobId
   };
 }
@@ -763,7 +777,7 @@ async function handleReview(argv) {
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "cwd", "prompt-file", "thread"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "allow-other-repo"],
     aliasMap: {
       m: "model"
     }
@@ -777,6 +791,7 @@ async function handleTask(argv) {
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
   const resumeThreadId = options.thread == null ? null : String(options.thread).trim();
+  const allowOtherRepo = Boolean(options["allow-other-repo"]);
   if (options.thread != null && (!resumeThreadId || resumeThreadId.startsWith("-"))) {
     throw new Error("Provide a thread id with --thread.");
   }
@@ -806,6 +821,7 @@ async function handleTask(argv) {
       write,
       resumeLast,
       resumeThreadId,
+      allowOtherRepo,
       jobId: job.id
     });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
@@ -825,6 +841,7 @@ async function handleTask(argv) {
         write,
         resumeLast,
         resumeThreadId,
+        allowOtherRepo,
         jobId: job.id,
         onProgress: progress
       }),

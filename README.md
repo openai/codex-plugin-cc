@@ -137,7 +137,7 @@ Use it when you want Codex to:
 > [!NOTE]
 > Depending on the task and the model you choose these tasks might take a long time and it's generally recommended to force the task to be in the background or move the agent to the background.
 
-It supports `--background`, `--wait`, `--thread <id>`, `--resume`, and `--fresh`. If you omit `--thread`, `--resume`, and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo.
+It supports `--background`, `--wait`, `--thread <id>`, `--allow-other-repo`, `--resume`, and `--fresh`. By default, `--thread` only resumes threads tracked for the current repo; use `--allow-other-repo` for a thread from another repo or one created outside this plugin. If you omit `--thread`, `--resume`, and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo.
 
 Examples:
 

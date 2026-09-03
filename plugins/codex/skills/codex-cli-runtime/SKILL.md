@@ -29,12 +29,14 @@ Command selection:
 - If the forwarded request includes `--model`, normalize `spark` to `gpt-5.3-codex-spark` and pass it through to `task`.
 - If the forwarded request includes `--effort`, pass it through to `task`.
 - If the forwarded request includes `--thread <id>`, strip the option and value from the task text and pass them through to `task`.
+- If the forwarded request includes `--allow-other-repo`, strip it from the task text and pass it through to `task`.
 - If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
 - If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
 - `--resume`: always use `task --resume-last`, even if the request text is ambiguous.
 - `--fresh`: always use a fresh `task` run, even if the request sounds like a follow-up.
 - `--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`.
-- `task --thread <id>`: resume that specific Codex thread without consulting tracked rescue jobs.
+- `task --thread <id>`: resume that specific Codex thread only when it is tracked for the current repo.
+- `task --thread <id> --allow-other-repo`: explicitly allow a thread from another repo or one created outside this plugin.
 - `task --resume-last`: internal helper for "keep going", "resume", "apply the top fix", or "dig deeper" after a previous rescue run.
 
 Safety rules:
