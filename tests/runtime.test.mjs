@@ -716,6 +716,59 @@ test("write task output focuses on the Codex result without generic follow-up hi
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
+test("task --prompt-file-consume removes the prompt file after a successful read", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const promptPath = path.join(repo, "prompt.txt");
+  fs.writeFileSync(promptPath, "inspect the failing test", "utf8");
+
+  const result = run(
+    "node",
+    [SCRIPT, "task", "--prompt-file", promptPath, "--prompt-file-consume"],
+    { cwd: repo, env: buildEnv(binDir) }
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(promptPath), false);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.prompt, "inspect the failing test");
+});
+
+test("task --prompt-file preserves the prompt file without consume", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const promptPath = path.join(repo, "prompt.txt");
+  fs.writeFileSync(promptPath, "inspect the failing test", "utf8");
+
+  const result = run("node", [SCRIPT, "task", "--prompt-file", promptPath], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(promptPath), true);
+});
+
+test("task --prompt-file-consume requires --prompt-file", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--prompt-file-consume", "hello"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /--prompt-file-consume requires --prompt-file\./);
+});
+
 test("task --resume acts like --resume-last without leaking the flag into the prompt", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

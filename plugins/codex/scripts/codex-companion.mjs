@@ -79,7 +79,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [--prompt-file <path> [--prompt-file-consume]] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -641,8 +641,18 @@ async function executeTransfer(cwd, options = {}) {
 }
 
 function readTaskPrompt(cwd, options, positionals) {
+  const consumePromptFile = Boolean(options["prompt-file-consume"]);
+  if (consumePromptFile && !options["prompt-file"]) {
+    throw new Error("--prompt-file-consume requires --prompt-file.");
+  }
+
   if (options["prompt-file"]) {
-    return fs.readFileSync(path.resolve(cwd, options["prompt-file"]), "utf8");
+    const promptPath = path.resolve(cwd, options["prompt-file"]);
+    const prompt = fs.readFileSync(promptPath, "utf8");
+    if (consumePromptFile) {
+      fs.unlinkSync(promptPath);
+    }
+    return prompt;
   }
 
   const positionalPrompt = positionals.join(" ");
@@ -762,7 +772,15 @@ async function handleReview(argv) {
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    booleanOptions: [
+      "json",
+      "write",
+      "resume-last",
+      "resume",
+      "fresh",
+      "background",
+      "prompt-file-consume"
+    ],
     aliasMap: {
       m: "model"
     }
