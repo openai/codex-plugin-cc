@@ -9,7 +9,7 @@ export function runCommand(command, args = [], options = {}) {
     input: options.input,
     maxBuffer: options.maxBuffer,
     stdio: options.stdio ?? "pipe",
-    shell: options.shell ?? (process.platform === "win32" ? (process.env.SHELL || true) : false),
+    shell: options.shell ?? false,
     windowsHide: true
   });
 
@@ -35,8 +35,33 @@ export function runCommandChecked(command, args = [], options = {}) {
   return result;
 }
 
+export function commandWithWindowsShim(command, args = [], options = {}) {
+  const platform = options.platform ?? process.platform;
+  if (platform !== "win32") {
+    return { command, args, shell: false };
+  }
+
+  return {
+    command: options.comspec ?? process.env.ComSpec ?? "cmd.exe",
+    args: ["/d", "/s", "/c", "call", command, ...args],
+    shell: false
+  };
+}
+
 export function binaryAvailable(command, versionArgs = ["--version"], options = {}) {
-  const result = runCommand(command, versionArgs, options);
+  const runCommandImpl = options.runCommandImpl ?? runCommand;
+  let result;
+
+  if (options.shell !== undefined) {
+    result = runCommandImpl(command, versionArgs, options);
+  } else {
+    const invocation = commandWithWindowsShim(command, versionArgs, options);
+    result = runCommandImpl(invocation.command, invocation.args, {
+      cwd: options.cwd,
+      env: options.env,
+      shell: invocation.shell
+    });
+  }
   if (result.error && /** @type {NodeJS.ErrnoException} */ (result.error).code === "ENOENT") {
     return { available: false, detail: "not found" };
   }
@@ -66,7 +91,8 @@ export function terminateProcessTree(pid, options = {}) {
   if (platform === "win32") {
     const result = runCommandImpl("taskkill", ["/PID", String(pid), "/T", "/F"], {
       cwd: options.cwd,
-      env: options.env
+      env: options.env,
+      shell: false
     });
 
     if (!result.error && result.status === 0) {
@@ -74,7 +100,7 @@ export function terminateProcessTree(pid, options = {}) {
     }
 
     const combinedOutput = `${result.stderr}\n${result.stdout}`.trim();
-    if (!result.error && looksLikeMissingProcessMessage(combinedOutput)) {
+    if (!result.error && (result.status === 128 || looksLikeMissingProcessMessage(combinedOutput))) {
       return { attempted: true, delivered: false, method: "taskkill", result };
     }
 
