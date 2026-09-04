@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.8
+
+- Require every `--read-root` to be an existing directory so scoped tasks do not claim unsupported file-level isolation on macOS.
+
 ## 1.0.7
 
 - Add opt-in `--read-root` enforcement for Codex rescue tasks using request-scoped permission profiles.

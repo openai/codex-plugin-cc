@@ -162,7 +162,7 @@ Ask Codex to redesign the database connection to be more resilient.
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
-- each `--read-root <path>` opts into an OS-enforced permission profile that denies local command reads outside the listed paths and Codex's minimal runtime paths
+- each `--read-root <directory>` must name an existing directory and opts into an OS-enforced permission profile that denies local command reads outside the listed directories and Codex's minimal runtime paths
 - scoped reads require Codex 0.138.0 or later and fail closed when the runtime cannot enforce permission profiles
 - filesystem profiles apply to local sandboxed commands, not web search, MCP servers, connectors, browser tools, or computer use
 

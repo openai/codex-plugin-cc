@@ -785,6 +785,23 @@ test("task --read-root fails closed when permission profiles are unsupported", (
   assert.match(result.stderr, /0\.138\.0 or later/);
 });
 
+test("task --read-root rejects files and missing directories before starting Codex", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "allowed.txt"), "fixture\n");
+
+  for (const readRoot of ["allowed.txt", "missing-directory"]) {
+    const result = run("node", [SCRIPT, "task", "--read-root", readRoot, "inspect"], {
+      cwd: repo,
+      env: buildEnv(binDir)
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /--read-root must name an existing directory/);
+  }
+});
+
 test("task --resume acts like --resume-last without leaking the flag into the prompt", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
