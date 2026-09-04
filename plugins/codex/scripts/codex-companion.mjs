@@ -157,6 +157,9 @@ function resolveCommandWorkspace(options = {}) {
 }
 
 function resolveReadRoot(cwd, readRoot) {
+  if (typeof readRoot !== "string" || !readRoot.trim()) {
+    throw new Error("--read-root must name an existing directory: value is empty");
+  }
   const resolved = path.resolve(cwd, readRoot);
   if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
     throw new Error(`--read-root must name an existing directory: ${readRoot}`);

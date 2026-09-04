@@ -809,7 +809,7 @@ test("task --read-root rejects files and missing directories before starting Cod
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "allowed.txt"), "fixture\n");
 
-  for (const readRoot of ["allowed.txt", "missing-directory"]) {
+  for (const readRoot of ["", "allowed.txt", "missing-directory"]) {
     const result = run("node", [SCRIPT, "task", "--read-root", readRoot, "inspect"], {
       cwd: repo,
       env: buildEnv(binDir)

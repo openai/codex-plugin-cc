@@ -1,12 +1,16 @@
 # Changelog
 
+## 1.0.11
+
+- Reject empty `--read-root` values instead of resolving them to the current workspace.
+
 ## 1.0.10
 
 - Deny inherited system temp roots in scoped profiles so only approved directories and minimal runtime paths remain readable.
 
 ## 1.0.9
 
-- Preserve the built-in `:workspace` safeguards for scoped write tasks and require the approved read roots to cover the workspace.
+- Use the built-in `:workspace` profile for scoped write tasks and require the approved read roots to cover the workspace.
 
 ## 1.0.8
 

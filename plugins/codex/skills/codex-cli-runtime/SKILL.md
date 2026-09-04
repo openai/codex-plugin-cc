@@ -29,7 +29,7 @@ Command selection:
 - If the forwarded request includes `--model`, normalize `spark` to `gpt-5.3-codex-spark` and pass it through to `task`.
 - If the forwarded request includes `--effort`, pass it through to `task`.
 - Preserve every `--read-root <directory>` pair, pass it through to `task`, and exclude both tokens from the natural-language task text. Each value must name an existing directory; files and missing paths fail before Codex starts.
-- With scoped access, `--write` requires an approved read root to cover the workspace directory; the runtime keeps the built-in `:workspace` safeguards.
+- With scoped access, `--write` requires an approved read root to cover the workspace directory and uses Codex's built-in `:workspace` write policy.
 - If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
 - If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
 - `--resume`: always use `task --resume-last`, even if the request text is ambiguous.
