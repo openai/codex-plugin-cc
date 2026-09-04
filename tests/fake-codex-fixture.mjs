@@ -653,6 +653,7 @@ export function buildEnv(binDir) {
   const sep = process.platform === "win32" ? ";" : ":";
   return {
     ...process.env,
+    CODEX_HOME: path.join(binDir, "codex-home"),
     PATH: `${binDir}${sep}${process.env.PATH}`
   };
 }

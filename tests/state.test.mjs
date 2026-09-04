@@ -5,7 +5,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
-import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import { getConfig, resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState, setConfig } from "../plugins/codex/scripts/lib/state.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -37,6 +37,28 @@ test("resolveStateDir uses CLAUDE_PLUGIN_DATA when it is provided", () => {
     } else {
       process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
     }
+  }
+});
+
+test("review-gate config remains authoritative when CLAUDE_PLUGIN_DATA changes", () => {
+  const workspace = makeTempDir();
+  const codexHome = makeTempDir();
+  const pluginDataA = makeTempDir();
+  const pluginDataB = makeTempDir();
+  const previousCodexHome = process.env.CODEX_HOME;
+  const previousPluginData = process.env.CLAUDE_PLUGIN_DATA;
+  try {
+    process.env.CODEX_HOME = codexHome;
+    process.env.CLAUDE_PLUGIN_DATA = pluginDataA;
+    setConfig(workspace, "stopReviewGate", true);
+    process.env.CLAUDE_PLUGIN_DATA = pluginDataB;
+    assert.equal(getConfig(workspace).stopReviewGate, true);
+    setConfig(workspace, "stopReviewGate", false);
+    process.env.CLAUDE_PLUGIN_DATA = pluginDataA;
+    assert.equal(getConfig(workspace).stopReviewGate, false);
+  } finally {
+    if (previousCodexHome == null) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = previousCodexHome;
+    if (previousPluginData == null) delete process.env.CLAUDE_PLUGIN_DATA; else process.env.CLAUDE_PLUGIN_DATA = previousPluginData;
   }
 });
 

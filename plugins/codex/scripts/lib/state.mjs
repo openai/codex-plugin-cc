@@ -7,6 +7,8 @@ import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
+const CODEX_HOME_ENV = "CODEX_HOME";
+const CONFIG_DIR_NAME = path.join("plugin-cc", "config");
 const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
@@ -26,7 +28,7 @@ function defaultState() {
   };
 }
 
-export function resolveStateDir(cwd) {
+function resolveWorkspaceKey(cwd) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   let canonicalWorkspaceRoot = workspaceRoot;
   try {
@@ -34,13 +36,21 @@ export function resolveStateDir(cwd) {
   } catch {
     canonicalWorkspaceRoot = workspaceRoot;
   }
-
   const slugSource = path.basename(workspaceRoot) || "workspace";
   const slug = slugSource.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex").slice(0, 16);
+  return `${slug}-${hash}`;
+}
+
+export function resolveStateDir(cwd) {
   const pluginDataDir = process.env[PLUGIN_DATA_ENV];
   const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
-  return path.join(stateRoot, `${slug}-${hash}`);
+  return path.join(stateRoot, resolveWorkspaceKey(cwd));
+}
+
+export function resolveConfigFile(cwd) {
+  const codexHome = path.resolve(process.env[CODEX_HOME_ENV] || path.join(os.homedir(), ".codex"));
+  return path.join(codexHome, CONFIG_DIR_NAME, `${resolveWorkspaceKey(cwd)}.json`);
 }
 
 export function resolveStateFile(cwd) {
@@ -150,17 +160,38 @@ export function listJobs(cwd) {
   return loadState(cwd).jobs;
 }
 
+function readDurableConfig(cwd) {
+  const configFile = resolveConfigFile(cwd);
+  if (!fs.existsSync(configFile)) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(configFile, "utf8"));
+    return { ...defaultState().config, ...(parsed ?? {}) };
+  } catch {
+    return null;
+  }
+}
+
+function writeDurableConfig(cwd, config) {
+  const configFile = resolveConfigFile(cwd);
+  fs.mkdirSync(path.dirname(configFile), { recursive: true });
+  const nextConfig = { ...defaultState().config, ...(config ?? {}) };
+  fs.writeFileSync(configFile, `${JSON.stringify(nextConfig, null, 2)}
+`, "utf8");
+  return nextConfig;
+}
+
 export function setConfig(cwd, key, value) {
-  return updateState(cwd, (state) => {
-    state.config = {
-      ...state.config,
-      [key]: value
-    };
+  const nextConfig = writeDurableConfig(cwd, { ...getConfig(cwd), [key]: value });
+  updateState(cwd, (state) => {
+    state.config = { ...state.config, ...nextConfig };
   });
+  return nextConfig;
 }
 
 export function getConfig(cwd) {
-  return loadState(cwd).config;
+  return readDurableConfig(cwd) ?? loadState(cwd).config;
 }
 
 export function writeJobFile(cwd, jobId, payload) {

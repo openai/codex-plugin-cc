@@ -2036,6 +2036,34 @@ test("stop hook logs running tasks to stderr without blocking when the review ga
   assert.match(blocked.stderr, /\/codex:cancel task-live/i);
 });
 
+test("review gate enabled under one plugin-data root is enforced by Stop under another", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const codexHome = makeTempDir();
+  const pluginDataSetup = makeTempDir();
+  const pluginDataStop = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], {
+    cwd: repo,
+    env: { ...buildEnv(binDir), CODEX_HOME: codexHome, CLAUDE_PLUGIN_DATA: pluginDataSetup }
+  });
+  assert.equal(setup.status, 0, setup.stderr);
+  assert.equal(JSON.parse(setup.stdout).reviewGateEnabled, true);
+  const stopped = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env: { ...buildEnv(binDir), CODEX_HOME: codexHome, CLAUDE_PLUGIN_DATA: pluginDataStop, CODEX_COMPANION_SESSION_ID: "sess-cross-root" },
+    input: JSON.stringify({ cwd: repo, session_id: "sess-cross-root", last_assistant_message: "I completed the change." })
+  });
+  assert.equal(stopped.status, 0, stopped.stderr);
+  const payload = JSON.parse(stopped.stdout);
+  assert.equal(payload.decision, "block");
+  assert.match(payload.reason, /Codex stop-time review found issues/i);
+});
+
 test("stop hook allows the stop when the review gate is enabled and the stop-time review task is clean", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -2068,8 +2096,10 @@ test("stop hook does not block when Codex is unavailable even if the review gate
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
+  const codexHome = makeTempDir();
   const setup = run(process.execPath, [SCRIPT, "setup", "--enable-review-gate", "--json"], {
-    cwd: repo
+    cwd: repo,
+    env: { ...process.env, CODEX_HOME: codexHome }
   });
   assert.equal(setup.status, 0, setup.stderr);
 
@@ -2077,6 +2107,7 @@ test("stop hook does not block when Codex is unavailable even if the review gate
     cwd: repo,
     env: {
       ...process.env,
+      CODEX_HOME: codexHome,
       PATH: ""
     },
     input: JSON.stringify({ cwd: repo })
