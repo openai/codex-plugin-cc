@@ -60,7 +60,9 @@ function buildThreadAccessParams(cwd, options = {}) {
 
   const filesystem = {
     ":root": "deny",
-    ":minimal": "read"
+    ":minimal": "read",
+    ":tmpdir": "deny",
+    ":slash_tmp": "deny"
   };
   for (const readRoot of readRoots) {
     filesystem[path.resolve(cwd, readRoot)] = "read";

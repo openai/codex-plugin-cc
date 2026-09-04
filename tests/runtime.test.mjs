@@ -738,6 +738,8 @@ test("task --read-root sends a scoped permission profile without legacy sandbox"
   assert.equal(params.config.default_permissions, "claude_companion_scoped");
   assert.equal(profile.filesystem[":root"], "deny");
   assert.equal(profile.filesystem[":minimal"], "read");
+  assert.equal(profile.filesystem[":tmpdir"], "deny");
+  assert.equal(profile.filesystem[":slash_tmp"], "deny");
   assert.equal(profile.filesystem[fs.realpathSync(repo)], "read");
   assert.equal(profile.filesystem[fs.realpathSync(extraReadRoot)], "read");
   assert.equal(profile.extends, ":workspace");
