@@ -161,6 +161,7 @@ Ask Codex to redesign the database connection to be more resilient.
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
+- write-capable rescue runs can write only inside the current repository and temporary directories. For destinations such as `~/.local/bin` or `~/.config`, have Codex create the artifact in the repository, then install or copy it separately.
 
 ### `/codex:transfer`
 
