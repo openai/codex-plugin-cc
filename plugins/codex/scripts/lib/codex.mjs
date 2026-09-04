@@ -65,9 +65,6 @@ function buildThreadAccessParams(cwd, options = {}) {
   for (const readRoot of readRoots) {
     filesystem[path.resolve(cwd, readRoot)] = "read";
   }
-  if (options.write) {
-    filesystem[path.resolve(cwd)] = "write";
-  }
 
   return {
     config: {
@@ -75,6 +72,7 @@ function buildThreadAccessParams(cwd, options = {}) {
       permissions: {
         [SCOPED_PERMISSION_PROFILE]: {
           description: "Claude companion request-scoped filesystem access",
+          ...(options.write ? { extends: ":workspace" } : {}),
           filesystem
         }
       }

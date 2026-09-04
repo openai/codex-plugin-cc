@@ -164,6 +164,11 @@ function resolveReadRoot(cwd, readRoot) {
   return fs.realpathSync(resolved);
 }
 
+function pathCovers(parent, child) {
+  const relative = path.relative(parent, child);
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== "..");
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -793,6 +798,9 @@ async function handleTask(argv) {
   }
   const write = Boolean(options.write);
   const readRoots = (options["read-root"] ?? []).map((readRoot) => resolveReadRoot(cwd, readRoot));
+  if (write && readRoots.length > 0 && !readRoots.some((readRoot) => pathCovers(readRoot, workspaceRoot))) {
+    throw new Error("--write requires an approved --read-root that covers the workspace directory.");
+  }
   const taskMetadata = buildTaskRunMetadata({
     prompt,
     resumeLast

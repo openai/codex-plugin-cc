@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.9
+
+- Preserve the built-in `:workspace` safeguards for scoped write tasks and require the approved read roots to cover the workspace.
+
 ## 1.0.8
 
 - Require every `--read-root` to be an existing directory so scoped tasks do not claim unsupported file-level isolation on macOS.

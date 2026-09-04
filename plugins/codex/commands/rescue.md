@@ -19,6 +19,7 @@ Execution mode:
 - `--background` and `--wait` are execution flags for Claude Code. Do not forward them to `task`, and do not treat them as part of the natural-language task text.
 - `--model` and `--effort` are runtime-selection flags. Preserve them for the forwarded `task` call, but do not treat them as part of the natural-language task text.
 - Preserve every `--read-root <directory>` pair for the forwarded `task` call and remove both tokens from the natural-language task text.
+- When scoped `--write` is requested, the approved read roots must cover the workspace directory.
 - If the request includes `--resume`, do not ask whether to continue. The user already chose.
 - If the request includes `--fresh`, do not ask whether to continue. The user already chose.
 - Otherwise, before starting Codex, check for a resumable rescue thread from this Claude session by running:

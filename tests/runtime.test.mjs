@@ -723,11 +723,10 @@ test("task --read-root sends a scoped permission profile without legacy sandbox"
   const statePath = path.join(binDir, "fake-codex-state.json");
   installFakeCodex(binDir);
   initGitRepo(repo);
-  fs.mkdirSync(path.join(repo, "src"));
 
   const result = run(
     "node",
-    [SCRIPT, "task", "--write", "--read-root", "src", "--read-root", extraReadRoot, "fix the test"],
+    [SCRIPT, "task", "--write", "--read-root", repo, "--read-root", extraReadRoot, "fix the test"],
     { cwd: repo, env: buildEnv(binDir) }
   );
 
@@ -739,9 +738,25 @@ test("task --read-root sends a scoped permission profile without legacy sandbox"
   assert.equal(params.config.default_permissions, "claude_companion_scoped");
   assert.equal(profile.filesystem[":root"], "deny");
   assert.equal(profile.filesystem[":minimal"], "read");
-  assert.equal(profile.filesystem[fs.realpathSync(path.join(repo, "src"))], "read");
+  assert.equal(profile.filesystem[fs.realpathSync(repo)], "read");
   assert.equal(profile.filesystem[fs.realpathSync(extraReadRoot)], "read");
-  assert.equal(profile.filesystem[fs.realpathSync(repo)], "write");
+  assert.equal(profile.extends, ":workspace");
+});
+
+test("task --write requires the approved read scope to cover the workspace", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+
+  const result = run("node", [SCRIPT, "task", "--write", "--read-root", "src", "fix"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /--write requires an approved --read-root that covers the workspace/);
 });
 
 test("task --resume-last reapplies the approved read roots", () => {
