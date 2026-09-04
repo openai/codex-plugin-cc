@@ -157,6 +157,20 @@ test("review renders a no-findings result from app-server review/start", () => {
   assert.match(result.stdout, /No material issues found/);
 });
 
+test("task thread names ignore leading recommended_plugins context", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const promptPath = path.join(repo, "prompt.txt");
+  fs.writeFileSync(promptPath, `<recommended_plugins>\nHere is a list of plugins.\n</recommended_plugins>\nFix the flaky login test`, "utf8");
+  const result = run("node", [SCRIPT, "task", "--prompt-file", promptPath], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.threads[0].name, "Codex Companion Task: Fix the flaky login test");
+});
+
 test("task runs when the active provider does not require OpenAI login", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

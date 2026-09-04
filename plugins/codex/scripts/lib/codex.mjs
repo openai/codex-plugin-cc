@@ -105,7 +105,11 @@ function looksLikeVerificationCommand(command) {
 }
 
 function buildTaskThreadName(prompt) {
-  const excerpt = shorten(prompt, 56);
+  const titleSource = String(prompt ?? "").replace(
+    /^\s*<recommended_plugins>[\s\S]*?<\/recommended_plugins>\s*/i,
+    ""
+  );
+  const excerpt = shorten(titleSource, 56);
   return excerpt ? `${TASK_THREAD_PREFIX}: ${excerpt}` : TASK_THREAD_PREFIX;
 }
 
