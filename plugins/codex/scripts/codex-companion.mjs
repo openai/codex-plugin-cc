@@ -382,7 +382,11 @@ async function executeReviewRun(request) {
         stderr: result.stderr,
         stdout: result.reviewText,
         reasoning: result.reasoningSummary
-      }
+      },
+      result: null,
+      rawOutput: result.reviewText,
+      parseError: "The built-in reviewer returns prose; use adversarial-review for structured output.",
+      reasoningSummary: result.reasoningSummary
     };
     const rendered = renderNativeReviewResult(
       {
