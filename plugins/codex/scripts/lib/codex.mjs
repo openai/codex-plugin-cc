@@ -50,6 +50,51 @@ const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
 const EXTERNAL_AGENT_IMPORT_TIMEOUT_MS = 2 * 60 * 1000;
+const SCOPED_PERMISSION_PROFILE = "claude_companion_scoped";
+
+function buildThreadAccessParams(cwd, options = {}) {
+  const readRoots = Array.isArray(options.readRoots) ? options.readRoots : [];
+  if (readRoots.length === 0) {
+    return { sandbox: options.sandbox ?? "read-only" };
+  }
+
+  const filesystem = {
+    ":root": "deny",
+    ":minimal": "read"
+  };
+  for (const readRoot of readRoots) {
+    filesystem[path.resolve(cwd, readRoot)] = "read";
+  }
+  if (options.write) {
+    filesystem[path.resolve(cwd)] = "write";
+  }
+
+  return {
+    config: {
+      default_permissions: SCOPED_PERMISSION_PROFILE,
+      permissions: {
+        [SCOPED_PERMISSION_PROFILE]: {
+          description: "Claude companion request-scoped filesystem access",
+          filesystem
+        }
+      }
+    }
+  };
+}
+
+function scopedAccessError(error, options = {}) {
+  const message = String(error?.message ?? error ?? "");
+  if (
+    (options.readRoots?.length ?? 0) > 0 &&
+    /default_permissions|permission profiles?|unknown field.*config|invalid.*permissions/i.test(message)
+  ) {
+    return new Error(
+      `Codex cannot enforce the requested read scope. Upgrade to a runtime with permission profiles (0.138.0 or later). Original error: ${message}`,
+      { cause: error }
+    );
+  }
+  return error;
+}
 
 function cleanCodexStderr(stderr) {
   return stderr
@@ -65,7 +110,7 @@ function buildThreadParams(cwd, options = {}) {
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
-    sandbox: options.sandbox ?? "read-only",
+    ...buildThreadAccessParams(cwd, options),
     serviceName: SERVICE_NAME,
     ephemeral: options.ephemeral ?? true
   };
@@ -78,7 +123,7 @@ function buildResumeParams(threadId, cwd, options = {}) {
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
-    sandbox: options.sandbox ?? "read-only"
+    ...buildThreadAccessParams(cwd, options)
   };
 }
 
@@ -1101,23 +1146,31 @@ export async function runAppServerTurn(cwd, options = {}) {
   return withAppServer(cwd, async (client) => {
     let threadId;
 
-    if (options.resumeThreadId) {
-      emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
-      const response = await resumeThread(client, options.resumeThreadId, cwd, {
-        model: options.model,
-        sandbox: options.sandbox,
-        ephemeral: false
-      });
-      threadId = response.thread.id;
-    } else {
-      emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
-      const response = await startThread(client, cwd, {
-        model: options.model,
-        sandbox: options.sandbox,
-        ephemeral: options.persistThread ? false : true,
-        threadName: options.persistThread ? options.threadName : options.threadName ?? null
-      });
-      threadId = response.thread.id;
+    try {
+      if (options.resumeThreadId) {
+        emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
+        const response = await resumeThread(client, options.resumeThreadId, cwd, {
+          model: options.model,
+          sandbox: options.sandbox,
+          readRoots: options.readRoots,
+          write: options.write,
+          ephemeral: false
+        });
+        threadId = response.thread.id;
+      } else {
+        emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
+        const response = await startThread(client, cwd, {
+          model: options.model,
+          sandbox: options.sandbox,
+          readRoots: options.readRoots,
+          write: options.write,
+          ephemeral: options.persistThread ? false : true,
+          threadName: options.persistThread ? options.threadName : options.threadName ?? null
+        });
+        threadId = response.thread.id;
+      }
+    } catch (error) {
+      throw scopedAccessError(error, options);
     }
 
     emitProgress(options.onProgress, `Thread ready (${threadId}).`, "starting", {
