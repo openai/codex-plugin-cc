@@ -309,9 +309,13 @@ rl.on("line", (line) => {
         if (BEHAVIOR === "auth-run-fails") {
           throw new Error("authentication expired; run codex login");
         }
+        if (BEHAVIOR === "permission-profiles-unsupported" && message.params.config) {
+          throw new Error("unknown field config.default_permissions");
+        }
         if (requiresExperimental("persistExtendedHistory", message, state) || requiresExperimental("persistFullHistory", message, state)) {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
+        state.lastThreadStart = message.params;
         const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
         send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
@@ -341,9 +345,13 @@ rl.on("line", (line) => {
       }
 
       case "thread/resume": {
+        if (BEHAVIOR === "permission-profiles-unsupported" && message.params.config) {
+          throw new Error("unknown field config.default_permissions");
+        }
         if (requiresExperimental("persistExtendedHistory", message, state) || requiresExperimental("persistFullHistory", message, state)) {
           throw new Error("thread/resume.persistFullHistory requires experimentalApi capability");
         }
+        state.lastThreadResume = message.params;
         const thread = ensureThread(state, message.params.threadId);
         thread.updatedAt = now();
         saveState(state);

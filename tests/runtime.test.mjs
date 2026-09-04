@@ -716,6 +716,109 @@ test("write task output focuses on the Codex result without generic follow-up hi
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
+test("task --read-root sends a scoped permission profile without legacy sandbox", () => {
+  const repo = makeTempDir();
+  const extraReadRoot = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const result = run(
+    "node",
+    [SCRIPT, "task", "--write", "--read-root", repo, "--read-root", extraReadRoot, "fix the test"],
+    { cwd: repo, env: buildEnv(binDir) }
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const params = fakeState.lastThreadStart;
+  const profile = params.config.permissions.claude_companion_scoped;
+  assert.equal(params.sandbox, undefined);
+  assert.equal(params.config.default_permissions, "claude_companion_scoped");
+  assert.equal(profile.filesystem[":root"], "deny");
+  assert.equal(profile.filesystem[":minimal"], "read");
+  assert.equal(profile.filesystem[":tmpdir"], "deny");
+  assert.equal(profile.filesystem[":slash_tmp"], "deny");
+  assert.equal(profile.filesystem[fs.realpathSync(repo)], "read");
+  assert.equal(profile.filesystem[fs.realpathSync(extraReadRoot)], "read");
+  assert.equal(profile.extends, ":workspace");
+});
+
+test("task --write requires the approved read scope to cover the workspace", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+
+  const result = run("node", [SCRIPT, "task", "--write", "--read-root", "src", "fix"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /--write requires an approved --read-root that covers the workspace/);
+});
+
+test("task --resume-last reapplies the approved read roots", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const first = run("node", [SCRIPT, "task", "initial task"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(first.status, 0, first.stderr);
+
+  const result = run("node", [SCRIPT, "task", "--resume-last", "--read-root", repo, "follow up"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastThreadResume.sandbox, undefined);
+  assert.equal(fakeState.lastThreadResume.config.default_permissions, "claude_companion_scoped");
+  assert.equal(
+    fakeState.lastThreadResume.config.permissions.claude_companion_scoped.filesystem[fs.realpathSync(repo)],
+    "read"
+  );
+});
+
+test("task --read-root fails closed when permission profiles are unsupported", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "permission-profiles-unsupported");
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--read-root", repo, "inspect the file"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /cannot enforce the requested read scope/i);
+  assert.match(result.stderr, /0\.138\.0 or later/);
+});
+
+test("task --read-root rejects files and missing directories before starting Codex", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "allowed.txt"), "fixture\n");
+
+  for (const readRoot of ["", "allowed.txt", "missing-directory"]) {
+    const result = run("node", [SCRIPT, "task", "--read-root", readRoot, "inspect"], {
+      cwd: repo,
+      env: buildEnv(binDir)
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /--read-root must name an existing directory/);
+  }
+});
+
 test("task --resume acts like --resume-last without leaking the flag into the prompt", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -967,6 +1070,30 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.equal(resultPayload.job.id, launchPayload.jobId);
   assert.equal(resultPayload.job.status, "completed");
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
+});
+
+test("task --background preserves read roots for the detached worker", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "--read-root", repo, "inspect"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+  const waited = run("node", [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "15000", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(waited.status, 0, waited.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastThreadStart.sandbox, undefined);
+  assert.equal(fakeState.lastThreadStart.config.default_permissions, "claude_companion_scoped");
 });
 
 test("review rejects focus text because it is native-review only", () => {
