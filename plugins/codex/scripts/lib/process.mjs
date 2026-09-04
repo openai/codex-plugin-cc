@@ -66,7 +66,13 @@ export function terminateProcessTree(pid, options = {}) {
   if (platform === "win32") {
     const result = runCommandImpl("taskkill", ["/PID", String(pid), "/T", "/F"], {
       cwd: options.cwd,
-      env: options.env
+      env: options.env,
+      // runCommand prefers process.env.SHELL on Windows, so under Git Bash this
+      // ran as `bash -c "taskkill /PID ..."` and MSYS path conversion rewrote
+      // the /PID switch into C:/Program Files/Git/PID, failing every kill with
+      // "ERROR: Invalid argument/option". taskkill takes /-switches and an
+      // argument array, so it does not need a shell.
+      shell: false
     });
 
     if (!result.error && result.status === 0) {
