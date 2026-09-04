@@ -37,6 +37,7 @@ Command selection:
 
 Safety rules:
 - Default to write-capable Codex work in `codex:codex-rescue` unless the user explicitly asks for read-only behavior.
+- `--write` allows changes only inside the current repository and temporary directories. If an artifact ultimately belongs elsewhere, have Codex create it in the repository so the caller can install or copy it afterward.
 - Preserve the user's task text as-is apart from stripping routing flags.
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own.
 - Return the stdout of the `task` command exactly as-is.
