@@ -4,6 +4,7 @@ import fs from "node:fs";
 import process from "node:process";
 
 import { terminateProcessTree } from "./lib/process.mjs";
+import { reconcileJobLiveness } from "./lib/job-control.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
   clearBrokerSession,
@@ -56,9 +57,15 @@ function cleanupSessionJobs(cwd, sessionId) {
     return;
   }
 
+  const retainedJobs = new Map();
   for (const job of removedJobs) {
-    const stillRunning = job.status === "queued" || job.status === "running";
+    const reconciled = reconcileJobLiveness(job);
+    const stillRunning = reconciled.status === "queued" || reconciled.status === "running";
     if (!stillRunning) {
+      continue;
+    }
+    if (reconciled.workerExited && reconciled.threadId) {
+      retainedJobs.set(job.id, reconciled);
       continue;
     }
     try {
@@ -70,7 +77,9 @@ function cleanupSessionJobs(cwd, sessionId) {
 
   saveState(workspaceRoot, {
     ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
+    jobs: state.jobs
+      .filter((job) => job.sessionId !== sessionId || retainedJobs.has(job.id))
+      .map((job) => retainedJobs.get(job.id) ?? job)
   });
 }
 

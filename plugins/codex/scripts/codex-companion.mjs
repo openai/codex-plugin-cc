@@ -38,6 +38,7 @@ import {
   buildSingleJobSnapshot,
   buildStatusSnapshot,
   readStoredJob,
+  reconcileJobsLiveness,
   resolveCancelableJob,
   resolveResultJob,
   sortJobsNewestFirst
@@ -336,7 +337,7 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
 async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const sessionId = getCurrentClaudeSessionId();
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
+  const jobs = sortJobsNewestFirst(reconcileJobsLiveness(listJobs(workspaceRoot))).filter((job) => job.id !== options.excludeJobId);
   const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
   const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
   if (activeTask) {
@@ -934,7 +935,7 @@ function handleTaskResumeCandidate(argv) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const sessionId = getCurrentClaudeSessionId();
-  const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
+  const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(reconcileJobsLiveness(listJobs(workspaceRoot))));
   const candidate = findLatestResumableTaskJob(jobs);
 
   const payload = {
@@ -972,6 +973,12 @@ async function handleCancel(argv) {
   const existing = readStoredJob(workspaceRoot, job.id) ?? {};
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
+
+  if (job.workerExited && threadId && !turnId) {
+    throw new Error(
+      `Cannot safely cancel ${job.id}: the worker exited after turn/start was accepted, but the turn id is not yet known. The Codex turn may still be running.`
+    );
+  }
 
   const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
   if (interrupt.attempted) {

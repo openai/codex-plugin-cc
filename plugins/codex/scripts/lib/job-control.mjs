@@ -24,6 +24,43 @@ function filterJobsForCurrentSession(jobs, options = {}) {
   return jobs.filter((job) => job.sessionId === sessionId);
 }
 
+function isActiveJob(job) {
+  return job.status === "queued" || job.status === "running";
+}
+
+export function reconcileJobLiveness(job, options = {}) {
+  if (!isActiveJob(job) || !Number.isSafeInteger(job.pid) || job.pid <= 0) {
+    return job;
+  }
+
+  const killImpl = options.killImpl ?? process.kill.bind(process);
+  try {
+    killImpl(job.pid, 0);
+    return job;
+  } catch (error) {
+    if (error?.code === "EPERM") {
+      return job;
+    }
+    if (error?.code === "ESRCH") {
+      if (job.threadId) {
+        return {
+          ...job,
+          status: "running",
+          phase: "worker-exited-turn-unknown",
+          pid: null,
+          workerExited: true
+        };
+      }
+      return { ...job, status: "terminated-unknown", phase: "worker-exited" };
+    }
+    return job;
+  }
+}
+
+export function reconcileJobsLiveness(jobs, options = {}) {
+  return jobs.map((job) => reconcileJobLiveness(job, options));
+}
+
 function getJobTypeLabel(job) {
   if (typeof job.kindLabel === "string" && job.kindLabel) {
     return job.kindLabel;
@@ -213,7 +250,9 @@ function matchJobReference(jobs, reference, predicate = () => true) {
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
-  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), options));
+  const jobs = sortJobsNewestFirst(
+    reconcileJobsLiveness(filterJobsForCurrentSession(listJobs(workspaceRoot), options), options)
+  );
   const maxJobs = options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS;
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
 
@@ -241,7 +280,7 @@ export function buildStatusSnapshot(cwd, options = {}) {
 
 export function buildSingleJobSnapshot(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  const jobs = sortJobsNewestFirst(reconcileJobsLiveness(listJobs(workspaceRoot), options));
   const selected = matchJobReference(jobs, reference);
   if (!selected) {
     throw new Error(`No job found for "${reference}". Run /codex:status to inspect known jobs.`);
@@ -253,13 +292,18 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
   };
 }
 
-export function resolveResultJob(cwd, reference) {
+export function resolveResultJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot)));
+  const scopedJobs = reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot), options);
+  const jobs = sortJobsNewestFirst(reconcileJobsLiveness(scopedJobs, options));
   const selected = matchJobReference(
     jobs,
     reference,
-    (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled"
+    (job) =>
+      job.status === "completed" ||
+      job.status === "failed" ||
+      job.status === "cancelled" ||
+      (Boolean(reference) && job.status === "terminated-unknown")
   );
 
   if (selected) {
@@ -280,7 +324,7 @@ export function resolveResultJob(cwd, reference) {
 
 export function resolveCancelableJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  const jobs = sortJobsNewestFirst(reconcileJobsLiveness(listJobs(workspaceRoot), options));
   const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
 
   if (reference) {

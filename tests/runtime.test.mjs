@@ -503,6 +503,46 @@ test("task --resume-last resumes the latest persisted task thread", () => {
   assert.equal(result.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
 });
 
+test("task --resume-last ignores a stale current-session worker and resumes the prior completed thread", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-current" };
+  const first = run("node", [SCRIPT, "task", "initial task"], { cwd: repo, env });
+  assert.equal(first.status, 0, first.stderr);
+  const statePath = path.join(resolveStateDir(repo), "state.json");
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  state.jobs.push({ id: "task-stale", status: "running", title: "Codex Task", jobClass: "task", sessionId: "sess-current", pid: 999999, updatedAt: "2099-01-01T00:00:00.000Z" });
+  fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  const resumed = run("node", [SCRIPT, "task", "--resume-last", "follow up"], { cwd: repo, env });
+  assert.equal(resumed.status, 0, resumed.stderr);
+  assert.equal(resumed.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
+});
+
+test("task --resume-last blocks when a dead wrapper still has a live turn identity", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-current" };
+  const first = run("node", [SCRIPT, "task", "initial task"], { cwd: repo, env });
+  assert.equal(first.status, 0, first.stderr);
+  const statePath = path.join(resolveStateDir(repo), "state.json");
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  state.jobs.push({ id: "task-orphan-turn", status: "running", title: "Codex Task", jobClass: "task", sessionId: "sess-current", pid: 999999, threadId: "thr_orphan", turnId: "turn_orphan", updatedAt: "2099-01-01T00:00:00.000Z" });
+  fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  const resumed = run("node", [SCRIPT, "task", "--resume-last", "follow up"], { cwd: repo, env });
+  assert.notEqual(resumed.status, 0);
+  assert.match(resumed.stderr, /task-orphan-turn is still running/i);
+});
+
 test("task-resume-candidate returns the latest rescue thread from the current session", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
@@ -1737,6 +1777,26 @@ test("cancel with a job id can still target an active job from another Claude se
   assert.equal(state.jobs[0].status, "cancelled");
 });
 
+test("cancel fails closed when an orphaned turn has no persisted turn id", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "state.json"), `${JSON.stringify({
+    version: 1, config: { stopReviewGate: false }, jobs: [{
+      id: "task-turn-pending", status: "running", title: "Codex Task", jobClass: "task",
+      sessionId: "sess-current", pid: 999999, threadId: "thr_pending",
+      updatedAt: "2099-01-01T00:00:00.000Z"
+    }]
+  }, null, 2)}
+`, "utf8");
+  const env = { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-current" };
+  const result = run("node", [SCRIPT, "cancel", "task-turn-pending", "--json"], { cwd: workspace, env });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /turn id|safely interrupt|still running/i);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(state.jobs[0].status, "running");
+});
+
 test("cancel sends turn interrupt to the shared app-server before killing a brokered task", async () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -1799,6 +1859,28 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
     })
   });
   assert.equal(cleanup.status, 0, cleanup.stderr);
+});
+
+test("session end preserves an orphaned turn whose worker exited", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "state.json"), `${JSON.stringify({
+    version: 1, config: { stopReviewGate: false }, jobs: [{
+      id: "task-orphaned-turn", status: "running", title: "Codex Task", jobClass: "task",
+      sessionId: "sess-current", pid: 999999, threadId: "thr_pending",
+      updatedAt: "2099-01-01T00:00:00.000Z"
+    }]
+  }, null, 2)}
+`, "utf8");
+  const result = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: workspace, env: { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-current" },
+    input: JSON.stringify({ hook_event_name: "SessionEnd", session_id: "sess-current", cwd: workspace })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(state.jobs.length, 1);
+  assert.equal(state.jobs[0].id, "task-orphaned-turn");
 });
 
 test("session end fully cleans up jobs for the ending session", async (t) => {
@@ -2034,6 +2116,44 @@ test("stop hook logs running tasks to stderr without blocking when the review ga
   assert.match(blocked.stderr, /Codex task task-live is still running/i);
   assert.match(blocked.stderr, /\/codex:status/i);
   assert.match(blocked.stderr, /\/codex:cancel task-live/i);
+});
+
+test("stop hook ignores a stale current-session worker when the review gate is disabled", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const stateDir = resolveStateDir(repo);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "state.json"), `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [{ id: "task-stale", status: "running", title: "Codex Task", jobClass: "task", sessionId: "sess-current", pid: 999999, updatedAt: "2099-01-01T00:00:00.000Z" }] }, null, 2)}\n`, "utf8");
+  const result = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env: { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-current" },
+    input: JSON.stringify({ cwd: repo })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "");
+  assert.doesNotMatch(result.stderr, /task-stale is still running/i);
+});
+
+test("stop hook keeps an orphaned live turn active when its wrapper died", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const stateDir = resolveStateDir(repo);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "state.json"), `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [{ id: "task-orphan-turn", status: "running", title: "Codex Task", jobClass: "task", sessionId: "sess-current", pid: 999999, threadId: "thr_orphan", turnId: "turn_orphan", updatedAt: "2099-01-01T00:00:00.000Z" }] }, null, 2)}\n`, "utf8");
+  const result = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env: { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-current" },
+    input: JSON.stringify({ cwd: repo })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "");
+  assert.match(result.stderr, /task-orphan-turn is still running/i);
 });
 
 test("stop hook allows the stop when the review gate is enabled and the stop-time review task is clean", () => {
