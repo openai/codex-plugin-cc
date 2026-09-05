@@ -66,6 +66,7 @@ function buildThreadParams(cwd, options = {}) {
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
     sandbox: options.sandbox ?? "read-only",
+    ...(options.network ? { config: { sandbox_workspace_write: { network_access: true } } } : {}),
     serviceName: SERVICE_NAME,
     ephemeral: options.ephemeral ?? true
   };
@@ -78,7 +79,8 @@ function buildResumeParams(threadId, cwd, options = {}) {
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
-    sandbox: options.sandbox ?? "read-only"
+    sandbox: options.sandbox ?? "read-only",
+    ...(options.network ? { config: { sandbox_workspace_write: { network_access: true } } } : {})
   };
 }
 
@@ -1106,6 +1108,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       const response = await resumeThread(client, options.resumeThreadId, cwd, {
         model: options.model,
         sandbox: options.sandbox,
+        network: options.network,
         ephemeral: false
       });
       threadId = response.thread.id;
@@ -1114,6 +1117,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       const response = await startThread(client, cwd, {
         model: options.model,
         sandbox: options.sandbox,
+        network: options.network,
         ephemeral: options.persistThread ? false : true,
         threadName: options.persistThread ? options.threadName : options.threadName ?? null
       });
