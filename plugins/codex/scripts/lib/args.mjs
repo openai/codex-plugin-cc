@@ -2,6 +2,7 @@ export function parseArgs(argv, config = {}) {
   const valueOptions = new Set(config.valueOptions ?? []);
   const booleanOptions = new Set(config.booleanOptions ?? []);
   const aliasMap = config.aliasMap ?? {};
+  const leadingOnlyOptions = new Set(config.leadingOnlyOptions ?? []);
   const options = {};
   const positionals = [];
   let passthrough = false;
@@ -25,11 +26,22 @@ export function parseArgs(argv, config = {}) {
     }
 
     if (token.startsWith("--")) {
-      const [rawKey, inlineValue] = token.slice(2).split("=", 2);
+      const body = token.slice(2);
+      const separator = body.indexOf("=");
+      const rawKey = separator === -1 ? body : body.slice(0, separator);
+      const inlineValue = separator === -1 ? undefined : body.slice(separator + 1);
       const key = aliasMap[rawKey] ?? rawKey;
 
+      if (leadingOnlyOptions.has(key) && positionals.length > 0) {
+        positionals.push(token);
+        continue;
+      }
+
       if (booleanOptions.has(key)) {
-        options[key] = inlineValue === undefined ? true : inlineValue !== "false";
+        if (inlineValue !== undefined && inlineValue !== "true" && inlineValue !== "false") {
+          throw new Error(`Invalid value for --${rawKey}: expected true or false`);
+        }
+        options[key] = inlineValue !== "false";
         continue;
       }
 
