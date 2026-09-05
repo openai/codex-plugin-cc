@@ -2,10 +2,10 @@
 description: Show active and recent Codex jobs for this repository, including review-gate status
 argument-hint: '[job-id] [--wait] [--timeout-ms <ms>] [--all]'
 disable-model-invocation: true
-allowed-tools: Bash(node:*)
+allowed-tools: Bash(bash:*)
 ---
 
-!`node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" status "$ARGUMENTS"`
+!`bash "$(if command -v cygpath >/dev/null 2>&1; then cygpath -u "${CLAUDE_PLUGIN_ROOT}"; else printf '%s' "${CLAUDE_PLUGIN_ROOT}"; fi)/scripts/run-node.sh" "codex-companion.mjs" status "$ARGUMENTS"`
 
 If the user did not pass a job ID:
 - Render the command output as a single Markdown table for the current and past runs in this session.

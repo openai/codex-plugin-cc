@@ -202,6 +202,19 @@ test("internal docs use task terminology for rescue runs", () => {
   assert.match(promptRecipes, /## Narrow Fix/);
 });
 
+test("hooks and deterministic commands use the portable Node launcher", () => {
+  const hooks = read("hooks/hooks.json");
+  for (const relative of ["commands/status.md", "commands/result.md", "commands/cancel.md", "commands/transfer.md"]) {
+    const source = read(relative);
+    assert.match(source, /scripts\/run-node\.sh/);
+    assert.match(source, /cygpath/);
+    assert.doesNotMatch(source, /!`node "/);
+  }
+  assert.match(hooks, /scripts\/run-node\.sh/);
+  assert.match(hooks, /cygpath/);
+  assert.doesNotMatch(hooks, /"command": "node /);
+});
+
 test("hooks keep session-end cleanup and stop gating enabled", () => {
   const source = read("hooks/hooks.json");
   assert.match(source, /SessionStart/);

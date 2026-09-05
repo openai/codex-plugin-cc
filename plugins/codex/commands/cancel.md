@@ -2,7 +2,7 @@
 description: Cancel an active background Codex job in this repository
 argument-hint: '[job-id]'
 disable-model-invocation: true
-allowed-tools: Bash(node:*)
+allowed-tools: Bash(bash:*)
 ---
 
-!`node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" cancel "$ARGUMENTS"`
+!`bash "$(if command -v cygpath >/dev/null 2>&1; then cygpath -u "${CLAUDE_PLUGIN_ROOT}"; else printf '%s' "${CLAUDE_PLUGIN_ROOT}"; fi)/scripts/run-node.sh" "codex-companion.mjs" cancel "$ARGUMENTS"`

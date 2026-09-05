@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-lifecycle-hook.mjs\" SessionStart",
+            "command": "bash \"$(if command -v cygpath >/dev/null 2>&1; then cygpath -u \"${CLAUDE_PLUGIN_ROOT}\"; else printf '%s' \"${CLAUDE_PLUGIN_ROOT}\"; fi)/scripts/run-node.sh\" \"session-lifecycle-hook.mjs\" SessionStart",
             "timeout": 5
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-lifecycle-hook.mjs\" SessionEnd",
+            "command": "bash \"$(if command -v cygpath >/dev/null 2>&1; then cygpath -u \"${CLAUDE_PLUGIN_ROOT}\"; else printf '%s' \"${CLAUDE_PLUGIN_ROOT}\"; fi)/scripts/run-node.sh\" \"session-lifecycle-hook.mjs\" SessionEnd",
             "timeout": 5
           }
         ]
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/stop-review-gate-hook.mjs\"",
+            "command": "bash \"$(if command -v cygpath >/dev/null 2>&1; then cygpath -u \"${CLAUDE_PLUGIN_ROOT}\"; else printf '%s' \"${CLAUDE_PLUGIN_ROOT}\"; fi)/scripts/run-node.sh\" \"stop-review-gate-hook.mjs\"",
             "timeout": 900
           }
         ]
