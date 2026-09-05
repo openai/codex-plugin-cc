@@ -503,6 +503,89 @@ test("task --resume-last resumes the latest persisted task thread", () => {
   assert.equal(result.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
 });
 
+test("task --resume-thread resumes the requested thread instead of the latest one", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  assert.equal(run("node", [SCRIPT, "task", "first task"], { cwd: repo, env: buildEnv(binDir) }).status, 0);
+  assert.equal(run("node", [SCRIPT, "task", "second task"], { cwd: repo, env: buildEnv(binDir) }).status, 0);
+
+  const result = run("node", [SCRIPT, "task", "--resume-thread", "thr_1", "follow up"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.threadId, "thr_1");
+  assert.equal(fakeState.lastTurnStart.prompt, "follow up");
+});
+
+test("task --resume-thread rebinds a foreign thread to the current workspace", () => {
+  const repoA = makeTempDir();
+  const repoB = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repoA);
+  initGitRepo(repoB);
+
+  assert.equal(run("node", [SCRIPT, "task", "first task"], { cwd: repoA, env: buildEnv(binDir) }).status, 0);
+  const resumed = run("node", [SCRIPT, "task", "--resume-thread", "thr_1", "follow up"], {
+    cwd: repoB,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(resumed.status, 0, resumed.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(path.resolve(fakeState.threads.find((thread) => thread.id === "thr_1").cwd), path.resolve(repoB));
+  assert.equal(fakeState.lastTurnStart.threadId, "thr_1");
+});
+
+test("task --resume-thread can continue without an explicit prompt", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  assert.equal(run("node", [SCRIPT, "task", "initial task"], { cwd: repo, env: buildEnv(binDir) }).status, 0);
+
+  const result = run("node", [SCRIPT, "task", "--resume-thread", "thr_1"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.threadId, "thr_1");
+  assert.equal(fakeState.lastTurnStart.prompt, "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.");
+});
+test("task --resume-thread rejects conflicting routing controls", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+
+  for (const args of [
+    ["task", "--resume-thread", "thr_1", "--resume-last", "follow up"],
+    ["task", "--resume-thread", "thr_1", "--fresh", "follow up"]
+  ]) {
+    const result = run("node", [SCRIPT, ...args], { cwd: repo, env });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Choose only one of --resume\/--resume-last, --resume-thread <id>, or --fresh/);
+  }
+});
+
 test("task-resume-candidate returns the latest rescue thread from the current session", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
@@ -967,6 +1050,40 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.equal(resultPayload.job.id, launchPayload.jobId);
   assert.equal(resultPayload.job.status, "completed");
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
+});
+
+test("task --background preserves an explicit resume thread", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const env = buildEnv(binDir);
+
+  assert.equal(run("node", [SCRIPT, "task", "first task"], { cwd: repo, env }).status, 0);
+  assert.equal(run("node", [SCRIPT, "task", "second task"], { cwd: repo, env }).status, 0);
+
+  const launched = run(
+    "node",
+    [SCRIPT, "task", "--background", "--json", "--resume-thread", "thr_1", "follow up"],
+    { cwd: repo, env }
+  );
+  assert.equal(launched.status, 0, launched.stderr);
+  const launchPayload = JSON.parse(launched.stdout);
+  const waited = run(
+    "node",
+    [SCRIPT, "status", launchPayload.jobId, "--wait", "--timeout-ms", "15000", "--json"],
+    { cwd: repo, env }
+  );
+  assert.equal(waited.status, 0, waited.stderr);
+  assert.equal(JSON.parse(waited.stdout).job.status, "completed");
+
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.threadId, "thr_1");
+  assert.equal(fakeState.lastTurnStart.prompt, "follow up");
 });
 
 test("review rejects focus text because it is native-review only", () => {
