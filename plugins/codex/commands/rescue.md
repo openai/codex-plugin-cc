@@ -16,7 +16,7 @@ Execution mode:
 - If the request includes `--background`, run the `codex:codex-rescue` subagent in the background.
 - If the request includes `--wait`, run the `codex:codex-rescue` subagent in the foreground.
 - If neither flag is present, default to foreground.
-- `--background` and `--wait` are execution flags for Claude Code. Do not forward them to `task`, and do not treat them as part of the natural-language task text.
+- `--background` and `--wait` are execution controls, not natural-language task text. `--background` selects the subagent's durable detached-task protocol; `--wait` selects the attached foreground-task protocol.
 - `--model` and `--effort` are runtime-selection flags. Preserve them for the forwarded `task` call, but do not treat them as part of the natural-language task text.
 - If the request includes `--resume`, do not ask whether to continue. The user already chose.
 - If the request includes `--fresh`, do not ask whether to continue. The user already chose.
@@ -38,10 +38,13 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task-resume-candidate -
 
 Operating rules:
 
-- The subagent is a thin forwarder only. It should use one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task ...` and return that command's stdout as-is.
+- The subagent is transport-only. The Agent itself is the only layer allowed to be backgrounded; inside the subagent, never set Bash `run_in_background`.
+- A background rescue must use a durable `task --background --json` launch, capture its `jobId`, wait in bounded foreground calls with `status "$jobId" --wait --timeout-ms 60000 --json`, then return the stdout of `result "$jobId" --raw` exactly as-is.
+- If the waiting subagent is interrupted after a background `jobId` exists, do not cancel the detached job; it remains authoritative and recoverable through `/codex:status` and `/codex:result` until it finishes or the user explicitly runs `/codex:cancel`.
+- A foreground rescue uses one foreground Bash call to `task` without `--background` and returns that stdout as-is.
 - Return the Codex companion stdout verbatim to the user.
 - Do not paraphrase, summarize, rewrite, or add commentary before or after it.
-- Do not ask the subagent to inspect files, monitor progress, poll `/codex:status`, fetch `/codex:result`, call `/codex:cancel`, summarize output, or do follow-up work of its own.
+- Do not ask the subagent to inspect files, solve the task, call user-facing `/codex:status` / `/codex:result` / `/codex:cancel`, or summarize Codex output. The direct runtime `status` / `result` calls above are allowed only for its own background job.
 - Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort.
 - Leave the model unset unless the user explicitly asks for one. If they ask for `spark`, map it to `gpt-5.3-codex-spark`.
 - Leave `--resume` and `--fresh` in the forwarded request. The subagent handles that routing when it builds the `task` command.

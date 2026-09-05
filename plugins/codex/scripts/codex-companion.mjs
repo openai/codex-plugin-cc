@@ -30,9 +30,12 @@ import {
   generateJobId,
   getConfig,
   listJobs,
+  readJobPid,
+  removeJobPid,
   setConfig,
   upsertJob,
-  writeJobFile
+  writeJobFile,
+  writeJobPid
 } from "./lib/state.mjs";
 import {
   buildSingleJobSnapshot,
@@ -82,7 +85,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
-      "  node scripts/codex-companion.mjs result [job-id] [--json]",
+      "  node scripts/codex-companion.mjs result [job-id] [--json|--raw]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
     ].join("\n")
   );
@@ -685,17 +688,22 @@ function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
     request
   };
+  // Persist the request before the detached worker can start reading it. The worker
+  // becomes the PID authority when runTrackedJob records its own process.pid.
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
+  // After spawn, the parent does not touch mutable job state. The worker publishes
+  // its own PID before reading queued state, while cancellation claims terminal state
+  // before PID discovery, so either side of startup is safe without a parent read/write race.
+  spawnDetachedTaskWorker(cwd, job.id);
 
   return {
     payload: {
@@ -846,13 +854,20 @@ async function handleTaskWorker(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
+  writeJobPid(workspaceRoot, options["job-id"], process.pid);
   const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
   if (!storedJob) {
+    removeJobPid(workspaceRoot, options["job-id"]);
     throw new Error(`No stored job found for ${options["job-id"]}.`);
+  }
+  if (storedJob.status !== "queued") {
+    removeJobPid(workspaceRoot, options["job-id"]);
+    return;
   }
 
   const request = storedJob.request;
   if (!request || typeof request !== "object") {
+    removeJobPid(workspaceRoot, options["job-id"]);
     throw new Error(`Stored job ${options["job-id"]} is missing its task request payload.`);
   }
 
@@ -865,19 +880,23 @@ async function handleTaskWorker(argv) {
       logFile: storedJob.logFile ?? null
     }
   );
-  await runTrackedJob(
-    {
-      ...storedJob,
-      workspaceRoot,
-      logFile
-    },
-    () =>
-      executeTaskRun({
-        ...request,
-        onProgress: progress
-      }),
-    { logFile }
-  );
+  try {
+    await runTrackedJob(
+      {
+        ...storedJob,
+        workspaceRoot,
+        logFile
+      },
+      () =>
+        executeTaskRun({
+          ...request,
+          onProgress: progress
+        }),
+      { logFile }
+    );
+  } finally {
+    removeJobPid(workspaceRoot, options["job-id"]);
+  }
 }
 
 async function handleStatus(argv) {
@@ -907,16 +926,40 @@ async function handleStatus(argv) {
   outputResult(renderStatusPayload(report, options.json), options.json);
 }
 
+function extractStoredCodexRawOutput(storedJob) {
+  if (typeof storedJob?.result?.rawOutput === "string") {
+    return storedJob.result.rawOutput;
+  }
+  if (typeof storedJob?.result?.codex?.stdout === "string") {
+    return storedJob.result.codex.stdout;
+  }
+  return null;
+}
+
 function handleResult(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd"],
-    booleanOptions: ["json"]
+    booleanOptions: ["json", "raw"]
   });
+
+  if (options.json && options.raw) {
+    throw new Error("`result --json` and `result --raw` are mutually exclusive.");
+  }
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
   const { workspaceRoot, job } = resolveResultJob(cwd, reference);
   const storedJob = readStoredJob(workspaceRoot, job.id);
+
+  if (options.raw) {
+    const rawOutput = extractStoredCodexRawOutput(storedJob);
+    if (rawOutput == null) {
+      throw new Error(`No raw Codex output was stored for job ${job.id}.`);
+    }
+    process.stdout.write(rawOutput);
+    return;
+  }
+
   const payload = {
     job,
     storedJob
@@ -983,9 +1026,6 @@ async function handleCancel(argv) {
     );
   }
 
-  terminateProcessTree(job.pid ?? Number.NaN);
-  appendLogLine(job.logFile, "Cancelled by user.");
-
   const completedAt = nowIso();
   const nextJob = {
     ...job,
@@ -995,20 +1035,32 @@ async function handleCancel(argv) {
     completedAt,
     errorMessage: "Cancelled by user."
   };
+  const persistCancellation = () => {
+    writeJobFile(workspaceRoot, job.id, {
+      ...existing,
+      ...nextJob,
+      cancelledAt: completedAt
+    });
+    upsertJob(workspaceRoot, {
+      id: job.id,
+      status: "cancelled",
+      phase: "cancelled",
+      pid: null,
+      errorMessage: "Cancelled by user.",
+      completedAt
+    });
+  };
 
-  writeJobFile(workspaceRoot, job.id, {
-    ...existing,
-    ...nextJob,
-    cancelledAt: completedAt
-  });
-  upsertJob(workspaceRoot, {
-    id: job.id,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    errorMessage: "Cancelled by user.",
-    completedAt
-  });
+  // Claim terminal cancellation before PID discovery so a worker that starts
+  // concurrently must either observe cancelled state or expose a PID we can stop.
+  persistCancellation();
+  const workerPid = Number.isFinite(job.pid) ? job.pid : readJobPid(workspaceRoot, job.id);
+  terminateProcessTree(workerPid ?? Number.NaN);
+  removeJobPid(workspaceRoot, job.id);
+  appendLogLine(job.logFile, "Cancelled by user.");
+  // Reassert the terminal state in case an already-starting worker published
+  // `running` between the initial cancellation claim and process termination.
+  persistCancellation();
 
   const payload = {
     jobId: job.id,

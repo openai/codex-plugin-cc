@@ -108,6 +108,7 @@ export function saveState(cwd, state) {
       continue;
     }
     removeJobFile(resolveJobFile(cwd, job.id));
+    removeFileIfExists(resolveJobPidFile(cwd, job.id));
     removeFileIfExists(job.logFile);
   }
 
@@ -188,4 +189,32 @@ export function resolveJobLogFile(cwd, jobId) {
 export function resolveJobFile(cwd, jobId) {
   ensureStateDir(cwd);
   return path.join(resolveJobsDir(cwd), `${jobId}.json`);
+}
+
+export function resolveJobPidFile(cwd, jobId) {
+  ensureStateDir(cwd);
+  return path.join(resolveJobsDir(cwd), `${jobId}.pid`);
+}
+
+export function writeJobPid(cwd, jobId, pid) {
+  const pidFile = resolveJobPidFile(cwd, jobId);
+  if (!Number.isFinite(pid)) {
+    removeFileIfExists(pidFile);
+    return null;
+  }
+  fs.writeFileSync(pidFile, `${pid}\n`, "utf8");
+  return pidFile;
+}
+
+export function readJobPid(cwd, jobId) {
+  const pidFile = resolveJobPidFile(cwd, jobId);
+  if (!fs.existsSync(pidFile)) {
+    return null;
+  }
+  const pid = Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
+  return Number.isFinite(pid) ? pid : null;
+}
+
+export function removeJobPid(cwd, jobId) {
+  removeFileIfExists(resolveJobPidFile(cwd, jobId));
 }

@@ -920,6 +920,115 @@ test("task using the shared broker still completes when Codex spawns subagents",
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
+test("background task persists its queued request before spawning the detached worker", () => {
+  const source = fs.readFileSync(SCRIPT, "utf8");
+  const start = source.indexOf("function enqueueBackgroundTask");
+  const end = source.indexOf("\nasync function handleReviewCommand", start);
+  assert.ok(start >= 0 && end > start, "enqueueBackgroundTask source must be discoverable");
+  const body = source.slice(start, end);
+  const writeJob = body.indexOf("writeJobFile(");
+  const upsertJob = body.indexOf("upsertJob(");
+  const spawnWorker = body.indexOf("spawnDetachedTaskWorker(");
+  assert.ok(writeJob >= 0 && writeJob < spawnWorker, "job file must exist before worker spawn");
+  assert.ok(upsertJob >= 0 && upsertJob < spawnWorker, "queued state must exist before worker spawn");
+});
+
+test("background parent does not touch mutable job state after spawning the worker", () => {
+  const source = fs.readFileSync(SCRIPT, "utf8");
+  const start = source.indexOf("function enqueueBackgroundTask");
+  const end = source.indexOf("\nasync function handleReviewCommand", start);
+  assert.ok(start >= 0 && end > start, "enqueueBackgroundTask source must be discoverable");
+  const body = source.slice(start, end);
+  const spawnWorker = body.indexOf("spawnDetachedTaskWorker(");
+  assert.ok(spawnWorker >= 0, "detached worker must be spawned");
+  const afterSpawn = body.slice(spawnWorker);
+  assert.equal(afterSpawn.includes("readStoredJob("), false, "parent must not parse the mutable job file after worker spawn");
+  assert.equal(afterSpawn.includes("writeJobFile("), false, "parent must not rewrite the job file after worker spawn");
+  assert.equal(afterSpawn.includes("upsertJob("), false, "parent must not rewrite indexed state after worker spawn");
+  assert.equal(afterSpawn.includes("writeJobPid("), false, "worker must be the sole PID-sidecar writer after spawn");
+});
+
+test("task-worker publishes its own pid before reading queued state", () => {
+  const source = fs.readFileSync(SCRIPT, "utf8");
+  const start = source.indexOf("async function handleTaskWorker");
+  const end = source.indexOf("\nasync function handleStatus", start);
+  assert.ok(start >= 0 && end > start, "handleTaskWorker source must be discoverable");
+  const body = source.slice(start, end);
+  const publishPid = body.indexOf("writeJobPid(workspaceRoot, options[\"job-id\"], process.pid)");
+  const readJob = body.indexOf("readStoredJob(workspaceRoot, options[\"job-id\"])");
+  assert.ok(publishPid >= 0, "worker must publish its own pid during startup");
+  assert.ok(readJob >= 0, "worker must read queued state");
+  assert.ok(publishPid < readJob, "worker pid must be visible to cancellation before queued state is claimed");
+});
+
+test("cancel records terminal state before reading the worker pid and reasserts it after termination", () => {
+  const source = fs.readFileSync(SCRIPT, "utf8");
+  const start = source.indexOf("async function handleCancel");
+  const end = source.indexOf("\nasync function main", start);
+  assert.ok(start >= 0 && end > start, "handleCancel source must be discoverable");
+  const body = source.slice(start, end);
+  const firstClaim = body.indexOf("persistCancellation();");
+  const readPid = body.indexOf("readJobPid(workspaceRoot, job.id)");
+  const terminate = body.indexOf("terminateProcessTree(");
+  const finalClaim = body.indexOf("persistCancellation();", firstClaim + 1);
+  assert.ok(firstClaim >= 0, "cancel must claim terminal state");
+  assert.ok(readPid > firstClaim, "cancelled state must be persisted before pid lookup");
+  assert.ok(terminate > readPid, "pid lookup must precede process termination");
+  assert.ok(finalClaim > terminate, "cancelled state must be reasserted after termination");
+});
+
+test("task-worker does not revive a job cancelled before worker startup", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  const jobId = "task-cancelled-before-worker";
+  const record = {
+    id: jobId,
+    kind: "task",
+    jobClass: "task",
+    title: "Cancelled rescue",
+    summary: "Cancelled before worker startup",
+    workspaceRoot: repo,
+    status: "cancelled",
+    phase: "cancelled",
+    pid: null,
+    write: true,
+    request: {
+      cwd: repo,
+      model: null,
+      effort: null,
+      prompt: "do not run this task",
+      write: true,
+      resumeLast: false,
+      jobId
+    }
+  };
+  fs.writeFileSync(path.join(jobsDir, `${jobId}.json`), `${JSON.stringify(record, null, 2)}\n`, "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [record] }, null, 2)}\n`,
+    "utf8"
+  );
+
+  const worker = run("node", [SCRIPT, "task-worker", "--cwd", repo, "--job-id", jobId], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(worker.status, 0, worker.stderr);
+  const stored = JSON.parse(fs.readFileSync(path.join(jobsDir, `${jobId}.json`), "utf8"));
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(stored.status, "cancelled");
+  assert.equal(state.jobs.find((job) => job.id === jobId)?.status, "cancelled");
+});
+
 test("task --background enqueues a detached worker and exposes per-job status", async () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -2256,4 +2365,46 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
   const payload = JSON.parse(setup.stdout);
   assert.equal(payload.sessionRuntime.mode, "shared");
   assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
+});
+
+
+test("result --raw returns only stored Codex output", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  fs.writeFileSync(
+    path.join(jobsDir, "task-raw.json"),
+    JSON.stringify({
+      id: "task-raw",
+      status: "completed",
+      title: "Codex Task",
+      threadId: "thr_raw",
+      result: { codex: { stdout: "RAW CODEX OUTPUT\nsecond line" } }
+    }, null, 2),
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify({
+      version: 1,
+      config: { stopReviewGate: false },
+      jobs: [{
+        id: "task-raw",
+        status: "completed",
+        title: "Codex Task",
+        jobClass: "task",
+        threadId: "thr_raw",
+        summary: "background rescue",
+        createdAt: "2026-09-05T17:00:00.000Z",
+        updatedAt: "2026-09-05T17:01:00.000Z"
+      }]
+    }, null, 2)}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "result", "task-raw", "--raw"], { cwd: workspace });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "RAW CODEX OUTPUT\nsecond line");
 });
