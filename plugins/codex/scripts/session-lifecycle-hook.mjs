@@ -13,7 +13,7 @@ import {
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
+import { loadState, markJobRemovalRequested, readJobFile, resolveJobFile, resolveStateFile, saveState } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -61,8 +61,14 @@ function cleanupSessionJobs(cwd, sessionId) {
     if (!stillRunning) {
       continue;
     }
+    markJobRemovalRequested(workspaceRoot, job.id);
+    let effectiveJob = job;
     try {
-      terminateProcessTree(job.pid ?? Number.NaN);
+      const jobFile = resolveJobFile(workspaceRoot, job.id);
+      if (fs.existsSync(jobFile)) effectiveJob = { ...job, ...readJobFile(jobFile) };
+    } catch {}
+    try {
+      terminateProcessTree(effectiveJob.pid ?? Number.NaN);
     } catch {
       // Ignore teardown failures during session shutdown.
     }

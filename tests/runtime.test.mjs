@@ -969,6 +969,38 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
 });
 
+test("cancelled queued task is never reclaimed by a late-starting worker", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  const jobId = "task-startup-cancel";
+  const logFile = path.join(jobsDir, `${jobId}.log`);
+  const record = {
+    id: jobId, status: "queued", phase: "queued", pid: null, title: "Codex Task",
+    jobClass: "task", summary: "Do not execute after cancel", workspaceRoot: repo, logFile,
+    request: { cwd: repo, prompt: "do not execute", write: true, resumeLast: false, jobId },
+    createdAt: "2026-09-04T18:00:00.000Z", updatedAt: "2026-09-04T18:00:00.000Z"
+  };
+  fs.writeFileSync(path.join(jobsDir, `${jobId}.json`), `${JSON.stringify(record, null, 2)}\n`, "utf8");
+  fs.writeFileSync(path.join(stateDir, "state.json"), `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [record] }, null, 2)}\n`, "utf8");
+  fs.writeFileSync(logFile, "queued\n", "utf8");
+  const env = buildEnv(binDir);
+  const cancelled = run("node", [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
+  assert.equal(cancelled.status, 0, cancelled.stderr);
+  assert.equal(JSON.parse(cancelled.stdout).status, "cancelled");
+  assert.equal(fs.existsSync(path.join(jobsDir, `${jobId}.cancelled`)), true);
+  const worker = run("node", [SCRIPT, "task-worker", "--cwd", repo, "--job-id", jobId], { cwd: repo, env });
+  assert.equal(worker.status, 0, worker.stderr);
+  assert.equal(fs.existsSync(fakeStatePath), false);
+  const stored = JSON.parse(fs.readFileSync(path.join(jobsDir, `${jobId}.json`), "utf8"));
+  assert.equal(stored.status, "cancelled");
+});
+
 test("review rejects focus text because it is native-review only", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -1905,7 +1937,7 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   assert.equal(fs.existsSync(otherJobFile), true);
   assert.deepEqual(
     fs.readdirSync(path.dirname(otherJobFile)).sort(),
-    [path.basename(otherJobFile), path.basename(otherSessionLog)].sort()
+    [path.basename(otherJobFile), path.basename(otherSessionLog), "review-running.removed"].sort()
   );
 
   await waitFor(() => {

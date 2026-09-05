@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { isJobCancellationRequested, isJobRemovalRequested, readJobFile, removeJobFromState, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
@@ -73,6 +73,9 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
   let lastTurnId = null;
 
   return (event) => {
+    if (isJobRemovalRequested(workspaceRoot, jobId)) {
+      return;
+    }
     const normalized = normalizeProgressEvent(event);
     const patch = { id: jobId };
     let changed = false;
@@ -139,7 +142,62 @@ function readStoredJobOrNull(workspaceRoot, jobId) {
   return readJobFile(jobFile);
 }
 
+function removedExecution(job) {
+  return {
+    exitStatus: 0,
+    payload: { jobId: job.id, status: "removed" },
+    rendered: "",
+    summary: "Session ended.",
+    threadId: null,
+    turnId: null
+  };
+}
+
+export function failTrackedJobLaunch(job, error) {
+  if (isJobRemovalRequested(job.workspaceRoot, job.id)) {
+    return { ...job, status: "removed", phase: "removed", pid: null };
+  }
+  const currentJob = readStoredJobOrNull(job.workspaceRoot, job.id) ?? job;
+  if (isJobCancellationRequested(job.workspaceRoot, job.id) || currentJob.status !== "queued") {
+    return currentJob;
+  }
+  const completedAt = nowIso();
+  const errorMessage = `Background worker failed to start: ${error instanceof Error ? error.message : String(error)}`;
+  const failedRecord = { ...currentJob, status: "failed", phase: "failed", pid: null, completedAt, errorMessage };
+  writeJobFile(job.workspaceRoot, job.id, failedRecord);
+  upsertJob(job.workspaceRoot, failedRecord);
+
+  if (isJobRemovalRequested(job.workspaceRoot, job.id)) {
+    const jobFile = resolveJobFile(job.workspaceRoot, job.id);
+    if (fs.existsSync(jobFile)) fs.unlinkSync(jobFile);
+    removeJobFromState(job.workspaceRoot, job.id);
+    return { ...currentJob, status: "removed", phase: "removed", pid: null };
+  }
+
+  if (isJobCancellationRequested(job.workspaceRoot, job.id)) {
+    const cancelledAt = nowIso();
+    const cancelledRecord = {
+      ...currentJob,
+      status: "cancelled",
+      phase: "cancelled",
+      pid: null,
+      completedAt: cancelledAt,
+      cancelledAt,
+      errorMessage: "Cancelled by user."
+    };
+    writeJobFile(job.workspaceRoot, job.id, cancelledRecord);
+    upsertJob(job.workspaceRoot, cancelledRecord);
+    return cancelledRecord;
+  }
+
+  appendLogLine(currentJob.logFile ?? null, errorMessage);
+  return failedRecord;
+}
+
 export async function runTrackedJob(job, runner, options = {}) {
+  if (isJobRemovalRequested(job.workspaceRoot, job.id)) {
+    return removedExecution(job);
+  }
   const runningRecord = {
     ...job,
     status: "running",
@@ -148,11 +206,60 @@ export async function runTrackedJob(job, runner, options = {}) {
     pid: process.pid,
     logFile: options.logFile ?? job.logFile ?? null
   };
-  writeJobFile(job.workspaceRoot, job.id, runningRecord);
-  upsertJob(job.workspaceRoot, runningRecord);
-
   try {
+    writeJobFile(job.workspaceRoot, job.id, runningRecord);
+    if (isJobRemovalRequested(job.workspaceRoot, job.id)) {
+      const jobFile = resolveJobFile(job.workspaceRoot, job.id);
+      if (fs.existsSync(jobFile)) fs.unlinkSync(jobFile);
+      return removedExecution(job);
+    }
+    upsertJob(job.workspaceRoot, runningRecord);
+    if (isJobRemovalRequested(job.workspaceRoot, job.id)) {
+      removeJobFromState(job.workspaceRoot, job.id);
+      return removedExecution(job);
+    }
+    if (isJobCancellationRequested(job.workspaceRoot, job.id)) {
+      const completedAt = nowIso();
+      const cancelledRecord = {
+        ...runningRecord,
+        status: "cancelled",
+        phase: "cancelled",
+        pid: null,
+        completedAt,
+        cancelledAt: completedAt,
+        errorMessage: "Cancelled by user."
+      };
+      writeJobFile(job.workspaceRoot, job.id, cancelledRecord);
+      upsertJob(job.workspaceRoot, {
+        id: job.id,
+        status: "cancelled",
+        phase: "cancelled",
+        pid: null,
+        completedAt,
+        cancelledAt: completedAt,
+        errorMessage: "Cancelled by user."
+      });
+      if (isJobRemovalRequested(job.workspaceRoot, job.id)) {
+        const jobFile = resolveJobFile(job.workspaceRoot, job.id);
+        if (fs.existsSync(jobFile)) fs.unlinkSync(jobFile);
+        removeJobFromState(job.workspaceRoot, job.id);
+        return removedExecution(job);
+      }
+      appendLogLine(options.logFile ?? job.logFile ?? null, "Cancelled before task execution.");
+      return {
+        exitStatus: 0,
+        payload: { jobId: job.id, status: "cancelled" },
+        rendered: "Cancelled by user.\n",
+        summary: "Cancelled by user.",
+        threadId: null,
+        turnId: null
+      };
+    }
     const execution = await runner();
+    if (isJobRemovalRequested(job.workspaceRoot, job.id)) {
+      removeJobFromState(job.workspaceRoot, job.id);
+      return removedExecution(job);
+    }
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
     writeJobFile(job.workspaceRoot, job.id, {
@@ -179,6 +286,10 @@ export async function runTrackedJob(job, runner, options = {}) {
     appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
     return execution;
   } catch (error) {
+    if (isJobRemovalRequested(job.workspaceRoot, job.id)) {
+      removeJobFromState(job.workspaceRoot, job.id);
+      return removedExecution(job);
+    }
     const errorMessage = error instanceof Error ? error.message : String(error);
     const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
     const completedAt = nowIso();

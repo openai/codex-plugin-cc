@@ -5,7 +5,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
-import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import { resolveJobCancellationFile, resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -61,6 +61,9 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
     };
   });
 
+  const prunedCancellationFile = resolveJobCancellationFile(workspace, "job-0");
+  fs.writeFileSync(prunedCancellationFile, "cancel requested\n", "utf8");
+
   fs.writeFileSync(
     stateFile,
     `${JSON.stringify(
@@ -89,6 +92,7 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
 
   assert.equal(fs.existsSync(retainedJobFile), true);
   assert.equal(fs.existsSync(retainedLogFile), true);
+  assert.equal(fs.existsSync(prunedCancellationFile), false);
 
   const savedState = JSON.parse(fs.readFileSync(stateFile, "utf8"));
   assert.equal(savedState.jobs.length, 50);

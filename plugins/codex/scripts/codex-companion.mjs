@@ -30,6 +30,7 @@ import {
   generateJobId,
   getConfig,
   listJobs,
+  markJobCancellationRequested,
   setConfig,
   upsertJob,
   writeJobFile
@@ -48,6 +49,7 @@ import {
   createJobProgressUpdater,
   createJobRecord,
   createProgressReporter,
+  failTrackedJobLaunch,
   nowIso,
   runTrackedJob,
   SESSION_ID_ENV
@@ -668,7 +670,7 @@ async function runForegroundCommand(job, runner, options = {}) {
   return execution;
 }
 
-function spawnDetachedTaskWorker(cwd, jobId) {
+function spawnDetachedTaskWorker(cwd, jobId, onError) {
   const scriptPath = path.join(ROOT_DIR, "scripts", "codex-companion.mjs");
   const child = spawn(process.execPath, [scriptPath, "task-worker", "--cwd", cwd, "--job-id", jobId], {
     cwd,
@@ -677,7 +679,8 @@ function spawnDetachedTaskWorker(cwd, jobId) {
     stdio: "ignore",
     windowsHide: true
   });
-  child.unref();
+  child.once("error", onError);
+  child.once("spawn", () => child.unref());
   return child;
 }
 
@@ -685,17 +688,23 @@ function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
     request
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
+  const failSpawn = (error) => failTrackedJobLaunch(queuedRecord, error);
+  try {
+    spawnDetachedTaskWorker(cwd, job.id, failSpawn);
+  } catch (error) {
+    failSpawn(error);
+    throw error;
+  }
 
   return {
     payload: {
@@ -850,6 +859,10 @@ async function handleTaskWorker(argv) {
   if (!storedJob) {
     throw new Error(`No stored job found for ${options["job-id"]}.`);
   }
+  if (storedJob.status !== "queued") {
+    appendLogLine(storedJob.logFile ?? null, `Background worker skipped ${storedJob.status} job.`);
+    return;
+  }
 
   const request = storedJob.request;
   if (!request || typeof request !== "object") {
@@ -969,9 +982,11 @@ async function handleCancel(argv) {
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
   const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
+  markJobCancellationRequested(workspaceRoot, job.id);
   const existing = readStoredJob(workspaceRoot, job.id) ?? {};
-  const threadId = existing.threadId ?? job.threadId ?? null;
-  const turnId = existing.turnId ?? job.turnId ?? null;
+  const latestJob = { ...job, ...existing };
+  const threadId = latestJob.threadId ?? null;
+  const turnId = latestJob.turnId ?? null;
 
   const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
   if (interrupt.attempted) {
@@ -983,8 +998,8 @@ async function handleCancel(argv) {
     );
   }
 
-  terminateProcessTree(job.pid ?? Number.NaN);
-  appendLogLine(job.logFile, "Cancelled by user.");
+  terminateProcessTree(latestJob.pid ?? Number.NaN);
+  appendLogLine(latestJob.logFile ?? job.logFile, "Cancelled by user.");
 
   const completedAt = nowIso();
   const nextJob = {
