@@ -78,7 +78,7 @@ function printUsage() {
       "Usage:",
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
+      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
@@ -139,13 +139,25 @@ function normalizeArgv(argv) {
 }
 
 function parseCommandInput(argv, config = {}) {
-  return parseArgs(normalizeArgv(argv), {
+  const parsed = parseArgs(normalizeArgv(argv), {
     ...config,
     aliasMap: {
       C: "cwd",
       ...(config.aliasMap ?? {})
     }
   });
+
+  // An unrecognised long option is still treated as a positional, because some
+  // commands take free-form text. Say so on stderr rather than swallowing it:
+  // a mistyped or unsupported flag would otherwise be silently folded into a
+  // prompt, and the run would look like it did what was asked.
+  for (const token of parsed.unknownOptions ?? []) {
+    console.warn(
+      `Warning: unrecognised option ${token}; treating it as text. It will be passed through verbatim, not interpreted as a flag.`
+    );
+  }
+
+  return parsed;
 }
 
 function resolveCommandCwd(options = {}) {
@@ -411,6 +423,7 @@ async function executeReviewRun(request) {
   const result = await runAppServerTurn(context.repoRoot, {
     prompt,
     model: request.model,
+    effort: request.effort,
     sandbox: "read-only",
     outputSchema: readOutputSchema(REVIEW_SCHEMA),
     onProgress: request.onProgress
@@ -711,7 +724,7 @@ function enqueueBackgroundTask(cwd, job, request) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+    valueOptions: ["base", "scope", "model", "effort", "cwd"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
       m: "model"
@@ -720,6 +733,7 @@ async function handleReviewCommand(argv, config) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
+  const effort = normalizeReasoningEffort(options.effort);
   const focusText = positionals.join(" ").trim();
   const target = resolveReviewTarget(cwd, {
     base: options.base,
@@ -744,6 +758,7 @@ async function handleReviewCommand(argv, config) {
         base: options.base,
         scope: options.scope,
         model: options.model,
+        effort,
         focusText,
         reviewName: config.reviewName,
         onProgress: progress

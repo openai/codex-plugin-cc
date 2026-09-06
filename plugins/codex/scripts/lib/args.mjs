@@ -4,6 +4,7 @@ export function parseArgs(argv, config = {}) {
   const aliasMap = config.aliasMap ?? {};
   const options = {};
   const positionals = [];
+  const unknownOptions = [];
   let passthrough = false;
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -45,6 +46,7 @@ export function parseArgs(argv, config = {}) {
         continue;
       }
 
+      unknownOptions.push(token);
       positionals.push(token);
       continue;
     }
@@ -70,7 +72,7 @@ export function parseArgs(argv, config = {}) {
     positionals.push(token);
   }
 
-  return { options, positionals };
+  return { options, positionals, unknownOptions };
 }
 
 export function splitRawArgumentString(raw) {
