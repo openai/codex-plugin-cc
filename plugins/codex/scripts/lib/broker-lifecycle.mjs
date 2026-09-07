@@ -146,7 +146,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
     env: options.env ?? process.env
   });
 
-  const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
+  const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 10000);
   if (!ready) {
     teardownBrokerSession({
       endpoint,

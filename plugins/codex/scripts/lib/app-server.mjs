@@ -65,6 +65,7 @@ class AppServerClientBase {
     this.exitError = null;
     /** @type {AppServerNotificationHandler | null} */
     this.notificationHandler = null;
+    this.serverRequestHandler = null;
     this.lineBuffer = "";
     this.transport = "unknown";
 
@@ -75,6 +76,14 @@ class AppServerClientBase {
 
   setNotificationHandler(handler) {
     this.notificationHandler = handler;
+  }
+
+  setServerRequestHandler(handler) {
+    this.serverRequestHandler = handler;
+  }
+
+  respond(id, result) {
+    this.sendMessage({ id, result });
   }
 
   /**
@@ -154,6 +163,9 @@ class AppServerClientBase {
   }
 
   handleServerRequest(message) {
+    if (this.serverRequestHandler?.(message)) {
+      return;
+    }
     this.sendMessage({
       id: message.id,
       error: buildJsonRpcError(-32601, `Unsupported server request: ${message.method}`)
@@ -187,7 +199,9 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   }
 
   async initialize() {
-    this.proc = spawn("codex", ["app-server"], {
+    const args = ["app-server"];
+    if (this.options.requestUserInput) args.push("-c", "features.default_mode_request_user_input=true");
+    this.proc = spawn("codex", args, {
       cwd: this.cwd,
       env: this.options.env ?? process.env,
       stdio: ["pipe", "pipe", "pipe"],
@@ -344,6 +358,9 @@ export class CodexAppServerClient {
         const brokerSession = await ensureBrokerSession(cwd, { env: options.env });
         brokerEndpoint = brokerSession?.endpoint ?? null;
       }
+    }
+    if (!brokerEndpoint && options.requireBroker) {
+      throw new Error("A shared broker is required for interactive tasks. Check /codex:setup before retrying.");
     }
     const client = brokerEndpoint
       ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })

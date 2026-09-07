@@ -8,6 +8,7 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
+import { LiveTurnControl } from "./lib/live-turn-control.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 
@@ -33,10 +34,6 @@ function send(socket, message) {
   socket.write(`${JSON.stringify(message)}\n`);
 }
 
-function isInterruptRequest(message) {
-  return message?.method === "turn/interrupt";
-}
-
 function writePidFile(pidFile) {
   if (!pidFile) {
     return;
@@ -52,7 +49,7 @@ async function main() {
   }
 
   const { options } = parseArgs(argv, {
-    valueOptions: ["cwd", "pid-file", "endpoint"]
+    valueOptions: ["cwd", "pid-file", "endpoint", "input-timeout-ms"]
   });
 
   if (!options.endpoint) {
@@ -63,9 +60,13 @@ async function main() {
   const endpoint = String(options.endpoint);
   const listenTarget = parseBrokerEndpoint(endpoint);
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
+  const inputTimeoutMs = Number(options["input-timeout-ms"] ?? 600000);
+  if (!Number.isSafeInteger(inputTimeoutMs) || inputTimeoutMs <= 0 || inputTimeoutMs > 2147483647) {
+    throw new Error("input-timeout-ms must be a positive timer duration.");
+  }
   writePidFile(pidFile);
-
-  const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
+  const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true, requestUserInput: true });
+  const controls = new LiveTurnControl(appClient, routeNotification, inputTimeoutMs);
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
@@ -82,6 +83,7 @@ async function main() {
   }
 
   function routeNotification(message) {
+    controls.observe(message);
     const target = activeRequestSocket ?? activeStreamSocket;
     if (!target) {
       return;
@@ -100,6 +102,7 @@ async function main() {
   }
 
   async function shutdown(server) {
+    controls.close();
     for (const socket of sockets) {
       socket.end();
     }
@@ -114,6 +117,7 @@ async function main() {
   }
 
   appClient.setNotificationHandler(routeNotification);
+  appClient.setServerRequestHandler((message) => controls.handleServerRequest(message));
 
   const server = net.createServer((socket) => {
     sockets.add(socket);
@@ -167,12 +171,21 @@ async function main() {
           continue;
         }
 
-        const allowInterruptDuringActiveStream =
-          isInterruptRequest(message) && activeStreamSocket && activeStreamSocket !== socket && !activeRequestSocket;
+        if (controls.handles(message.method)) {
+          try {
+            if (message.method === "broker/redirect" && !activeStreamSocket) {
+              throw new Error("No task owner is connected to continue after interruption.");
+            }
+            const result = await controls.request(message.method, message.params ?? {});
+            send(socket, { id: message.id, result });
+          } catch (error) {
+            send(socket, { id: message.id, error: buildJsonRpcError(error.rpcCode ?? -32600, error.message) });
+          }
+          continue;
+        }
 
         if (
-          ((activeRequestSocket && activeRequestSocket !== socket) || (activeStreamSocket && activeStreamSocket !== socket)) &&
-          !allowInterruptDuringActiveStream
+          (activeRequestSocket && activeRequestSocket !== socket) || (activeStreamSocket && activeStreamSocket !== socket)
         ) {
           send(socket, {
             id: message.id,
@@ -181,21 +194,9 @@ async function main() {
           continue;
         }
 
-        if (allowInterruptDuringActiveStream) {
-          try {
-            const result = await appClient.request(message.method, message.params ?? {});
-            send(socket, { id: message.id, result });
-          } catch (error) {
-            send(socket, {
-              id: message.id,
-              error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
-            });
-          }
-          continue;
-        }
-
         const isStreaming = STREAMING_METHODS.has(message.method);
         activeRequestSocket = socket;
+        if (message.method === "turn/start") controls.starting(message.params ?? {});
 
         try {
           const result = await appClient.request(message.method, message.params ?? {});

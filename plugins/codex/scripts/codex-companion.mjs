@@ -22,6 +22,7 @@ import {
     runAppServerTurn
   } from "./lib/codex.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
+import { liveStatus, sendLiveCommand } from "./lib/live-commands.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
@@ -82,6 +83,8 @@ function printUsage() {
       "  node scripts/codex-companion.mjs task [--background] [--write] [--thread <id>|--resume-last|--resume|--fresh] [--allow-other-repo] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
+      "  node scripts/codex-companion.mjs message <job-id> [--interrupt] [--prompt-file <path>] [text] [--json]",
+      "  node scripts/codex-companion.mjs answer <job-id> --request-id <id> --answers-file <path> [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
     ].join("\n")
@@ -322,6 +325,10 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
   let snapshot = buildSingleJobSnapshot(cwd, reference);
 
   while (isActiveJobStatus(snapshot.job.status) && Date.now() < deadline) {
+    if (snapshot.job.threadId) {
+      snapshot.job.live = await liveStatus(snapshot.workspaceRoot, snapshot.job);
+      if (snapshot.job.live?.questions?.length) return { ...snapshot, waitingForAnswer: true, waitTimedOut: false, timeoutMs };
+    }
     await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
     snapshot = buildSingleJobSnapshot(cwd, reference);
   }
@@ -526,6 +533,8 @@ async function executeTaskRun(request) {
     threadId: result.threadId,
     rawOutput,
     touchedFiles: result.touchedFiles,
+    interruptedTurns: result.interruptedTurns,
+    error: result.error ?? null,
     reasoningSummary: result.reasoningSummary
   };
 
@@ -922,6 +931,8 @@ async function handleStatus(argv) {
           pollIntervalMs: options["poll-interval-ms"]
         })
       : buildSingleJobSnapshot(cwd, reference);
+    snapshot.job.live ??= await liveStatus(snapshot.workspaceRoot, snapshot.job);
+    if (snapshot.job.live?.questions?.length) snapshot.job.phase = "waiting-for-answer";
     outputCommandResult(snapshot, renderJobStatusReport(snapshot.job), options.json);
     return;
   }
@@ -931,7 +942,26 @@ async function handleStatus(argv) {
   }
 
   const report = buildStatusSnapshot(cwd, { all: options.all });
+  for (const job of report.running) {
+    job.live = await liveStatus(report.workspaceRoot, job);
+    if (job.live?.questions?.length) job.phase = "waiting-for-answer";
+    else if (job.live?.interrupting) job.phase = "interrupting";
+  }
   outputResult(renderStatusPayload(report, options.json), options.json);
+}
+
+async function handleLiveCommand(command, argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "prompt-file", "request-id", "answers-file"],
+    booleanOptions: ["json", "interrupt"]
+  });
+  const cwd = resolveCommandWorkspace(options);
+  if (options["answers-file"]) options["answers-file"] = path.resolve(resolveCommandCwd(options), options["answers-file"]);
+  const text = options["prompt-file"]
+    ? fs.readFileSync(path.resolve(resolveCommandCwd(options), options["prompt-file"]), "utf8")
+    : positionals.slice(1).join(" ");
+  const result = await sendLiveCommand(cwd, positionals[0], command, options, text);
+  outputCommandResult(result, `${JSON.stringify(result, null, 2)}\n`, options.json);
 }
 
 function handleResult(argv) {
@@ -1078,6 +1108,10 @@ async function main() {
       break;
     case "status":
       await handleStatus(argv);
+      break;
+    case "message":
+    case "answer":
+      await handleLiveCommand(subcommand, argv);
       break;
     case "result":
       handleResult(argv);

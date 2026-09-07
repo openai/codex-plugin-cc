@@ -15,3 +15,5 @@ If the user did not pass a job ID:
 If the user did pass a job ID:
 - Present the full command output to the user.
 - Do not summarize or condense it.
+
+`--wait` returns early when the job has a pending question. This is not task completion: show the questions and answer with `/codex:answer`, then wait for the same job again. Live details distinguish accepted-but-unconsumed messages, pending questions, interruption, and observed file changes. Unavailable live state must not be presented as an empty queue.

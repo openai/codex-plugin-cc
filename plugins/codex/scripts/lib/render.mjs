@@ -384,6 +384,22 @@ export function renderJobStatusReport(job) {
     showResultHint: true,
     showReviewHint: true
   });
+  if (job.live?.unavailable) lines.push(`Live controls unavailable: ${job.live.unavailable}`);
+  else if (job.live) {
+    lines.push("", `Interrupting: ${job.live.interrupting ? "yes" : "no"}`);
+    for (const message of job.live.pendingMessages ?? []) {
+      lines.push(`Pending message ${message.id} (${message.status}): ${message.input.map((item) => item.text).join("\n")}`);
+    }
+    for (const question of job.live.questions ?? []) {
+      lines.push(`Waiting for answer: ${question.requestId} (expires ${new Date(question.expiresAt).toISOString()})`,
+        JSON.stringify(question.questions, null, 2),
+        `Answer: /codex:answer ${job.id} --request-id ${question.requestId} --answers-file <path>`);
+    }
+    for (const change of job.live.partialChanges ?? []) lines.push(`File change (${change.status}): ${change.path}`);
+    for (const message of job.live.undeliveredMessages ?? []) lines.push(`Not observed in thread history before turn ended: ${message.id}`);
+    if (job.live.workspaceStatus) lines.push("Workspace status at interruption (includes pre-existing changes):", job.live.workspaceStatus);
+    if (job.live.error) lines.push(job.live.error);
+  }
   return `${lines.join("\n").trimEnd()}\n`;
 }
 

@@ -26,6 +26,10 @@ import type {
   TurnInterruptResponse,
   TurnStartParams,
   TurnStartResponse,
+  TurnSteerParams,
+  TurnSteerResponse,
+  TurnCompletedNotification,
+  ToolRequestUserInputParams,
   UserInput
 } from "../../.generated/app-server-types/v2/index.js";
 
@@ -54,6 +58,26 @@ export interface CodexAppServerClientOptions {
   brokerEndpoint?: string;
   disableBroker?: boolean;
   reuseExistingBroker?: boolean;
+  requestUserInput?: boolean;
+  requireBroker?: boolean;
+}
+
+export interface PendingMessage {
+  id: string;
+  input: UserInput[];
+  status: "sending" | "accepted";
+}
+
+export interface LiveTurnStatus {
+  threadId: string;
+  turnId: string | null;
+  pendingMessages: PendingMessage[];
+  undeliveredMessages: PendingMessage[];
+  questions: Array<ToolRequestUserInputParams & { requestId: string | number; expiresAt: number }>;
+  interrupting: boolean;
+  partialChanges: Array<{ path: string; status: string }>;
+  error: string | null;
+  workspaceStatus?: string;
 }
 
 export interface AppServerMethodMap {
@@ -66,10 +90,16 @@ export interface AppServerMethodMap {
   "review/start": { params: ReviewStartParams; result: ReviewStartResponse };
   "turn/start": { params: TurnStartParams; result: TurnStartResponse };
   "turn/interrupt": { params: TurnInterruptParams; result: TurnInterruptResponse };
+  "turn/steer": { params: TurnSteerParams; result: TurnSteerResponse & { messageId?: string } };
+  "broker/status": { params: { threadId: string }; result: LiveTurnStatus };
+  "broker/answer": { params: { threadId: string; turnId: string; requestId: string | number; answers: unknown }; result: { answered: boolean; requestId: string | number } };
+  "broker/redirect": { params: { threadId: string; turnId: string; input: UserInput[] }; result: { interrupted: boolean; threadId: string; turnId: string; partialChanges: LiveTurnStatus["partialChanges"] } };
 }
 
 export type AppServerMethod = keyof AppServerMethodMap;
 export type AppServerRequestParams<M extends AppServerMethod> = AppServerMethodMap[M]["params"];
 export type AppServerResponse<M extends AppServerMethod> = AppServerMethodMap[M]["result"];
-export type AppServerNotification = ServerNotification;
+export type AppServerNotification = Exclude<ServerNotification, { method: "turn/completed" }> |
+  { method: "turn/completed"; params: TurnCompletedNotification & { redirectInput?: UserInput[]; controlError?: string; interruptedWorkspaceStatus?: string } } |
+  { method: "companion/question"; params: { threadId: string; turnId: string; requestId: string | number } };
 export type AppServerNotificationHandler = (message: AppServerNotification) => void;
