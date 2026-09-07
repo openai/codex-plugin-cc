@@ -1801,6 +1801,44 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
+test("session end does not signal a stale broker pid", (t) => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+
+  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    detached: true,
+    stdio: "ignore"
+  });
+  sleeper.unref();
+  t.after(() => {
+    try {
+      process.kill(-sleeper.pid, "SIGTERM");
+    } catch {
+      // Ignore an already-exited process.
+    }
+  });
+
+  saveBrokerSession(repo, {
+    endpoint: null,
+    pid: sleeper.pid,
+    pidFile: null,
+    logFile: null,
+    sessionDir: null
+  });
+
+  const result = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      cwd: repo
+    })
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotThrow(() => process.kill(sleeper.pid, 0));
+  assert.equal(loadBrokerSession(repo), null);
+});
+
 test("session end fully cleans up jobs for the ending session", async (t) => {
   const repo = makeTempDir();
   initGitRepo(repo);
