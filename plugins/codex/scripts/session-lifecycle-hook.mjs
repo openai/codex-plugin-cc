@@ -95,7 +95,6 @@ async function handleSessionEnd(input) {
   const pidFile = brokerSession?.pidFile ?? null;
   const logFile = brokerSession?.logFile ?? null;
   const sessionDir = brokerSession?.sessionDir ?? null;
-  const pid = brokerSession?.pid ?? null;
 
   if (brokerEndpoint) {
     await sendBrokerShutdown(brokerEndpoint);
@@ -107,7 +106,6 @@ async function handleSessionEnd(input) {
     pidFile,
     logFile,
     sessionDir,
-    pid,
     killProcess: terminateProcessTree
   });
   clearBrokerSession(cwd);

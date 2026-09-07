@@ -122,7 +122,6 @@ export async function ensureBrokerSession(cwd, options = {}) {
       pidFile: existing.pidFile ?? null,
       logFile: existing.logFile ?? null,
       sessionDir: existing.sessionDir ?? null,
-      pid: existing.pid ?? null,
       killProcess: options.killProcess ?? null
     });
     clearBrokerSession(cwd);
@@ -153,7 +152,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
       pidFile,
       logFile,
       sessionDir,
-      pid: child.pid ?? null,
+      ownedPid: child.pid ?? null,
       killProcess: options.killProcess ?? null
     });
     return null;
@@ -170,10 +169,10 @@ export async function ensureBrokerSession(cwd, options = {}) {
   return session;
 }
 
-export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null }) {
-  if (Number.isFinite(pid) && killProcess) {
+export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, ownedPid = null, killProcess = null }) {
+  if (Number.isFinite(ownedPid) && killProcess) {
     try {
-      killProcess(pid);
+      killProcess(ownedPid);
     } catch {
       // Ignore missing or already-exited broker processes.
     }
