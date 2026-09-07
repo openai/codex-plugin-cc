@@ -32,11 +32,27 @@ function shellEscape(value) {
   return `'${String(value).replace(/'/g, `'\"'\"'`)}'`;
 }
 
-function appendEnvVar(name, value) {
-  if (!process.env.CLAUDE_ENV_FILE || value == null || value === "") {
+function setEnv(name, value) {
+  const envFile = process.env.CLAUDE_ENV_FILE;
+  if (!envFile || value == null || value === "") {
     return;
   }
-  fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `export ${name}=${shellEscape(value)}\n`, "utf8");
+  const prefix = `export ${name}=`;
+  const line = `${prefix}${shellEscape(value)}`;
+
+  let content = "";
+  try {
+    content = fs.readFileSync(envFile, "utf8");
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
+
+  const lines = content.split(/\r?\n/).filter((l) => l && !l.startsWith(prefix));
+  lines.push(line);
+
+  const tmp = `${envFile}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, lines.join("\n") + "\n", "utf8");
+  fs.renameSync(tmp, envFile);
 }
 
 function cleanupSessionJobs(cwd, sessionId) {
@@ -75,9 +91,9 @@ function cleanupSessionJobs(cwd, sessionId) {
 }
 
 function handleSessionStart(input) {
-  appendEnvVar(SESSION_ID_ENV, input.session_id);
-  appendEnvVar(TRANSCRIPT_PATH_ENV, input.transcript_path);
-  appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
+  setEnv(SESSION_ID_ENV, input.session_id);
+  setEnv(TRANSCRIPT_PATH_ENV, input.transcript_path);
+  setEnv(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
 }
 
 async function handleSessionEnd(input) {
