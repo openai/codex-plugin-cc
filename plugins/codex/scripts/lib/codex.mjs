@@ -48,6 +48,19 @@ import { binaryAvailable } from "./process.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
+/** @type {import("./app-server-protocol").DynamicToolSpec} */
+const NOTIFY_DIRECTOR_TOOL = {
+  type: "function",
+  name: "notify_director",
+  description: "Send a short note to the director agent that started you, without stopping your work. Use it only for conclusions that change the plan, blockers you are working around, or a finished phase the director could act on now. Do not report routine progress. Returns immediately; the director does not reply through this tool. Notes longer than 400 characters are rejected.",
+  inputSchema: {
+    type: "object",
+    properties: { message: { type: "string", maxLength: 400 } },
+    required: ["message"],
+    additionalProperties: false
+  },
+  deferLoading: false
+};
 const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
@@ -69,7 +82,8 @@ function buildThreadParams(cwd, options = {}) {
     approvalPolicy: options.approvalPolicy ?? "never",
     sandbox: options.sandbox ?? "read-only",
     serviceName: SERVICE_NAME,
-    ephemeral: options.ephemeral ?? true
+    ephemeral: options.ephemeral ?? true,
+    ...(options.persistThread ? { dynamicTools: [NOTIFY_DIRECTOR_TOOL] } : {})
   };
 }
 
@@ -493,6 +507,9 @@ function recordItem(state, item, lifecycle, threadId = null) {
 
 function applyTurnNotification(state, message) {
   switch (message.method) {
+    case "companion/notification":
+      emitProgress(state.onProgress, `Notification: ${message.params.message}`, "notified");
+      break;
     case "companion/question":
       clearCompletionTimer(state);
       state.finalAnswerSeen = false;
@@ -1132,6 +1149,7 @@ export async function runAppServerTurn(cwd, options = {}) {
         model: options.model,
         sandbox: options.sandbox,
         ephemeral: options.persistThread ? false : true,
+        persistThread: options.persistThread,
         threadName: options.persistThread ? options.threadName : options.threadName ?? null
       });
       threadId = response.thread.id;
@@ -1159,9 +1177,11 @@ export async function runAppServerTurn(cwd, options = {}) {
           input,
           cwd,
           approvalPolicy: "never",
-          sandboxPolicy: options.sandbox === "workspace-write"
-            ? { type: "workspaceWrite", writableRoots: [cwd], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false }
-            : { type: "readOnly" },
+          sandboxPolicy: options.sandbox === "danger-full-access"
+            ? { type: "dangerFullAccess" }
+            : options.sandbox === "workspace-write"
+              ? { type: "workspaceWrite", writableRoots: [cwd], networkAccess: Boolean(options.network), excludeTmpdirEnvVar: false, excludeSlashTmp: false }
+              : { type: "readOnly", networkAccess: false },
           model: options.model ?? null,
           effort: options.effort ?? null,
           outputSchema: options.outputSchema ?? null

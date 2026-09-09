@@ -12,7 +12,15 @@ const send = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
 const threads = new Map();
 let nextTurn = 0;
 let pendingQuestion = null;
+const pendingTools = new Map();
 const emit = (method, params) => send({ method, params });
+function ask(thread) {
+  pendingQuestion = { id: "question-1", thread };
+  send({ id: "question-1", method: "item/tool/requestUserInput", params: {
+    threadId: thread.id, turnId: thread.turnId, itemId: "ask-1", autoResolutionMs: null,
+    questions: [{ id: "source", header: "Source", question: "Which source?", options: null }]
+  } });
+}
 function complete(thread, text, status = "completed") {
   const turn = { id: thread.turnId, status, items: [], error: null };
   if (text) emit("item/completed", { threadId: thread.id, turnId: turn.id, item: {
@@ -23,10 +31,17 @@ function complete(thread, text, status = "completed") {
 }
 readline.createInterface({ input: process.stdin }).on("line", (line) => {
   const message = JSON.parse(line);
+  if (process.env.LIVE_CODEX_RECORDING) fs.appendFileSync(process.env.LIVE_CODEX_RECORDING, `${line}\n`);
   const p = message.params ?? {};
   const reply = (result) => send({ id: message.id, result });
   const thread = threads.get(p.threadId);
   if (!message.method) {
+    if (pendingTools.has(message.id)) {
+      const { thread: toolThread, text } = pendingTools.get(message.id);
+      pendingTools.delete(message.id);
+      if (text.startsWith("ask notify:")) ask(toolThread);
+      else if (!text.startsWith("hold notify:")) complete(toolThread, JSON.stringify(message.result ?? message.error));
+    }
     if (pendingQuestion && message.id === pendingQuestion.id) {
       const question = pendingQuestion;
       pendingQuestion = null;
@@ -53,12 +68,17 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       reply({ turn: { id: thread.turnId, status: "inProgress", items: [], error: null } });
       emit("turn/started", { threadId: thread.id, turn: { id: thread.turnId } });
       const text = p.input.map((item) => item.text).join("\n");
-      if (text === "ask") {
-        pendingQuestion = { id: "question-1", thread };
-        send({ id: "question-1", method: "item/tool/requestUserInput", params: {
-          threadId: thread.id, turnId: thread.turnId, itemId: "ask-1", autoResolutionMs: null,
-          questions: [{ id: "source", header: "Source", question: "Which source?", options: null }]
+      const notification = text.match(/(?:^|\s)notify:(.*)/);
+      if (notification || ["notify-invalid", "notify-missing", "unknown-tool"].includes(text)) {
+        const id = `tool-${thread.turnId}`;
+        pendingTools.set(id, { thread, text });
+        send({ id, method: "item/tool/call", params: {
+          threadId: thread.id, turnId: thread.turnId, callId: id,
+          tool: text === "unknown-tool" ? "other_tool" : "notify_director",
+          arguments: text === "notify-missing" ? {} : { message: notification ? notification[1] : 42 }
         } });
+      } else if (text === "ask") {
+        ask(thread);
       } else if (text === "approve") {
         pendingQuestion = { id: "approval-1", thread };
         send({ id: "approval-1", method: "item/fileChange/requestApproval", params: {
@@ -70,7 +90,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
         } });
         setTimeout(() => complete(thread, "", "failed"), 600);
       } else if (text.startsWith("write")) {
-        if (p.sandboxPolicy?.type === "workspaceWrite") {
+        if (["workspaceWrite", "dangerFullAccess"].includes(p.sandboxPolicy?.type)) {
           fs.writeFileSync(path.join(thread.cwd, "written.txt"), text);
           complete(thread, "written");
         } else complete(thread, "read-only", "failed");

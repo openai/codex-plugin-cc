@@ -121,6 +121,14 @@ function appendActiveJobsTable(lines, jobs) {
   }
 }
 
+function formatSandboxDetails(job) {
+  const sandbox = job?.sandbox ?? job?.request?.sandbox;
+  if (!sandbox) return "";
+  const network = sandbox === "danger-full-access" ||
+    (sandbox === "workspace-write" && (job.network ?? job.request?.network));
+  return `Sandbox: ${sandbox} (network: ${network ? "enabled" : "disabled"})`;
+}
+
 function pushJobDetails(lines, job, options = {}) {
   lines.push(`- ${formatJobLine(job)}`);
   if (job.summary) {
@@ -128,6 +136,13 @@ function pushJobDetails(lines, job, options = {}) {
   }
   if (job.phase) {
     lines.push(`  Phase: ${job.phase}`);
+  }
+  if (job.errorMessage) lines.push(`  Error: ${job.errorMessage}`);
+  const sandboxDetails = formatSandboxDetails(job);
+  if (sandboxDetails) lines.push(`  ${sandboxDetails}`);
+  if (job.status === "running") {
+    lines.push(`  Owner: ${job.ownerAlive === true ? "alive" : job.ownerAlive === false ? "exited" : "unknown"}`);
+    if (job.progressAgeMinutes != null) lines.push(`  Last progress: ${job.progressAgeMinutes}m ago`);
   }
   if (options.showElapsed && job.elapsed) {
     lines.push(`  Elapsed: ${job.elapsed}`);
@@ -395,6 +410,9 @@ export function renderJobStatusReport(job) {
         JSON.stringify(question.questions, null, 2),
         `Answer: /codex:answer ${job.id} --request-id ${question.requestId} --answers-file <path>`);
     }
+    for (const notification of job.live.notifications ?? []) {
+      lines.push(`Notification ${notification.id} (received ${notification.receivedAt}): ${notification.message}`);
+    }
     for (const change of job.live.partialChanges ?? []) lines.push(`File change (${change.status}): ${change.path}`);
     for (const message of job.live.undeliveredMessages ?? []) lines.push(`Not observed in thread history before turn ended: ${message.id}`);
     if (job.live.workspaceStatus) lines.push("Workspace status at interruption (includes pre-existing changes):", job.live.workspaceStatus);
@@ -406,12 +424,14 @@ export function renderJobStatusReport(job) {
 export function renderStoredJobResult(job, storedJob) {
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
   const resumeCommand = threadId ? `codex resume ${threadId}` : null;
+  const sandboxDetails = formatSandboxDetails(storedJob) || formatSandboxDetails(job);
+  const sandboxSuffix = sandboxDetails ? `\n${sandboxDetails}\n` : "";
   if (isStructuredReviewStoredResult(storedJob) && storedJob?.rendered) {
     const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
     if (!threadId) {
-      return output;
+      return `${output}${sandboxSuffix}`;
     }
-    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
+    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n${sandboxSuffix}`;
   }
 
   const rawOutput =
@@ -421,17 +441,17 @@ export function renderStoredJobResult(job, storedJob) {
   if (rawOutput) {
     const output = rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
     if (!threadId) {
-      return output;
+      return `${output}${sandboxSuffix}`;
     }
-    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
+    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n${sandboxSuffix}`;
   }
 
   if (storedJob?.rendered) {
     const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
     if (!threadId) {
-      return output;
+      return `${output}${sandboxSuffix}`;
     }
-    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
+    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n${sandboxSuffix}`;
   }
 
   const lines = [
@@ -440,6 +460,7 @@ export function renderStoredJobResult(job, storedJob) {
     `Job: ${job.id}`,
     `Status: ${job.status}`
   ];
+  if (sandboxDetails) lines.push(sandboxDetails);
 
   if (threadId) {
     lines.push(`Codex session ID: ${threadId}`);

@@ -9,12 +9,13 @@ import { fileURLToPath } from "node:url";
 import { CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { createBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 import { sendBrokerShutdown, waitForBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { initGitRepo, makeTempDir } from "./helpers.mjs";
+import { initGitRepo, isolateTestEnvironment, makeTempDir } from "./helpers.mjs";
 
 const SCRIPTS = fileURLToPath(new URL("../plugins/codex/scripts/", import.meta.url));
 const enabled = process.env.CODEX_REAL_APP_SERVER_TEST === "1";
 
-test("installed app-server: question, loaded-thread write, steering, and interruption", { skip: !enabled, timeout: 120000 }, async (t) => {
+test("installed app-server: question, notifications, loaded-thread write, steering, and interruption", { skip: !enabled, timeout: 120000 }, async (t) => {
+  isolateTestEnvironment(t);
   const repo = fs.realpathSync(makeTempDir());
   const home = makeTempDir();
   const socketDir = makeTempDir("cxr-");
@@ -41,10 +42,11 @@ test("installed app-server: question, loaded-thread write, steering, and interru
       const item = count === 1 ? call("request_user_input", { questions: [{ id: "source", header: "Source",
         question: "Which source?", options: [{ label: "Latest", description: "Read the latest plan." },
           { label: "Stored", description: "Read the stored plan." }] }] }, "question")
-        : count === 3 ? call("exec_command", { cmd: "node -e \"require('fs').writeFileSync('live-proof.mjs', 'export const value = 2;\\n'); require('child_process').execFileSync(process.execPath, ['--check', 'live-proof.mjs']); setTimeout(() => {}, 2000)\"",
+        : count === 2 || count === 4 ? call("notify_director", { message: count === 2 ? "Latest source selected." : "Resumed work can notify." }, `notification-${count}`)
+        : count === 5 ? call("exec_command", { cmd: "node -e \"require('fs').writeFileSync('live-proof.mjs', 'export const value = 2;\\n'); require('child_process').execFileSync(process.execPath, ['--check', 'live-proof.mjs']); setTimeout(() => {}, 2000)\"",
           yield_time_ms: 10000 }, "write")
-        : count === 5 ? call("exec_command", { cmd: "node -e \"require('fs').writeFileSync('shell-partial.txt', 'partial'); setTimeout(() => {}, 20000)\"", yield_time_ms: 10000 }, "partial")
-        : final(count === 2 ? "answer received" : "write and steering complete");
+        : count === 7 ? call("exec_command", { cmd: "node -e \"require('fs').writeFileSync('shell-partial.txt', 'partial'); setTimeout(() => {}, 20000)\"", yield_time_ms: 10000 }, "partial")
+        : final(count === 3 ? "answer received" : "write and steering complete");
       const id = `response-${count}`;
       const events = [{ type: "response.created", response: { id } },
         { type: "response.output_item.done", item },
@@ -87,7 +89,7 @@ unified_exec = true
   launch("app-server-broker.mjs", ["serve", "--cwd", repo, "--endpoint", endpoint]);
   let control;
   t.after(async () => {
-    if (t.signal.aborted || serverError || requests.length !== 6) {
+    if (t.signal.aborted || serverError || requests.length !== 8) {
       t.diagnostic(JSON.stringify({ paths, requests: requests.length, processes: children.slice(-3).map((entry) => entry.inspect()) }));
     }
     await control?.close();
@@ -125,18 +127,25 @@ unified_exec = true
   const firstResult = await first;
   assert.equal(firstResult.code, 0, firstResult.stderr);
   assert.match(JSON.stringify(requests[1].input), /Latest/);
+  assert.ok(requests[0].tools.some((tool) => tool.name === "notify_director"));
+  assert.match(JSON.stringify(requests[2].input), /Delivered to the director\./);
+  const notified = await control.request("broker/status", { threadId: job.threadId });
+  assert.equal(notified.notifications[0].message, "Latest source selected.");
 
   const second = launch("codex-companion.mjs", ["task", "--thread", job.threadId, "--write", "--json", "Write and validate the module."]);
-  await waitFor(() => requests.length === 3);
+  await waitFor(() => requests.length === 5);
   const live = await control.request("broker/status", { threadId: job.threadId });
+  assert.ok(requests[3].tools.some((tool) => tool.name === "notify_director"));
+  assert.match(JSON.stringify(requests[4].input), /Delivered to the director\./);
+  assert.deepEqual(live.notifications.map((notification) => notification.message), ["Latest source selected.", "Resumed work can notify."]);
   await control.request("turn/steer", { threadId: job.threadId, expectedTurnId: live.turnId,
     input: [{ type: "text", text: "Use the latest plan, never the stored chargeId." }] });
   const secondResult = await second;
   assert.equal(secondResult.code, 0, secondResult.stderr);
   assert.equal(JSON.parse(secondResult.stdout).threadId, job.threadId);
   assert.equal(fs.readFileSync(path.join(repo, "live-proof.mjs"), "utf8"), "export const value = 2;\n");
-  assert.match(JSON.stringify(requests[3].input), /Use the latest plan/);
-  assert.match(JSON.stringify(requests[3].input), /Process exited with code 0/);
+  assert.match(JSON.stringify(requests[5].input), /Use the latest plan/);
+  assert.match(JSON.stringify(requests[5].input), /Process exited with code 0/);
 
   const third = launch("codex-companion.mjs", ["task", "--thread", job.threadId, "--write", "--json", "Start the next change."]);
   await waitFor(() => fs.existsSync(path.join(repo, "shell-partial.txt")));

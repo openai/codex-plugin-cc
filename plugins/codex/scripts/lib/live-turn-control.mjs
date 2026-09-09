@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { runCommand } from "./process.mjs";
 
-const CONTROL_METHODS = new Set(["turn/steer", "turn/interrupt", "broker/status", "broker/answer", "broker/redirect"]);
+const CONTROL_METHODS = new Set(["turn/steer", "turn/interrupt", "broker/status", "broker/answer", "broker/redirect", "broker/ack-notifications"]);
 
 // The broker owns this state so short-lived control clients cannot steal the event stream.
 export class LiveTurnControl {
@@ -16,7 +16,7 @@ export class LiveTurnControl {
 
   state(threadId) {
     if (!this.threads.has(threadId)) {
-      this.threads.set(threadId, { threadId, turnId: null, pendingMessages: [], questions: [],
+      this.threads.set(threadId, { threadId, turnId: null, pendingMessages: [], questions: [], notifications: [],
         interrupting: false, partialChanges: [], undeliveredMessages: [], error: null });
     }
     return this.threads.get(threadId);
@@ -94,6 +94,25 @@ export class LiveTurnControl {
   }
 
   handleServerRequest(message) {
+    if (message.method === "item/tool/call") {
+      const p = message.params;
+      const state = this.threads.get(p.threadId);
+      if (p.tool !== "notify_director" || !state) return false;
+      if (typeof p.arguments?.message !== "string") {
+        this.client.respond(message.id, { contentItems: [{ type: "inputText", text: 'Expected arguments: { "message": "..." } with a string message.' }], success: false });
+        return true;
+      }
+      if ([...p.arguments.message].length > 400) {
+        this.client.respond(message.id, { contentItems: [{ type: "inputText", text: "Message must be at most 400 characters." }], success: false });
+        return true;
+      }
+      this.client.respond(message.id, { contentItems: [{ type: "inputText", text: "Delivered to the director." }], success: true });
+      const notification = { id: crypto.randomBytes(6).toString("hex"), message: p.arguments.message,
+        turnId: p.turnId, receivedAt: new Date().toISOString() };
+      state.notifications.push(notification);
+      this.notify({ method: "companion/notification", params: { threadId: p.threadId, ...notification } });
+      return true;
+    }
     if (message.method !== "item/tool/requestUserInput") return false;
     const p = message.params;
     const state = this.state(p.threadId);
@@ -119,6 +138,11 @@ export class LiveTurnControl {
 
   async execute(method, p) {
     const state = this.threads.get(p.threadId);
+    if (method === "broker/ack-notifications") {
+      if (!state) throw new Error("Thread is not loaded in this broker.");
+      state.notifications = state.notifications.filter((notification) => !p.ids.includes(notification.id));
+      return { remaining: state.notifications.length };
+    }
     if (!state?.turnId) throw new Error("No active turn or pending question in this broker.");
     const expectedTurnId = p.expectedTurnId ?? p.turnId;
     if (state.turnId !== expectedTurnId) throw new Error("Active turn mismatch; refresh status before retrying.");

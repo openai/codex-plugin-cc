@@ -22,7 +22,8 @@ import {
     runAppServerTurn
   } from "./lib/codex.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
-import { liveStatus, sendLiveCommand } from "./lib/live-commands.mjs";
+import { acknowledgeNotifications, liveStatus, sendLiveCommand } from "./lib/live-commands.mjs";
+import { streamJobEvents } from "./lib/job-events.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
@@ -38,6 +39,9 @@ import {
 import {
   buildSingleJobSnapshot,
   buildStatusSnapshot,
+  checkJobLiveness,
+  DEFAULT_STALL_MS,
+  lastJobProgressAt,
   readStoredJob,
   resolveCancelableJob,
   resolveResultJob,
@@ -80,9 +84,10 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--thread <id>|--resume-last|--resume|--fresh] [--allow-other-repo] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--sandbox <read-only|workspace-write|danger-full-access>] [--network] [--thread <id>|--resume-last|--resume|--fresh] [--allow-other-repo] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
+      "  node scripts/codex-companion.mjs events [--cwd <repo>] [--poll-ms <ms>] [--stall-ms <ms>]",
       "  node scripts/codex-companion.mjs message <job-id> [--interrupt] [--prompt-file <path>] [text] [--json]",
       "  node scripts/codex-companion.mjs answer <job-id> --request-id <id> --answers-file <path> [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -322,12 +327,28 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
   const timeoutMs = Math.max(0, Number(options.timeoutMs) || DEFAULT_STATUS_WAIT_TIMEOUT_MS);
   const pollIntervalMs = Math.max(100, Number(options.pollIntervalMs) || DEFAULT_STATUS_POLL_INTERVAL_MS);
   const deadline = Date.now() + timeoutMs;
+  const stallMs = options.stallMs ?? DEFAULT_STALL_MS;
+  const brokerFailures = new Map();
   let snapshot = buildSingleJobSnapshot(cwd, reference);
 
   while (isActiveJobStatus(snapshot.job.status) && Date.now() < deadline) {
+    snapshot.job.live = await liveStatus(snapshot.workspaceRoot, snapshot.job);
+    snapshot.job = checkJobLiveness(snapshot.workspaceRoot, snapshot.job, snapshot.job.live, brokerFailures);
+    if (!isActiveJobStatus(snapshot.job.status)) break;
     if (snapshot.job.threadId) {
-      snapshot.job.live = await liveStatus(snapshot.workspaceRoot, snapshot.job);
       if (snapshot.job.live?.questions?.length) return { ...snapshot, waitingForAnswer: true, waitTimedOut: false, timeoutMs };
+      if (snapshot.job.live?.notifications?.length) {
+        await acknowledgeNotifications(snapshot.workspaceRoot, snapshot.job, snapshot.job.live.notifications.map((notification) => notification.id));
+        return { ...snapshot, hasNotifications: true, waitTimedOut: false, timeoutMs };
+      }
+    }
+    const lastStall = Date.parse(snapshot.job.lastStalledAt ?? "") || 0;
+    if (snapshot.job.status === "running" && Date.now() - Math.max(lastJobProgressAt(snapshot.job), lastStall) >= stallMs) {
+      snapshot.job.lastStalledAt = nowIso();
+      const stored = readStoredJob(snapshot.workspaceRoot, snapshot.job.id);
+      writeJobFile(snapshot.workspaceRoot, snapshot.job.id, { ...(stored ?? snapshot.job), lastStalledAt: snapshot.job.lastStalledAt });
+      upsertJob(snapshot.workspaceRoot, { id: snapshot.job.id, lastStalledAt: snapshot.job.lastStalledAt });
+      return { ...snapshot, stalled: true, waitTimedOut: false, timeoutMs, stallMs };
     }
     await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
     snapshot = buildSingleJobSnapshot(cwd, reference);
@@ -508,7 +529,8 @@ async function executeTaskRun(request) {
     defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
     model: request.model,
     effort: request.effort,
-    sandbox: request.write ? "workspace-write" : "read-only",
+    sandbox: request.sandbox ?? (request.write ? "workspace-write" : "read-only"),
+    network: Boolean(request.network),
     onProgress: request.onProgress,
     persistThread: true,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
@@ -611,8 +633,8 @@ function createTrackedProgress(job, options = {}) {
   };
 }
 
-function buildTaskJob(workspaceRoot, taskMetadata, write) {
-  return createCompanionJob({
+function buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, network) {
+  return { ...createCompanionJob({
     prefix: "task",
     kind: "task",
     title: taskMetadata.title,
@@ -620,16 +642,18 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
     jobClass: "task",
     summary: taskMetadata.summary,
     write
-  });
+  }), sandbox, network };
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, resumeThreadId, allowOtherRepo, jobId }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, sandbox, network, resumeLast, resumeThreadId, allowOtherRepo, jobId }) {
   return {
     cwd,
     model,
     effort,
     prompt,
     write,
+    sandbox,
+    network,
     resumeLast,
     resumeThreadId,
     allowOtherRepo,
@@ -785,8 +809,8 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file", "thread"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "allow-other-repo"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "thread", "sandbox"],
+    booleanOptions: ["json", "write", "network", "resume-last", "resume", "fresh", "background", "allow-other-repo"],
     aliasMap: {
       m: "model"
     }
@@ -811,47 +835,47 @@ async function handleTask(argv) {
   if (resumeThreadId && (resumeLast || fresh)) {
     throw new Error("Choose only one of --thread, --resume/--resume-last, or --fresh.");
   }
-  const write = Boolean(options.write);
+  const sandbox = options.sandbox ?? (options.write ? "workspace-write" : "read-only");
+  if (!["read-only", "workspace-write", "danger-full-access"].includes(sandbox)) {
+    throw new Error("--sandbox must be read-only, workspace-write, or danger-full-access.");
+  }
+  const write = sandbox !== "read-only";
+  const network = Boolean(options.network);
   const taskMetadata = buildTaskRunMetadata({
     prompt,
     resumeLast: Boolean(resumeLast || resumeThreadId)
   });
 
+  const job = buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, network);
+  const request = buildTaskRequest({
+    cwd,
+    model,
+    effort,
+    prompt,
+    write,
+    sandbox,
+    network,
+    resumeLast,
+    resumeThreadId,
+    allowOtherRepo,
+    jobId: job.id
+  });
+  job.request = request;
+
   if (options.background) {
     ensureCodexAvailable(cwd);
     requireTaskRequest(prompt, Boolean(resumeLast || resumeThreadId));
 
-    const job = buildTaskJob(workspaceRoot, taskMetadata, write);
-    const request = buildTaskRequest({
-      cwd,
-      model,
-      effort,
-      prompt,
-      write,
-      resumeLast,
-      resumeThreadId,
-      allowOtherRepo,
-      jobId: job.id
-    });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
   }
 
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
   await runForegroundCommand(
     job,
     (progress) =>
       executeTaskRun({
-        cwd,
-        model,
-        effort,
-        prompt,
-        write,
-        resumeLast,
-        resumeThreadId,
-        allowOtherRepo,
-        jobId: job.id,
+        ...request,
         onProgress: progress
       }),
     { json: options.json }
@@ -916,9 +940,36 @@ async function handleTaskWorker(argv) {
   );
 }
 
+async function handleEvents(argv) {
+  const { options } = parseCommandInput(argv, { valueOptions: ["cwd", "poll-ms", "stall-ms"] });
+  const pollMs = Number(options["poll-ms"] ?? 2000);
+  if (!Number.isSafeInteger(pollMs) || pollMs <= 0 || pollMs > 2147483647) {
+    throw new Error("--poll-ms must be a positive integer no greater than 2147483647.");
+  }
+  const controller = new AbortController();
+  const stop = () => {
+    controller.abort();
+    process.stdout.write("", () => process.exit(0));
+  };
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
+  try {
+    await streamJobEvents(resolveCommandCwd(options), { pollMs, stallMs: parseStallMs(options), signal: controller.signal });
+  } finally {
+    process.off("SIGINT", stop);
+    process.off("SIGTERM", stop);
+  }
+}
+
+function parseStallMs(options) {
+  const stallMs = Number(options["stall-ms"] ?? DEFAULT_STALL_MS);
+  if (!Number.isSafeInteger(stallMs) || stallMs <= 0) throw new Error("--stall-ms must be a positive integer.");
+  return stallMs;
+}
+
 async function handleStatus(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
+    valueOptions: ["cwd", "timeout-ms", "poll-interval-ms", "stall-ms"],
     booleanOptions: ["json", "all", "wait"]
   });
 
@@ -928,12 +979,16 @@ async function handleStatus(argv) {
     const snapshot = options.wait
       ? await waitForSingleJobSnapshot(cwd, reference, {
           timeoutMs: options["timeout-ms"],
-          pollIntervalMs: options["poll-interval-ms"]
+          pollIntervalMs: options["poll-interval-ms"],
+          stallMs: parseStallMs(options)
         })
       : buildSingleJobSnapshot(cwd, reference);
     snapshot.job.live ??= await liveStatus(snapshot.workspaceRoot, snapshot.job);
-    if (snapshot.job.live?.questions?.length) snapshot.job.phase = "waiting-for-answer";
-    outputCommandResult(snapshot, renderJobStatusReport(snapshot.job), options.json);
+    if (isActiveJobStatus(snapshot.job.status) && snapshot.job.live?.questions?.length) snapshot.job.phase = "waiting-for-answer";
+    const stalledLine = snapshot.stalled
+      ? `STALLED job=${snapshot.job.id} thread=${snapshot.job.threadId ?? "unknown"} ${snapshot.job.progressAgeMinutes}m without progress\n`
+      : "";
+    outputCommandResult(snapshot, `${stalledLine}${renderJobStatusReport(snapshot.job)}`, options.json);
     return;
   }
 
@@ -1108,6 +1163,9 @@ async function main() {
       break;
     case "status":
       await handleStatus(argv);
+      break;
+    case "events":
+      await handleEvents(argv);
       break;
     case "message":
     case "answer":

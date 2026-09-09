@@ -31,7 +31,7 @@ const DEFAULT_CLIENT_INFO = {
 
 /** @type {InitializeCapabilities} */
 const DEFAULT_CAPABILITIES = {
-  experimentalApi: false,
+  experimentalApi: true,
   requestAttestation: false,
   optOutNotificationMethods: [
     "item/agentMessage/delta",
@@ -300,6 +300,9 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
     await new Promise((resolve, reject) => {
       const target = parseBrokerEndpoint(this.endpoint);
       this.socket = net.createConnection({ path: target.path });
+      const timeout = this.options.brokerTimeoutMs
+        ? setTimeout(() => this.socket.destroy(new Error("Live broker request timed out.")), this.options.brokerTimeoutMs)
+        : null;
       this.socket.setEncoding("utf8");
       this.socket.on("connect", resolve);
       this.socket.on("data", (chunk) => {
@@ -312,6 +315,7 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
         this.handleExit(error);
       });
       this.socket.on("close", () => {
+        if (timeout) clearTimeout(timeout);
         this.handleExit(this.exitError);
       });
     });

@@ -6,6 +6,7 @@ import type {
   ServerNotification
 } from "../../.generated/app-server-types/index.js";
 import type {
+  DynamicToolSpec,
   ExternalAgentConfigImportParams,
   ExternalAgentConfigImportResponse,
   ReviewStartParams,
@@ -34,6 +35,7 @@ import type {
 } from "../../.generated/app-server-types/v2/index.js";
 
 export type {
+  DynamicToolSpec,
   ClientInfo,
   InitializeCapabilities,
   InitializeParams,
@@ -56,6 +58,7 @@ export interface CodexAppServerClientOptions {
   clientInfo?: ClientInfo;
   capabilities?: InitializeCapabilities;
   brokerEndpoint?: string;
+  brokerTimeoutMs?: number;
   disableBroker?: boolean;
   reuseExistingBroker?: boolean;
   requestUserInput?: boolean;
@@ -74,10 +77,18 @@ export interface LiveTurnStatus {
   pendingMessages: PendingMessage[];
   undeliveredMessages: PendingMessage[];
   questions: Array<ToolRequestUserInputParams & { requestId: string | number; expiresAt: number }>;
+  notifications: DirectorNotification[];
   interrupting: boolean;
   partialChanges: Array<{ path: string; status: string }>;
   error: string | null;
   workspaceStatus?: string;
+}
+
+export interface DirectorNotification {
+  id: string;
+  message: string;
+  turnId: string;
+  receivedAt: string;
 }
 
 export interface AppServerMethodMap {
@@ -92,6 +103,7 @@ export interface AppServerMethodMap {
   "turn/interrupt": { params: TurnInterruptParams; result: TurnInterruptResponse };
   "turn/steer": { params: TurnSteerParams; result: TurnSteerResponse & { messageId?: string } };
   "broker/status": { params: { threadId: string }; result: LiveTurnStatus };
+  "broker/ack-notifications": { params: { threadId: string; ids: string[] }; result: { remaining: number } };
   "broker/answer": { params: { threadId: string; turnId: string; requestId: string | number; answers: unknown }; result: { answered: boolean; requestId: string | number } };
   "broker/redirect": { params: { threadId: string; turnId: string; input: UserInput[] }; result: { interrupted: boolean; threadId: string; turnId: string; partialChanges: LiveTurnStatus["partialChanges"] } };
 }
@@ -101,5 +113,6 @@ export type AppServerRequestParams<M extends AppServerMethod> = AppServerMethodM
 export type AppServerResponse<M extends AppServerMethod> = AppServerMethodMap[M]["result"];
 export type AppServerNotification = Exclude<ServerNotification, { method: "turn/completed" }> |
   { method: "turn/completed"; params: TurnCompletedNotification & { redirectInput?: UserInput[]; controlError?: string; interruptedWorkspaceStatus?: string } } |
-  { method: "companion/question"; params: { threadId: string; turnId: string; requestId: string | number } };
+  { method: "companion/question"; params: { threadId: string; turnId: string; requestId: string | number } } |
+  { method: "companion/notification"; params: DirectorNotification & { threadId: string } };
 export type AppServerNotificationHandler = (message: AppServerNotification) => void;

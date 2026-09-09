@@ -1,7 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { renderReviewResult, renderStoredJobResult } from "../plugins/codex/scripts/lib/render.mjs";
+import { renderJobStatusReport, renderReviewResult, renderStoredJobResult } from "../plugins/codex/scripts/lib/render.mjs";
+
+test("running job status shows owner liveness and time since progress", () => {
+  const job = { id: "task-live", status: "running", ownerAlive: true, progressAgeMinutes: 17 };
+  assert.match(renderJobStatusReport(job), /Owner: alive\n  Last progress: 17m ago/);
+  assert.match(renderJobStatusReport({ ...job, ownerAlive: false }), /Owner: exited/);
+});
 
 test("renderReviewResult degrades gracefully when JSON is missing required review fields", () => {
   const output = renderReviewResult(
@@ -56,4 +62,18 @@ test("renderStoredJobResult prefers rendered output for structured review jobs",
   assert.doesNotMatch(output, /^\{/);
   assert.match(output, /Codex session ID: thr_123/);
   assert.match(output, /Resume in Codex: codex resume thr_123/);
+});
+
+test("task status and result show the stored sandbox and effective network access", () => {
+  for (const [sandbox, network, expected] of [
+    ["read-only", true, "disabled"],
+    ["workspace-write", false, "disabled"],
+    ["workspace-write", true, "enabled"],
+    ["danger-full-access", false, "enabled"]
+  ]) {
+    const job = { id: "task-1", status: "completed", jobClass: "task", sandbox, network };
+    const details = `Sandbox: ${sandbox} (network: ${expected})`;
+    assert.ok(renderJobStatusReport(job).includes(details));
+    assert.ok(renderStoredJobResult(job, { request: { sandbox, network }, result: { rawOutput: "Finished" } }).includes(details));
+  }
 });
