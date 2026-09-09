@@ -13,6 +13,7 @@ function read(relativePath) {
 
 test("review command uses AskUserQuestion and background Bash while staying review-only", () => {
   const source = read("commands/review.md");
+  assert.match(source, /disable-model-invocation:\s*false/);
   assert.match(source, /AskUserQuestion/);
   assert.match(source, /\bBash\(/);
   assert.match(source, /Do not fix issues/i);
@@ -165,9 +166,9 @@ test("result and cancel commands are exposed as deterministic runtime entrypoint
   const resultHandling = read("skills/codex-result-handling/SKILL.md");
 
   assert.match(result, /disable-model-invocation:\s*true/);
-  assert.match(result, /codex-companion\.mjs" result \$ARGUMENTS/);
+  assert.match(result, /codex-companion\.mjs" result "\$ARGUMENTS"/);
   assert.match(cancel, /disable-model-invocation:\s*true/);
-  assert.match(cancel, /codex-companion\.mjs" cancel \$ARGUMENTS/);
+  assert.match(cancel, /codex-companion\.mjs" cancel "\$ARGUMENTS"/);
   assert.match(resultHandling, /do not turn a failed or incomplete Codex run into a Claude-side implementation attempt/i);
   assert.match(resultHandling, /if Codex was never successfully invoked, do not generate a substitute answer at all/i);
 });
