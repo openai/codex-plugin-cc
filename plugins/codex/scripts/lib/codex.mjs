@@ -32,6 +32,8 @@
  *   fileChanges: ThreadItem[],
  *   commandExecutions: ThreadItem[],
  *   onProgress: ProgressReporter | null
+ *   redirectInput?: UserInput[]
+ *   interruptedWorkspaceStatus?: string
  * }} TurnCaptureState
  */
 import crypto from "node:crypto";
@@ -46,6 +48,19 @@ import { binaryAvailable } from "./process.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
+/** @type {import("./app-server-protocol").DynamicToolSpec} */
+const NOTIFY_DIRECTOR_TOOL = {
+  type: "function",
+  name: "notify_director",
+  description: "Send a short note to the director agent that started you, without stopping your work. Use it only for conclusions that change the plan, blockers you are working around, or a finished phase the director could act on now. Do not report routine progress. Returns immediately; the director does not reply through this tool. Notes longer than 400 characters are rejected.",
+  inputSchema: {
+    type: "object",
+    properties: { message: { type: "string", maxLength: 400 } },
+    required: ["message"],
+    additionalProperties: false
+  },
+  deferLoading: false
+};
 const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
@@ -67,7 +82,8 @@ function buildThreadParams(cwd, options = {}) {
     approvalPolicy: options.approvalPolicy ?? "never",
     sandbox: options.sandbox ?? "read-only",
     serviceName: SERVICE_NAME,
-    ephemeral: options.ephemeral ?? true
+    ephemeral: options.ephemeral ?? true,
+    ...(options.persistThread ? { dynamicTools: [NOTIFY_DIRECTOR_TOOL] } : {})
   };
 }
 
@@ -371,7 +387,9 @@ function completeTurn(state, turn = null, options = {}) {
 }
 
 function scheduleInferredCompletion(state) {
-  if (state.completed || state.finalTurn || !state.finalAnswerSeen) {
+  // Only the legacy subagent flow can omit the parent completion notification.
+  // A normal turn's final text may still be followed by failure or interruption.
+  if (state.completed || state.finalTurn || !state.finalAnswerSeen || state.threadIds.size <= 1) {
     return;
   }
 
@@ -489,6 +507,14 @@ function recordItem(state, item, lifecycle, threadId = null) {
 
 function applyTurnNotification(state, message) {
   switch (message.method) {
+    case "companion/notification":
+      emitProgress(state.onProgress, `Notification: ${message.params.message}`, "notified");
+      break;
+    case "companion/question":
+      clearCompletionTimer(state);
+      state.finalAnswerSeen = false;
+      emitProgress(state.onProgress, `Waiting for answer to request ${message.params.requestId}. Use /codex:status to read the questions.`, "waiting-for-answer");
+      break;
     case "thread/started":
       registerThread(state, message.params.thread.id, {
         threadName: message.params.thread.name,
@@ -549,6 +575,9 @@ function applyTurnNotification(state, message) {
         `Turn ${message.params.turn.status === "completed" ? "completed" : message.params.turn.status}.`,
         "finalizing"
       );
+      state.redirectInput = message.params.redirectInput;
+      state.interruptedWorkspaceStatus = message.params.interruptedWorkspaceStatus;
+      if (message.params.controlError) state.error = { message: message.params.controlError };
       completeTurn(state, message.params.turn);
       break;
     default:
@@ -603,17 +632,22 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       completeTurn(state, response.turn);
     }
 
-    return await state.completion;
+    return await Promise.race([
+      state.completion,
+      client.exitPromise.then(() => {
+        throw client.exitError ?? new Error("Codex connection closed before the turn completed.");
+      })
+    ]);
   } finally {
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
   }
 }
 
-async function withAppServer(cwd, fn) {
+async function withAppServer(cwd, fn, options = {}) {
   let client = null;
   try {
-    client = await CodexAppServerClient.connect(cwd);
+    client = await CodexAppServerClient.connect(cwd, { requireBroker: options.requireBroker });
     const result = await fn(client);
     await client.close();
     return result;
@@ -628,7 +662,7 @@ async function withAppServer(cwd, fn) {
       client = null;
     }
 
-    if (!shouldRetryDirect) {
+    if (!shouldRetryDirect || options.requireBroker) {
       throw error;
     }
 
@@ -1115,6 +1149,7 @@ export async function runAppServerTurn(cwd, options = {}) {
         model: options.model,
         sandbox: options.sandbox,
         ephemeral: options.persistThread ? false : true,
+        persistThread: options.persistThread,
         threadName: options.persistThread ? options.threadName : options.threadName ?? null
       });
       threadId = response.thread.id;
@@ -1129,19 +1164,38 @@ export async function runAppServerTurn(cwd, options = {}) {
       throw new Error("A prompt is required for this Codex run.");
     }
 
-    const turnState = await captureTurn(
-      client,
-      threadId,
-      () =>
-        client.request("turn/start", {
+    let turnState;
+    let input = buildTurnInput(prompt);
+    const fileChanges = [];
+    const interruptedTurns = [];
+    do {
+      turnState = await captureTurn(
+        client,
+        threadId,
+        () => client.request("turn/start", {
           threadId,
-          input: buildTurnInput(prompt),
+          input,
+          cwd,
+          approvalPolicy: "never",
+          sandboxPolicy: options.sandbox === "danger-full-access"
+            ? { type: "dangerFullAccess" }
+            : options.sandbox === "workspace-write"
+              ? { type: "workspaceWrite", writableRoots: [cwd], networkAccess: Boolean(options.network), excludeTmpdirEnvVar: false, excludeSlashTmp: false }
+              : { type: "readOnly", networkAccess: false },
           model: options.model ?? null,
           effort: options.effort ?? null,
           outputSchema: options.outputSchema ?? null
         }),
-      { onProgress: options.onProgress }
-    );
+        { onProgress: options.onProgress }
+      );
+      fileChanges.push(...turnState.fileChanges);
+      input = turnState.redirectInput;
+      if (input) {
+        interruptedTurns.push({ turnId: turnState.turnId, touchedFiles: collectTouchedFiles(turnState.fileChanges),
+          workspaceStatus: turnState.interruptedWorkspaceStatus });
+        emitProgress(options.onProgress, "Turn interrupted; continuing in the same thread with the new instruction. Existing file changes are retained.", "redirecting");
+      }
+    } while (input);
 
     return {
       status: buildResultStatus(turnState),
@@ -1152,11 +1206,12 @@ export async function runAppServerTurn(cwd, options = {}) {
       turn: turnState.finalTurn,
       error: turnState.error,
       stderr: cleanCodexStderr(client.stderr),
-      fileChanges: turnState.fileChanges,
-      touchedFiles: collectTouchedFiles(turnState.fileChanges),
+      fileChanges,
+      touchedFiles: collectTouchedFiles(fileChanges),
+      interruptedTurns,
       commandExecutions: turnState.commandExecutions
     };
-  });
+  }, { requireBroker: options.persistThread });
 }
 
 export async function findLatestTaskThread(cwd) {

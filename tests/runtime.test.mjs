@@ -1,12 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
-import test from "node:test";
+import test, { beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { initGitRepo, isolateTestEnvironment, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
@@ -15,6 +15,34 @@ const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
+
+beforeEach(isolateTestEnvironment);
+
+test("test environment excludes inherited live broker and session state", () => {
+  const inheritedData = makeTempDir();
+  const result = run(process.execPath, ["--input-type=module", "-e", `
+    import assert from "node:assert/strict";
+    import { isolateTestEnvironment } from ${JSON.stringify(new URL("./helpers.mjs", import.meta.url).href)};
+    const inheritedData = process.env.CLAUDE_PLUGIN_DATA;
+    let cleanup;
+    isolateTestEnvironment({ after(fn) { cleanup = fn; } });
+    assert.notEqual(process.env.CLAUDE_PLUGIN_DATA, inheritedData);
+    assert.equal(Object.keys(process.env).some((key) => key.startsWith("CODEX_COMPANION_")), false);
+    assert.equal(process.env.CLAUDE_ENV_FILE, undefined);
+    await cleanup();
+  `], { env: {
+    ...process.env,
+    CLAUDE_PLUGIN_DATA: inheritedData,
+    CLAUDE_ENV_FILE: path.join(inheritedData, "session.env"),
+    CODEX_COMPANION_APP_SERVER_ENDPOINT: `unix:${path.join(inheritedData, "live.sock")}`,
+    CODEX_COMPANION_APP_SERVER_PID_FILE: path.join(inheritedData, "live.pid"),
+    CODEX_COMPANION_APP_SERVER_LOG_FILE: path.join(inheritedData, "live.log"),
+    CODEX_COMPANION_SESSION_ID: "live-session",
+    CODEX_COMPANION_JOB_ID: "live-job"
+  } });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(fs.readdirSync(inheritedData), []);
+});
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   const start = Date.now();
@@ -26,6 +54,78 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
   throw new Error("Timed out waiting for condition.");
+}
+
+function seedFakeCodexThread(binDir, repo, threadId) {
+  fs.writeFileSync(
+    path.join(binDir, "fake-codex-state.json"),
+    `${JSON.stringify(
+      {
+        nextThreadId: 2,
+        nextTurnId: 1,
+        appServerStarts: 0,
+        threads: [
+          {
+            id: threadId,
+            cwd: repo,
+            name: null,
+            preview: "",
+            ephemeral: false,
+            createdAt: 1,
+            updatedAt: 1
+          }
+        ],
+        capabilities: null,
+        lastInterrupt: null
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+}
+
+function resolveStateDirWithPluginData(repo, pluginDataDir) {
+  const previousPluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    return resolveStateDir(repo);
+  } finally {
+    if (previousPluginDataDir === undefined) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
+    }
+  }
+}
+
+function seedTrackedThread(repo, pluginDataDir, threadId, sessionId = "sess-other") {
+  const stateDir = resolveStateDirWithPluginData(repo, pluginDataDir);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "task-tracked",
+            status: "completed",
+            title: "Codex Task",
+            jobClass: "task",
+            sessionId,
+            threadId,
+            summary: "Tracked task",
+            updatedAt: "2026-09-03T00:00:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
 }
 
 test("setup reports ready when fake codex is installed and authenticated", () => {
@@ -501,6 +601,234 @@ test("task --resume-last resumes the latest persisted task thread", () => {
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
+});
+
+test("task --thread resumes a thread tracked in the current workspace across Claude sessions", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const threadId = "thr_specific";
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  const pluginDataDir = makeTempDir();
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: pluginDataDir,
+    CODEX_COMPANION_SESSION_ID: "sess-current"
+  };
+  installFakeCodex(binDir);
+  seedFakeCodexThread(binDir, repo, threadId);
+  seedTrackedThread(repo, pluginDataDir, threadId);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "--thread", threadId, "follow up by id"], {
+    cwd: repo,
+    env
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.threadId, threadId);
+  assert.equal(fakeState.lastTurnStart.prompt, "follow up by id");
+});
+
+test("task --thread works in background mode", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const threadId = "thr_background";
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  const pluginDataDir = makeTempDir();
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: pluginDataDir
+  };
+  installFakeCodex(binDir, "slow-task");
+  seedFakeCodexThread(binDir, repo, threadId);
+  seedTrackedThread(repo, pluginDataDir, threadId);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const launched = run(
+    "node",
+    [SCRIPT, "task", "--background", "--json", "--thread", threadId, "background follow up"],
+    {
+      cwd: repo,
+      env
+    }
+  );
+
+  assert.equal(launched.status, 0, launched.stderr);
+  const launchPayload = JSON.parse(launched.stdout);
+  const waitedStatus = run(
+    "node",
+    [SCRIPT, "status", launchPayload.jobId, "--wait", "--timeout-ms", "15000", "--json"],
+    {
+      cwd: repo,
+      env
+    }
+  );
+
+  assert.equal(waitedStatus.status, 0, waitedStatus.stderr);
+  assert.equal(JSON.parse(waitedStatus.stdout).job.status, "completed");
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.threadId, threadId);
+  assert.equal(fakeState.lastTurnStart.prompt, "background follow up");
+});
+
+test("task --thread rejects conflicting and invalid routing values", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+
+  for (const conflictingFlag of ["--resume-last", "--resume", "--fresh"]) {
+    const result = run("node", [SCRIPT, "task", "--thread", "thr_specific", conflictingFlag, "follow up"], {
+      cwd: repo
+    });
+    assert.equal(result.status > 0, true);
+    assert.match(result.stderr, /Choose only one of --thread, --resume\/--resume-last, or --fresh/);
+  }
+
+  for (const invalidThreadOption of ["--thread=", "--thread=-bad"]) {
+    const result = run("node", [SCRIPT, "task", invalidThreadOption, "follow up"], {
+      cwd: repo
+    });
+    assert.equal(result.status > 0, true);
+    assert.match(result.stderr, /Provide a thread id with --thread/);
+  }
+});
+
+test("task --thread --allow-other-repo with an unknown id fails at codex and does not pre-write the thread id", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: pluginDataDir
+  };
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--thread", "thr_missing", "--allow-other-repo", "follow up"], {
+    cwd: repo,
+    env
+  });
+
+  assert.equal(result.status > 0, true);
+  assert.match(result.stderr, /unknown thread thr_missing/);
+  const state = JSON.parse(
+    fs.readFileSync(path.join(resolveStateDirWithPluginData(repo, pluginDataDir), "state.json"), "utf8")
+  );
+  assert.equal(state.jobs.length, 1);
+  assert.equal(state.jobs[0].status, "failed");
+  assert.equal("threadId" in state.jobs[0], false);
+});
+
+test("a failed task --thread does not pre-write the requested thread id into the job", () => {
+  const repo = makeTempDir();
+  const otherRepo = makeTempDir();
+  const binDir = makeTempDir();
+  const threadId = "thr_other_repo";
+  const pluginDataDir = makeTempDir();
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: pluginDataDir
+  };
+  installFakeCodex(binDir);
+  seedFakeCodexThread(binDir, otherRepo, threadId);
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--thread", threadId, "follow up"], {
+    cwd: repo,
+    env
+  });
+
+  assert.equal(result.status > 0, true);
+  assert.match(result.stderr, /not tracked for this repository/);
+  assert.match(result.stderr, /--allow-other-repo/);
+  assert.match(result.stderr, /created outside this plugin/);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal("lastTurnStart" in fakeState, false);
+  const state = JSON.parse(
+    fs.readFileSync(path.join(resolveStateDirWithPluginData(repo, pluginDataDir), "state.json"), "utf8")
+  );
+  assert.equal(state.jobs.length, 1);
+  assert.equal(state.jobs[0].status, "failed");
+  assert.equal("threadId" in state.jobs[0], false);
+});
+
+test("task --thread --allow-other-repo resumes an untracked thread", () => {
+  const repo = makeTempDir();
+  const otherRepo = makeTempDir();
+  const binDir = makeTempDir();
+  const threadId = "thr_other_repo";
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  const pluginDataDir = makeTempDir();
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: pluginDataDir
+  };
+  installFakeCodex(binDir);
+  seedFakeCodexThread(binDir, otherRepo, threadId);
+  initGitRepo(repo);
+
+  const result = run(
+    "node",
+    [SCRIPT, "task", "--thread", threadId, "--allow-other-repo", "cross-repo follow up"],
+    {
+      cwd: repo,
+      env
+    }
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.threadId, threadId);
+  assert.equal(fakeState.lastTurnStart.prompt, "cross-repo follow up");
+});
+
+test("task --thread rejects an untracked thread in background mode", () => {
+  const repo = makeTempDir();
+  const otherRepo = makeTempDir();
+  const binDir = makeTempDir();
+  const threadId = "thr_background_other_repo";
+  const pluginDataDir = makeTempDir();
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: pluginDataDir
+  };
+  installFakeCodex(binDir);
+  seedFakeCodexThread(binDir, otherRepo, threadId);
+  initGitRepo(repo);
+
+  const launched = run(
+    "node",
+    [SCRIPT, "task", "--background", "--json", "--thread", threadId, "background follow up"],
+    {
+      cwd: repo,
+      env
+    }
+  );
+
+  assert.equal(launched.status, 0, launched.stderr);
+  const launchPayload = JSON.parse(launched.stdout);
+  const waitedStatus = run(
+    "node",
+    [SCRIPT, "status", launchPayload.jobId, "--wait", "--timeout-ms", "15000", "--json"],
+    {
+      cwd: repo,
+      env
+    }
+  );
+
+  assert.equal(waitedStatus.status, 0, waitedStatus.stderr);
+  const job = JSON.parse(waitedStatus.stdout).job;
+  assert.equal(job.status, "failed");
+  assert.match(job.errorMessage, /--allow-other-repo/);
+  assert.equal("threadId" in job, false);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal("lastTurnStart" in fakeState, false);
 });
 
 test("task-resume-candidate returns the latest rescue thread from the current session", () => {
