@@ -1,13 +1,78 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import test, { beforeEach } from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 
-import { makeTempDir } from "./helpers.mjs";
-import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import { isolateTestEnvironment, makeTempDir, run } from "./helpers.mjs";
+import { loadState, resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState, upsertJob } from "../plugins/codex/scripts/lib/state.mjs";
+
+beforeEach(isolateTestEnvironment);
+
+test("concurrent job writers preserve both indices and artifacts", { timeout: 60000 }, async (t) => {
+  const workspace = makeTempDir();
+  const gate = path.join(workspace, "start");
+  const source = `
+    import fs from "node:fs";
+    import { updateState, writeJobFile, resolveJobLogFile } from ${JSON.stringify(new URL("../plugins/codex/scripts/lib/state.mjs", import.meta.url).href)};
+    const [workspace, id, gate] = process.argv.slice(1);
+    const wait = new Int32Array(new SharedArrayBuffer(4));
+    const logFile = resolveJobLogFile(workspace, id);
+    writeJobFile(workspace, id, { id });
+    fs.writeFileSync(logFile, id);
+    fs.writeFileSync(gate + id, "ready");
+    while (!fs.existsSync(gate)) Atomics.wait(wait, 0, 0, 10);
+    for (let iteration = 0; iteration < 6; iteration += 1) {
+      updateState(workspace, (state) => {
+        Atomics.wait(wait, 0, 0, iteration === 0 ? 100 : 10);
+        const job = { id, iteration, logFile };
+        const index = state.jobs.findIndex((item) => item.id === id);
+        if (index < 0) state.jobs.push(job);
+        else state.jobs[index] = job;
+      });
+    }
+  `;
+  const workers = ["task-one", "task-two"].map((id) => {
+    const child = spawn(process.execPath, ["--input-type=module", "-e", source, workspace, id, gate], { env: process.env });
+    let stderr = "";
+    child.stderr.on("data", (data) => { stderr += data; });
+    const done = new Promise((resolve, reject) => {
+      child.on("error", reject);
+      child.on("exit", (code) => code === 0 ? resolve() : reject(new Error(stderr || `Worker exited ${code}`)));
+    });
+    t.after(() => { if (child.exitCode === null) child.kill(); });
+    return { id, done };
+  });
+  while (!workers.every(({ id }) => fs.existsSync(gate + id))) {
+    t.signal.throwIfAborted();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  fs.writeFileSync(gate, "start");
+  await Promise.all(workers.map(({ done }) => done));
+  assert.deepEqual(loadState(workspace).jobs.map(({ id, iteration }) => ({ id, iteration })).sort((a, b) => a.id.localeCompare(b.id)),
+    workers.map(({ id }) => ({ id, iteration: 5 })));
+  for (const { id } of workers) {
+    assert.equal(JSON.parse(fs.readFileSync(resolveJobFile(workspace, id), "utf8")).id, id);
+    assert.equal(fs.readFileSync(resolveJobLogFile(workspace, id), "utf8"), id);
+  }
+  assert.equal(fs.existsSync(path.join(resolveStateDir(workspace), "state.lock")), false);
+});
+
+test("state writes recover the lock of an exited writer", () => {
+  const workspace = makeTempDir();
+  const exited = run(process.execPath, ["-e", "process.stdout.write(String(process.pid))"]);
+  assert.equal(exited.status, 0, exited.stderr);
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "state.lock"), exited.stdout);
+  upsertJob(workspace, { id: "recovered", status: "running" });
+  assert.equal(loadState(workspace).jobs[0].id, "recovered");
+  assert.equal(fs.existsSync(path.join(stateDir, "state.lock")), false);
+});
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
+  delete process.env.CLAUDE_PLUGIN_DATA;
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
 

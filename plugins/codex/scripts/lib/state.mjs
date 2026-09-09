@@ -11,6 +11,7 @@ const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
+const LOCK_WAIT = new Int32Array(new SharedArrayBuffer(4));
 
 function nowIso() {
   return new Date().toISOString();
@@ -89,7 +90,44 @@ function removeFileIfExists(filePath) {
   }
 }
 
-export function saveState(cwd, state) {
+function withStateLock(cwd, action) {
+  ensureStateDir(cwd);
+  const lockFile = path.join(resolveStateDir(cwd), "state.lock");
+  const deadline = Date.now() + 30000;
+  let fd;
+  while (fd === undefined) {
+    try {
+      fd = fs.openSync(lockFile, "wx");
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      try {
+        const owner = Number(fs.readFileSync(lockFile, "utf8"));
+        if (Number.isSafeInteger(owner) && owner > 0) {
+          try {
+            process.kill(owner, 0);
+          } catch (ownerError) {
+            if (ownerError.code === "ESRCH" && Number(fs.readFileSync(lockFile, "utf8")) === owner) {
+              fs.unlinkSync(lockFile);
+            }
+          }
+        }
+      } catch (readError) {
+        if (readError.code !== "ENOENT") throw readError;
+      }
+      if (Date.now() >= deadline) throw new Error(`Timed out waiting for job state lock: ${lockFile}`);
+      Atomics.wait(LOCK_WAIT, 0, 0, 10);
+    }
+  }
+  try {
+    fs.writeFileSync(fd, `${process.pid}\n`);
+    return action();
+  } finally {
+    fs.closeSync(fd);
+    fs.unlinkSync(lockFile);
+  }
+}
+
+function writeState(cwd, state) {
   const previousJobs = loadState(cwd).jobs;
   ensureStateDir(cwd);
   const nextJobs = pruneJobs(state.jobs ?? []);
@@ -111,14 +149,23 @@ export function saveState(cwd, state) {
     removeFileIfExists(job.logFile);
   }
 
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  const stateFile = resolveStateFile(cwd);
+  const temporaryFile = `${stateFile}.${process.pid}.tmp`;
+  fs.writeFileSync(temporaryFile, `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  fs.renameSync(temporaryFile, stateFile);
   return nextState;
 }
 
+export function saveState(cwd, state) {
+  return withStateLock(cwd, () => writeState(cwd, state));
+}
+
 export function updateState(cwd, mutate) {
-  const state = loadState(cwd);
-  mutate(state);
-  return saveState(cwd, state);
+  return withStateLock(cwd, () => {
+    const state = loadState(cwd);
+    mutate(state);
+    return writeState(cwd, state);
+  });
 }
 
 export function generateJobId(prefix = "job") {

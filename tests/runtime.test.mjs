@@ -1,12 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
-import test from "node:test";
+import test, { beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { initGitRepo, isolateTestEnvironment, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
@@ -15,6 +15,34 @@ const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
+
+beforeEach(isolateTestEnvironment);
+
+test("test environment excludes inherited live broker and session state", () => {
+  const inheritedData = makeTempDir();
+  const result = run(process.execPath, ["--input-type=module", "-e", `
+    import assert from "node:assert/strict";
+    import { isolateTestEnvironment } from ${JSON.stringify(new URL("./helpers.mjs", import.meta.url).href)};
+    const inheritedData = process.env.CLAUDE_PLUGIN_DATA;
+    let cleanup;
+    isolateTestEnvironment({ after(fn) { cleanup = fn; } });
+    assert.notEqual(process.env.CLAUDE_PLUGIN_DATA, inheritedData);
+    assert.equal(Object.keys(process.env).some((key) => key.startsWith("CODEX_COMPANION_")), false);
+    assert.equal(process.env.CLAUDE_ENV_FILE, undefined);
+    await cleanup();
+  `], { env: {
+    ...process.env,
+    CLAUDE_PLUGIN_DATA: inheritedData,
+    CLAUDE_ENV_FILE: path.join(inheritedData, "session.env"),
+    CODEX_COMPANION_APP_SERVER_ENDPOINT: `unix:${path.join(inheritedData, "live.sock")}`,
+    CODEX_COMPANION_APP_SERVER_PID_FILE: path.join(inheritedData, "live.pid"),
+    CODEX_COMPANION_APP_SERVER_LOG_FILE: path.join(inheritedData, "live.log"),
+    CODEX_COMPANION_SESSION_ID: "live-session",
+    CODEX_COMPANION_JOB_ID: "live-job"
+  } });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(fs.readdirSync(inheritedData), []);
+});
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   const start = Date.now();

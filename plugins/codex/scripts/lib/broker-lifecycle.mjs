@@ -111,6 +111,44 @@ async function isBrokerEndpointReady(endpoint) {
 }
 
 export async function ensureBrokerSession(cwd, options = {}) {
+  const lockFile = path.join(resolveStateDir(cwd), "broker.lock");
+  fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+  const deadline = Date.now() + 30000;
+  while (true) {
+    try {
+      const fd = fs.openSync(lockFile, "wx");
+      try {
+        fs.writeFileSync(fd, `${process.pid}\n`);
+      } finally {
+        fs.closeSync(fd);
+      }
+      break;
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      try {
+        const pid = Number(fs.readFileSync(lockFile, "utf8"));
+        if (Number.isSafeInteger(pid) && pid > 0) {
+          try {
+            process.kill(pid, 0);
+          } catch (error) {
+            if (error.code === "ESRCH" && Number(fs.readFileSync(lockFile, "utf8")) === pid) fs.unlinkSync(lockFile);
+          }
+        }
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+      if (Date.now() >= deadline) throw new Error("Timed out waiting for the shared Codex broker startup lock.");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+  try {
+    return await ensureLockedBrokerSession(cwd, options);
+  } finally {
+    fs.unlinkSync(lockFile);
+  }
+}
+
+async function ensureLockedBrokerSession(cwd, options) {
   const existing = loadBrokerSession(cwd);
   if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
     return existing;

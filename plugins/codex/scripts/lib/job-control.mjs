@@ -1,12 +1,54 @@
 import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
+import { getConfig, listJobs, readJobFile, resolveJobFile, upsertJob, writeJobFile } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
 export const DEFAULT_MAX_PROGRESS_LINES = 4;
+export const DEFAULT_STALL_MS = 15 * 60 * 1000;
+
+export function ownerProcessAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code !== "ESRCH";
+  }
+}
+
+export function lastJobProgressAt(job) {
+  if (job.logFile) {
+    try {
+      return fs.statSync(job.logFile).mtimeMs;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+  return Date.parse(job.startedAt ?? job.createdAt ?? "") || Date.now();
+}
+
+export function checkJobLiveness(cwd, job, live, brokerFailures, options = {}) {
+  if (job.status !== "queued" && job.status !== "running") return job;
+  const failures = job.threadId && live?.unavailable ? (brokerFailures.get(job.id) ?? 0) + 1 : 0;
+  brokerFailures.set(job.id, failures);
+  const reason = (options.ownerAlive ?? ownerProcessAlive)(job.pid) === false
+    ? "owner process exited"
+    : failures > 2 ? "broker unreachable" : null;
+  if (!reason) return job;
+  const fail = options.fail ?? ((workspaceRoot, current, errorMessage) => {
+    const latest = listJobs(workspaceRoot).find((item) => item.id === current.id);
+    if (!latest || (latest.status !== "queued" && latest.status !== "running")) return latest ?? current;
+    const patch = { id: current.id, status: "failed", phase: "failed", errorMessage, completedAt: new Date().toISOString() };
+    const stored = readStoredJob(workspaceRoot, current.id);
+    writeJobFile(workspaceRoot, current.id, { ...(stored ?? latest), ...patch });
+    upsertJob(workspaceRoot, patch);
+    return { ...current, ...patch };
+  });
+  return fail(cwd, job, reason);
+}
 
 export function sortJobsNewestFirst(jobs) {
   return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
@@ -160,8 +202,15 @@ function inferLegacyJobPhase(job, progressPreview = []) {
 
 export function enrichJob(job, options = {}) {
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
+  const active = job.status === "queued" || job.status === "running";
+  const progressAt = active ? lastJobProgressAt(job) : null;
   const enriched = {
     ...job,
+    ...(active ? {
+      ownerAlive: ownerProcessAlive(job.pid),
+      lastProgressAt: new Date(progressAt).toISOString(),
+      progressAgeMinutes: Math.max(0, Math.floor((Date.now() - progressAt) / 60000))
+    } : {}),
     kindLabel: getJobTypeLabel(job),
     progressPreview:
       job.status === "queued" || job.status === "running" || job.status === "failed"
