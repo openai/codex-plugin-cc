@@ -350,7 +350,13 @@ export function terminalizeTrackedJob(workspaceRoot, job, terminal) {
     const claimed = claimFile(resolveAdmissionFile(workspaceRoot, job.id), { status: terminal.status, completedAt });
     const winner = claimed ? { status: terminal.status, completedAt } : readAdmissionClaim(workspaceRoot, job.id);
     if (winner?.status !== "admitted") {
-      return { job: applyTerminalFence(readStoredJobOrNull(workspaceRoot, job.id) ?? job, winner), claimed };
+      const storedJob = readStoredJobOrNull(workspaceRoot, job.id);
+      const effectiveJob = applyTerminalFence(claimed ? { ...(storedJob ?? job), ...terminal } : storedJob ?? job, winner);
+      if (claimed) {
+        writeJobFile(workspaceRoot, job.id, effectiveJob);
+        upsertJob(workspaceRoot, effectiveJob);
+      }
+      return { job: effectiveJob, claimed };
     }
   } else if (admission.status !== "admitted") {
     return { job: applyTerminalFence(readStoredJobOrNull(workspaceRoot, job.id) ?? job, admission), claimed: false };
