@@ -83,7 +83,9 @@ export function readSessionState(cwd, sessionId) {
 
 export function setSessionLifecycle(cwd, sessionId, ended) {
   ensureStateDir(cwd);
-  const generation = ended ? readSessionState(cwd, sessionId)?.generation ?? null : randomUUID();
+  const previous = readSessionState(cwd, sessionId);
+  if (!ended && previous?.ended === false) return previous.generation;
+  const generation = ended ? previous?.generation ?? null : randomUUID();
   writeAtomicJson(resolveSessionFile(cwd, sessionId), { generation, ended });
   return generation;
 }

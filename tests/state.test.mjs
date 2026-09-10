@@ -7,15 +7,44 @@ import assert from "node:assert/strict";
 import { makeTempDir } from "./helpers.mjs";
 import {
   loadState,
+  isJobSessionEnded,
   listJobs,
   resolveJobFile,
   resolveJobLogFile,
   resolveStateDir,
   resolveStateFile,
   saveState,
+  setSessionLifecycle,
   upsertJob,
   writeJobFile
 } from "../plugins/codex/scripts/lib/state.mjs";
+
+test("repeated active session starts preserve tracked jobs until SessionEnd", () => {
+  const workspace = makeTempDir();
+  const sessionId = "session-compacted";
+  const generation = setSessionLifecycle(workspace, sessionId, false);
+  const job = {
+    id: "active-background", status: "running", pid: process.pid,
+    sessionId, sessionGeneration: generation
+  };
+  writeJobFile(workspace, job.id, job);
+  upsertJob(workspace, job);
+
+  assert.equal(setSessionLifecycle(workspace, sessionId, false), generation);
+  upsertJob(workspace, { id: job.id, phase: "working" });
+  assert.equal(isJobSessionEnded(workspace, job), false);
+  assert.equal(listJobs(workspace)[0].id, job.id);
+  assert.equal(listJobs(workspace)[0].pid, process.pid);
+  assert.equal(fs.existsSync(resolveJobFile(workspace, job.id)), true);
+  assert.equal(fs.existsSync(resolveJobFile(workspace, job.id).replace(/\.json$/, ".removed")), false);
+
+  setSessionLifecycle(workspace, sessionId, true);
+  assert.equal(isJobSessionEnded(workspace, job), true);
+  const resumedGeneration = setSessionLifecycle(workspace, sessionId, false);
+  assert.notEqual(resumedGeneration, generation);
+  assert.equal(isJobSessionEnded(workspace, job), true);
+  assert.equal(isJobSessionEnded(workspace, { ...job, sessionGeneration: resumedGeneration }), false);
+});
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
