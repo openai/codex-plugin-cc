@@ -2,7 +2,7 @@ import fs from "node:fs";
 import process from "node:process";
 
 import { isProcessAlive } from "./process.mjs";
-import { isJobRemovedLocked, listJobs, readJobFile, resolveJobFile, resolveJobLogFile, updateState, upsertJob, writeJobFile } from "./state.mjs";
+import { isJobRemovedLocked, isJobSessionEnded, listJobs, readJobFile, readSessionState, resolveJobFile, resolveJobLogFile, SESSION_GENERATION_ENV, updateState, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 export const GATE_KEY_ENV = "CODEX_COMPANION_GATE_KEY";
@@ -73,7 +73,10 @@ export function createJobRecord(base, options = {}) {
   return {
     ...base,
     createdAt: nowIso(),
-    ...(sessionId ? { sessionId } : {})
+    ...(sessionId ? {
+      sessionId,
+      sessionGeneration: env[SESSION_GENERATION_ENV] ?? readSessionState(base.workspaceRoot, sessionId)?.generation ?? null
+    } : {})
   };
 }
 
@@ -436,7 +439,7 @@ export function reconcileTrackedJobs(workspaceRoot, options = {}) {
 }
 
 export async function runTrackedJob(job, runner, options = {}) {
-  if (isJobRemoved(job.workspaceRoot, job.id)) {
+  if (isJobSessionEnded(job.workspaceRoot, job) || isJobRemoved(job.workspaceRoot, job.id)) {
     return removedLifecycleRecord(job);
   }
   const storedJob = readStoredJobOrNull(job.workspaceRoot, job.id);
@@ -500,7 +503,7 @@ export async function runTrackedJob(job, runner, options = {}) {
   }
   let admitted = false;
   updateState(job.workspaceRoot, () => {
-    if (!isJobRemoved(job.workspaceRoot, job.id)) {
+    if (!isJobSessionEnded(job.workspaceRoot, runningRecord) && !isJobRemoved(job.workspaceRoot, job.id)) {
       admitted = claimFile(resolveAdmissionFile(job.workspaceRoot, job.id), { status: "admitted" });
     }
   });

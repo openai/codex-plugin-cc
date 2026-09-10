@@ -239,6 +239,9 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
 
     this.closed = true;
 
+    if (!this.proc) {
+      this.handleExit(this.exitError);
+    }
     if (this.readline) {
       this.readline.close();
     }
@@ -320,6 +323,8 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
     this.closed = true;
     if (this.socket) {
       this.socket.end();
+    } else {
+      this.handleExit(this.exitError);
     }
     await this.exitPromise;
   }

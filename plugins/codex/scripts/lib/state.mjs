@@ -61,6 +61,39 @@ export function ensureStateDir(cwd) {
   fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
 }
 
+export const SESSION_GENERATION_ENV = "CODEX_COMPANION_SESSION_GENERATION";
+
+function resolveSessionFile(cwd, sessionId) {
+  const key = createHash("sha256").update(sessionId).digest("hex");
+  return path.join(resolveStateDir(cwd), `session-${key}.json`);
+}
+
+export function readSessionState(cwd, sessionId) {
+  try {
+    const session = JSON.parse(fs.readFileSync(resolveSessionFile(cwd, sessionId), "utf8"));
+    if (!session || typeof session.ended !== "boolean" || !(session.generation === null || typeof session.generation === "string")) {
+      throw new Error("Invalid Codex Companion session lifecycle state.");
+    }
+    return session;
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+export function setSessionLifecycle(cwd, sessionId, ended) {
+  ensureStateDir(cwd);
+  const generation = ended ? readSessionState(cwd, sessionId)?.generation ?? null : randomUUID();
+  writeAtomicJson(resolveSessionFile(cwd, sessionId), { generation, ended });
+  return generation;
+}
+
+export function isJobSessionEnded(cwd, job) {
+  if (!job.sessionId) return false;
+  const session = readSessionState(cwd, job.sessionId);
+  return session != null && (session.ended || (job.sessionGeneration ?? null) !== session.generation);
+}
+
 function isObject(value) {
   return value && typeof value === "object" && !Array.isArray(value);
 }
@@ -264,7 +297,7 @@ function saveStateLocked(cwd, state) {
   const previousJobs = loadState(cwd).jobs;
   ensureStateDir(cwd);
   const requestedJobs = candidate.jobs;
-  const nextJobs = pruneJobs(requestedJobs.filter((job) => !fs.existsSync(resolveJobSidecarFile(cwd, job.id, ".removed"))));
+  const nextJobs = pruneJobs(requestedJobs.filter((job) => !isJobSessionEnded(cwd, job) && !fs.existsSync(resolveJobSidecarFile(cwd, job.id, ".removed"))));
   const nextState = {
     version: STATE_VERSION,
     config: candidate.config,

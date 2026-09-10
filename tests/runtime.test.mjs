@@ -11,7 +11,7 @@ import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { listJobs, readJobFile, resolveJobFile, resolveJobLogFile, resolveStateDir, saveState, upsertJob, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
-import { createJobProgressUpdater, reconcileTrackedJobs, runTrackedJob, terminalizeTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
+import { createJobRecord, createJobProgressUpdater, reconcileTrackedJobs, runTrackedJob, terminalizeTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -712,8 +712,9 @@ test("session start hook exports the Claude session id, transcript path, and plu
   });
 
   assert.equal(result.status, 0, result.stderr);
+  assert.match(fs.readFileSync(envFile, "utf8"), /^export CODEX_COMPANION_SESSION_GENERATION='[a-f0-9-]+'\n/);
   assert.equal(
-    fs.readFileSync(envFile, "utf8"),
+    fs.readFileSync(envFile, "utf8").replace(/^export CODEX_COMPANION_SESSION_GENERATION='[^']+'\n/, ""),
     `export CODEX_COMPANION_SESSION_ID='sess-current'\nexport CODEX_COMPANION_TRANSCRIPT_PATH='${transcriptPath}'\nexport CLAUDE_PLUGIN_DATA='${pluginDataDir}'\n`
   );
 });
@@ -2322,7 +2323,7 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
-for (const stalledMethod of ["initialize", "turn/interrupt", "retry"]) {
+for (const stalledMethod of ["initialize", "turn/interrupt", "retry", "invalid-endpoint", "job-write-error", "state-write-error"]) {
   test(`cancel stops its worker when broker stalls at ${stalledMethod}`, async (t) => {
     const repo = makeTempDir();
     const binDir = makeTempDir();
@@ -2353,7 +2354,7 @@ for (const stalledMethod of ["initialize", "turn/interrupt", "retry"]) {
       for (const socket of sockets) socket.destroy();
       return new Promise((resolve) => server.close(resolve));
     });
-    saveBrokerSession(repo, { endpoint: `unix:${socketPath}` });
+    saveBrokerSession(repo, { endpoint: stalledMethod === "invalid-endpoint" ? "invalid-endpoint" : `unix:${socketPath}` });
     const worker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
     t.after(() => worker.kill());
     const job = {
@@ -2390,14 +2391,86 @@ for (const stalledMethod of ["initialize", "turn/interrupt", "retry"]) {
       assert.equal(worker.signalCode, null);
       assert.equal(readJobFile(resolveJobFile(repo, job.id)).cancellationPid, worker.pid);
     }
-    const result = await cancel(buildEnv(binDir));
-    assert.equal(result.status, 0, result.stderr);
-    const payload = JSON.parse(result.stdout);
-    assert.equal(payload.status, "cancelled");
-    assert.equal(payload.turnInterrupted, false);
-    assert.equal(interrupted, stalledMethod !== "initialize");
+    let env = buildEnv(binDir);
+    const writeFailure = stalledMethod.endsWith("write-error");
+    if (writeFailure) {
+      const preload = path.join(binDir, "deny-publication.cjs");
+      const target = stalledMethod === "job-write-error" ? resolveJobFile(repo, job.id) : path.join(resolveStateDir(repo), "state.json");
+      fs.writeFileSync(preload, `
+        const fs = require("node:fs");
+        const rename = fs.renameSync;
+        fs.renameSync = (from, to) => {
+          if (to === ${JSON.stringify(target)}) throw new Error("Injected persistence failure");
+          return rename(from, to);
+        };
+      `);
+      env = { ...env, NODE_OPTIONS: `--require=${preload}` };
+    }
+    const result = await cancel(env);
+    assert.equal(result.status, writeFailure ? 1 : 0, result.stderr);
+    if (writeFailure) {
+      assert.match(result.stderr, /Injected persistence failure/);
+    } else {
+      const payload = JSON.parse(result.stdout);
+      assert.equal(payload.status, "cancelled");
+      assert.equal(payload.turnInterrupted, false);
+    }
+    assert.equal(interrupted, !["initialize", "invalid-endpoint", "job-write-error", "state-write-error"].includes(stalledMethod));
     await waitFor(() => worker.exitCode !== null || worker.signalCode !== null);
-    assert.equal(readJobFile(resolveJobFile(repo, job.id)).status, "cancelled");
+    assert.equal(reconcileTrackedJobs(repo)[0].status, "cancelled");
+  });
+}
+
+for (const hasState of [false, true]) {
+  test(`session end fences an unindexed worker (state exists: ${hasState}) and allows a fresh session start`, async (t) => {
+    const repo = makeTempDir();
+    initGitRepo(repo);
+    if (hasState) saveState(repo, { jobs: [] });
+    const marker = path.join(repo, "published");
+    const release = path.join(repo, "release");
+    const ran = path.join(repo, "runner-called");
+    const job = { id: "late-session-job", workspaceRoot: repo, sessionId: "session-late", status: "queued" };
+    const jobFile = resolveJobFile(repo, job.id);
+    const preload = path.join(repo, "pause-publication.cjs");
+    fs.writeFileSync(preload, `
+      const fs = require("node:fs");
+      const rename = fs.renameSync;
+      fs.renameSync = (from, to) => {
+        rename(from, to);
+        if (to === ${JSON.stringify(jobFile)}) {
+          fs.writeFileSync(${JSON.stringify(marker)}, "ready");
+          while (!fs.existsSync(${JSON.stringify(release)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+        }
+      };
+    `);
+    const child = spawn(process.execPath, ["--require", preload, "--input-type=module", "-e", `
+      import fs from "node:fs";
+      import { runTrackedJob } from ${JSON.stringify(new URL("../plugins/codex/scripts/lib/tracked-jobs.mjs", import.meta.url).href)};
+      await runTrackedJob(${JSON.stringify(job)}, async () => { fs.writeFileSync(${JSON.stringify(ran)}, "ran"); return { exitStatus: 0 }; });
+    `], { cwd: repo, stdio: "ignore", timeout: 10000 });
+    t.after(() => { fs.writeFileSync(release, "go"); child.kill(); });
+    await waitFor(() => fs.existsSync(marker));
+    const ended = run(process.execPath, [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo, input: JSON.stringify({ cwd: repo, session_id: job.sessionId })
+    });
+    assert.equal(ended.status, 0, ended.stderr);
+    fs.writeFileSync(release, "go");
+    await waitFor(() => child.exitCode !== null || child.signalCode !== null);
+    assert.equal(child.exitCode, 0);
+    assert.equal(fs.existsSync(ran), false);
+    assert.deepEqual(listJobs(repo), []);
+
+    const started = run(process.execPath, [SESSION_HOOK, "SessionStart"], {
+      cwd: repo, input: JSON.stringify({ cwd: repo, session_id: job.sessionId })
+    });
+    assert.equal(started.status, 0, started.stderr);
+    await runTrackedJob(job, async () => assert.fail("Old worker cannot join the resumed session"));
+    const fresh = createJobRecord({ id: "fresh-session-job", workspaceRoot: repo, status: "queued" }, {
+      env: { CODEX_COMPANION_SESSION_ID: job.sessionId }
+    });
+    let ranFresh = false;
+    await runTrackedJob(fresh, async () => { ranFresh = true; return { exitStatus: 0 }; });
+    assert.equal(ranFresh, true);
   });
 }
 

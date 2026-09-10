@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 
 import { getCodexAvailability } from "./lib/codex.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
-import { getConfig } from "./lib/state.mjs";
+import { getConfig, readSessionState, SESSION_GENERATION_ENV } from "./lib/state.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
 import { GATE_KEY_ENV, reconcileTrackedJobs, SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
@@ -57,13 +57,15 @@ function buildStopReviewPrompt(input = {}) {
   });
 }
 
-function getGateKey(input = {}) {
+function getGateKey(input = {}, cwd) {
   const sessionId = input.session_id || process.env[SESSION_ID_ENV] || "";
   const lastAssistantMessage = String(input.last_assistant_message ?? "");
   if (!sessionId || !lastAssistantMessage) {
     return null;
   }
-  return createHash("sha256").update(`${sessionId}\0${lastAssistantMessage}`).digest("hex");
+  const generation = process.env[SESSION_GENERATION_ENV] ?? readSessionState(cwd, sessionId)?.generation;
+  const sessionKey = generation ? `${sessionId}\0${generation}` : sessionId;
+  return createHash("sha256").update(`${sessionKey}\0${lastAssistantMessage}`).digest("hex");
 }
 
 function gateJobNote(job) {
@@ -192,7 +194,7 @@ function main() {
     return;
   }
 
-  const gateKey = getGateKey(input);
+  const gateKey = getGateKey(input, workspaceRoot);
   const cachedJob = getGateJob(jobs, gateKey);
   if (cachedJob) {
     const review = cachedJob.status === "completed" ? parseStoredGateReview(cachedJob) : { ok: false, reason: gateJobNote(cachedJob) };

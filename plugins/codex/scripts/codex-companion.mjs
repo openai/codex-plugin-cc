@@ -998,32 +998,34 @@ async function handleCancel(argv) {
     errorMessage: "Cancelled by user."
   };
 
-  const terminal = terminalizeTrackedJob(workspaceRoot, {
-    ...existing,
-    ...nextJob
-  }, {
-    ...nextJob,
-    cancellationPid,
-    cancelledAt: completedAt
-  });
-  if (!terminal.claimed && terminal.job?.status !== "cancelled") {
-    const firstOutcome = terminal.job ?? job;
-    const payload = {
-      jobId: job.id,
-      status: firstOutcome.status,
-      title: job.title,
-      turnInterruptAttempted: false,
-      turnInterrupted: false
-    };
-    outputCommandResult(payload, renderCancelReport(firstOutcome), options.json);
-    return;
-  }
-
   let interrupt;
+  let stopWorker = true;
   try {
+    const terminal = terminalizeTrackedJob(workspaceRoot, {
+      ...existing,
+      ...nextJob
+    }, {
+      ...nextJob,
+      cancellationPid,
+      cancelledAt: completedAt
+    });
+    if (!terminal.claimed && terminal.job?.status !== "cancelled") {
+      stopWorker = false;
+      const firstOutcome = terminal.job ?? job;
+      const payload = {
+        jobId: job.id,
+        status: firstOutcome.status,
+        title: job.title,
+        turnInterruptAttempted: false,
+        turnInterrupted: false
+      };
+      outputCommandResult(payload, renderCancelReport(firstOutcome), options.json);
+      return;
+    }
+
     interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
   } finally {
-    terminateProcessTree(cancellationPid ?? Number.NaN);
+    if (stopWorker) terminateProcessTree(cancellationPid ?? Number.NaN);
   }
   if (interrupt.attempted) {
     appendLogLine(

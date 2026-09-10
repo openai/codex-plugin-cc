@@ -13,7 +13,7 @@ import {
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { listJobs, resolveStateFile, updateState } from "./lib/state.mjs";
+import { listJobs, resolveStateFile, SESSION_GENERATION_ENV, setSessionLifecycle, updateState } from "./lib/state.mjs";
 import { markTrackedJobRemoved, readEffectiveStoredJob } from "./lib/tracked-jobs.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
@@ -55,6 +55,11 @@ function cleanupSessionJobs(cwd, sessionId) {
   }
 
   const workspaceRoot = resolveWorkspaceRoot(cwd);
+  try {
+    setSessionLifecycle(workspaceRoot, sessionId, true);
+  } catch (error) {
+    warnSessionCleanup("could not fence its session", error);
+  }
   const stateFile = resolveStateFile(workspaceRoot);
   if (!fs.existsSync(stateFile)) {
     return;
@@ -118,6 +123,10 @@ function cleanupSessionJobs(cwd, sessionId) {
 }
 
 function handleSessionStart(input) {
+  if (input.session_id) {
+    const generation = setSessionLifecycle(input.cwd || process.cwd(), input.session_id, false);
+    appendEnvVar(SESSION_GENERATION_ENV, generation);
+  }
   appendEnvVar(SESSION_ID_ENV, input.session_id);
   appendEnvVar(TRANSCRIPT_PATH_ENV, input.transcript_path);
   appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
