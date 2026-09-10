@@ -986,6 +986,7 @@ async function handleCancel(argv) {
   const existing = readStoredJob(workspaceRoot, job.id) ?? {};
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
+  const cancellationPid = existing.cancellationPid ?? job.cancellationPid ?? job.pid ?? null;
 
   const completedAt = nowIso();
   const nextJob = {
@@ -1002,9 +1003,10 @@ async function handleCancel(argv) {
     ...nextJob
   }, {
     ...nextJob,
+    cancellationPid,
     cancelledAt: completedAt
   });
-  if (!terminal.claimed) {
+  if (!terminal.claimed && terminal.job?.status !== "cancelled") {
     const firstOutcome = terminal.job ?? job;
     const payload = {
       jobId: job.id,
@@ -1017,7 +1019,12 @@ async function handleCancel(argv) {
     return;
   }
 
-  const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
+  let interrupt;
+  try {
+    interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
+  } finally {
+    terminateProcessTree(cancellationPid ?? Number.NaN);
+  }
   if (interrupt.attempted) {
     appendLogLine(
       job.logFile,
@@ -1026,7 +1033,6 @@ async function handleCancel(argv) {
         : `Codex turn interrupt failed${interrupt.detail ? `: ${interrupt.detail}` : "."}`
     );
   }
-  terminateProcessTree(job.pid ?? Number.NaN);
   appendLogLine(job.logFile, "Cancelled by user.");
 
   const payload = {

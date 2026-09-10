@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { isProcessAlive } from "./process.mjs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
 import { getConfig } from "./state.mjs";
@@ -278,7 +279,8 @@ export function resolveResultJob(cwd, reference) {
 export function resolveCancelableJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const jobs = sortJobsNewestFirst(reconcileTrackedJobs(workspaceRoot));
-  const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
+  const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running" ||
+    (job.status === "cancelled" && isProcessAlive(job.cancellationPid)));
 
   if (reference) {
     const selected = matchJobReference(activeJobs, reference);

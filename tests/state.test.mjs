@@ -108,6 +108,20 @@ test("saveState reaps a lock left by a dead owner", () => {
   assert.equal(fs.existsSync(path.join(stateDir, ".state.lock")), false);
 });
 
+test("saveState recovers dead reapers as well as the original dead owner", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(stateDir, { recursive: true });
+  for (const suffix of ["", ".reap", ".reap.reap"]) {
+    fs.writeFileSync(path.join(stateDir, `.state.lock${suffix}`), JSON.stringify({
+      pid: 2147483647, token: `dead${suffix}`, createdAt: "2026-08-19T12:00:00.000Z"
+    }));
+  }
+  saveState(workspace, { config: { stopReviewGate: true }, jobs: [] });
+  assert.equal(loadState(workspace).config.stopReviewGate, true);
+  assert.deepEqual(fs.readdirSync(stateDir).filter((name) => name.startsWith(".state.lock")), []);
+});
+
 test("saveState bounds waiting when a dead lock cannot acquire its reap guard", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);

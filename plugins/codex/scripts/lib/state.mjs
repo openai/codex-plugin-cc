@@ -143,6 +143,11 @@ function reapDeadStateLock(lockFile, owner) {
   const reapFile = `${lockFile}.reap`;
   const token = randomUUID();
   if (!tryCreateStateLock(reapFile, { pid: process.pid, token, createdAt: nowIso() })) {
+    const reaper = readStateLockOwner(reapFile);
+    if (!isProcessAlive(reaper.pid)) {
+      // Serialize recovery of the guard just like recovery of the original lock.
+      reapDeadStateLock(reapFile, reaper);
+    }
     return false;
   }
   try {

@@ -2322,6 +2322,85 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
+for (const stalledMethod of ["initialize", "turn/interrupt", "retry"]) {
+  test(`cancel stops its worker when broker stalls at ${stalledMethod}`, async (t) => {
+    const repo = makeTempDir();
+    const binDir = makeTempDir();
+    initGitRepo(repo);
+    installFakeCodex(binDir, "interruptible-slow-task");
+    const socketPath = path.join(makeTempDir(), "cancel-broker.sock");
+    const sockets = new Set();
+    let interrupted = false;
+    const server = net.createServer((socket) => {
+      sockets.add(socket);
+      socket.on("close", () => sockets.delete(socket));
+      let buffer = "";
+      socket.on("data", (chunk) => {
+        buffer += chunk;
+        let end;
+        while ((end = buffer.indexOf("\n")) !== -1) {
+          const message = JSON.parse(buffer.slice(0, end));
+          buffer = buffer.slice(end + 1);
+          if (message.method === "initialize" && stalledMethod !== "initialize") {
+            socket.write(`${JSON.stringify({ id: message.id, result: {} })}\n`);
+          }
+          if (message.method === "turn/interrupt") interrupted = true;
+        }
+      });
+    });
+    await new Promise((resolve) => server.listen(socketPath, resolve));
+    t.after(() => {
+      for (const socket of sockets) socket.destroy();
+      return new Promise((resolve) => server.close(resolve));
+    });
+    saveBrokerSession(repo, { endpoint: `unix:${socketPath}` });
+    const worker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+    t.after(() => worker.kill());
+    const job = {
+      id: "cancel-stalled", workspaceRoot: repo, status: "running", pid: worker.pid,
+      threadId: "thread-1", turnId: "turn-1", createdAt: new Date().toISOString()
+    };
+    writeJobFile(repo, job.id, job);
+    upsertJob(repo, job);
+    const cancel = (env) => new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [SCRIPT, "cancel", job.id, "--json"], {
+        cwd: repo, env, timeout: 8000, stdio: ["ignore", "pipe", "pipe"]
+      });
+      let stdout = "", stderr = "";
+      child.stdout.on("data", (chunk) => { stdout += chunk; });
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+      child.on("error", reject);
+      child.on("close", (status) => resolve({ status, stdout, stderr }));
+    });
+    if (stalledMethod === "retry") {
+      const preload = path.join(binDir, "deny-worker-kill.cjs");
+      fs.writeFileSync(preload, `
+        const kill = process.kill.bind(process);
+        process.kill = (pid, signal) => {
+          if (Math.abs(pid) === ${worker.pid} && signal !== 0) {
+            throw Object.assign(new Error("Injected worker termination failure"), { code: "EPERM" });
+          }
+          return kill(pid, signal);
+        };
+      `);
+      const failed = await cancel({ ...buildEnv(binDir), NODE_OPTIONS: `--require=${preload}` });
+      assert.equal(failed.status, 1, failed.stderr);
+      assert.match(failed.stderr, /Injected worker termination failure/);
+      assert.equal(worker.exitCode, null);
+      assert.equal(worker.signalCode, null);
+      assert.equal(readJobFile(resolveJobFile(repo, job.id)).cancellationPid, worker.pid);
+    }
+    const result = await cancel(buildEnv(binDir));
+    assert.equal(result.status, 0, result.stderr);
+    const payload = JSON.parse(result.stdout);
+    assert.equal(payload.status, "cancelled");
+    assert.equal(payload.turnInterrupted, false);
+    assert.equal(interrupted, stalledMethod !== "initialize");
+    await waitFor(() => worker.exitCode !== null || worker.signalCode !== null);
+    assert.equal(readJobFile(resolveJobFile(repo, job.id)).status, "cancelled");
+  });
+}
+
 test("session end fully cleans up jobs for the ending session", async (t) => {
   const repo = makeTempDir();
   initGitRepo(repo);
