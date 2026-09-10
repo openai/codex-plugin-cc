@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
+import net from "node:net";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -2461,6 +2462,314 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
       "review-running.removed"
     ].sort()
   );
+});
+
+test("session end fences and stops workers while another process holds the state lock", async (t) => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const spawnSleeper = () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      cwd: repo,
+      detached: true,
+      stdio: "ignore"
+    });
+    child.unref();
+    t.after(() => {
+      try {
+        process.kill(-child.pid, "SIGTERM");
+      } catch {
+        try {
+          process.kill(child.pid, "SIGTERM");
+        } catch {
+          // Ignore missing process.
+        }
+      }
+    });
+    return child;
+  };
+
+  const worker = spawnSleeper();
+  const lockOwner = spawnSleeper();
+
+  const runningJobFile = path.join(jobsDir, "review-running.json");
+  fs.writeFileSync(runningJobFile, JSON.stringify({ id: "review-running" }, null, 2), "utf8");
+  fs.writeFileSync(
+    runningJobFile.replace(/\.json$/, ".started.json"),
+    JSON.stringify({ status: "running", pid: worker.pid, startedAt: "2026-08-19T12:00:00.000Z" }),
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "review-running",
+            status: "running",
+            title: "Codex Review",
+            sessionId: "sess-current",
+            pid: worker.pid,
+            createdAt: "2026-03-18T15:32:00.000Z",
+            updatedAt: "2026-03-18T15:33:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(stateDir, ".state.lock"),
+    JSON.stringify({ pid: lockOwner.pid, token: "live-owner", createdAt: "2026-08-19T12:00:00.000Z" }),
+    "utf8"
+  );
+
+  const startedAt = Date.now();
+  const result = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      CODEX_COMPANION_SESSION_ID: "sess-current"
+    },
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      session_id: "sess-current",
+      cwd: repo
+    })
+  });
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /could not prune its state/);
+  assert.ok(elapsedMs < 5000, `SessionEnd cleanup took ${elapsedMs}ms while the state lock was held`);
+  assert.equal(fs.existsSync(path.join(jobsDir, "review-running.removed")), true);
+
+  await waitFor(() => {
+    try {
+      process.kill(worker.pid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  });
+});
+
+test("session end still fences and stops the rest of the batch when a job file is corrupt", async (t) => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const worker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    cwd: repo,
+    detached: true,
+    stdio: "ignore"
+  });
+  worker.unref();
+  t.after(() => {
+    try {
+      process.kill(-worker.pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(worker.pid, "SIGTERM");
+      } catch {
+        // Ignore missing process.
+      }
+    }
+  });
+
+  fs.writeFileSync(path.join(jobsDir, "review-corrupt.json"), "{ not json", "utf8");
+  const liveJobFile = path.join(jobsDir, "review-live.json");
+  fs.writeFileSync(liveJobFile, JSON.stringify({ id: "review-live" }, null, 2), "utf8");
+  fs.writeFileSync(
+    liveJobFile.replace(/\.json$/, ".started.json"),
+    JSON.stringify({ status: "running", pid: worker.pid, startedAt: "2026-08-19T12:00:00.000Z" }),
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "review-corrupt",
+            status: "running",
+            title: "Codex Review",
+            sessionId: "sess-current",
+            pid: null,
+            createdAt: "2026-03-18T15:30:00.000Z",
+            updatedAt: "2026-03-18T15:31:00.000Z"
+          },
+          {
+            id: "review-live",
+            status: "running",
+            title: "Codex Review",
+            sessionId: "sess-current",
+            pid: null,
+            createdAt: "2026-03-18T15:32:00.000Z",
+            updatedAt: "2026-03-18T15:33:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      CODEX_COMPANION_SESSION_ID: "sess-current"
+    },
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      session_id: "sess-current",
+      cwd: repo
+    })
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(path.join(jobsDir, "review-corrupt.removed")), true);
+  assert.equal(fs.existsSync(path.join(jobsDir, "review-live.removed")), true);
+
+  await waitFor(() => {
+    try {
+      process.kill(worker.pid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  });
+});
+
+test("session end finishes its teardown when the state file cannot be read", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+
+  const stateDir = resolveStateDir(repo);
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "state.json"), "{ not json", "utf8");
+  saveBrokerSession(repo, { endpoint: `unix:${path.join(makeTempDir(), "missing-broker.sock")}` });
+
+  const result = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      CODEX_COMPANION_SESSION_ID: "sess-current"
+    },
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      session_id: "sess-current",
+      cwd: repo
+    })
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /could not read its job list/);
+  assert.equal(loadBrokerSession(repo), null);
+});
+
+test("session end stops session workers even when the broker never answers its shutdown", async (t) => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+
+  const socketPath = path.join(makeTempDir(), "silent-broker.sock");
+  const server = net.createServer((socket) => {
+    // Accepted connections are deliberately left unanswered; draining the
+    // socket lets it observe the hook's close so server.close() can finish.
+    socket.resume();
+  });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  saveBrokerSession(repo, { endpoint: `unix:${socketPath}` });
+
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const worker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    cwd: repo,
+    detached: true,
+    stdio: "ignore"
+  });
+  worker.unref();
+  t.after(() => {
+    try {
+      process.kill(-worker.pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(worker.pid, "SIGTERM");
+      } catch {
+        // Ignore missing process.
+      }
+    }
+  });
+
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "review-live",
+            status: "running",
+            title: "Codex Review",
+            sessionId: "sess-current",
+            pid: worker.pid,
+            createdAt: "2026-03-18T15:32:00.000Z",
+            updatedAt: "2026-03-18T15:33:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const startedAt = Date.now();
+  const result = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      CODEX_COMPANION_SESSION_ID: "sess-current"
+    },
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      session_id: "sess-current",
+      cwd: repo
+    })
+  });
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(elapsedMs < 10000, `SessionEnd took ${elapsedMs}ms against an unresponsive broker`);
+  assert.equal(fs.existsSync(path.join(jobsDir, "review-live.removed")), true);
+
+  await waitFor(() => {
+    try {
+      process.kill(worker.pid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  });
 });
 
 test("session end preserves an other-session job added after its stale snapshot", async () => {

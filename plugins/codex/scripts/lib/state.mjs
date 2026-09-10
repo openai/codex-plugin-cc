@@ -161,10 +161,10 @@ function reapDeadStateLock(lockFile, owner) {
   return false;
 }
 
-function withStateLock(cwd, action) {
+function withStateLock(cwd, action, { waitMs = STATE_LOCK_WAIT_MS } = {}) {
   ensureStateDir(cwd);
   const lockFile = path.join(resolveStateDir(cwd), STATE_LOCK_FILE_NAME);
-  const deadline = Date.now() + STATE_LOCK_WAIT_MS;
+  const deadline = Date.now() + waitMs;
   const token = randomUUID();
   while (true) {
     if (tryCreateStateLock(lockFile, { pid: process.pid, token, createdAt: nowIso() })) {
@@ -289,12 +289,12 @@ export function saveState(cwd, state) {
   return withStateLock(cwd, () => saveStateLocked(cwd, state));
 }
 
-export function updateState(cwd, mutate) {
+export function updateState(cwd, mutate, options) {
   return withStateLock(cwd, () => {
     const state = loadState(cwd);
     mutate(state);
     return saveStateLocked(cwd, state);
-  });
+  }, options);
 }
 
 export function isJobRemovedLocked(cwd, jobId) {

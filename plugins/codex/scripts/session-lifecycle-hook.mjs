@@ -13,13 +13,17 @@ import {
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { resolveStateFile, updateState } from "./lib/state.mjs";
+import { listJobs, resolveStateFile, updateState } from "./lib/state.mjs";
 import { markTrackedJobRemoved, readEffectiveStoredJob } from "./lib/tracked-jobs.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
+// SessionEnd runs under a bounded hook timeout, so cleanup fences and stops this
+// session's workers before it ever waits on the shared state lock, and gives the
+// lock a deadline short enough to leave room for the rest of the teardown.
+export const SESSION_END_STATE_LOCK_WAIT_MS = 1000;
 
 function readHookInput() {
   const raw = fs.readFileSync(0, "utf8").trim();
@@ -40,6 +44,11 @@ function appendEnvVar(name, value) {
   fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `export ${name}=${shellEscape(value)}\n`, "utf8");
 }
 
+function warnSessionCleanup(what, error) {
+  const detail = error instanceof Error ? error.message : String(error);
+  process.stderr.write(`Codex Companion session cleanup ${what}: ${detail}\n`);
+}
+
 function cleanupSessionJobs(cwd, sessionId) {
   if (!cwd || !sessionId) {
     return;
@@ -51,25 +60,61 @@ function cleanupSessionJobs(cwd, sessionId) {
     return;
   }
 
-  const pids = [];
-  updateState(workspaceRoot, (state) => {
-    for (const job of state.jobs.filter((candidate) => candidate.sessionId === sessionId)) {
-      const effectiveJob = { ...job, ...(readEffectiveStoredJob(workspaceRoot, job.id) ?? {}) };
-      markTrackedJobRemoved(workspaceRoot, job.id);
+  const fenced = new Set();
+  const fenceSessionJobs = (jobs) => {
+    const pids = [];
+    for (const job of jobs.filter((candidate) => candidate.sessionId === sessionId && !fenced.has(candidate.id))) {
+      fenced.add(job.id);
+      // The stored job carries the live pid, so it is read before the fence makes
+      // it unreadable, but an unreadable job must still be fenced.
+      let effectiveJob = job;
+      try {
+        effectiveJob = { ...job, ...(readEffectiveStoredJob(workspaceRoot, job.id) ?? {}) };
+      } catch (error) {
+        warnSessionCleanup(`could not read job ${job.id}`, error);
+      }
+      try {
+        markTrackedJobRemoved(workspaceRoot, job.id);
+      } catch (error) {
+        warnSessionCleanup(`could not fence job ${job.id}`, error);
+      }
       if (Number.isSafeInteger(effectiveJob.pid) && effectiveJob.pid > 0) {
         pids.push(effectiveJob.pid);
       }
     }
-    state.jobs = state.jobs.filter((job) => job.sessionId !== sessionId);
-  });
+    return pids;
+  };
 
-  for (const pid of pids) {
-    try {
-      terminateProcessTree(pid);
-    } catch {
-      // Ignore teardown failures during session shutdown.
+  const stopWorkers = (pids) => {
+    for (const pid of pids) {
+      try {
+        terminateProcessTree(pid);
+      } catch {
+        // Ignore teardown failures during session shutdown.
+      }
     }
+  };
+
+  try {
+    stopWorkers(fenceSessionJobs(listJobs(workspaceRoot)));
+  } catch (error) {
+    warnSessionCleanup("could not read its job list", error);
   }
+
+  let latePids = [];
+  try {
+    updateState(
+      workspaceRoot,
+      (state) => {
+        latePids = fenceSessionJobs(state.jobs);
+        state.jobs = state.jobs.filter((job) => job.sessionId !== sessionId);
+      },
+      { waitMs: SESSION_END_STATE_LOCK_WAIT_MS }
+    );
+  } catch (error) {
+    warnSessionCleanup("could not prune its state", error);
+  }
+  stopWorkers(latePids);
 }
 
 function handleSessionStart(input) {
