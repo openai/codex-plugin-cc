@@ -210,6 +210,19 @@ test("hooks keep session-end cleanup and stop gating enabled", () => {
   assert.match(source, /session-lifecycle-hook\.mjs/);
 });
 
+test("session end hook timeout leaves margin above its state lock deadline", () => {
+  const hooks = JSON.parse(read("hooks/hooks.json"));
+  const timeoutSeconds = hooks.hooks.SessionEnd[0].hooks[0].timeout;
+  const lockWaitMs = Number(read("scripts/session-lifecycle-hook.mjs").match(/SESSION_END_STATE_LOCK_WAIT_MS = (\d+)/)?.[1]);
+
+  assert.ok(Number.isFinite(timeoutSeconds));
+  assert.ok(Number.isFinite(lockWaitMs));
+  assert.ok(
+    timeoutSeconds * 1000 >= lockWaitMs * 5,
+    `SessionEnd hook timeout ${timeoutSeconds}s must stay well above the ${lockWaitMs}ms state lock deadline`
+  );
+});
+
 test("setup command can offer Codex install and still points users to codex login", () => {
   const setup = read("commands/setup.md");
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");

@@ -1,14 +1,17 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
+import net from "node:net";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { listJobs, readJobFile, resolveJobFile, resolveJobLogFile, resolveStateDir, saveState, upsertJob, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
+import { createJobRecord, createJobProgressUpdater, reconcileTrackedJobs, runTrackedJob, terminalizeTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -26,6 +29,23 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
   throw new Error("Timed out waiting for condition.");
+}
+
+function resolveTerminalFenceFile(workspaceRoot, jobId) {
+  return resolveJobFile(workspaceRoot, jobId).replace(/\.json$/, ".terminal.json");
+}
+
+function runHookAsync(cwd, env, input, script = STOP_HOOK) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [script], { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("close", (status) => resolve({ status, stdout, stderr }));
+    child.stdin.end(input);
+  });
 }
 
 test("setup reports ready when fake codex is installed and authenticated", () => {
@@ -692,8 +712,9 @@ test("session start hook exports the Claude session id, transcript path, and plu
   });
 
   assert.equal(result.status, 0, result.stderr);
+  assert.match(fs.readFileSync(envFile, "utf8"), /^export CODEX_COMPANION_SESSION_GENERATION='[a-f0-9-]+'\n/);
   assert.equal(
-    fs.readFileSync(envFile, "utf8"),
+    fs.readFileSync(envFile, "utf8").replace(/^export CODEX_COMPANION_SESSION_GENERATION='[^']+'\n/, ""),
     `export CODEX_COMPANION_SESSION_ID='sess-current'\nexport CODEX_COMPANION_TRANSCRIPT_PATH='${transcriptPath}'\nexport CLAUDE_PLUGIN_DATA='${pluginDataDir}'\n`
   );
 });
@@ -969,6 +990,331 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
 });
 
+test("background task publishes its queued record before spawning the detached worker", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const markerFile = path.join(makeTempDir(), "task-worker-spawned-at");
+  const preloadFile = path.join(makeTempDir(), "record-task-worker-spawn.cjs");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(
+    preloadFile,
+    [
+      'const fs = require("node:fs");',
+      'const childProcess = require("node:child_process");',
+      "const originalSpawn = childProcess.spawn;",
+      "childProcess.spawn = (...args) => {",
+      '  if (args[1]?.includes("task-worker")) fs.writeFileSync(process.env.CODEX_TASK_WORKER_SPAWN_MARKER, String(Date.now()));',
+      "  return originalSpawn(...args);",
+      "};"
+    ].join("\n"),
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "task", "--background", "--json", "check queue publication"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      CODEX_TASK_WORKER_SPAWN_MARKER: markerFile,
+      NODE_OPTIONS: `--require ${preloadFile}`
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const jobId = JSON.parse(result.stdout).jobId;
+  const jobFile = resolveJobFile(repo, jobId);
+  assert.equal(fs.existsSync(jobFile), true);
+  assert.ok(fs.statSync(jobFile).mtimeMs <= Number(fs.readFileSync(markerFile, "utf8")));
+});
+
+test("terminal job fence prevents a queued worker from running", async () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-fenced", workspaceRoot, status: "queued", request: { prompt: "do not run" } };
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, job);
+  fs.writeFileSync(
+    resolveTerminalFenceFile(workspaceRoot, job.id),
+    JSON.stringify({ status: "cancelled", completedAt: "2026-08-19T12:00:00.000Z" }),
+    "utf8"
+  );
+
+  let runnerInvoked = false;
+  const result = await runTrackedJob(job, async () => {
+    runnerInvoked = true;
+    return { exitStatus: 0 };
+  });
+
+  assert.equal(runnerInvoked, false);
+  assert.equal(result.status, "cancelled");
+  assert.equal(readJobFile(resolveJobFile(workspaceRoot, job.id)).status, "queued");
+});
+
+test("terminal initial claim prevents a late worker from publishing running state", async () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-initial-terminal", workspaceRoot, status: "queued", request: { prompt: "do not run" } };
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, job);
+  fs.writeFileSync(
+    resolveJobFile(workspaceRoot, job.id).replace(/\.json$/, ".started.json"),
+    JSON.stringify({ status: "failed", completedAt: "2026-08-19T12:00:00.000Z" }),
+    "utf8"
+  );
+
+  let runnerInvoked = false;
+  const result = await runTrackedJob(job, async () => {
+    runnerInvoked = true;
+    return { exitStatus: 0 };
+  });
+
+  assert.equal(runnerInvoked, false);
+  assert.equal(result.status, "failed");
+  assert.equal(readJobFile(resolveJobFile(workspaceRoot, job.id)).status, "queued");
+});
+
+test("terminalizer that loses the initial claim to running wins the terminal fence", () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-stage-two", workspaceRoot, status: "queued" };
+  const jobFile = resolveJobFile(workspaceRoot, job.id);
+  const initialFile = jobFile.replace(/\.json$/, ".started.json");
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, job);
+  const originalOpen = fs.openSync;
+  let intercepted = false;
+  fs.openSync = (file, flags, ...rest) => {
+    if (!intercepted && file === initialFile && flags === "wx") {
+      intercepted = true;
+      fs.writeFileSync(initialFile, JSON.stringify({ status: "running", pid: process.pid, startedAt: "2026-08-19T12:00:00.000Z" }));
+    }
+    return originalOpen(file, flags, ...rest);
+  };
+  try {
+    const result = terminalizeTrackedJob(workspaceRoot, job, { status: "cancelled", completedAt: "2026-08-19T12:01:00.000Z" });
+    assert.equal(result.claimed, true);
+    assert.equal(result.job.status, "cancelled");
+  } finally {
+    fs.openSync = originalOpen;
+  }
+});
+
+test("terminalization and reconciliation never return null jobs after removal races", () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-mutable-gone", workspaceRoot, status: "running" };
+  const jobFile = resolveJobFile(workspaceRoot, job.id);
+  upsertJob(workspaceRoot, job);
+  fs.writeFileSync(
+    jobFile.replace(/\.json$/, ".started.json"),
+    JSON.stringify({ status: "running", pid: process.pid, startedAt: "2026-08-19T12:00:00.000Z" }),
+    "utf8"
+  );
+  fs.writeFileSync(
+    resolveTerminalFenceFile(workspaceRoot, job.id),
+    JSON.stringify({ status: "failed", completedAt: "2026-08-19T12:01:00.000Z" }),
+    "utf8"
+  );
+
+  const result = terminalizeTrackedJob(workspaceRoot, job, { status: "cancelled", completedAt: "2026-08-19T12:02:00.000Z" });
+  assert.equal(result.job.status, "cancelled");
+
+  fs.writeFileSync(jobFile.replace(/\.json$/, ".removed"), "", "utf8");
+  assert.deepEqual(reconcileTrackedJobs(workspaceRoot), []);
+});
+
+test("terminal admission claim after running publication prevents runner invocation", async () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-admission-terminal", workspaceRoot, status: "queued" };
+  const jobFile = resolveJobFile(workspaceRoot, job.id);
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, job);
+  fs.writeFileSync(jobFile.replace(/\.json$/, ".started.json"), JSON.stringify({ status: "running", pid: process.pid, startedAt: "2026-08-19T12:00:00.000Z" }));
+  const terminal = terminalizeTrackedJob(workspaceRoot, job, { status: "cancelled", completedAt: "2026-08-19T12:01:00.000Z" });
+  let invoked = false;
+  const result = await runTrackedJob(job, async () => {
+    invoked = true;
+    return { exitStatus: 0 };
+  });
+  assert.equal(terminal.claimed, true);
+  assert.equal(result.status, "cancelled");
+  assert.equal(invoked, false);
+});
+
+test("admitted running job uses the later terminal fence", () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-admitted", workspaceRoot, status: "running" };
+  const jobFile = resolveJobFile(workspaceRoot, job.id);
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, job);
+  fs.writeFileSync(jobFile.replace(/\.json$/, ".started.json"), JSON.stringify({ status: "running", pid: process.pid, startedAt: "2026-08-19T12:00:00.000Z" }));
+  fs.writeFileSync(jobFile.replace(/\.json$/, ".admission.json"), JSON.stringify({ status: "admitted" }));
+  const result = terminalizeTrackedJob(workspaceRoot, job, { status: "cancelled", completedAt: "2026-08-19T12:01:00.000Z" });
+  assert.equal(result.claimed, true);
+  assert.equal(result.job.status, "cancelled");
+  assert.equal(fs.existsSync(resolveTerminalFenceFile(workspaceRoot, job.id)), true);
+});
+
+test("corrupt admission fails closed before runner invocation", async () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-admission-corrupt", workspaceRoot, status: "queued" };
+  const jobFile = resolveJobFile(workspaceRoot, job.id);
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, job);
+  fs.writeFileSync(jobFile.replace(/\.json$/, ".started.json"), JSON.stringify({ status: "running", pid: process.pid, startedAt: "2026-08-19T12:00:00.000Z" }));
+  fs.writeFileSync(jobFile.replace(/\.json$/, ".admission.json"), "{");
+  let invoked = false;
+  const result = await runTrackedJob(job, async () => {
+    invoked = true;
+    return { exitStatus: 0 };
+  });
+  assert.equal(result.status, "failed");
+  assert.equal(invoked, false);
+});
+
+test("progress updates an unindexed mutable job without making it visible", () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-unindexed-progress", workspaceRoot, status: "running" };
+  writeJobFile(workspaceRoot, job.id, job);
+
+  createJobProgressUpdater(workspaceRoot, job.id)({ phase: "investigating" });
+
+  assert.deepEqual(listJobs(workspaceRoot), []);
+  assert.equal(readJobFile(resolveJobFile(workspaceRoot, job.id)).phase, "investigating");
+});
+
+test("terminal job reconciliation wins over late worker finalization", async () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-race", workspaceRoot, status: "queued" };
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, job);
+
+  let releaseRunner;
+  const runnerStarted = new Promise((resolve) => {
+    releaseRunner = resolve;
+  });
+  const execution = runTrackedJob(job, async () => {
+    await runnerStarted;
+    return { exitStatus: 0 };
+  });
+
+  await waitFor(() => listJobs(workspaceRoot).some((candidate) => candidate.id === job.id && candidate.status === "running"));
+  reconcileTrackedJobs(workspaceRoot, {
+    killImpl() {
+      throw Object.assign(new Error("gone"), { code: "ESRCH" });
+    }
+  });
+  releaseRunner();
+  const result = await execution;
+
+  assert.equal(result.status, "failed");
+  assert.equal(listJobs(workspaceRoot).find((candidate) => candidate.id === job.id).status, "failed");
+  assert.equal(readJobFile(resolveJobFile(workspaceRoot, job.id)).status, "failed");
+});
+
+test("removed fence claimed during completion suppresses stale runner output", async () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-remove-at-terminal", workspaceRoot, status: "queued" };
+  const jobFile = writeJobFile(workspaceRoot, job.id, job);
+  const terminalFile = resolveTerminalFenceFile(workspaceRoot, job.id);
+  const removedFile = jobFile.replace(/\.json$/, ".removed");
+  upsertJob(workspaceRoot, job);
+  const originalOpen = fs.openSync;
+  let runnerInvoked = false;
+  fs.openSync = (file, flags, ...rest) => {
+    if (file === terminalFile && flags === "wx" && !fs.existsSync(removedFile)) {
+      fs.writeFileSync(removedFile, "", "utf8");
+    }
+    return originalOpen(file, flags, ...rest);
+  };
+  try {
+    const result = await runTrackedJob(job, async () => {
+      runnerInvoked = true;
+      return { exitStatus: 0, payload: { rawOutput: "ALLOW: stale" }, rendered: "ALLOW: stale" };
+    });
+    assert.equal(result.removed, true);
+  } finally {
+    fs.openSync = originalOpen;
+  }
+  assert.equal(runnerInvoked, true);
+});
+
+test("reconciliation fails a running job with an invalid process id", () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-invalid-pid", workspaceRoot, status: "running", pid: null };
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, job);
+
+  const [result] = reconcileTrackedJobs(workspaceRoot);
+  assert.equal(result.status, "failed");
+  assert.match(result.errorMessage, /invalid process id/i);
+});
+
+test("reconciliation fails a queued job without a valid creation time", () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-invalid-queued-time", workspaceRoot, status: "queued", pid: null, createdAt: "not-a-date" };
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, job);
+
+  const [result] = reconcileTrackedJobs(workspaceRoot);
+  assert.equal(result.status, "failed");
+  assert.match(result.errorMessage, /invalid creation time/i);
+});
+
+test("removed job terminal fence prevents progress and finalization from recreating it", async () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-removed", workspaceRoot, status: "queued" };
+  writeJobFile(workspaceRoot, job.id, job);
+  upsertJob(workspaceRoot, job);
+  const progress = createJobProgressUpdater(workspaceRoot, job.id);
+
+  let releaseRunner;
+  const runnerStarted = new Promise((resolve) => {
+    releaseRunner = resolve;
+  });
+  const execution = runTrackedJob(job, async () => {
+    await runnerStarted;
+    return { exitStatus: 0 };
+  });
+
+  await waitFor(() => listJobs(workspaceRoot).some((candidate) => candidate.id === job.id && candidate.status === "running"));
+  fs.writeFileSync(resolveJobFile(workspaceRoot, job.id).replace(/\.json$/, ".removed"), "", "utf8");
+  saveState(workspaceRoot, { config: { stopReviewGate: false }, jobs: [] });
+  progress({ phase: "investigating" });
+  releaseRunner();
+  await execution;
+
+  assert.deepEqual(listJobs(workspaceRoot), []);
+  assert.equal(fs.existsSync(resolveJobFile(workspaceRoot, job.id)), false);
+});
+
+test("removal between the pre-admission check and claim prevents runner invocation", async () => {
+  const workspaceRoot = makeTempDir();
+  const job = { id: "task-remove-before-admission", workspaceRoot, status: "queued" };
+  const jobFile = writeJobFile(workspaceRoot, job.id, job);
+  const removedFile = jobFile.replace(/\.json$/, ".removed");
+  upsertJob(workspaceRoot, job);
+  const originalExists = fs.existsSync;
+  let removalChecks = 0;
+  let invoked = false;
+  fs.existsSync = (file) => {
+    if (file === removedFile && ++removalChecks === 2) {
+      fs.writeFileSync(removedFile, "", "utf8");
+      return false;
+    }
+    return originalExists(file);
+  };
+  try {
+    const result = await runTrackedJob(job, async () => {
+      invoked = true;
+      return { exitStatus: 0 };
+    });
+    assert.equal(result.removed, true);
+  } finally {
+    fs.existsSync = originalExists;
+  }
+  assert.equal(invoked, false);
+});
+
 test("review rejects focus text because it is native-review only", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -1108,6 +1454,7 @@ test("status shows phases, hints, and the latest finished job", () => {
             kind: "review",
             kindLabel: "review",
             status: "running",
+            pid: process.pid,
             title: "Codex Review",
             jobClass: "review",
             phase: "reviewing",
@@ -1251,6 +1598,7 @@ test("status preserves adversarial review kind labels", () => {
             id: "review-adv-live",
             kind: "adversarial-review",
             status: "running",
+            pid: process.pid,
             title: "Codex Adversarial Review",
             jobClass: "review",
             phase: "reviewing",
@@ -1307,6 +1655,7 @@ test("status --wait times out cleanly when a job is still active", () => {
         id: "task-live",
         status: "running",
         title: "Codex Task",
+        pid: process.pid,
         logFile
       },
       null,
@@ -1325,9 +1674,11 @@ test("status --wait times out cleanly when a job is still active", () => {
           {
             id: "task-live",
             status: "running",
+            pid: process.pid,
             title: "Codex Task",
             jobClass: "task",
             summary: "Investigate flaky test",
+            pid: process.pid,
             logFile,
             createdAt: "2026-03-18T15:30:00.000Z",
             startedAt: "2026-03-18T15:30:01.000Z",
@@ -1350,6 +1701,105 @@ test("status --wait times out cleanly when a job is still active", () => {
   assert.equal(payload.job.id, "task-live");
   assert.equal(payload.job.status, "running");
   assert.equal(payload.waitTimedOut, true);
+});
+
+test("status --wait marks a dead worker as failed before timing out", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const logFile = path.join(jobsDir, "task-dead.log");
+  fs.writeFileSync(logFile, "", "utf8");
+  fs.writeFileSync(
+    path.join(jobsDir, "task-dead.json"),
+    JSON.stringify({ id: "task-dead", status: "running", title: "Codex Task", pid: 999999, logFile }, null, 2),
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "task-dead",
+            status: "running",
+            title: "Codex Task",
+            jobClass: "task",
+            pid: 999999,
+            logFile,
+            createdAt: "2026-03-18T15:30:00.000Z",
+            startedAt: "2026-03-18T15:30:01.000Z",
+            updatedAt: "2026-03-18T15:30:02.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "status", "task-dead", "--wait", "--timeout-ms", "25", "--json"], {
+    cwd: workspace
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.job.status, "failed");
+  assert.equal(payload.waitTimedOut, false);
+  assert.match(payload.job.errorMessage, /worker exited/i);
+
+  const rendered = run("node", [SCRIPT, "status", "task-dead"], { cwd: workspace });
+  assert.equal(rendered.status, 0, rendered.stderr);
+  assert.match(rendered.stdout, /Error: Background worker exited before completing the job\./);
+});
+
+test("status marks a queued job past startup grace as failed", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const logFile = path.join(jobsDir, "task-unstarted.log");
+  fs.writeFileSync(logFile, "", "utf8");
+  fs.writeFileSync(
+    path.join(jobsDir, "task-unstarted.json"),
+    JSON.stringify({ id: "task-unstarted", status: "queued", title: "Codex Task", logFile }, null, 2),
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "task-unstarted",
+            status: "queued",
+            title: "Codex Task",
+            jobClass: "task",
+            logFile,
+            createdAt: "2026-03-18T15:30:00.000Z",
+            updatedAt: "2026-03-18T15:30:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "status", "task-unstarted", "--json"], { cwd: workspace });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.job.status, "failed");
+  assert.match(payload.job.errorMessage, /did not start within 5 seconds/i);
 });
 
 test("result returns the stored output for the latest finished job by default", () => {
@@ -1652,6 +2102,7 @@ test("cancel without a job id ignores active jobs from other Claude sessions", (
           {
             id: "task-other",
             status: "running",
+            pid: process.pid,
             title: "Codex Task",
             jobClass: "task",
             sessionId: "sess-other",
@@ -1689,13 +2140,26 @@ test("cancel without a job id ignores active jobs from other Claude sessions", (
   assert.equal(state.jobs[0].status, "running");
 });
 
-test("cancel with a job id can still target an active job from another Claude session", () => {
+test("cancel with a job id can still target an active job from another Claude session", (t) => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
   const jobsDir = path.join(stateDir, "jobs");
   fs.mkdirSync(jobsDir, { recursive: true });
 
   const logFile = path.join(jobsDir, "task-other.log");
+  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+  sleeper.unref();
+  t.after(() => {
+    try {
+      process.kill(-sleeper.pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(sleeper.pid, "SIGTERM");
+      } catch {
+        // Ignore missing process.
+      }
+    }
+  });
   fs.writeFileSync(logFile, "", "utf8");
   fs.writeFileSync(
     path.join(stateDir, "state.json"),
@@ -1707,6 +2171,7 @@ test("cancel with a job id can still target an active job from another Claude se
           {
             id: "task-other",
             status: "running",
+            pid: sleeper.pid,
             title: "Codex Task",
             jobClass: "task",
             sessionId: "sess-other",
@@ -1737,6 +2202,64 @@ test("cancel with a job id can still target an active job from another Claude se
   assert.equal(state.jobs[0].status, "cancelled");
 });
 
+test("cancel reports a completed first terminal outcome without killing the worker", async (t) => {
+  const workspace = makeTempDir();
+  const job = { id: "task-cancel-race", status: "running", title: "Codex Task", jobClass: "task" };
+  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+  sleeper.unref();
+  t.after(() => {
+    try {
+      process.kill(-sleeper.pid, "SIGTERM");
+    } catch {
+      process.kill(sleeper.pid, "SIGTERM");
+    }
+  });
+  const preloadFile = path.join(makeTempDir(), "complete-before-cancel-claim.cjs");
+  const jobFile = resolveJobFile(workspace, job.id);
+  const terminalFile = jobFile.replace(/\.json$/, ".terminal.json");
+  writeJobFile(workspace, job.id, { ...job, pid: sleeper.pid });
+  upsertJob(workspace, { ...job, pid: sleeper.pid });
+  fs.writeFileSync(
+    jobFile.replace(/\.json$/, ".started.json"),
+    JSON.stringify({ status: "running", pid: sleeper.pid, startedAt: "2026-08-19T12:00:00.000Z" }),
+    "utf8"
+  );
+  fs.writeFileSync(jobFile.replace(/\.json$/, ".admission.json"), JSON.stringify({ status: "admitted" }), "utf8");
+  fs.writeFileSync(
+    preloadFile,
+    [
+      'const fs = require("node:fs");',
+      "const originalOpen = fs.openSync;",
+      "let armed = true;",
+      "fs.openSync = (file, flags, ...rest) => {",
+      "  if (armed && file === process.env.CODEX_CANCEL_RACE_FENCE && flags === \"wx\") {",
+      "    armed = false; fs.writeFileSync(file, JSON.stringify({ status: \"completed\", completedAt: \"2026-08-19T12:01:00.000Z\" }));",
+      "  }",
+      "  return originalOpen(file, flags, ...rest);",
+      "};"
+    ].join("\n"),
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "cancel", job.id, "--json"], {
+    cwd: workspace,
+    env: { ...process.env, CODEX_CANCEL_RACE_FENCE: terminalFile, NODE_OPTIONS: `--require ${preloadFile}` }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).status, "completed");
+  assert.doesNotMatch(result.stdout, /Cancelled/i);
+  fs.unlinkSync(terminalFile);
+  const rendered = run("node", [SCRIPT, "cancel", job.id], {
+    cwd: workspace,
+    env: { ...process.env, CODEX_CANCEL_RACE_FENCE: terminalFile, NODE_OPTIONS: `--require ${preloadFile}` }
+  });
+  assert.equal(rendered.status, 0, rendered.stderr);
+  assert.match(rendered.stdout, /already completed/i);
+  assert.doesNotMatch(rendered.stdout, /Cancelled/i);
+  process.kill(sleeper.pid, 0);
+});
+
 test("cancel sends turn interrupt to the shared app-server before killing a brokered task", async () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -1760,8 +2283,7 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
 
   const stateDir = resolveStateDir(repo);
   const runningJob = await waitFor(() => {
-    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
-    const job = state.jobs.find((candidate) => candidate.id === jobId);
+    const job = readJobFile(resolveJobFile(repo, jobId));
     if (job?.status === "running" && job.threadId && job.turnId) {
       return job;
     }
@@ -1801,6 +2323,157 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
+for (const stalledMethod of ["initialize", "turn/interrupt", "retry", "invalid-endpoint", "job-write-error", "state-write-error"]) {
+  test(`cancel stops its worker when broker stalls at ${stalledMethod}`, async (t) => {
+    const repo = makeTempDir();
+    const binDir = makeTempDir();
+    initGitRepo(repo);
+    installFakeCodex(binDir, "interruptible-slow-task");
+    const socketPath = path.join(makeTempDir(), "cancel-broker.sock");
+    const sockets = new Set();
+    let interrupted = false;
+    const server = net.createServer((socket) => {
+      sockets.add(socket);
+      socket.on("close", () => sockets.delete(socket));
+      let buffer = "";
+      socket.on("data", (chunk) => {
+        buffer += chunk;
+        let end;
+        while ((end = buffer.indexOf("\n")) !== -1) {
+          const message = JSON.parse(buffer.slice(0, end));
+          buffer = buffer.slice(end + 1);
+          if (message.method === "initialize" && stalledMethod !== "initialize") {
+            socket.write(`${JSON.stringify({ id: message.id, result: {} })}\n`);
+          }
+          if (message.method === "turn/interrupt") interrupted = true;
+        }
+      });
+    });
+    await new Promise((resolve) => server.listen(socketPath, resolve));
+    t.after(() => {
+      for (const socket of sockets) socket.destroy();
+      return new Promise((resolve) => server.close(resolve));
+    });
+    saveBrokerSession(repo, { endpoint: stalledMethod === "invalid-endpoint" ? "invalid-endpoint" : `unix:${socketPath}` });
+    const worker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+    t.after(() => worker.kill());
+    const job = {
+      id: "cancel-stalled", workspaceRoot: repo, status: "running", pid: worker.pid,
+      threadId: "thread-1", turnId: "turn-1", createdAt: new Date().toISOString()
+    };
+    writeJobFile(repo, job.id, job);
+    upsertJob(repo, job);
+    const cancel = (env) => new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [SCRIPT, "cancel", job.id, "--json"], {
+        cwd: repo, env, timeout: 8000, stdio: ["ignore", "pipe", "pipe"]
+      });
+      let stdout = "", stderr = "";
+      child.stdout.on("data", (chunk) => { stdout += chunk; });
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+      child.on("error", reject);
+      child.on("close", (status) => resolve({ status, stdout, stderr }));
+    });
+    if (stalledMethod === "retry") {
+      const preload = path.join(binDir, "deny-worker-kill.cjs");
+      fs.writeFileSync(preload, `
+        const kill = process.kill.bind(process);
+        process.kill = (pid, signal) => {
+          if (Math.abs(pid) === ${worker.pid} && signal !== 0) {
+            throw Object.assign(new Error("Injected worker termination failure"), { code: "EPERM" });
+          }
+          return kill(pid, signal);
+        };
+      `);
+      const failed = await cancel({ ...buildEnv(binDir), NODE_OPTIONS: `--require=${preload}` });
+      assert.equal(failed.status, 1, failed.stderr);
+      assert.match(failed.stderr, /Injected worker termination failure/);
+      assert.equal(worker.exitCode, null);
+      assert.equal(worker.signalCode, null);
+      assert.equal(readJobFile(resolveJobFile(repo, job.id)).cancellationPid, worker.pid);
+    }
+    let env = buildEnv(binDir);
+    const writeFailure = stalledMethod.endsWith("write-error");
+    if (writeFailure) {
+      const preload = path.join(binDir, "deny-publication.cjs");
+      const target = stalledMethod === "job-write-error" ? resolveJobFile(repo, job.id) : path.join(resolveStateDir(repo), "state.json");
+      fs.writeFileSync(preload, `
+        const fs = require("node:fs");
+        const rename = fs.renameSync;
+        fs.renameSync = (from, to) => {
+          if (to === ${JSON.stringify(target)}) throw new Error("Injected persistence failure");
+          return rename(from, to);
+        };
+      `);
+      env = { ...env, NODE_OPTIONS: `--require=${preload}` };
+    }
+    const result = await cancel(env);
+    assert.equal(result.status, writeFailure ? 1 : 0, result.stderr);
+    if (writeFailure) {
+      assert.match(result.stderr, /Injected persistence failure/);
+    } else {
+      const payload = JSON.parse(result.stdout);
+      assert.equal(payload.status, "cancelled");
+      assert.equal(payload.turnInterrupted, false);
+    }
+    assert.equal(interrupted, !["initialize", "invalid-endpoint", "job-write-error", "state-write-error"].includes(stalledMethod));
+    await waitFor(() => worker.exitCode !== null || worker.signalCode !== null);
+    assert.equal(reconcileTrackedJobs(repo)[0].status, "cancelled");
+  });
+}
+
+for (const hasState of [false, true]) {
+  test(`session end fences an unindexed worker (state exists: ${hasState}) and allows a fresh session start`, async (t) => {
+    const repo = makeTempDir();
+    initGitRepo(repo);
+    if (hasState) saveState(repo, { jobs: [] });
+    const marker = path.join(repo, "published");
+    const release = path.join(repo, "release");
+    const ran = path.join(repo, "runner-called");
+    const job = { id: "late-session-job", workspaceRoot: repo, sessionId: "session-late", status: "queued" };
+    const jobFile = resolveJobFile(repo, job.id);
+    const preload = path.join(repo, "pause-publication.cjs");
+    fs.writeFileSync(preload, `
+      const fs = require("node:fs");
+      const rename = fs.renameSync;
+      fs.renameSync = (from, to) => {
+        rename(from, to);
+        if (to === ${JSON.stringify(jobFile)}) {
+          fs.writeFileSync(${JSON.stringify(marker)}, "ready");
+          while (!fs.existsSync(${JSON.stringify(release)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+        }
+      };
+    `);
+    const child = spawn(process.execPath, ["--require", preload, "--input-type=module", "-e", `
+      import fs from "node:fs";
+      import { runTrackedJob } from ${JSON.stringify(new URL("../plugins/codex/scripts/lib/tracked-jobs.mjs", import.meta.url).href)};
+      await runTrackedJob(${JSON.stringify(job)}, async () => { fs.writeFileSync(${JSON.stringify(ran)}, "ran"); return { exitStatus: 0 }; });
+    `], { cwd: repo, stdio: "ignore", timeout: 10000 });
+    t.after(() => { fs.writeFileSync(release, "go"); child.kill(); });
+    await waitFor(() => fs.existsSync(marker));
+    const ended = run(process.execPath, [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo, input: JSON.stringify({ cwd: repo, session_id: job.sessionId })
+    });
+    assert.equal(ended.status, 0, ended.stderr);
+    fs.writeFileSync(release, "go");
+    await waitFor(() => child.exitCode !== null || child.signalCode !== null);
+    assert.equal(child.exitCode, 0);
+    assert.equal(fs.existsSync(ran), false);
+    assert.deepEqual(listJobs(repo), []);
+
+    const started = run(process.execPath, [SESSION_HOOK, "SessionStart"], {
+      cwd: repo, input: JSON.stringify({ cwd: repo, session_id: job.sessionId })
+    });
+    assert.equal(started.status, 0, started.stderr);
+    await runTrackedJob(job, async () => assert.fail("Old worker cannot join the resumed session"));
+    const fresh = createJobRecord({ id: "fresh-session-job", workspaceRoot: repo, status: "queued" }, {
+      env: { CODEX_COMPANION_SESSION_ID: job.sessionId }
+    });
+    let ranFresh = false;
+    await runTrackedJob(fresh, async () => { ranFresh = true; return { exitStatus: 0 }; });
+    assert.equal(ranFresh, true);
+  });
+}
+
 test("session end fully cleans up jobs for the ending session", async (t) => {
   const repo = makeTempDir();
   initGitRepo(repo);
@@ -1812,9 +2485,9 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   const jobsDir = path.join(stateDir, "jobs");
   fs.mkdirSync(jobsDir, { recursive: true });
 
-  const completedLog = path.join(jobsDir, "completed.log");
-  const runningLog = path.join(jobsDir, "running.log");
-  const otherSessionLog = path.join(jobsDir, "other.log");
+  const completedLog = resolveJobLogFile(repo, "review-completed");
+  const runningLog = resolveJobLogFile(repo, "review-running");
+  const otherSessionLog = resolveJobLogFile(repo, "review-other");
   const completedJobFile = path.join(jobsDir, "review-completed.json");
   const runningJobFile = path.join(jobsDir, "review-running.json");
   const otherJobFile = path.join(jobsDir, "review-other.json");
@@ -1831,6 +2504,11 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   });
   sleeper.unref();
   fs.writeFileSync(runningJobFile, JSON.stringify({ id: "review-running" }, null, 2), "utf8");
+  fs.writeFileSync(
+    runningJobFile.replace(/\.json$/, ".started.json"),
+    JSON.stringify({ status: "running", pid: sleeper.pid, startedAt: "2026-08-19T12:00:00.000Z" }),
+    "utf8"
+  );
 
   t.after(() => {
     try {
@@ -1862,10 +2540,10 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
           },
           {
             id: "review-running",
-            status: "running",
+            status: "queued",
             title: "Codex Review",
             sessionId: "sess-current",
-            pid: sleeper.pid,
+            pid: null,
             logFile: runningLog,
             createdAt: "2026-03-18T15:32:00.000Z",
             updatedAt: "2026-03-18T15:33:00.000Z"
@@ -1905,7 +2583,12 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   assert.equal(fs.existsSync(otherJobFile), true);
   assert.deepEqual(
     fs.readdirSync(path.dirname(otherJobFile)).sort(),
-    [path.basename(otherJobFile), path.basename(otherSessionLog)].sort()
+    [
+      path.basename(otherJobFile),
+      path.basename(otherSessionLog),
+      "review-completed.removed",
+      "review-running.removed"
+    ].sort()
   );
 
   await waitFor(() => {
@@ -1921,6 +2604,390 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   assert.deepEqual(state.jobs.map((job) => job.id), ["review-other"]);
   const otherJob = state.jobs[0];
   assert.equal(otherJob.logFile, otherSessionLog);
+  saveState(repo, state);
+  assert.deepEqual(
+    fs.readdirSync(jobsDir).sort(),
+    [
+      path.basename(otherJobFile),
+      path.basename(otherSessionLog),
+      "review-completed.removed",
+      "review-running.removed"
+    ].sort()
+  );
+});
+
+test("session end fences and stops workers while another process holds the state lock", async (t) => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const spawnSleeper = () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      cwd: repo,
+      detached: true,
+      stdio: "ignore"
+    });
+    child.unref();
+    t.after(() => {
+      try {
+        process.kill(-child.pid, "SIGTERM");
+      } catch {
+        try {
+          process.kill(child.pid, "SIGTERM");
+        } catch {
+          // Ignore missing process.
+        }
+      }
+    });
+    return child;
+  };
+
+  const worker = spawnSleeper();
+  const lockOwner = spawnSleeper();
+
+  const runningJobFile = path.join(jobsDir, "review-running.json");
+  fs.writeFileSync(runningJobFile, JSON.stringify({ id: "review-running" }, null, 2), "utf8");
+  fs.writeFileSync(
+    runningJobFile.replace(/\.json$/, ".started.json"),
+    JSON.stringify({ status: "running", pid: worker.pid, startedAt: "2026-08-19T12:00:00.000Z" }),
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "review-running",
+            status: "running",
+            title: "Codex Review",
+            sessionId: "sess-current",
+            pid: worker.pid,
+            createdAt: "2026-03-18T15:32:00.000Z",
+            updatedAt: "2026-03-18T15:33:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(stateDir, ".state.lock"),
+    JSON.stringify({ pid: lockOwner.pid, token: "live-owner", createdAt: "2026-08-19T12:00:00.000Z" }),
+    "utf8"
+  );
+
+  const startedAt = Date.now();
+  const result = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      CODEX_COMPANION_SESSION_ID: "sess-current"
+    },
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      session_id: "sess-current",
+      cwd: repo
+    })
+  });
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /could not prune its state/);
+  assert.ok(elapsedMs < 5000, `SessionEnd cleanup took ${elapsedMs}ms while the state lock was held`);
+  assert.equal(fs.existsSync(path.join(jobsDir, "review-running.removed")), true);
+
+  await waitFor(() => {
+    try {
+      process.kill(worker.pid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  });
+});
+
+test("session end still fences and stops the rest of the batch when a job file is corrupt", async (t) => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const worker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    cwd: repo,
+    detached: true,
+    stdio: "ignore"
+  });
+  worker.unref();
+  t.after(() => {
+    try {
+      process.kill(-worker.pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(worker.pid, "SIGTERM");
+      } catch {
+        // Ignore missing process.
+      }
+    }
+  });
+
+  fs.writeFileSync(path.join(jobsDir, "review-corrupt.json"), "{ not json", "utf8");
+  const liveJobFile = path.join(jobsDir, "review-live.json");
+  fs.writeFileSync(liveJobFile, JSON.stringify({ id: "review-live" }, null, 2), "utf8");
+  fs.writeFileSync(
+    liveJobFile.replace(/\.json$/, ".started.json"),
+    JSON.stringify({ status: "running", pid: worker.pid, startedAt: "2026-08-19T12:00:00.000Z" }),
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "review-corrupt",
+            status: "running",
+            title: "Codex Review",
+            sessionId: "sess-current",
+            pid: null,
+            createdAt: "2026-03-18T15:30:00.000Z",
+            updatedAt: "2026-03-18T15:31:00.000Z"
+          },
+          {
+            id: "review-live",
+            status: "running",
+            title: "Codex Review",
+            sessionId: "sess-current",
+            pid: null,
+            createdAt: "2026-03-18T15:32:00.000Z",
+            updatedAt: "2026-03-18T15:33:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      CODEX_COMPANION_SESSION_ID: "sess-current"
+    },
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      session_id: "sess-current",
+      cwd: repo
+    })
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(path.join(jobsDir, "review-corrupt.removed")), true);
+  assert.equal(fs.existsSync(path.join(jobsDir, "review-live.removed")), true);
+
+  await waitFor(() => {
+    try {
+      process.kill(worker.pid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  });
+});
+
+test("session end finishes its teardown when the state file cannot be read", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+
+  const stateDir = resolveStateDir(repo);
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "state.json"), "{ not json", "utf8");
+  saveBrokerSession(repo, { endpoint: `unix:${path.join(makeTempDir(), "missing-broker.sock")}` });
+
+  const result = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      CODEX_COMPANION_SESSION_ID: "sess-current"
+    },
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      session_id: "sess-current",
+      cwd: repo
+    })
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /could not read its job list/);
+  assert.equal(loadBrokerSession(repo), null);
+});
+
+test("session end stops session workers even when the broker never answers its shutdown", async (t) => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+
+  const socketPath = path.join(makeTempDir(), "silent-broker.sock");
+  const server = net.createServer((socket) => {
+    // Accepted connections are deliberately left unanswered; draining the
+    // socket lets it observe the hook's close so server.close() can finish.
+    socket.resume();
+  });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  saveBrokerSession(repo, { endpoint: `unix:${socketPath}` });
+
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const worker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    cwd: repo,
+    detached: true,
+    stdio: "ignore"
+  });
+  worker.unref();
+  t.after(() => {
+    try {
+      process.kill(-worker.pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(worker.pid, "SIGTERM");
+      } catch {
+        // Ignore missing process.
+      }
+    }
+  });
+
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "review-live",
+            status: "running",
+            title: "Codex Review",
+            sessionId: "sess-current",
+            pid: worker.pid,
+            createdAt: "2026-03-18T15:32:00.000Z",
+            updatedAt: "2026-03-18T15:33:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const startedAt = Date.now();
+  const result = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      CODEX_COMPANION_SESSION_ID: "sess-current"
+    },
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      session_id: "sess-current",
+      cwd: repo
+    })
+  });
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(elapsedMs < 10000, `SessionEnd took ${elapsedMs}ms against an unresponsive broker`);
+  assert.equal(fs.existsSync(path.join(jobsDir, "review-live.removed")), true);
+
+  await waitFor(() => {
+    try {
+      process.kill(worker.pid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  });
+});
+
+test("session end preserves an other-session job added after its stale snapshot", async () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  const staleJob = { id: "stale-current", status: "completed", sessionId: "sess-current", logFile: path.join(jobsDir, "stale-current.log") };
+  writeJobFile(repo, staleJob.id, staleJob);
+  fs.writeFileSync(staleJob.logFile, "stale\n", "utf8");
+  saveState(repo, { config: { stopReviewGate: false }, jobs: [staleJob] });
+
+  const marker = path.join(makeTempDir(), "stale-read");
+  const release = path.join(path.dirname(marker), "release");
+  const preload = path.join(path.dirname(marker), "pause-state-read.cjs");
+  fs.writeFileSync(preload, [
+    'const fs = require("node:fs");',
+    'const original = fs.readFileSync;',
+    'let paused = false;',
+    'fs.readFileSync = function(file, ...args) {',
+    '  const value = original.call(this, file, ...args);',
+    '  if (!paused && file === process.env.CODEX_STALE_STATE_FILE) {',
+    '    paused = true; fs.writeFileSync(process.env.CODEX_STALE_MARKER, "paused");',
+    '    while (!fs.existsSync(process.env.CODEX_STALE_RELEASE)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);',
+    '  }',
+    '  return value;',
+    '};'
+  ].join("\n"), "utf8");
+  fs.writeFileSync(marker, "ready", "utf8");
+  fs.unlinkSync(marker);
+
+  const hook = runHookAsync(repo, {
+    ...process.env,
+    CODEX_COMPANION_SESSION_ID: "sess-current",
+    CODEX_STALE_STATE_FILE: path.join(stateDir, "state.json"),
+    CODEX_STALE_MARKER: marker,
+    CODEX_STALE_RELEASE: release,
+    NODE_OPTIONS: `--require ${preload}`
+  }, JSON.stringify({ hook_event_name: "SessionEnd", session_id: "sess-current", cwd: repo }), SESSION_HOOK);
+  await waitFor(() => fs.existsSync(marker));
+
+  const freshJob = { id: "fresh-other", status: "completed", sessionId: "sess-other", logFile: path.join(jobsDir, "fresh-other.log") };
+  const stateModule = path.join(PLUGIN_ROOT, "scripts", "lib", "state.mjs");
+  let writerDone = false;
+  const writer = new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["--input-type=module", "--eval", [
+      'import fs from "node:fs";',
+      `import { upsertJob, writeJobFile } from ${JSON.stringify(stateModule)};`,
+      `const job = ${JSON.stringify(freshJob)};`,
+      `writeJobFile(${JSON.stringify(repo)}, job.id, job);`,
+      'fs.writeFileSync(job.logFile, "fresh\\n", "utf8");',
+      `upsertJob(${JSON.stringify(repo)}, job);`
+    ].join("\n")], { stdio: "ignore" });
+    child.once("error", reject);
+    child.once("close", (status) => { writerDone = true; resolve(status); });
+  });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(writerDone, false);
+  fs.writeFileSync(release, "go", "utf8");
+  const result = await hook;
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(await writer, 0);
+  assert.deepEqual(listJobs(repo).map((job) => job.id), ["fresh-other"]);
+  assert.equal(fs.existsSync(resolveJobFile(repo, freshJob.id)), true);
+  assert.equal(fs.existsSync(freshJob.logFile), true);
 });
 
 test("stop hook runs a stop-time review task and blocks on findings when the review gate is enabled", () => {
@@ -1979,6 +3046,255 @@ test("stop hook runs a stop-time review task and blocks on findings when the rev
   assert.match(status.stdout, /Codex Stop Gate Review/);
 });
 
+test("stop hook reuses the completed review for the same Claude response", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const env = buildEnv(binDir);
+  const input = JSON.stringify({
+    cwd: repo,
+    session_id: "sess-stop-idempotent",
+    last_assistant_message: "I completed the exact same change."
+  });
+
+  const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const first = run("node", [STOP_HOOK], { cwd: repo, env, input });
+  assert.equal(first.status, 0, first.stderr);
+  const nextTurnId = JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).nextTurnId;
+
+  const second = run("node", [STOP_HOOK], { cwd: repo, env, input });
+  assert.equal(second.status, 0, second.stderr);
+  assert.deepEqual(JSON.parse(second.stdout), JSON.parse(first.stdout));
+  assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).nextTurnId, nextTurnId);
+});
+
+test("stop hook keeps cached ALLOW decisions silent", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "adversarial-clean");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const env = buildEnv(binDir);
+  const input = JSON.stringify({
+    cwd: repo,
+    session_id: "sess-stop-cached-allow",
+    last_assistant_message: "I completed a clean change."
+  });
+
+  const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  const first = run("node", [STOP_HOOK], { cwd: repo, env, input });
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(first.stdout.trim(), "");
+  const nextTurnId = JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).nextTurnId;
+  const second = run(process.execPath, [STOP_HOOK], { cwd: repo, env: { ...env, PATH: "" }, input });
+  assert.equal(second.status, 0, second.stderr);
+  assert.equal(second.stdout.trim(), "");
+  assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).nextTurnId, nextTurnId);
+});
+
+test("stop hook reuses a cached BLOCK before checking Codex availability", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+  const input = JSON.stringify({ cwd: repo, session_id: "sess-stop-cached-block", last_assistant_message: "A blocked change." });
+  const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  const first = run("node", [STOP_HOOK], { cwd: repo, env, input });
+  assert.equal(first.status, 0, first.stderr);
+  const second = run(process.execPath, [STOP_HOOK], { cwd: repo, env: { ...env, PATH: "" }, input });
+  assert.equal(second.status, 0, second.stderr);
+  assert.deepEqual(JSON.parse(second.stdout), JSON.parse(first.stdout));
+});
+
+test("stop hook blocks every matching non-reusable gate job without starting a turn", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+  const sessionId = "sess-stop-lifecycle";
+  const message = "Exact lifecycle response.";
+  const gateKey = createHash("sha256").update(`${sessionId}\0${message}`).digest("hex");
+  const jobId = `gate-${gateKey}`;
+  const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  for (const [status, cachedResult] of [
+    ["queued", undefined],
+    ["running", undefined],
+    ["failed", undefined],
+    ["cancelled", undefined],
+    ["completed", undefined],
+    ["completed", { rawOutput: null }],
+    ["completed", "corrupt"]
+  ]) {
+    saveState(repo, {
+      version: 1,
+      config: { stopReviewGate: true },
+      jobs: [{ id: jobId, gateKey, sessionId, status, title: "Codex Stop Gate Review", ...(status === "queued" ? { createdAt: new Date().toISOString() } : {}), ...(status === "running" ? { pid: process.pid } : {}), ...(cachedResult === undefined ? {} : { result: cachedResult }) }]
+    });
+    const beforeTurns = fs.existsSync(fakeStatePath) ? JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).nextTurnId : 1;
+    const hookResult = run("node", [STOP_HOOK], { cwd: repo, env, input: JSON.stringify({ cwd: repo, session_id: sessionId, last_assistant_message: message }) });
+    assert.equal(hookResult.status, 0, hookResult.stderr);
+    assert.equal(JSON.parse(hookResult.stdout).decision, "block");
+    const reason = JSON.parse(hookResult.stdout).reason;
+    assert.match(reason, new RegExp(jobId));
+    if (status === "queued" || status === "running") {
+      assert.match(reason, new RegExp(`/codex:cancel ${jobId}`));
+    } else {
+      assert.doesNotMatch(reason, /\/codex:cancel/);
+      assert.match(reason, /\/codex:status/);
+      assert.match(reason, /manual|bypass/i);
+    }
+    const afterTurns = fs.existsSync(fakeStatePath) ? JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).nextTurnId : 1;
+    assert.equal(afterTurns, beforeTurns);
+  }
+});
+
+test("stop hook blocks a parsed state with an invalid schema", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const stateDir = resolveStateDir(repo);
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "state.json"), JSON.stringify({ version: 1, config: {}, jobs: [] }), "utf8");
+
+  const result = run("node", [STOP_HOOK], {
+    cwd: repo,
+    input: JSON.stringify({ cwd: repo, session_id: "sess-invalid-state", last_assistant_message: "done" })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const decision = JSON.parse(result.stdout);
+  assert.equal(decision.decision, "block");
+  assert.match(decision.reason, /could not safely continue.*invalid state schema/i);
+});
+
+test("stop gate blocks when removal wins during foreground completion", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "adversarial-clean");
+  initGitRepo(repo);
+  const sessionId = "sess-stop-terminal-race";
+  const message = "Clean review that loses the terminal race.";
+  const gateKey = createHash("sha256").update(`${sessionId}\0${message}`).digest("hex");
+  const jobId = `gate-${gateKey}`;
+  const terminalFile = resolveTerminalFenceFile(repo, jobId);
+  const removedFile = terminalFile.replace(/\.terminal\.json$/, ".removed");
+  const preload = path.join(makeTempDir(), "terminal-race.cjs");
+  fs.writeFileSync(preload, [
+    'const fs = require("node:fs");',
+    'const original = fs.openSync;',
+    'let armed = true;',
+    'fs.openSync = (file, flags, ...rest) => {',
+    '  if (armed && file === process.env.CODEX_FOREGROUND_TERMINAL_FENCE && flags === "wx") {',
+    '    armed = false; fs.writeFileSync(process.env.CODEX_FOREGROUND_REMOVED_FENCE, "");',
+    '  }',
+    '  return original(file, flags, ...rest);',
+    '};'
+  ].join("\n"), "utf8");
+  const env = {
+    ...buildEnv(binDir),
+    CODEX_FOREGROUND_TERMINAL_FENCE: terminalFile,
+    CODEX_FOREGROUND_REMOVED_FENCE: removedFile,
+    NODE_OPTIONS: `--require ${preload}`
+  };
+  assert.equal(run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], { cwd: repo, env }).status, 0);
+
+  const result = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ cwd: repo, session_id: sessionId, last_assistant_message: message })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const decision = JSON.parse(result.stdout);
+  assert.equal(decision.decision, "block");
+  assert.match(decision.reason, new RegExp(jobId));
+  assert.doesNotMatch(result.stdout, /ALLOW:/);
+});
+
+test("stop hook without an assistant message runs fresh reviews", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+  const input = JSON.stringify({ cwd: repo, session_id: "sess-stop-empty-message", last_assistant_message: "" });
+  const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  assert.equal(run("node", [STOP_HOOK], { cwd: repo, env, input }).status, 0);
+  const nextTurnId = JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).nextTurnId;
+  assert.equal(run("node", [STOP_HOOK], { cwd: repo, env, input }).status, 0);
+  assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).nextTurnId, nextTurnId + 1);
+});
+
+test("concurrent stop hooks start exactly one review for the same Claude response", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const env = buildEnv(binDir);
+  const input = JSON.stringify({
+    cwd: repo,
+    session_id: "sess-stop-concurrent",
+    last_assistant_message: "I completed this concurrent change."
+  });
+
+  const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const [first, second] = await Promise.all([runHookAsync(repo, env, input), runHookAsync(repo, env, input)]);
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(second.status, 0, second.stderr);
+  assert.equal(JSON.parse(first.stdout).decision, "block");
+  assert.equal(JSON.parse(second.stdout).decision, "block");
+  assert.equal(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).nextTurnId, 2);
+  const jobs = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "state.json"), "utf8")).jobs;
+  assert.equal(jobs.filter((job) => job.title === "Codex Stop Gate Review").length, 1);
+});
+
+test("concurrent stop hooks do not truncate or duplicate the winner log", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+  const sessionId = "sess-stop-log-race";
+  const message = "Concurrent log response.";
+  const gateKey = createHash("sha256").update(`${sessionId}\0${message}`).digest("hex");
+  const logFile = resolveJobLogFile(repo, `gate-${gateKey}`);
+  const input = JSON.stringify({ cwd: repo, session_id: sessionId, last_assistant_message: message });
+  const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+
+  const first = runHookAsync(repo, env, input);
+  await waitFor(() => fs.existsSync(logFile) && fs.readFileSync(logFile, "utf8").includes("Starting Codex Stop Gate Review."));
+  fs.appendFileSync(logFile, "winner-marker\n", "utf8");
+  const second = runHookAsync(repo, env, input);
+  await Promise.all([first, second]);
+
+  const log = fs.readFileSync(logFile, "utf8");
+  assert.match(log, /winner-marker/);
+  assert.equal((log.match(/Starting Codex Stop Gate Review\./g) ?? []).length, 1);
+});
+
 test("stop hook logs running tasks to stderr without blocking when the review gate is disabled", () => {
   const repo = makeTempDir();
   initGitRepo(repo);
@@ -2005,6 +3321,7 @@ test("stop hook logs running tasks to stderr without blocking when the review ga
           {
             id: "task-live",
             status: "running",
+            pid: process.pid,
             title: "Codex Task",
             jobClass: "task",
             sessionId: "sess-current",
@@ -2061,7 +3378,7 @@ test("stop hook allows the stop when the review gate is enabled and the stop-tim
   assert.equal(allowed.stdout.trim(), "");
 });
 
-test("stop hook does not block when Codex is unavailable even if the review gate is enabled", () => {
+test("stop hook blocks when Codex is unavailable and the review gate is enabled", () => {
   const repo = makeTempDir();
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
@@ -2073,7 +3390,7 @@ test("stop hook does not block when Codex is unavailable even if the review gate
   });
   assert.equal(setup.status, 0, setup.stderr);
 
-  const allowed = run(process.execPath, [STOP_HOOK], {
+  const blocked = run(process.execPath, [STOP_HOOK], {
     cwd: repo,
     env: {
       ...process.env,
@@ -2082,10 +3399,30 @@ test("stop hook does not block when Codex is unavailable even if the review gate
     input: JSON.stringify({ cwd: repo })
   });
 
-  assert.equal(allowed.status, 0, allowed.stderr);
-  assert.equal(allowed.stdout.trim(), "");
-  assert.match(allowed.stderr, /Codex is not set up for the review gate/i);
-  assert.match(allowed.stderr, /Run \/codex:setup/i);
+  assert.equal(blocked.status, 0, blocked.stderr);
+  assert.equal(JSON.parse(blocked.stdout).decision, "block");
+  assert.match(JSON.parse(blocked.stdout).reason, /not set up/i);
+});
+
+test("stop hook blocks on corrupt state instead of silently allowing", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const stateFile = path.join(resolveStateDir(repo), "state.json");
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+  fs.writeFileSync(stateFile, "{invalid json", "utf8");
+
+  const blocked = run(process.execPath, [STOP_HOOK], {
+    cwd: repo,
+    env: process.env,
+    input: JSON.stringify({ cwd: repo })
+  });
+
+  assert.equal(blocked.status, 0, blocked.stderr);
+  const payload = JSON.parse(blocked.stdout);
+  assert.equal(payload.decision, "block");
+  assert.match(payload.reason, /Failed to read Codex Companion state at/);
+  assert.match(payload.reason, new RegExp(stateFile.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(payload.reason, /Unexpected|Expected/);
 });
 
 test("stop hook runs the actual task when auth status looks stale", () => {

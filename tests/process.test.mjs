@@ -1,7 +1,51 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import { isProcessAlive, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+
+test("isProcessAlive treats successful and permission-denied probes as alive", () => {
+  assert.equal(isProcessAlive(123, { killImpl() {} }), true);
+  assert.equal(
+    isProcessAlive(123, {
+      killImpl() {
+        throw Object.assign(new Error("denied"), { code: "EPERM" });
+      }
+    }),
+    true
+  );
+});
+
+test("isProcessAlive treats a missing process as dead", () => {
+  assert.equal(
+    isProcessAlive(123, {
+      killImpl() {
+        throw Object.assign(new Error("gone"), { code: "ESRCH" });
+      }
+    }),
+    false
+  );
+});
+
+test("process helpers reject unsafe process ids", () => {
+  for (const pid of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.equal(isProcessAlive(pid, { killImpl() { throw new Error("must not probe"); } }), false);
+    assert.equal(terminateProcessTree(pid, { killImpl() { throw new Error("must not kill"); } }).attempted, false);
+  }
+});
+
+test("terminateProcessTree falls back from a missing POSIX group to its leader", () => {
+  const calls = [];
+  const outcome = terminateProcessTree(1234, {
+    platform: "linux",
+    killImpl(pid) {
+      calls.push(pid);
+      throw Object.assign(new Error("gone"), { code: "ESRCH" });
+    }
+  });
+  assert.deepEqual(calls, [-1234, 1234]);
+  assert.equal(outcome.delivered, false);
+  assert.equal(outcome.method, "process");
+});
 
 test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;

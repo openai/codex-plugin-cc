@@ -191,6 +191,8 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       cwd: this.cwd,
       env: this.options.env ?? process.env,
       stdio: ["pipe", "pipe", "pipe"],
+      signal: this.options.signal,
+      killSignal: this.options.signal ? "SIGKILL" : "SIGTERM",
       shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
       windowsHide: true
     });
@@ -237,6 +239,9 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
 
     this.closed = true;
 
+    if (!this.proc) {
+      this.handleExit(this.exitError);
+    }
     if (this.readline) {
       this.readline.close();
     }
@@ -285,7 +290,7 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
   async initialize() {
     await new Promise((resolve, reject) => {
       const target = parseBrokerEndpoint(this.endpoint);
-      this.socket = net.createConnection({ path: target.path });
+      this.socket = net.createConnection({ path: target.path, signal: this.options.signal });
       this.socket.setEncoding("utf8");
       this.socket.on("connect", resolve);
       this.socket.on("data", (chunk) => {
@@ -318,6 +323,8 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
     this.closed = true;
     if (this.socket) {
       this.socket.end();
+    } else {
+      this.handleExit(this.exitError);
     }
     await this.exitPromise;
   }
@@ -348,7 +355,12 @@ export class CodexAppServerClient {
     const client = brokerEndpoint
       ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
       : new SpawnedCodexAppServerClient(cwd, options);
-    await client.initialize();
+    try {
+      await client.initialize();
+    } catch (error) {
+      await client.close().catch(() => {});
+      throw error;
+    }
     return client;
   }
 }

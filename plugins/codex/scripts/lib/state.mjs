@@ -1,8 +1,9 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { isProcessAlive } from "./process.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
@@ -11,6 +12,11 @@ const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
+const STATE_LOCK_FILE_NAME = ".state.lock";
+const STATE_LOCK_WAIT_MS = 5000;
+const STATE_LOCK_RETRY_MS = 20;
+const JOB_STATUSES = new Set(["queued", "running", "completed", "failed", "cancelled"]);
+const SAFE_JOB_ID = /^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 function nowIso() {
   return new Date().toISOString();
@@ -55,32 +61,203 @@ export function ensureStateDir(cwd) {
   fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
 }
 
-export function loadState(cwd) {
-  const stateFile = resolveStateFile(cwd);
-  if (!fs.existsSync(stateFile)) {
-    return defaultState();
-  }
+export const SESSION_GENERATION_ENV = "CODEX_COMPANION_SESSION_GENERATION";
 
+function resolveSessionFile(cwd, sessionId) {
+  const key = createHash("sha256").update(sessionId).digest("hex");
+  return path.join(resolveStateDir(cwd), `session-${key}.json`);
+}
+
+export function readSessionState(cwd, sessionId) {
+  try {
+    const session = JSON.parse(fs.readFileSync(resolveSessionFile(cwd, sessionId), "utf8"));
+    if (!session || typeof session.ended !== "boolean" || !(session.generation === null || typeof session.generation === "string")) {
+      throw new Error("Invalid Codex Companion session lifecycle state.");
+    }
+    return session;
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+export function setSessionLifecycle(cwd, sessionId, ended) {
+  ensureStateDir(cwd);
+  const previous = readSessionState(cwd, sessionId);
+  if (!ended && previous?.ended === false) return previous.generation;
+  const generation = ended ? previous?.generation ?? null : randomUUID();
+  writeAtomicJson(resolveSessionFile(cwd, sessionId), { generation, ended });
+  return generation;
+}
+
+export function isJobSessionEnded(cwd, job) {
+  if (!job.sessionId) return false;
+  const session = readSessionState(cwd, job.sessionId);
+  return session != null && (session.ended || (job.sessionGeneration ?? null) !== session.generation);
+}
+
+function isObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value);
+}
+
+function validateState(parsed) {
+  if (!isObject(parsed) || parsed.version !== STATE_VERSION || !isObject(parsed.config) || typeof parsed.config.stopReviewGate !== "boolean" || !Array.isArray(parsed.jobs)) {
+    throw new Error("invalid state schema");
+  }
+  for (const job of parsed.jobs) {
+    if (!isObject(job) || typeof job.id !== "string" || !SAFE_JOB_ID.test(job.id) || !JOB_STATUSES.has(job.status)) {
+      throw new Error("invalid job schema");
+    }
+  }
+}
+
+export function loadState(cwd) {
+  const stateFile = path.resolve(resolveStateFile(cwd));
   try {
     const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-    return {
-      ...defaultState(),
-      ...parsed,
-      config: {
-        ...defaultState().config,
-        ...(parsed.config ?? {})
-      },
-      jobs: Array.isArray(parsed.jobs) ? parsed.jobs : []
-    };
-  } catch {
-    return defaultState();
+    validateState(parsed);
+    return parsed;
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return defaultState();
+    }
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to read Codex Companion state at ${stateFile}: ${detail}`, { cause: error });
+  }
+}
+
+function pauseForStateLock() {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, STATE_LOCK_RETRY_MS);
+}
+
+function readStateLockOwner(lockFile) {
+  let owner;
+  try {
+    owner = JSON.parse(fs.readFileSync(lockFile, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw error;
+    }
+    throw new Error(`Codex Companion state lock at ${path.resolve(lockFile)} has an invalid owner.`, { cause: error });
+  }
+  if (!isObject(owner) || !Number.isSafeInteger(owner.pid) || owner.pid <= 0 || typeof owner.token !== "string" || !owner.token || typeof owner.createdAt !== "string") {
+    throw new Error(`Codex Companion state lock at ${path.resolve(lockFile)} has an invalid owner.`);
+  }
+  return owner;
+}
+
+function tryCreateStateLock(filePath, payload) {
+  const temporaryFile = `${filePath}.${process.pid}.${payload.token}.tmp`;
+  try {
+    fs.writeFileSync(temporaryFile, `${JSON.stringify(payload)}\n`, "utf8");
+    fs.linkSync(temporaryFile, filePath);
+    return true;
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      return false;
+    }
+    throw error;
+  } finally {
+    removeFileIfExists(temporaryFile);
+  }
+}
+
+function releaseStateLock(lockFile, token) {
+  try {
+    if (readStateLockOwner(lockFile).token === token) {
+      fs.unlinkSync(lockFile);
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+  }
+}
+
+function reapDeadStateLock(lockFile, owner) {
+  const reapFile = `${lockFile}.reap`;
+  const token = randomUUID();
+  if (!tryCreateStateLock(reapFile, { pid: process.pid, token, createdAt: nowIso() })) {
+    const reaper = readStateLockOwner(reapFile);
+    if (!isProcessAlive(reaper.pid)) {
+      // Serialize recovery of the guard just like recovery of the original lock.
+      reapDeadStateLock(reapFile, reaper);
+    }
+    return false;
+  }
+  try {
+    const current = readStateLockOwner(lockFile);
+    if (current.token === owner.token && current.pid === owner.pid && !isProcessAlive(current.pid)) {
+      fs.unlinkSync(lockFile);
+      return true;
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+  } finally {
+    releaseStateLock(reapFile, token);
+  }
+  return false;
+}
+
+function withStateLock(cwd, action, { waitMs = STATE_LOCK_WAIT_MS } = {}) {
+  ensureStateDir(cwd);
+  const lockFile = path.join(resolveStateDir(cwd), STATE_LOCK_FILE_NAME);
+  const deadline = Date.now() + waitMs;
+  const token = randomUUID();
+  while (true) {
+    if (tryCreateStateLock(lockFile, { pid: process.pid, token, createdAt: nowIso() })) {
+      try {
+        return action();
+      } finally {
+        releaseStateLock(lockFile, token);
+      }
+    }
+    try {
+      const owner = readStateLockOwner(lockFile);
+      if (!isProcessAlive(owner.pid)) {
+        if (reapDeadStateLock(lockFile, owner)) {
+          continue;
+        }
+      }
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw error;
+      }
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for Codex Companion state lock at ${path.resolve(lockFile)}.`);
+    }
+    pauseForStateLock();
+  }
+}
+
+function writeAtomicJson(filePath, value) {
+  const temporaryFile = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  const content = `${JSON.stringify(value, null, 2)}\n`;
+  try {
+    fs.writeFileSync(temporaryFile, content, "utf8");
+    fs.renameSync(temporaryFile, filePath);
+  } catch (error) {
+    try {
+      fs.unlinkSync(temporaryFile);
+    } catch {
+      // The temporary file may not have been created or may already have been renamed.
+    }
+    throw error;
   }
 }
 
 function pruneJobs(jobs) {
-  return [...jobs]
-    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")))
-    .slice(0, MAX_JOBS);
+  const sorted = [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
+  const active = sorted.filter((job) => job.status === "queued" || job.status === "running");
+  const terminal = sorted.filter((job) => job.status !== "queued" && job.status !== "running");
+  return [...active, ...terminal.slice(0, Math.max(0, MAX_JOBS - active.length))]
+    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
 }
 
 function removeFileIfExists(filePath) {
@@ -89,36 +266,79 @@ function removeFileIfExists(filePath) {
   }
 }
 
-export function saveState(cwd, state) {
-  const previousJobs = loadState(cwd).jobs;
-  ensureStateDir(cwd);
-  const nextJobs = pruneJobs(state.jobs ?? []);
-  const nextState = {
+function resolveJobSidecarFile(cwd, jobId, suffix) {
+  return path.join(resolveJobsDir(cwd), `${jobId}${suffix}`);
+}
+
+function markJobRemoved(cwd, jobId) {
+  try {
+    fs.closeSync(fs.openSync(resolveJobSidecarFile(cwd, jobId, ".removed"), "wx"));
+  } catch (error) {
+    if (error?.code !== "EEXIST") {
+      throw error;
+    }
+  }
+}
+
+function removeJobSidecars(cwd, jobId) {
+  for (const suffix of [".started.json", ".admission.json", ".terminal.json"]) {
+    removeFileIfExists(resolveJobSidecarFile(cwd, jobId, suffix));
+  }
+}
+
+function saveStateLocked(cwd, state) {
+  const candidate = {
     version: STATE_VERSION,
     config: {
       ...defaultState().config,
       ...(state.config ?? {})
     },
+    jobs: state.jobs ?? []
+  };
+  validateState(candidate);
+  const previousJobs = loadState(cwd).jobs;
+  ensureStateDir(cwd);
+  const requestedJobs = candidate.jobs;
+  const nextJobs = pruneJobs(requestedJobs.filter((job) => !isJobSessionEnded(cwd, job) && !fs.existsSync(resolveJobSidecarFile(cwd, job.id, ".removed"))));
+  const nextState = {
+    version: STATE_VERSION,
+    config: candidate.config,
     jobs: nextJobs
   };
 
   const retainedIds = new Set(nextJobs.map((job) => job.id));
-  for (const job of previousJobs) {
+  const knownJobs = new Map(previousJobs.map((job) => [job.id, job]));
+  for (const job of requestedJobs) {
+    knownJobs.set(job.id, { ...knownJobs.get(job.id), ...job });
+  }
+  for (const job of knownJobs.values()) {
     if (retainedIds.has(job.id)) {
       continue;
     }
+    markJobRemoved(cwd, job.id);
     removeJobFile(resolveJobFile(cwd, job.id));
-    removeFileIfExists(job.logFile);
+    removeFileIfExists(resolveJobLogFile(cwd, job.id));
+    removeJobSidecars(cwd, job.id);
   }
 
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  writeAtomicJson(resolveStateFile(cwd), nextState);
   return nextState;
 }
 
-export function updateState(cwd, mutate) {
-  const state = loadState(cwd);
-  mutate(state);
-  return saveState(cwd, state);
+export function saveState(cwd, state) {
+  return withStateLock(cwd, () => saveStateLocked(cwd, state));
+}
+
+export function updateState(cwd, mutate, options) {
+  return withStateLock(cwd, () => {
+    const state = loadState(cwd);
+    mutate(state);
+    return saveStateLocked(cwd, state);
+  }, options);
+}
+
+export function isJobRemovedLocked(cwd, jobId) {
+  return withStateLock(cwd, () => fs.existsSync(resolveJobSidecarFile(cwd, jobId, ".removed")));
 }
 
 export function generateJobId(prefix = "job") {
@@ -166,7 +386,7 @@ export function getConfig(cwd) {
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  writeAtomicJson(jobFile, payload);
   return jobFile;
 }
 

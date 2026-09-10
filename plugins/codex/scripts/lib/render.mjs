@@ -126,6 +126,9 @@ function pushJobDetails(lines, job, options = {}) {
   if (job.summary) {
     lines.push(`  Summary: ${job.summary}`);
   }
+  if (job.status === "failed" && job.errorMessage) {
+    lines.push(`  Error: ${job.errorMessage}`);
+  }
   if (job.phase) {
     lines.push(`  Phase: ${job.phase}`);
   }
@@ -446,10 +449,11 @@ export function renderStoredJobResult(job, storedJob) {
 }
 
 export function renderCancelReport(job) {
+  const outcome = job.status === "cancelled" ? `Cancelled ${job.id}.` : `${job.id} already ${job.status}.`;
   const lines = [
     "# Codex Cancel",
     "",
-    `Cancelled ${job.id}.`,
+    outcome,
     ""
   ];
 

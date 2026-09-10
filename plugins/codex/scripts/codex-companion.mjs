@@ -29,7 +29,6 @@ import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
   getConfig,
-  listJobs,
   setConfig,
   upsertJob,
   writeJobFile
@@ -48,9 +47,12 @@ import {
   createJobProgressUpdater,
   createJobRecord,
   createProgressReporter,
+  GATE_KEY_ENV,
   nowIso,
+  reconcileTrackedJobs,
   runTrackedJob,
-  SESSION_ID_ENV
+  SESSION_ID_ENV,
+  terminalizeTrackedJob
 } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
@@ -336,7 +338,7 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
 async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const sessionId = getCurrentClaudeSessionId();
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
+  const jobs = sortJobsNewestFirst(reconcileTrackedJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
   const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
   const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
   if (activeTask) {
@@ -564,16 +566,17 @@ function getJobKindLabel(kind, jobClass) {
   return jobClass === "review" ? "review" : "rescue";
 }
 
-function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false }) {
+function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false, id, gateKey }) {
   return createJobRecord({
-    id: generateJobId(prefix),
+    id: id ?? generateJobId(prefix),
     kind,
     kindLabel: getJobKindLabel(kind, jobClass),
     title,
     workspaceRoot,
     jobClass,
     summary,
-    write
+    write,
+    ...(gateKey ? { gateKey } : {})
   });
 }
 
@@ -589,7 +592,7 @@ function createTrackedProgress(job, options = {}) {
   };
 }
 
-function buildTaskJob(workspaceRoot, taskMetadata, write) {
+function buildTaskJob(workspaceRoot, taskMetadata, write, gateKey = null) {
   return createCompanionJob({
     prefix: "task",
     kind: "task",
@@ -597,7 +600,8 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
     workspaceRoot,
     jobClass: "task",
     summary: taskMetadata.summary,
-    write
+    write,
+    ...(gateKey ? { id: `gate-${gateKey}`, gateKey } : {})
   });
 }
 
@@ -661,6 +665,13 @@ async function runForegroundCommand(job, runner, options = {}) {
     stderr: !options.json
   });
   const execution = await runTrackedJob(job, () => runner(progress), { logFile });
+  if (!Number.isFinite(execution?.exitStatus)) {
+    if (job.gateKey) {
+      outputResult({ jobId: job.id, status: execution?.status ?? "failed", gateDuplicate: true }, true);
+      return execution;
+    }
+    throw new Error(`Codex job ${job.id} is ${execution?.status ?? "removed"}; no new run was started.`);
+  }
   outputResult(options.json ? execution.payload : execution.rendered, options.json);
   if (execution.exitStatus !== 0) {
     process.exitCode = execution.exitStatus;
@@ -685,17 +696,17 @@ function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
     request
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
+  spawnDetachedTaskWorker(cwd, job.id);
 
   return {
     payload: {
@@ -804,7 +815,10 @@ async function handleTask(argv) {
     return;
   }
 
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+  const gateKey = !resumeLast && taskMetadata.title === "Codex Stop Gate Review" && /^[a-f0-9]{64}$/.test(process.env[GATE_KEY_ENV] ?? "")
+    ? process.env[GATE_KEY_ENV]
+    : null;
+  const job = buildTaskJob(workspaceRoot, taskMetadata, write, gateKey);
   await runForegroundCommand(
     job,
     (progress) =>
@@ -934,7 +948,7 @@ function handleTaskResumeCandidate(argv) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const sessionId = getCurrentClaudeSessionId();
-  const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
+  const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(reconcileTrackedJobs(workspaceRoot)));
   const candidate = findLatestResumableTaskJob(jobs);
 
   const payload = {
@@ -972,19 +986,7 @@ async function handleCancel(argv) {
   const existing = readStoredJob(workspaceRoot, job.id) ?? {};
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
-
-  const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
-  if (interrupt.attempted) {
-    appendLogLine(
-      job.logFile,
-      interrupt.interrupted
-        ? `Requested Codex turn interrupt for ${turnId} on ${threadId}.`
-        : `Codex turn interrupt failed${interrupt.detail ? `: ${interrupt.detail}` : "."}`
-    );
-  }
-
-  terminateProcessTree(job.pid ?? Number.NaN);
-  appendLogLine(job.logFile, "Cancelled by user.");
+  const cancellationPid = existing.cancellationPid ?? job.cancellationPid ?? job.pid ?? null;
 
   const completedAt = nowIso();
   const nextJob = {
@@ -996,19 +998,44 @@ async function handleCancel(argv) {
     errorMessage: "Cancelled by user."
   };
 
-  writeJobFile(workspaceRoot, job.id, {
-    ...existing,
-    ...nextJob,
-    cancelledAt: completedAt
-  });
-  upsertJob(workspaceRoot, {
-    id: job.id,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    errorMessage: "Cancelled by user.",
-    completedAt
-  });
+  let interrupt;
+  let stopWorker = true;
+  try {
+    const terminal = terminalizeTrackedJob(workspaceRoot, {
+      ...existing,
+      ...nextJob
+    }, {
+      ...nextJob,
+      cancellationPid,
+      cancelledAt: completedAt
+    });
+    if (!terminal.claimed && terminal.job?.status !== "cancelled") {
+      stopWorker = false;
+      const firstOutcome = terminal.job ?? job;
+      const payload = {
+        jobId: job.id,
+        status: firstOutcome.status,
+        title: job.title,
+        turnInterruptAttempted: false,
+        turnInterrupted: false
+      };
+      outputCommandResult(payload, renderCancelReport(firstOutcome), options.json);
+      return;
+    }
+
+    interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
+  } finally {
+    if (stopWorker) terminateProcessTree(cancellationPid ?? Number.NaN);
+  }
+  if (interrupt.attempted) {
+    appendLogLine(
+      job.logFile,
+      interrupt.interrupted
+        ? `Requested Codex turn interrupt for ${turnId} on ${threadId}.`
+        : `Codex turn interrupt failed${interrupt.detail ? `: ${interrupt.detail}` : "."}`
+    );
+  }
+  appendLogLine(job.logFile, "Cancelled by user.");
 
   const payload = {
     jobId: job.id,

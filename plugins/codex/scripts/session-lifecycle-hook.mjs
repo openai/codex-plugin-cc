@@ -13,12 +13,17 @@ import {
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
+import { listJobs, resolveStateFile, SESSION_GENERATION_ENV, setSessionLifecycle, updateState } from "./lib/state.mjs";
+import { markTrackedJobRemoved, readEffectiveStoredJob } from "./lib/tracked-jobs.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
+// SessionEnd runs under a bounded hook timeout, so cleanup fences and stops this
+// session's workers before it ever waits on the shared state lock, and gives the
+// lock a deadline short enough to leave room for the rest of the teardown.
+export const SESSION_END_STATE_LOCK_WAIT_MS = 1000;
 
 function readHookInput() {
   const raw = fs.readFileSync(0, "utf8").trim();
@@ -39,42 +44,89 @@ function appendEnvVar(name, value) {
   fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `export ${name}=${shellEscape(value)}\n`, "utf8");
 }
 
+function warnSessionCleanup(what, error) {
+  const detail = error instanceof Error ? error.message : String(error);
+  process.stderr.write(`Codex Companion session cleanup ${what}: ${detail}\n`);
+}
+
 function cleanupSessionJobs(cwd, sessionId) {
   if (!cwd || !sessionId) {
     return;
   }
 
   const workspaceRoot = resolveWorkspaceRoot(cwd);
+  try {
+    setSessionLifecycle(workspaceRoot, sessionId, true);
+  } catch (error) {
+    warnSessionCleanup("could not fence its session", error);
+  }
   const stateFile = resolveStateFile(workspaceRoot);
   if (!fs.existsSync(stateFile)) {
     return;
   }
 
-  const state = loadState(workspaceRoot);
-  const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
-  if (removedJobs.length === 0) {
-    return;
+  const fenced = new Set();
+  const fenceSessionJobs = (jobs) => {
+    const pids = [];
+    for (const job of jobs.filter((candidate) => candidate.sessionId === sessionId && !fenced.has(candidate.id))) {
+      fenced.add(job.id);
+      // The stored job carries the live pid, so it is read before the fence makes
+      // it unreadable, but an unreadable job must still be fenced.
+      let effectiveJob = job;
+      try {
+        effectiveJob = { ...job, ...(readEffectiveStoredJob(workspaceRoot, job.id) ?? {}) };
+      } catch (error) {
+        warnSessionCleanup(`could not read job ${job.id}`, error);
+      }
+      try {
+        markTrackedJobRemoved(workspaceRoot, job.id);
+      } catch (error) {
+        warnSessionCleanup(`could not fence job ${job.id}`, error);
+      }
+      if (Number.isSafeInteger(effectiveJob.pid) && effectiveJob.pid > 0) {
+        pids.push(effectiveJob.pid);
+      }
+    }
+    return pids;
+  };
+
+  const stopWorkers = (pids) => {
+    for (const pid of pids) {
+      try {
+        terminateProcessTree(pid);
+      } catch {
+        // Ignore teardown failures during session shutdown.
+      }
+    }
+  };
+
+  try {
+    stopWorkers(fenceSessionJobs(listJobs(workspaceRoot)));
+  } catch (error) {
+    warnSessionCleanup("could not read its job list", error);
   }
 
-  for (const job of removedJobs) {
-    const stillRunning = job.status === "queued" || job.status === "running";
-    if (!stillRunning) {
-      continue;
-    }
-    try {
-      terminateProcessTree(job.pid ?? Number.NaN);
-    } catch {
-      // Ignore teardown failures during session shutdown.
-    }
+  let latePids = [];
+  try {
+    updateState(
+      workspaceRoot,
+      (state) => {
+        latePids = fenceSessionJobs(state.jobs);
+        state.jobs = state.jobs.filter((job) => job.sessionId !== sessionId);
+      },
+      { waitMs: SESSION_END_STATE_LOCK_WAIT_MS }
+    );
+  } catch (error) {
+    warnSessionCleanup("could not prune its state", error);
   }
-
-  saveState(workspaceRoot, {
-    ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
-  });
+  stopWorkers(latePids);
 }
 
 function handleSessionStart(input) {
+  if (input.session_id) {
+    const generation = setSessionLifecycle(input.cwd || process.cwd(), input.session_id, false);
+    appendEnvVar(SESSION_GENERATION_ENV, generation);
+  }
   appendEnvVar(SESSION_ID_ENV, input.session_id);
   appendEnvVar(TRANSCRIPT_PATH_ENV, input.transcript_path);
   appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
