@@ -3,9 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 
-import { makeTempDir } from "./helpers.mjs";
-import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import { initGitRepo, makeTempDir } from "./helpers.mjs";
+import { listJobsAcrossWorkspaces, resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -102,4 +104,59 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
       .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
       .sort()
   );
+});
+
+test("cross-workspace scans validate each workspace once while rejecting misplaced job records", (t) => {
+  const previousPluginData = process.env.CLAUDE_PLUGIN_DATA;
+  const pluginData = makeTempDir();
+  const workspaces = [makeTempDir(), makeTempDir()];
+  process.env.CLAUDE_PLUGIN_DATA = pluginData;
+  let spawnSpy;
+
+  try {
+    const expectedJobs = workspaces.flatMap((workspaceRoot, workspaceIndex) => {
+      initGitRepo(workspaceRoot);
+      const jobs = Array.from({ length: 50 }, (_, index) => ({
+        id: `job-${workspaceIndex}-${index}`,
+        workspaceRoot
+      }));
+      saveState(workspaceRoot, { jobs });
+      return jobs;
+    });
+    const misplacedStateFile = path.join(pluginData, "state", "misplaced", "state.json");
+    fs.mkdirSync(path.dirname(misplacedStateFile), { recursive: true });
+    fs.writeFileSync(misplacedStateFile, JSON.stringify({
+      jobs: [
+        { id: "forged-first-workspace", workspaceRoot: workspaces[0] },
+        { id: "forged-second-workspace", workspaceRoot: workspaces[1] },
+        null,
+        { id: "malformed", workspaceRoot: 123 }
+      ]
+    }), "utf8");
+
+    const gitWorkspaceResolutions = [];
+    const originalSpawnSync = childProcess.spawnSync;
+    spawnSpy = t.mock.method(childProcess, "spawnSync", (command, args, options) => {
+      if (command === "git" && args[0] === "rev-parse" && args[1] === "--show-toplevel") {
+        gitWorkspaceResolutions.push(options.cwd);
+      }
+      return originalSpawnSync(command, args, options);
+    });
+    syncBuiltinESMExports();
+
+    for (let scan = 0; scan < 2; scan += 1) {
+      gitWorkspaceResolutions.length = 0;
+      const jobs = listJobsAcrossWorkspaces();
+      assert.deepEqual(jobs.map((job) => job.id).sort(), expectedJobs.map((job) => job.id).sort());
+      assert.deepEqual([...gitWorkspaceResolutions].sort(), [...workspaces].sort());
+    }
+  } finally {
+    spawnSpy?.mock.restore();
+    syncBuiltinESMExports();
+    if (previousPluginData == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previousPluginData;
+    }
+  }
 });
