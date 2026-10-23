@@ -100,9 +100,10 @@ function runStopReview(cwd, input = {}) {
   const prompt = buildStopReviewPrompt(input);
   const childEnv = {
     ...process.env,
+    CODEX_COMPANION_STOP_GATE: "1",
     ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {})
   };
-  const result = spawnSync(process.execPath, [scriptPath, "task", "--stop-gate", "--json", prompt], {
+  const result = spawnSync(process.execPath, [scriptPath, "task", "--json", prompt], {
     cwd,
     env: childEnv,
     encoding: "utf8",

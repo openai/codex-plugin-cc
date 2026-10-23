@@ -1973,8 +1973,10 @@ test("stop hook runs a stop-time review task and blocks on findings when the rev
   const stopGateThread = fakeState.threads.find((thread) => thread.id === fakeState.lastTurnStart.threadId);
   assert.ok(stopGateThread, "stop-gate review thread should exist");
   assert.equal(stopGateThread.ephemeral, true);
+  assert.equal(fakeState.lastThreadStart.sandbox, "read-only");
 
   const catalog = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "state.json"), "utf8"));
+  assert.equal(catalog.jobs.length, 1, "the hook must not add a job to the existing catalog");
   assert.ok(!catalog.jobs.some((job) => job.title === "Codex Stop Gate Review"));
 
   const status = run("node", [SCRIPT, "status"], {
@@ -1988,7 +1990,7 @@ test("stop hook runs a stop-time review task and blocks on findings when the rev
   assert.doesNotMatch(status.stdout, /Codex Stop Gate Review/);
 });
 
-test("a normal task whose prompt contains the stop-gate marker is still tracked (routing is flag-gated, not prompt-sniffed)", () => {
+test("a normal task whose prompt contains the stop-gate marker is still tracked", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
@@ -2010,6 +2012,44 @@ test("a normal task whose prompt contains the stop-gate marker is still tracked 
   const thread = fakeState.threads.find((entry) => entry.id === fakeState.lastTurnStart.threadId);
   assert.equal(thread.ephemeral, false);
 });
+
+for (const { name, rawArgument, sandbox } of [
+  {
+    name: "a single prompt argument containing --stop-gate remains a normal tracked task",
+    rawArgument: "Explain the --stop-gate path",
+    sandbox: "read-only"
+  },
+  {
+    name: "a single raw argument with --write preserves write access when the prompt contains --stop-gate",
+    rawArgument: "--write Explain the --stop-gate path",
+    sandbox: "workspace-write"
+  }
+]) {
+  test(name, () => {
+    const repo = makeTempDir();
+    const binDir = makeTempDir();
+    installFakeCodex(binDir);
+    initGitRepo(repo);
+    fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+    run("git", ["add", "README.md"], { cwd: repo });
+    run("git", ["commit", "-m", "init"], { cwd: repo });
+
+    // Keep the input as one argv entry so this exercises the command's raw-argument parser.
+    const result = run(process.execPath, [SCRIPT, "task", rawArgument], {
+      cwd: repo,
+      env: { ...buildEnv(binDir), CODEX_COMPANION_STOP_GATE: "" }
+    });
+    assert.equal(result.status, 0, result.stderr);
+
+    const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+    assert.equal(fakeState.lastThreadStart.sandbox, sandbox);
+    const thread = fakeState.threads.find((entry) => entry.id === fakeState.lastTurnStart.threadId);
+    assert.equal(thread.ephemeral, false);
+    assert.equal(fakeState.lastTurnStart.prompt, "Explain the --stop-gate path");
+    const catalog = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "state.json"), "utf8"));
+    assert.equal(catalog.jobs.length, 1);
+  });
+}
 
 test("stop hook logs running tasks to stderr without blocking when the review gate is disabled", () => {
   const repo = makeTempDir();

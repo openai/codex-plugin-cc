@@ -763,7 +763,7 @@ async function handleReview(argv) {
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "stop-gate"],
+    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
     aliasMap: {
       m: "model"
     }
@@ -786,7 +786,8 @@ async function handleTask(argv) {
     resumeLast
   });
 
-  if (options["stop-gate"]) {
+  // The hook signals out of band so prompt text cannot select this untracked path.
+  if (process.env.CODEX_COMPANION_STOP_GATE === "1") {
     ensureCodexAvailable(cwd);
     const execution = await executeTaskRun({
       cwd,
