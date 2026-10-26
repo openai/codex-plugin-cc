@@ -287,9 +287,9 @@ Check out the Codex docs for more [configuration options](https://developers.ope
 
 ### Moving The Work Over To Codex
 
-Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/codex:result` or `/codex:status` or by selecting it from the list.
+Delegated tasks can be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/codex:result` or `/codex:status` or by selecting it from the list. This way you can review the Codex work or continue the work there.
 
-This way you can review the Codex work or continue the work there.
+[Stop-gate reviews](#what-does-the-review-gate-do) are ephemeral, one-shot checks consumed by the hook. They do not save a Codex session or create a tracked job, so they cannot be resumed with `codex resume` or retrieved through `/codex:status` or `/codex:result`.
 
 ## FAQ
 
