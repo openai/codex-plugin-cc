@@ -18,7 +18,7 @@ export function run(command, args, options = {}) {
     env: options.env,
     encoding: "utf8",
     input: options.input,
-    shell: process.platform === "win32" && !path.isAbsolute(command),
+    shell: options.shell ?? (process.platform === "win32" && !path.isAbsolute(command)),
     windowsHide: true
   });
 }
