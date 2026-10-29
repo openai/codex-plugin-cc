@@ -1,7 +1,28 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { renderReviewResult, renderStoredJobResult } from "../plugins/codex/scripts/lib/render.mjs";
+import { renderReviewResult, renderStatusReport, renderStoredJobResult } from "../plugins/codex/scripts/lib/render.mjs";
+
+test("renderStatusReport keeps a backslash followed by a pipe in one table cell", () => {
+  const output = renderStatusReport({
+    sessionRuntime: { label: "native" },
+    config: { stopReviewGate: false },
+    running: [{
+      id: "task-1",
+      kindLabel: "task",
+      status: "running",
+      phase: "running",
+      elapsed: "1s",
+      summary: String.raw`a\|b`
+    }],
+    recent: []
+  });
+  const row = output.split("\n").find((line) => line.startsWith("| task-1 |"));
+
+  assert.ok(row);
+  assert.ok(row.includes(String.raw` | a\\\|b |`));
+  assert.equal([...row.matchAll(/(?<!\\)(?:\\\\)*\|/g)].length, 9);
+});
 
 test("renderReviewResult degrades gracefully when JSON is missing required review fields", () => {
   const output = renderReviewResult(

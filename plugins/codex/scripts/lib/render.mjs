@@ -94,7 +94,7 @@ function formatJobLine(job) {
 
 function escapeMarkdownCell(value) {
   return String(value ?? "")
-    .replace(/\|/g, "\\|")
+    .replace(/(\\*)\|/g, "$1$1\\|")
     .replace(/\r?\n/g, " ")
     .trim();
 }
