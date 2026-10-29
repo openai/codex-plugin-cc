@@ -9,6 +9,7 @@ they already have.
 
 ## What You Get
 
+- `/codex:sessions`, `/codex:send`, and `/codex:queue` to find existing local sessions and queue a follow-up
 - `/codex:review` for a normal read-only Codex review
 - `/codex:adversarial-review` for a steerable challenge review
 - `/codex:rescue`, `/codex:transfer`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work, hand off sessions, and manage background jobs
@@ -176,6 +177,51 @@ Examples:
 ```
 
 The plugin's existing `SessionStart` hook supplies the current transcript path automatically; `--source` is available as a manual override. The transfer uses Codex's external-agent session importer, so it follows the same conversion rules as importing Claude history in the Codex App and creates visible turns that can be continued in the App or TUI. The source must be under `~/.claude/projects`, and older Codex versions that do not expose session import must be upgraded before using this command.
+
+### Existing local sessions
+
+Use `/codex:sessions` to find an existing Codex conversation by its section, title,
+UUID, and working directory, then `/codex:send` to queue a follow-up to that exact
+conversation. This works with conversations created outside the plugin as well.
+
+```text
+/codex:sessions
+/codex:sessions --archived
+/codex:send <thread-uuid> Check the failing test and report your findings
+/codex:queue <thread-uuid>
+```
+
+`send` previews the target before executing the user's authorized instruction. It
+uses native `codex queue`, preserves the target's settings, and does not resume or
+interrupt its writer. **QUEUED** is a delivery receipt, not proof of task completion.
+An idle conversation may need to be opened in Codex; an active goal may delay queue
+consumption. `queue` lists pending IDs without message bodies. An empty queue does
+not prove the instruction was executed. Uncertain sends are never retried automatically.
+
+These commands require the experimental `threadSection/list`, `thread/list`,
+`thread/read`, and `thread/queue/list` APIs, plus `codex queue` for sending. They were
+verified with Codex CLI 0.163.0 on macOS. Older versions fail explicitly, without an
+automatic upgrade. Sending requires a native Codex executable on PATH; Windows `.cmd`
+wrappers are not executed through a shell. Windows execution is not verified.
+
+The listing covers the current local Codex home, including unsectioned sessions;
+`--archived` selects archived sessions instead of non-archived sessions. Remote hosts
+and ChatGPT conversations are excluded. API section order can differ from Desktop,
+and pagination is a best-effort view, not an atomic snapshot. A `notLoaded` status
+from the metadata connection does not prove the conversation is idle.
+
+The standalone entry point supports JSON output and accepts messages on stdin:
+
+```sh
+node plugins/codex/scripts/codex-sessions.mjs sessions --json
+node plugins/codex/scripts/codex-sessions.mjs send --thread <uuid> < message.txt
+# After checking the preview and the user's authorization:
+node plugins/codex/scripts/codex-sessions.mjs send --thread <uuid> --execute < message.txt
+node plugins/codex/scripts/codex-sessions.mjs queue --thread <uuid>
+```
+
+Do not send credentials or other secrets: the wrapper does not save message bodies,
+but native `codex queue` receives the text in its process arguments.
 
 ### `/codex:status`
 

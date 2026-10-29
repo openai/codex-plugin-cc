@@ -92,7 +92,11 @@ class AppServerClientBase {
     this.nextId += 1;
 
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, method });
+      const timer = this.options.requestTimeoutMs > 0 ? setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`codex app-server ${method} timed out.`));
+      }, this.options.requestTimeoutMs) : null;
+      this.pending.set(id, { resolve, reject, method, timer });
       this.sendMessage({ id, method, params });
     });
   }
@@ -139,6 +143,7 @@ class AppServerClientBase {
         return;
       }
       this.pending.delete(message.id);
+      clearTimeout(pending.timer);
 
       if (message.error) {
         pending.reject(createProtocolError(message.error.message ?? `codex app-server ${pending.method} failed.`, message.error));
@@ -169,6 +174,7 @@ class AppServerClientBase {
     this.exitError = error ?? null;
 
     for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
       pending.reject(this.exitError ?? new Error("codex app-server connection closed."));
     }
     this.pending.clear();
@@ -348,7 +354,12 @@ export class CodexAppServerClient {
     const client = brokerEndpoint
       ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
       : new SpawnedCodexAppServerClient(cwd, options);
-    await client.initialize();
-    return client;
+    try {
+      await client.initialize();
+      return client;
+    } catch (error) {
+      await client.close();
+      throw error;
+    }
   }
 }

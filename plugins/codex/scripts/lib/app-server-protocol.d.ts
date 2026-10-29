@@ -49,6 +49,7 @@ export type ThreadResumeParams = Omit<RawThreadResumeParams, "persistExtendedHis
 
 export interface CodexAppServerClientOptions {
   env?: NodeJS.ProcessEnv;
+  requestTimeoutMs?: number;
   clientInfo?: ClientInfo;
   capabilities?: InitializeCapabilities;
   brokerEndpoint?: string;

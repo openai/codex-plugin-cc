@@ -14,6 +14,8 @@
   },
   "include": [
     "plugins/codex/scripts/lib/app-server.mjs",
+    "plugins/codex/scripts/lib/sessions.mjs",
+    "plugins/codex/scripts/codex-sessions.mjs",
     "plugins/codex/scripts/lib/codex.mjs",
     "plugins/codex/scripts/lib/fs.mjs",
     "plugins/codex/scripts/lib/process.mjs",
