@@ -144,8 +144,28 @@ test("collectReviewContext skips broken untracked symlinks instead of crashing",
   const context = collectReviewContext(cwd, target);
 
   assert.equal(target.mode, "working-tree");
-  assert.match(context.content, /### broken-link/);
-  assert.match(context.content, /skipped: broken symlink or unreadable file/i);
+  assert.match(context.content, /### broken-link\n\(skipped: symlink\)/);
+});
+
+test("collectReviewContext never inlines the target of an untracked symlink", { skip: process.platform === "win32" }, () => {
+  const root = makeTempDir();
+  const cwd = path.join(root, "repo");
+  fs.mkdirSync(cwd);
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v1');\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(root, "outside.txt"), "OUTSIDE_SECRET_MARKER\n");
+  fs.symlinkSync(path.join("..", "outside.txt"), path.join(cwd, "notes.txt"));
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v2');\n");
+
+  const target = resolveReviewTarget(cwd, {});
+  // The lightweight path (includeDiff: false) still inlines untracked files.
+  for (const options of [{ includeDiff: true }, { includeDiff: false }]) {
+    const context = collectReviewContext(cwd, target, options);
+    assert.match(context.content, /### notes\.txt\n\(skipped: symlink\)/);
+    assert.doesNotMatch(context.content, /OUTSIDE_SECRET_MARKER/);
+  }
 });
 
 test("collectReviewContext falls back to lightweight context for larger adversarial reviews", () => {
