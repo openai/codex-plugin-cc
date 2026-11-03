@@ -49,6 +49,7 @@ const TASK_THREAD_PREFIX = "Codex Companion Task";
 const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
+const LEDGER_REWRITE_ATTEMPTS = 5;
 const EXTERNAL_AGENT_IMPORT_TIMEOUT_MS = 2 * 60 * 1000;
 
 function cleanCodexStderr(stderr) {
@@ -678,20 +679,34 @@ function importRecordsForSource(canonicalSource) {
 // Codex records each imported transcript by path and skips a path it has already imported,
 // even after the transcript has grown. `--refresh` removes this transcript's records (after
 // backing up the ledger) so that Codex imports the current content into a new thread.
-function forgetImportRecordsForSource(canonicalSource) {
-  const ledger = readImportLedger();
-  const records = Array.isArray(ledger?.records) ? ledger.records : [];
-  const kept = records.filter((record) => record?.source_path !== canonicalSource);
-  if (kept.length === records.length) {
-    return { removed: 0, backupPath: null };
-  }
+//
+// Codex writes the ledger without a lock the plugin could share, so the rewrite is optimistic:
+// it re-reads the ledger right before the rename and starts over if another import changed it.
+export function forgetImportRecordsForSource(canonicalSource) {
   const ledgerPath = importLedgerPath();
-  const backupPath = `${ledgerPath}.bak-${Date.now()}`;
-  fs.copyFileSync(ledgerPath, backupPath);
-  const tempPath = `${ledgerPath}.tmp-${process.pid}`;
-  fs.writeFileSync(tempPath, `${JSON.stringify({ ...ledger, records: kept }, null, 2)}\n`);
-  fs.renameSync(tempPath, ledgerPath);
-  return { removed: records.length - kept.length, backupPath };
+  for (let attempt = 0; attempt < LEDGER_REWRITE_ATTEMPTS; attempt += 1) {
+    if (!fs.existsSync(ledgerPath)) {
+      return { removed: 0, backupPath: null };
+    }
+    const original = fs.readFileSync(ledgerPath, "utf8");
+    const ledger = JSON.parse(original);
+    const records = Array.isArray(ledger?.records) ? ledger.records : [];
+    const kept = records.filter((record) => record?.source_path !== canonicalSource);
+    if (kept.length === records.length) {
+      return { removed: 0, backupPath: null };
+    }
+    const tempPath = `${ledgerPath}.tmp-${process.pid}`;
+    fs.writeFileSync(tempPath, `${JSON.stringify({ ...ledger, records: kept }, null, 2)}\n`);
+    if (fs.readFileSync(ledgerPath, "utf8") !== original) {
+      fs.rmSync(tempPath, { force: true });
+      continue;
+    }
+    const backupPath = `${ledgerPath}.bak-${Date.now()}`;
+    fs.writeFileSync(backupPath, original);
+    fs.renameSync(tempPath, ledgerPath);
+    return { removed: records.length - kept.length, backupPath };
+  }
+  throw new Error("Codex's import ledger kept changing while `--refresh` tried to update it. Retry in a moment.");
 }
 
 function sessionImportResults(completion) {
