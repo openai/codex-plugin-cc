@@ -80,7 +80,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
-      "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
+      "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--refresh] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
@@ -614,11 +614,28 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId
 }
 
 function renderTransferResult(payload) {
+  if (payload.alreadyImported) {
+    const when = payload.importedAt ? ` on ${payload.importedAt}` : "";
+    const lines = [
+      payload.upToDate
+        ? `This Claude session was already transferred to Codex${when}, and the transcript has not changed since.`
+        : `This Claude session was already transferred to Codex${when}. Codex imports a transcript only once, so that thread does not include later turns.`,
+      `Codex session ID: ${payload.threadId}`,
+      `Resume in Codex: ${payload.resumeCommand}`
+    ];
+    if (!payload.upToDate) {
+      lines.push("To import the current session into a new Codex thread, run `/codex:transfer --refresh`.");
+    }
+    return `${lines.join("\n")}\n`;
+  }
   const lines = [
     "Transferred the Claude session into a Codex thread with visible turn history.",
     `Codex session ID: ${payload.threadId}`,
     `Resume in Codex: ${payload.resumeCommand}`
   ];
+  if (payload.refreshed) {
+    lines.push(`Replaced the earlier import record for this session; the earlier Codex thread is unchanged. Ledger backup: ${payload.ledgerBackupPath}`);
+  }
   return `${lines.join("\n")}\n`;
 }
 
@@ -626,12 +643,17 @@ async function executeTransfer(cwd, options = {}) {
   const sourcePath = resolveClaudeSessionPath(cwd, {
     source: options.source
   });
-  const result = await importExternalAgentSession(cwd, { sourcePath });
+  const result = await importExternalAgentSession(cwd, { sourcePath, refresh: Boolean(options.refresh) });
   const payload = {
     threadId: result.threadId,
     resumeCommand: `codex resume ${result.threadId}`,
     sourcePath,
-    sessionId: path.basename(sourcePath, ".jsonl")
+    sessionId: path.basename(sourcePath, ".jsonl"),
+    alreadyImported: result.alreadyImported,
+    upToDate: result.upToDate,
+    importedAt: result.importedAt,
+    refreshed: result.refreshed,
+    ledgerBackupPath: result.ledgerBackupPath
   };
 
   return {
@@ -825,12 +847,13 @@ async function handleTask(argv) {
 async function handleTransfer(argv) {
   const { options } = parseCommandInput(argv, {
     valueOptions: ["cwd", "source"],
-    booleanOptions: ["json"]
+    booleanOptions: ["json", "refresh"]
   });
 
   const cwd = resolveCommandCwd(options);
   const { payload, rendered } = await executeTransfer(cwd, {
-    source: options.source
+    source: options.source,
+    refresh: options.refresh
   });
   outputCommandResult(payload, rendered, options.json);
 }

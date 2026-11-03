@@ -658,24 +658,56 @@ function sourceContentSha256(sourcePath) {
   return crypto.createHash("sha256").update(fs.readFileSync(sourcePath)).digest("hex");
 }
 
-function importedThreadIdForSource(sourcePath) {
-  const ledgerPath = path.join(resolveCodexHome(), "external_agent_session_imports.json");
-  if (!fs.existsSync(ledgerPath)) {
+function importLedgerPath() {
+  return path.join(resolveCodexHome(), "external_agent_session_imports.json");
+}
+
+function readImportLedger() {
+  const ledgerPath = importLedgerPath();
+  return fs.existsSync(ledgerPath) ? readJsonFile(ledgerPath) : null;
+}
+
+function importRecordsForSource(canonicalSource) {
+  const ledger = readImportLedger();
+  const records = Array.isArray(ledger?.records) ? ledger.records : [];
+  return records.filter(
+    (record) => record?.source_path === canonicalSource && typeof record?.imported_thread_id === "string"
+  );
+}
+
+// Codex records each imported transcript by path and skips a path it has already imported,
+// even after the transcript has grown. `--refresh` removes this transcript's records (after
+// backing up the ledger) so that Codex imports the current content into a new thread.
+function forgetImportRecordsForSource(canonicalSource) {
+  const ledger = readImportLedger();
+  const records = Array.isArray(ledger?.records) ? ledger.records : [];
+  const kept = records.filter((record) => record?.source_path !== canonicalSource);
+  if (kept.length === records.length) {
+    return { removed: 0, backupPath: null };
+  }
+  const ledgerPath = importLedgerPath();
+  const backupPath = `${ledgerPath}.bak-${Date.now()}`;
+  fs.copyFileSync(ledgerPath, backupPath);
+  const tempPath = `${ledgerPath}.tmp-${process.pid}`;
+  fs.writeFileSync(tempPath, `${JSON.stringify({ ...ledger, records: kept }, null, 2)}\n`);
+  fs.renameSync(tempPath, ledgerPath);
+  return { removed: records.length - kept.length, backupPath };
+}
+
+function sessionImportResults(completion) {
+  if (!Array.isArray(completion?.itemTypeResults)) {
     return null;
   }
-  const ledger = readJsonFile(ledgerPath);
-  const canonicalSource = fs.realpathSync(sourcePath);
-  const contentSha256 = sourceContentSha256(canonicalSource);
-  const records = Array.isArray(ledger?.records) ? ledger.records : [];
-  const match = records
-    .filter(
-      (record) =>
-        record?.source_path === canonicalSource &&
-        record?.content_sha256 === contentSha256 &&
-        typeof record?.imported_thread_id === "string"
-    )
-    .at(-1);
-  return match?.imported_thread_id ?? null;
+  const sessions = completion.itemTypeResults.filter((result) => result?.itemType === "SESSIONS");
+  return {
+    successes: sessions.flatMap((result) => (Array.isArray(result.successes) ? result.successes : [])),
+    failures: sessions.flatMap((result) => (Array.isArray(result.failures) ? result.failures : []))
+  };
+}
+
+function importedAtIso(record) {
+  const seconds = Number(record?.imported_at);
+  return Number.isFinite(seconds) && seconds > 0 ? new Date(seconds * 1000).toISOString() : null;
 }
 
 function externalAgentSessionMigration(sourcePath, cwd) {
@@ -711,7 +743,7 @@ async function requestExternalAgentSessionImport(client, params) {
 
   client.setNotificationHandler((message) => {
     if (message.method === EXTERNAL_AGENT_IMPORT_COMPLETED) {
-      resolveCompleted();
+      resolveCompleted(message.params ?? null);
       return;
     }
     previousHandler?.(message);
@@ -722,7 +754,7 @@ async function requestExternalAgentSessionImport(client, params) {
 
   try {
     await client.request("externalAgentConfig/import", params);
-    await completed;
+    return await completed;
   } finally {
     clearTimeout(timeout);
     client.setNotificationHandler(previousHandler ?? null);
@@ -1064,10 +1096,18 @@ export async function importExternalAgentSession(cwd, options = {}) {
     throw new Error("A Claude session source path is required.");
   }
 
+  const canonicalSource = fs.realpathSync(options.sourcePath);
   return withDirectAppServer(cwd, async (client) => {
+    const priorRecords = importRecordsForSource(canonicalSource);
+    const priorThreadIds = new Set(priorRecords.map((record) => record.imported_thread_id));
+    const refresh = options.refresh ? forgetImportRecordsForSource(canonicalSource) : { removed: 0, backupPath: null };
+    if (refresh.removed > 0) {
+      emitProgress(options.onProgress, `Removed the earlier import record (ledger backup: ${refresh.backupPath}).`, "transferring");
+    }
     emitProgress(options.onProgress, "Importing Claude session into Codex.", "transferring");
+    let completion;
     try {
-      await requestExternalAgentSessionImport(client, externalAgentSessionMigration(options.sourcePath, cwd));
+      completion = await requestExternalAgentSessionImport(client, externalAgentSessionMigration(options.sourcePath, cwd));
     } catch (error) {
       if (error?.rpcCode === -32601) {
         throw new Error(
@@ -1077,18 +1117,52 @@ export async function importExternalAgentSession(cwd, options = {}) {
       }
       throw error;
     }
-    const threadId = importedThreadIdForSource(options.sourcePath);
-    if (!threadId) {
-      const stderr = cleanCodexStderr(client.stderr);
-      throw new Error(
-        `Codex reported that the Claude import completed, but did not record an imported thread.${stderr ? `\n${stderr}` : " Check the Codex app-server logs for the underlying import error."}`
-      );
+    const stderr = cleanCodexStderr(client.stderr);
+    const results = sessionImportResults(completion);
+    const imported = results?.successes.find((success) => typeof success?.target === "string" && success.target);
+    // Codex versions that do not report results: use the ledger record this import added. Match
+    // on path only, because the live transcript can grow after Codex hashed it.
+    const created = imported
+      ? null
+      : importRecordsForSource(canonicalSource)
+          .filter((record) => !priorThreadIds.has(record.imported_thread_id))
+          .at(-1);
+    const threadId = imported?.target ?? created?.imported_thread_id ?? null;
+    if (threadId) {
+      emitProgress(options.onProgress, `Claude session imported (${threadId}).`, "completed", { threadId });
+      return {
+        threadId,
+        alreadyImported: false,
+        upToDate: null,
+        importedAt: null,
+        refreshed: refresh.removed > 0,
+        ledgerBackupPath: refresh.backupPath,
+        stderr
+      };
     }
-    emitProgress(options.onProgress, `Claude session imported (${threadId}).`, "completed", { threadId });
-    return {
-      threadId,
-      stderr: cleanCodexStderr(client.stderr)
-    };
+    if (results?.failures.length) {
+      const detail = results.failures.map((failure) => failure?.message).filter(Boolean).join("; ");
+      throw new Error(`Codex could not import the Claude session${detail ? `: ${detail}` : "."}${stderr ? `\n${stderr}` : ""}`);
+    }
+    // Codex skipped the transcript because it already imported this path.
+    const previous = options.refresh ? null : priorRecords.at(-1);
+    if (previous) {
+      emitProgress(options.onProgress, `Claude session already imported (${previous.imported_thread_id}).`, "completed", {
+        threadId: previous.imported_thread_id
+      });
+      return {
+        threadId: previous.imported_thread_id,
+        alreadyImported: true,
+        upToDate: previous.content_sha256 === sourceContentSha256(canonicalSource),
+        importedAt: importedAtIso(previous),
+        refreshed: false,
+        ledgerBackupPath: null,
+        stderr
+      };
+    }
+    throw new Error(
+      `Codex reported that the Claude import completed, but did not record an imported thread.${stderr ? `\n${stderr}` : " Check the Codex app-server logs for the underlying import error."}`
+    );
   });
 }
 

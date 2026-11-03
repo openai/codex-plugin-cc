@@ -1,6 +1,6 @@
 ---
 description: Transfer the current Claude Code session into a resumable Codex thread
-argument-hint: "[--source <claude-jsonl>]"
+argument-hint: "[--source <claude-jsonl>] [--refresh]"
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---
