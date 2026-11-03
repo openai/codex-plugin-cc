@@ -623,8 +623,8 @@ function renderTransferResult(payload) {
       `Codex session ID: ${payload.threadId}`,
       `Resume in Codex: ${payload.resumeCommand}`
     ];
-    if (!payload.upToDate) {
-      lines.push("To import the current session into a new Codex thread, run `/codex:transfer --refresh`.");
+    if (payload.refreshCommand) {
+      lines.push(`To import the current session into a new Codex thread, run \`${payload.refreshCommand}\`.`);
     }
     return `${lines.join("\n")}\n`;
   }
@@ -644,6 +644,12 @@ async function executeTransfer(cwd, options = {}) {
     source: options.source
   });
   const result = await importExternalAgentSession(cwd, { sourcePath, refresh: Boolean(options.refresh) });
+  // Keep an explicit --source in the hint; without it, --refresh would resolve the session's own transcript.
+  const sourceArgument = /[\s"'\\]/.test(sourcePath) ? JSON.stringify(sourcePath) : sourcePath;
+  const refreshCommand =
+    result.alreadyImported && !result.upToDate
+      ? `/codex:transfer --refresh${options.source ? ` --source ${sourceArgument}` : ""}`
+      : null;
   const payload = {
     threadId: result.threadId,
     resumeCommand: `codex resume ${result.threadId}`,
@@ -652,6 +658,7 @@ async function executeTransfer(cwd, options = {}) {
     alreadyImported: result.alreadyImported,
     upToDate: result.upToDate,
     importedAt: result.importedAt,
+    refreshCommand,
     refreshed: result.refreshed,
     ledgerBackupPath: result.ledgerBackupPath
   };

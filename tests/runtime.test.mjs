@@ -394,6 +394,28 @@ test("transfer --refresh re-imports a grown transcript into a new thread", () =>
   assert.match(rendered.stdout, /codex resume thr_2/);
 });
 
+test("transfer keeps an explicit --source in the refresh hint", () => {
+  const fixture = setupTransferFixture();
+  const olderSource = path.join(path.dirname(fixture.sourcePath), "older-session.jsonl");
+  fs.writeFileSync(olderSource, `${JSON.stringify({ type: "user", message: { role: "user", content: "Older request." } })}\n`);
+  assert.equal(fixture.transfer("").status, 0);
+  assert.equal(fixture.transfer(`--source ${olderSource}`).status, 0);
+  fs.appendFileSync(olderSource, `${JSON.stringify({ type: "user", message: { role: "user", content: "Older follow-up." } })}\n`);
+
+  const result = fixture.transfer(`--source ${olderSource} --json`);
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.alreadyImported, true);
+  assert.equal(payload.refreshCommand, `/codex:transfer --refresh --source ${fs.realpathSync(olderSource)}`);
+
+  // Following the hint refreshes the older transcript, not the session's own transcript.
+  const refreshed = fixture.transfer(`${payload.refreshCommand.replace("/codex:transfer ", "")} --json`);
+  assert.equal(refreshed.status, 0, refreshed.stderr);
+  const records = fixture.ledgerRecords();
+  assert.equal(records.find((record) => record.source_path === fs.realpathSync(fixture.sourcePath)).imported_thread_id, "thr_1");
+  assert.equal(records.find((record) => record.source_path === fs.realpathSync(olderSource)).imported_thread_id, "thr_3");
+});
+
 test("transfer surfaces import failures reported by Codex", () => {
   const fixture = setupTransferFixture("external-import-reports-failure");
 
