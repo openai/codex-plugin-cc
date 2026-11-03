@@ -332,7 +332,8 @@ function setupTransferFixture(behavior) {
   const ledgerRecords = () =>
     JSON.parse(fs.readFileSync(path.join(codexHome, "external_agent_session_imports.json"), "utf8")).records;
   const fakeThreads = () => JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8")).threads;
-  return { codexHome, sourcePath, transfer, appendTurn, ledgerRecords, fakeThreads };
+  const useBehavior = (nextBehavior) => installFakeCodex(binDir, nextBehavior);
+  return { codexHome, sourcePath, transfer, appendTurn, ledgerRecords, fakeThreads, useBehavior };
 }
 
 test("transfer reports an already-imported session instead of failing", () => {
@@ -414,6 +415,30 @@ test("transfer keeps an explicit --source in the refresh hint", () => {
   const records = fixture.ledgerRecords();
   assert.equal(records.find((record) => record.source_path === fs.realpathSync(fixture.sourcePath)).imported_thread_id, "thr_1");
   assert.equal(records.find((record) => record.source_path === fs.realpathSync(olderSource)).imported_thread_id, "thr_3");
+});
+
+test("transfer --refresh restores the earlier import record when Codex rejects the import", () => {
+  const fixture = setupTransferFixture();
+  assert.equal(fixture.transfer("").status, 0);
+  fixture.appendTurn("More work after the first transfer.");
+
+  for (const behavior of ["external-import-reports-failure", "external-import-unsupported"]) {
+    fixture.useBehavior(behavior);
+    const rejected = fixture.transfer("--refresh");
+    assert.notEqual(rejected.status, 0, behavior);
+    assert.match(rejected.stderr, /earlier import record for this transcript was restored \(ledger backup: .+\)/, behavior);
+    assert.deepEqual(
+      fixture.ledgerRecords().map((record) => record.imported_thread_id),
+      ["thr_1"],
+      behavior
+    );
+  }
+
+  fixture.useBehavior();
+  const afterwards = JSON.parse(fixture.transfer("--json").stdout);
+  assert.equal(afterwards.alreadyImported, true);
+  assert.equal(afterwards.threadId, "thr_1");
+  assert.equal(fixture.fakeThreads().length, 1);
 });
 
 test("transfer surfaces import failures reported by Codex", () => {
