@@ -70,6 +70,24 @@ async function main() {
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
   const sockets = new Set();
+  const activeTurns = new Set();
+  let pendingRequests = 0;
+  let idleTimer = null;
+  let shuttingDown = false;
+  const configuredIdleMs = Number(process.env.CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS);
+  const idleTimeoutMs = Number.isFinite(configuredIdleMs) && configuredIdleMs > 0 ? configuredIdleMs : 60000;
+
+  function updateIdleTimer() {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+    if (shuttingDown || sockets.size || pendingRequests || activeTurns.size) return;
+    idleTimer = setTimeout(() => {
+      shutdown(server).then(() => process.exit(0)).catch((error) => {
+        process.stderr.write(`${error.message}\n`);
+        process.exit(1);
+      });
+    }, idleTimeoutMs);
+  }
 
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
@@ -82,6 +100,11 @@ async function main() {
   }
 
   function routeNotification(message) {
+    // A disconnected caller must not make its running turn eligible for shutdown.
+    const turnKey = `${message.params?.threadId}:${message.params?.turn?.id}`;
+    if (message.method === "turn/started") activeTurns.add(turnKey);
+    if (message.method === "turn/completed") activeTurns.delete(turnKey);
+    updateIdleTimer();
     const target = activeRequestSocket ?? activeStreamSocket;
     if (!target) {
       return;
@@ -100,6 +123,9 @@ async function main() {
   }
 
   async function shutdown(server) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    clearTimeout(idleTimer);
     for (const socket of sockets) {
       socket.end();
     }
@@ -117,6 +143,7 @@ async function main() {
 
   const server = net.createServer((socket) => {
     sockets.add(socket);
+    updateIdleTimer();
     socket.setEncoding("utf8");
     let buffer = "";
 
@@ -182,6 +209,7 @@ async function main() {
         }
 
         if (allowInterruptDuringActiveStream) {
+          pendingRequests += 1;
           try {
             const result = await appClient.request(message.method, message.params ?? {});
             send(socket, { id: message.id, result });
@@ -190,12 +218,16 @@ async function main() {
               id: message.id,
               error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
             });
+          } finally {
+            pendingRequests -= 1;
+            updateIdleTimer();
           }
           continue;
         }
 
         const isStreaming = STREAMING_METHODS.has(message.method);
         activeRequestSocket = socket;
+        pendingRequests += 1;
 
         try {
           const result = await appClient.request(message.method, message.params ?? {});
@@ -218,6 +250,9 @@ async function main() {
           if (activeStreamSocket === socket && !isStreaming) {
             activeStreamSocket = null;
           }
+        } finally {
+          pendingRequests -= 1;
+          updateIdleTimer();
         }
       }
     });
@@ -225,11 +260,13 @@ async function main() {
     socket.on("close", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      updateIdleTimer();
     });
 
     socket.on("error", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      updateIdleTimer();
     });
   });
 
@@ -243,7 +280,7 @@ async function main() {
     process.exit(0);
   });
 
-  server.listen(listenTarget.path);
+  server.listen(listenTarget.path, updateIdleTimer);
 }
 
 main().catch((error) => {

@@ -5,6 +5,7 @@ import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { resolveStateDir } from "./state.mjs";
 
@@ -40,19 +41,22 @@ export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
   return false;
 }
 
-export async function sendBrokerShutdown(endpoint) {
+export async function sendBrokerShutdown(endpoint, { timeoutMs = 1000 } = {}) {
   await new Promise((resolve) => {
     const socket = connectToEndpoint(endpoint);
+    const finish = () => {
+      clearTimeout(timer);
+      socket.destroy();
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
     socket.setEncoding("utf8");
     socket.on("connect", () => {
       socket.write(`${JSON.stringify({ id: 1, method: "broker/shutdown", params: {} })}\n`);
     });
-    socket.on("data", () => {
-      socket.end();
-      resolve();
-    });
-    socket.on("error", resolve);
-    socket.on("close", resolve);
+    socket.on("data", finish);
+    socket.on("error", finish);
+    socket.on("close", finish);
   });
 }
 
@@ -111,6 +115,52 @@ async function isBrokerEndpointReady(endpoint) {
 }
 
 export async function ensureBrokerSession(cwd, options = {}) {
+  // Serialize the readiness check, spawn and state publication across processes.
+  // Otherwise simultaneous first commands each leave a detached broker behind.
+  const stateFile = resolveBrokerStateFile(cwd);
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+  const lockFile = `${stateFile}.lock`;
+  const owner = { pid: process.pid, token: randomUUID() };
+  const deadline = Date.now() + (options.timeoutMs ?? 2000) + 3000;
+  while (true) {
+    try {
+      const fd = fs.openSync(lockFile, "wx");
+      try {
+        fs.writeFileSync(fd, JSON.stringify(owner));
+      } finally {
+        fs.closeSync(fd);
+      }
+      break;
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      try {
+        const text = fs.readFileSync(lockFile, "utf8");
+        let stale = false;
+        if (text) {
+          const previous = JSON.parse(text);
+          if (Number.isInteger(previous.pid) && previous.pid > 0) {
+            try { process.kill(previous.pid, 0); } catch (err) { stale = err.code === "ESRCH"; }
+          }
+        } else {
+          // A process may die between exclusive creation and writing its PID.
+          stale = Date.now() - fs.statSync(lockFile).mtimeMs > 30000;
+        }
+        if (stale && fs.readFileSync(lockFile, "utf8") === text) fs.unlinkSync(lockFile);
+      } catch (err) {
+        if (err.code !== "ENOENT") throw err;
+      }
+      if (Date.now() >= deadline) throw new Error("Timed out waiting for Codex broker startup lock.");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+  try {
+    return await startBrokerSession(cwd, options);
+  } finally {
+    if (JSON.parse(fs.readFileSync(lockFile, "utf8")).token === owner.token) fs.unlinkSync(lockFile);
+  }
+}
+
+async function startBrokerSession(cwd, options) {
   const existing = loadBrokerSession(cwd);
   if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
     return existing;
