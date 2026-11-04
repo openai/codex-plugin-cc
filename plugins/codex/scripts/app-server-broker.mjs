@@ -208,30 +208,19 @@ async function main() {
           continue;
         }
 
-        if (allowInterruptDuringActiveStream) {
-          pendingRequests += 1;
-          try {
-            const result = await appClient.request(message.method, message.params ?? {});
-            send(socket, { id: message.id, result });
-          } catch (error) {
-            send(socket, {
-              id: message.id,
-              error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
-            });
-          } finally {
-            pendingRequests -= 1;
-            updateIdleTimer();
-          }
-          continue;
-        }
-
         const isStreaming = STREAMING_METHODS.has(message.method);
-        activeRequestSocket = socket;
+        if (!allowInterruptDuringActiveStream) {
+          activeRequestSocket = socket;
+        }
         pendingRequests += 1;
 
         try {
           const result = await appClient.request(message.method, message.params ?? {});
           send(socket, { id: message.id, result });
+          // Interrupts share request bookkeeping without taking stream ownership.
+          if (allowInterruptDuringActiveStream) {
+            continue;
+          }
           if (isStreaming) {
             activeStreamSocket = socket;
             activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
@@ -244,6 +233,9 @@ async function main() {
             id: message.id,
             error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
           });
+          if (allowInterruptDuringActiveStream) {
+            continue;
+          }
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
           }

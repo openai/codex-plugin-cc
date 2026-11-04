@@ -114,6 +114,33 @@ async function isBrokerEndpointReady(endpoint) {
   }
 }
 
+function removeStaleBrokerLock(lockFile) {
+  try {
+    const text = fs.readFileSync(lockFile, "utf8");
+    let stale = false;
+    if (text) {
+      const owner = JSON.parse(text);
+      if (Number.isInteger(owner.pid) && owner.pid > 0) {
+        try {
+          process.kill(owner.pid, 0);
+        } catch (error) {
+          stale = error.code === "ESRCH";
+        }
+      }
+    } else {
+      // A process may die between exclusive creation and writing its PID.
+      stale = Date.now() - fs.statSync(lockFile).mtimeMs > 30000;
+    }
+    if (stale && fs.readFileSync(lockFile, "utf8") === text) {
+      fs.unlinkSync(lockFile);
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      throw error;
+    }
+  }
+}
+
 export async function ensureBrokerSession(cwd, options = {}) {
   // Serialize the readiness check, spawn and state publication across processes.
   // Otherwise simultaneous first commands each leave a detached broker behind.
@@ -132,31 +159,22 @@ export async function ensureBrokerSession(cwd, options = {}) {
       }
       break;
     } catch (error) {
-      if (error.code !== "EEXIST") throw error;
-      try {
-        const text = fs.readFileSync(lockFile, "utf8");
-        let stale = false;
-        if (text) {
-          const previous = JSON.parse(text);
-          if (Number.isInteger(previous.pid) && previous.pid > 0) {
-            try { process.kill(previous.pid, 0); } catch (err) { stale = err.code === "ESRCH"; }
-          }
-        } else {
-          // A process may die between exclusive creation and writing its PID.
-          stale = Date.now() - fs.statSync(lockFile).mtimeMs > 30000;
-        }
-        if (stale && fs.readFileSync(lockFile, "utf8") === text) fs.unlinkSync(lockFile);
-      } catch (err) {
-        if (err.code !== "ENOENT") throw err;
+      if (error.code !== "EEXIST") {
+        throw error;
       }
-      if (Date.now() >= deadline) throw new Error("Timed out waiting for Codex broker startup lock.");
+      removeStaleBrokerLock(lockFile);
+      if (Date.now() >= deadline) {
+        throw new Error("Timed out waiting for Codex broker startup lock.");
+      }
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
   }
   try {
     return await startBrokerSession(cwd, options);
   } finally {
-    if (JSON.parse(fs.readFileSync(lockFile, "utf8")).token === owner.token) fs.unlinkSync(lockFile);
+    if (JSON.parse(fs.readFileSync(lockFile, "utf8")).token === owner.token) {
+      fs.unlinkSync(lockFile);
+    }
   }
 }
 
