@@ -1,9 +1,11 @@
 import fs from "node:fs";
+import os from "node:os";
 import process from "node:process";
 
 import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
+const TERMINATION_SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP"];
 
 export function nowIso() {
   return new Date().toISOString();
@@ -139,6 +141,59 @@ function readStoredJobOrNull(workspaceRoot, jobId) {
   return readJobFile(jobFile);
 }
 
+function isTerminalJobStatus(status) {
+  return status === "completed" || status === "failed" || status === "cancelled";
+}
+
+// The companion process owns the Codex turn: when it is told to stop (its Claude
+// Bash call or subagent was stopped), record that before exiting. Exiting closes
+// the app-server connection, which makes the broker interrupt the turn and takes
+// a directly spawned app-server down with it.
+function stopJobWithProcess(job, runningRecord) {
+  let stopping = false;
+  const onSignal = (signal) => {
+    if (stopping) {
+      return;
+    }
+    stopping = true;
+    try {
+      const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
+      // `/codex:cancel` may already have recorded its own outcome.
+      if (!isTerminalJobStatus(existing.status)) {
+        const completedAt = nowIso();
+        const errorMessage = `Interrupted: the Codex companion received ${signal}.`;
+        writeJobFile(job.workspaceRoot, job.id, {
+          ...existing,
+          status: "cancelled",
+          phase: "cancelled",
+          errorMessage,
+          pid: null,
+          completedAt
+        });
+        upsertJob(job.workspaceRoot, {
+          id: job.id,
+          status: "cancelled",
+          phase: "cancelled",
+          pid: null,
+          errorMessage,
+          completedAt
+        });
+        appendLogLine(runningRecord.logFile, errorMessage);
+      }
+    } finally {
+      process.exit(128 + (os.constants.signals[signal] ?? 0));
+    }
+  };
+  for (const signal of TERMINATION_SIGNALS) {
+    process.on(signal, onSignal);
+  }
+  return () => {
+    for (const signal of TERMINATION_SIGNALS) {
+      process.off(signal, onSignal);
+    }
+  };
+}
+
 export async function runTrackedJob(job, runner, options = {}) {
   const runningRecord = {
     ...job,
@@ -150,6 +205,7 @@ export async function runTrackedJob(job, runner, options = {}) {
   };
   writeJobFile(job.workspaceRoot, job.id, runningRecord);
   upsertJob(job.workspaceRoot, runningRecord);
+  const releaseSignals = options.stopOnSignal ? stopJobWithProcess(job, runningRecord) : () => {};
 
   try {
     const execution = await runner();
@@ -200,5 +256,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       completedAt
     });
     throw error;
+  } finally {
+    releaseSignals();
   }
 }

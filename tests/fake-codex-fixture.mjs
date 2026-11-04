@@ -25,7 +25,9 @@ const readline = require("node:readline");
 	}
 
 function saveState(state) {
-  fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
+  const temporaryPath = STATE_PATH + "." + process.pid + ".tmp";
+  fs.writeFileSync(temporaryPath, JSON.stringify(state, null, 2));
+  fs.renameSync(temporaryPath, STATE_PATH);
 }
 
 function requiresExperimental(field, message, state) {
@@ -180,6 +182,28 @@ function emitTurnCompletedLater(threadId, turnId, item, delayMs) {
   }, delayMs);
 }
 
+function whenReleased(phase, action) {
+  if (fs.existsSync(STATE_PATH + ".release-" + phase)) {
+    action();
+  } else {
+    setTimeout(() => whenReleased(phase, action), 10);
+  }
+}
+
+function startInterruptibleTurn(threadId, turnId, items = []) {
+  send({ method: "turn/started", params: { threadId, turn: buildTurn(turnId) } });
+  const timer = setTimeout(() => {
+    interruptibleTurns.delete(turnId);
+    for (const entry of items) {
+      if (entry && entry.completed) {
+        send({ method: "item/completed", params: { threadId, turnId, item: entry.completed } });
+      }
+    }
+    send({ method: "turn/completed", params: { threadId, turn: buildTurn(turnId, "completed") } });
+  }, 5000);
+  interruptibleTurns.set(turnId, { threadId, timer });
+}
+
 function nativeReviewText(target) {
   if (target.type === "baseBranch") {
     return "Reviewed changes against " + target.branch + ".\\nNo material issues found.";
@@ -275,6 +299,7 @@ bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
 saveState(bootState);
 
 const rl = readline.createInterface({ input: process.stdin });
+rl.on("close", () => process.exit(0));
 rl.on("line", (line) => {
   if (!line.trim()) {
     return;
@@ -428,7 +453,7 @@ rl.on("line", (line) => {
         }
         const turnId = nextTurnId(state);
         send({ id: message.id, result: { turn: buildTurn(turnId), reviewThreadId: reviewThread.id } });
-        emitTurnCompleted(reviewThread.id, turnId, [
+        const items = [
           {
             started: { type: "enteredReviewMode", id: turnId, review: "current changes" }
           },
@@ -447,7 +472,12 @@ rl.on("line", (line) => {
           {
             completed: { type: "exitedReviewMode", id: turnId, review: nativeReviewText(message.params.target) }
           }
-        ]);
+        ];
+        if (BEHAVIOR === "interruptible-review") {
+          startInterruptibleTurn(reviewThread.id, turnId, items);
+        } else {
+          emitTurnCompleted(reviewThread.id, turnId, items);
+        }
         break;
       }
 
@@ -467,6 +497,13 @@ rl.on("line", (line) => {
 	          prompt
 	        };
 	        saveState(state);
+	        if (BEHAVIOR === "deferred-task") {
+          whenReleased("start", () => {
+            send({ id: message.id, result: { turn: buildTurn(turnId) } });
+            startInterruptibleTurn(thread.id, turnId);
+          });
+          break;
+        }
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
 
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
@@ -601,20 +638,7 @@ rl.on("line", (line) => {
         ];
 
 	        if (BEHAVIOR === "interruptible-slow-task") {
-	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
-	          const timer = setTimeout(() => {
-	            if (!interruptibleTurns.has(turnId)) {
-	              return;
-	            }
-	            interruptibleTurns.delete(turnId);
-	            for (const entry of items) {
-	              if (entry && entry.completed) {
-	                send({ method: "item/completed", params: { threadId: thread.id, turnId, item: entry.completed } });
-	              }
-	            }
-	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
-	          }, 5000);
-	          interruptibleTurns.set(turnId, { threadId: thread.id, timer });
+          startInterruptibleTurn(thread.id, turnId, items);
 	        } else if (BEHAVIOR === "slow-task") {
 	          emitTurnCompletedLater(thread.id, turnId, items, 400);
 	        } else {
@@ -629,19 +653,26 @@ rl.on("line", (line) => {
 	          turnId: message.params.turnId
 	        };
 	        saveState(state);
-	        const pending = interruptibleTurns.get(message.params.turnId);
-	        if (pending) {
-	          clearTimeout(pending.timer);
-	          interruptibleTurns.delete(message.params.turnId);
-	          send({
-	            method: "turn/completed",
-	            params: {
-	              threadId: pending.threadId,
-	              turn: buildTurn(message.params.turnId, "interrupted")
-	            }
-	          });
-	        }
-	        send({ id: message.id, result: {} });
+        const finishInterrupt = () => {
+          const pending = interruptibleTurns.get(message.params.turnId);
+          if (pending) {
+            clearTimeout(pending.timer);
+            interruptibleTurns.delete(message.params.turnId);
+            send({
+              method: "turn/completed",
+              params: {
+                threadId: pending.threadId,
+                turn: buildTurn(message.params.turnId, "interrupted")
+              }
+            });
+          }
+          send({ id: message.id, result: {} });
+        };
+        if (BEHAVIOR === "deferred-task") {
+          whenReleased("interrupt", finishInterrupt);
+        } else {
+          finishInterrupt();
+        }
 	        break;
 	      }
 

@@ -38,6 +38,7 @@ import {
   buildSingleJobSnapshot,
   buildStatusSnapshot,
   readStoredJob,
+  reconcileOrphanedJobs,
   resolveCancelableJob,
   resolveResultJob,
   sortJobsNewestFirst
@@ -367,6 +368,7 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
 async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const sessionId = getCurrentClaudeSessionId();
+  reconcileOrphanedJobs(workspaceRoot);
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
   const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
   const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
@@ -695,7 +697,7 @@ async function runForegroundCommand(job, runner, options = {}) {
     logFile: options.logFile,
     stderr: !options.json
   });
-  const execution = await runTrackedJob(job, () => runner(progress), { logFile });
+  const execution = await runTrackedJob(job, () => runner(progress), { logFile, stopOnSignal: true });
   outputResult(options.json ? execution.payload : execution.rendered, options.json);
   if (execution.exitStatus !== 0) {
     process.exitCode = execution.exitStatus;
@@ -705,11 +707,11 @@ async function runForegroundCommand(job, runner, options = {}) {
 
 function spawnDetachedTaskWorker(cwd, jobId) {
   const scriptPath = path.join(ROOT_DIR, "scripts", "codex-companion.mjs");
-  const child = spawn(process.execPath, [scriptPath, "task-worker", "--cwd", cwd, "--job-id", jobId], {
+  const child = spawn(process.execPath, [scriptPath, "task-worker", "--cwd", cwd, "--job-id", jobId, "--wait-for-launch"], {
     cwd,
     env: process.env,
     detached: true,
-    stdio: "ignore",
+    stdio: ["pipe", "ignore", "ignore"],
     windowsHide: true
   });
   child.unref();
@@ -731,6 +733,9 @@ function enqueueBackgroundTask(cwd, job, request) {
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
+  // The worker must not read or update the job before both queued records exist.
+  child.stdin.on("error", () => {});
+  child.stdin.end("start\n");
 
   return {
     payload: {
@@ -878,11 +883,21 @@ async function handleTransfer(argv) {
 
 async function handleTaskWorker(argv) {
   const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "job-id"]
+    valueOptions: ["cwd", "job-id"],
+    booleanOptions: ["wait-for-launch"]
   });
 
   if (!options["job-id"]) {
     throw new Error("Missing required --job-id for task-worker.");
+  }
+  if (options["wait-for-launch"]) {
+    let launchMessage = "";
+    for await (const chunk of process.stdin) {
+      launchMessage += chunk;
+    }
+    if (launchMessage.trim() !== "start") {
+      throw new Error("Background task launcher exited before saving the job.");
+    }
   }
 
   const cwd = resolveCommandCwd(options);
@@ -890,6 +905,9 @@ async function handleTaskWorker(argv) {
   const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
   if (!storedJob) {
     throw new Error(`No stored job found for ${options["job-id"]}.`);
+  }
+  if (storedJob.status === "cancelled" || storedJob.status === "completed" || storedJob.status === "failed") {
+    return;
   }
 
   const request = storedJob.request;
@@ -917,7 +935,7 @@ async function handleTaskWorker(argv) {
         ...request,
         onProgress: progress
       }),
-    { logFile }
+    { logFile, stopOnSignal: true }
   );
 }
 
@@ -975,6 +993,7 @@ function handleTaskResumeCandidate(argv) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const sessionId = getCurrentClaudeSessionId();
+  reconcileOrphanedJobs(workspaceRoot);
   const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
   const candidate = findLatestResumableTaskJob(jobs);
 

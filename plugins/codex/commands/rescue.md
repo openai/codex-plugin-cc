@@ -15,7 +15,7 @@ Execution mode:
 
 - If the request includes `--background`, run the `codex:codex-rescue` subagent in the background.
 - If the request includes `--wait`, run the `codex:codex-rescue` subagent in the foreground.
-- If neither flag is present, default to foreground.
+- If neither flag is present, default to foreground for a small, clearly bounded request. Use a background subagent for complicated, open-ended, multi-step, or long-running work.
 - `--background` and `--wait` are execution flags for Claude Code. Do not forward them to `task`, and do not treat them as part of the natural-language task text.
 - `--model`, `--effort`, and `--sandbox` are runtime-selection flags. Preserve them for the forwarded `task` call, but do not treat them as part of the natural-language task text.
 

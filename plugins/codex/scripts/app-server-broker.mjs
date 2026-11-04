@@ -22,6 +22,14 @@ function buildStreamThreadIds(method, params, result) {
   return threadIds;
 }
 
+// Capture the turn returned by a streaming request. Compaction returns no turn
+// here; turn/started notifications may still supply one.
+function buildStreamTurn(method, params, result) {
+  const turnId = result?.turn?.id ?? null;
+  const threadId = method === "review/start" ? result?.reviewThreadId ?? params?.threadId : params?.threadId;
+  return turnId && threadId ? { threadId, turnId } : null;
+}
+
 function buildJsonRpcError(code, message, data) {
   return data === undefined ? { code, message } : { code, message, data };
 }
@@ -67,39 +75,80 @@ async function main() {
 
   const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
   let activeRequestSocket = null;
-  let activeStreamSocket = null;
-  let activeStreamThreadIds = null;
+  let activeStream = null;
+  let pendingOrphanInterrupts = 0;
+  let shuttingDown = false;
   const sockets = new Set();
 
-  function clearSocketOwnership(socket) {
-    if (activeRequestSocket === socket) {
-      activeRequestSocket = null;
+  // The broker outlives the companion process that started a turn. Without this,
+  // a killed client (e.g. its Claude subagent was stopped) leaves Codex running
+  // with nobody listening, so tie the turn's lifetime to the owning connection.
+  async function interruptOrphanedTurn(stream) {
+    if (!stream.turn || stream.completed || stream.interrupting || shuttingDown) {
+      return;
     }
-    if (activeStreamSocket === socket) {
-      activeStreamSocket = null;
-      activeStreamThreadIds = null;
+    stream.interrupting = true;
+    pendingOrphanInterrupts += 1;
+    const turn = stream.turn;
+    try {
+      await appClient.request("turn/interrupt", turn);
+      process.stderr.write(`Interrupted turn ${turn.turnId} on ${turn.threadId}: its client disconnected.\n`);
+    } catch (error) {
+      // The turn may already have completed; nothing else to clean up.
+      process.stderr.write(
+        `Could not interrupt turn ${turn.turnId} on ${turn.threadId} after its client disconnected: ${error instanceof Error ? error.message : String(error)}\n`
+      );
+    } finally {
+      pendingOrphanInterrupts -= 1;
+      if (activeStream === stream) {
+        activeStream = null;
+      }
+    }
+  }
+
+  function clearSocketOwnership(socket) {
+    // Keep an in-flight request busy until its response arrives: it may still
+    // create a turn after the socket closes.
+    if (activeStream?.socket === socket) {
+      activeStream.disconnected = true;
+      void interruptOrphanedTurn(activeStream);
+      if (!activeStream.pending && !activeStream.turn) {
+        activeStream = null;
+      }
     }
   }
 
   function routeNotification(message) {
-    const target = activeRequestSocket ?? activeStreamSocket;
-    if (!target) {
-      return;
+    const stream = activeStream;
+    const threadId = message.params?.threadId ?? null;
+    const turnId = message.params?.turn?.id ?? null;
+    if (stream && message.method === "turn/started" && threadId && turnId && stream.threadIds.has(threadId)) {
+      stream.turn = { threadId, turnId };
+      if (stream.disconnected) {
+        void interruptOrphanedTurn(stream);
+      }
     }
-    send(target, message);
-    if (message.method === "turn/completed" && activeStreamSocket === target) {
-      const threadId = message.params?.threadId ?? null;
-      if (!threadId || !activeStreamThreadIds || activeStreamThreadIds.has(threadId)) {
-        activeStreamSocket = null;
-        activeStreamThreadIds = null;
-        if (activeRequestSocket === target) {
-          activeRequestSocket = null;
-        }
+
+    const target = activeRequestSocket ?? stream?.socket;
+    if (target) {
+      send(target, message);
+    }
+    if (stream && message.method === "turn/completed") {
+      // Notifications can arrive in the same chunk as the start response,
+      // before the awaiting request handler has resumed.
+      stream.completedTurns.add(`${threadId}:${turnId}`);
+      if (
+        (stream.turn?.threadId === threadId && stream.turn?.turnId === turnId) ||
+        (!stream.turn && stream.method === "thread/compact/start" && stream.threadIds.has(threadId))
+      ) {
+        stream.completed = true;
+        activeStream = null;
       }
     }
   }
 
   async function shutdown(server) {
+    shuttingDown = true;
     for (const socket of sockets) {
       socket.end();
     }
@@ -168,11 +217,12 @@ async function main() {
         }
 
         const allowInterruptDuringActiveStream =
-          isInterruptRequest(message) && activeStreamSocket && activeStreamSocket !== socket && !activeRequestSocket;
+          isInterruptRequest(message) && activeStream && activeStream.socket !== socket && !activeRequestSocket;
 
         if (
-          ((activeRequestSocket && activeRequestSocket !== socket) || (activeStreamSocket && activeStreamSocket !== socket)) &&
-          !allowInterruptDuringActiveStream
+          pendingOrphanInterrupts > 0 ||
+          (((activeRequestSocket && activeRequestSocket !== socket) || (activeStream && activeStream.socket !== socket)) &&
+            !allowInterruptDuringActiveStream)
         ) {
           send(socket, {
             id: message.id,
@@ -196,13 +246,43 @@ async function main() {
 
         const isStreaming = STREAMING_METHODS.has(message.method);
         activeRequestSocket = socket;
+        const stream = isStreaming
+          ? {
+              socket,
+              method: message.method,
+              threadIds: buildStreamThreadIds(message.method, message.params ?? {}, {}),
+              turn: null,
+              pending: true,
+              disconnected: false,
+              completed: false,
+              interrupting: false,
+              completedTurns: new Set()
+            }
+          : null;
+        if (stream) {
+          activeStream = stream;
+        }
 
         try {
           const result = await appClient.request(message.method, message.params ?? {});
           send(socket, { id: message.id, result });
-          if (isStreaming) {
-            activeStreamSocket = socket;
-            activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
+          if (stream) {
+            stream.pending = false;
+            stream.threadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
+            stream.turn = buildStreamTurn(message.method, message.params ?? {}, result) ?? stream.turn;
+            if (stream.turn && stream.completedTurns.has(`${stream.turn.threadId}:${stream.turn.turnId}`)) {
+              stream.completed = true;
+            }
+            if (stream.completed) {
+              if (activeStream === stream) {
+                activeStream = null;
+              }
+            } else if (stream.disconnected) {
+              void interruptOrphanedTurn(stream);
+              if (!stream.turn && activeStream === stream) {
+                activeStream = null;
+              }
+            }
           }
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
@@ -215,8 +295,8 @@ async function main() {
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
           }
-          if (activeStreamSocket === socket && !isStreaming) {
-            activeStreamSocket = null;
+          if (stream && activeStream === stream) {
+            activeStream = null;
           }
         }
       }

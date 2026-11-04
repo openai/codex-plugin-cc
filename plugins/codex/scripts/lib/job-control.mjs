@@ -1,8 +1,8 @@
 import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
-import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
+import { getConfig, listJobs, readJobFile, resolveJobFile, upsertJob, writeJobFile } from "./state.mjs";
+import { appendLogLine, nowIso, SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
@@ -188,6 +188,73 @@ export function readStoredJob(workspaceRoot, jobId) {
   return readJobFile(jobFile);
 }
 
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM: the process exists but belongs to someone else.
+    return error?.code === "EPERM";
+  }
+}
+
+/**
+ * A job whose companion process died without recording an outcome (for example
+ * SIGKILL) would otherwise stay "running" forever and block `--resume-last`.
+ * Settle such jobs from the stored job file, or mark them failed.
+ */
+export function reconcileOrphanedJobs(workspaceRoot, options = {}) {
+  const isAlive = options.isProcessAlive ?? isProcessAlive;
+  for (const job of listJobs(workspaceRoot)) {
+    if (job.status !== "queued" && job.status !== "running") {
+      continue;
+    }
+    if (!Number.isInteger(job.pid) || job.pid <= 0 || isAlive(job.pid)) {
+      continue;
+    }
+
+    const stored = readStoredJob(workspaceRoot, job.id);
+    if (stored && (stored.status === "completed" || stored.status === "failed" || stored.status === "cancelled")) {
+      upsertJob(workspaceRoot, {
+        id: job.id,
+        status: stored.status,
+        phase: stored.phase ?? stored.status,
+        pid: null,
+        threadId: stored.threadId ?? job.threadId ?? null,
+        turnId: stored.turnId ?? job.turnId ?? null,
+        ...(stored.errorMessage ? { errorMessage: stored.errorMessage } : {}),
+        completedAt: stored.completedAt ?? nowIso()
+      });
+      continue;
+    }
+
+    const completedAt = nowIso();
+    const errorMessage = `The Codex companion process (pid ${job.pid}) exited before the job finished.`;
+    if (stored) {
+      writeJobFile(workspaceRoot, job.id, {
+        ...stored,
+        status: "failed",
+        phase: "failed",
+        pid: null,
+        errorMessage,
+        completedAt
+      });
+    }
+    upsertJob(workspaceRoot, {
+      id: job.id,
+      status: "failed",
+      phase: "failed",
+      pid: null,
+      errorMessage,
+      completedAt
+    });
+    const logFile = job.logFile ?? stored?.logFile;
+    if (logFile && fs.existsSync(logFile)) {
+      appendLogLine(logFile, errorMessage);
+    }
+  }
+}
+
 function matchJobReference(jobs, reference, predicate = () => true) {
   const filtered = jobs.filter(predicate);
   if (!reference) {
@@ -212,6 +279,7 @@ function matchJobReference(jobs, reference, predicate = () => true) {
 
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
+  reconcileOrphanedJobs(workspaceRoot);
   const config = getConfig(workspaceRoot);
   const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), options));
   const maxJobs = options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS;
@@ -241,6 +309,7 @@ export function buildStatusSnapshot(cwd, options = {}) {
 
 export function buildSingleJobSnapshot(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
+  reconcileOrphanedJobs(workspaceRoot);
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
   const selected = matchJobReference(jobs, reference);
   if (!selected) {
@@ -255,6 +324,7 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
 
 export function resolveResultJob(cwd, reference) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
+  reconcileOrphanedJobs(workspaceRoot);
   const jobs = sortJobsNewestFirst(reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot)));
   const selected = matchJobReference(
     jobs,
@@ -280,6 +350,7 @@ export function resolveResultJob(cwd, reference) {
 
 export function resolveCancelableJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
+  reconcileOrphanedJobs(workspaceRoot);
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
   const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
 

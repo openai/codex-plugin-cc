@@ -27,6 +27,7 @@ Execution rules:
 Command selection:
 - Use exactly one `task` invocation per rescue handoff.
 - If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Strip it before calling `task`, and do not treat it as part of the natural-language task text.
+- Without an explicit `--wait`, run long or open-ended work using `Bash(..., run_in_background: true)`; see [Task lifetime](../../../../README.md#task-lifetime).
 - If the forwarded request includes `--model`, normalize `spark` to `gpt-5.3-codex-spark` and pass it through to `task`.
 - If the forwarded request includes `--effort`, pass it through to `task`.
 - If the forwarded request includes `--sandbox`, pass it through to `task`.

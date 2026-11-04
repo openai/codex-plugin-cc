@@ -136,7 +136,7 @@ Use it when you want Codex to:
 - take a faster or cheaper pass with a smaller model
 
 > [!NOTE]
-> Depending on the task and the model you choose these tasks might take a long time and it's generally recommended to force the task to be in the background or move the agent to the background.
+> Long or open-ended rescue tasks run in the background unless you request `--wait`. See [Task lifetime](#task-lifetime) for what happens when a task is stopped.
 
 It supports `--background`, `--wait`, `--resume`, `--fresh`, `--model`, `--effort`, and `--sandbox`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo.
 
@@ -291,6 +291,14 @@ Your configuration will be picked up based on:
 - project-level overrides only load when the [project is trusted](https://developers.openai.com/codex/config-advanced#project-config-files-codexconfigtoml)
 
 Check out the Codex docs for more [configuration options](https://developers.openai.com/codex/config-reference).
+
+### Task lifetime
+
+The companion process running a task or review owns its Codex turn. If that process exits before the turn finishes, the shared broker interrupts the turn, including after `SIGKILL`. Stopping a foreground Bash task therefore also stops the Codex work it owns.
+
+`SIGTERM`, `SIGINT`, and `SIGHUP` record the job as cancelled. After an abrupt exit, status, result, resume checks, and the stop hook repair active job records whose process is gone: completed results are preserved, and unfinished jobs become failed so they no longer block resuming work.
+
+Use Claude background execution for work that may exceed a foreground Bash timeout. The runtime's internal `task --background` mode instead launches a detached worker: the worker owns the turn and continues after its launcher exits, until it finishes or is cancelled.
 
 ### Moving The Work Over To Codex
 

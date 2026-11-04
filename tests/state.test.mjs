@@ -3,9 +3,51 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 
 import { makeTempDir } from "./helpers.mjs";
-import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState, upsertJob, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
+
+test("concurrent readers see complete state and job snapshots during progress updates", { timeout: 15000 }, async (t) => {
+  const workspace = makeTempDir();
+  const job = { id: "progress", status: "running", details: "x".repeat(128 * 1024) };
+  writeJobFile(workspace, job.id, job);
+  upsertJob(workspace, job);
+  const stateFile = resolveStateFile(workspace);
+  const jobFile = resolveJobFile(workspace, job.id);
+  const moduleUrl = new URL("../plugins/codex/scripts/lib/state.mjs", import.meta.url).href;
+  const writer = spawn(process.execPath, ["--input-type=module", "-e", `
+    import { upsertJob, writeJobFile } from ${JSON.stringify(moduleUrl)};
+    const workspace = ${JSON.stringify(workspace)};
+    for (let progress = 0; progress < 16; progress++) {
+      const job = { id: "progress", status: "running", details: "x".repeat(128 * 1024), progress };
+      writeJobFile(workspace, job.id, job);
+      upsertJob(workspace, job);
+    }
+  `], { stdio: ["ignore", "ignore", "pipe"] });
+  let stderr = "";
+  writer.stderr.on("data", (chunk) => { stderr += chunk; });
+  const closed = once(writer, "close");
+  t.after(async () => {
+    if (writer.exitCode === null && writer.signalCode === null) writer.kill("SIGKILL");
+    await closed;
+  });
+  let snapshots = 0;
+  while (writer.exitCode === null && writer.signalCode === null) {
+    const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    const stored = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+    assert.equal(state.jobs[0].details.length, job.details.length);
+    assert.equal(stored.details.length, job.details.length);
+    snapshots++;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  const [code] = await closed;
+  assert.equal(code, 0, stderr);
+  assert.ok(snapshots > 0);
+  assert.equal(JSON.parse(fs.readFileSync(stateFile, "utf8")).jobs[0].progress, 15);
+  assert.equal(JSON.parse(fs.readFileSync(jobFile, "utf8")).progress, 15);
+});
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
