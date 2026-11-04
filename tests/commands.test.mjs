@@ -22,6 +22,8 @@ test("review command uses AskUserQuestion and background Bash while staying revi
   assert.match(source, /```typescript/);
   assert.match(source, /review "\$ARGUMENTS"/);
   assert.match(source, /\[--scope auto\|working-tree\|branch\]/);
+  assert.match(source, /\[--model <model\|spark>\] \[--effort <none\|minimal\|low\|medium\|high\|xhigh\|max>\]/);
+  assert.match(source, /`--model` and `--effort` select the Codex model and reasoning effort for the review/i);
   assert.match(source, /run_in_background:\s*true/);
   assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" review "\$ARGUMENTS"`/);
   assert.match(source, /description:\s*"Codex review"/);
@@ -49,7 +51,8 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /```bash/);
   assert.match(source, /```typescript/);
   assert.match(source, /adversarial-review "\$ARGUMENTS"/);
-  assert.match(source, /\[--scope auto\|working-tree\|branch\] \[focus \.\.\.\]/);
+  assert.match(source, /\[--scope auto\|working-tree\|branch\] \[--model <model\|spark>\] \[--effort <none\|minimal\|low\|medium\|high\|xhigh\|max>\] \[focus \.\.\.\]/);
+  assert.match(source, /`--model` and `--effort` select the Codex model and reasoning effort for the review/i);
   assert.match(source, /run_in_background:\s*true/);
   assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" adversarial-review "\$ARGUMENTS"`/);
   assert.match(source, /description:\s*"Codex adversarial review"/);
@@ -104,7 +107,8 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /--background\|--wait/);
   assert.match(rescue, /--resume\|--fresh/);
   assert.match(rescue, /--model <model\|spark>/);
-  assert.match(rescue, /--effort <none\|minimal\|low\|medium\|high\|xhigh>/);
+  assert.match(rescue, /--effort <none\|minimal\|low\|medium\|high\|xhigh\|max>/);
+  assert.match(rescue, /--sandbox <read-only\|workspace-write\|danger-full-access>/);
   assert.match(rescue, /task-resume-candidate --json/);
   assert.match(rescue, /AskUserQuestion/);
   assert.match(rescue, /Continue current Codex thread/);
@@ -112,7 +116,14 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /run the `codex:codex-rescue` subagent in the background/i);
   assert.match(rescue, /default to foreground/i);
   assert.match(rescue, /Do not forward them to `task`/i);
-  assert.match(rescue, /`--model` and `--effort` are runtime-selection flags/i);
+  assert.match(rescue, /`--model`, `--effort`, and `--sandbox` are runtime-selection flags/i);
+  // Natural-language delegation never reaches the subagent with a way to ask,
+  // so every open runtime choice must be collected up front in one prompt.
+  assert.match(rescue, /ask them together in a single `AskUserQuestion` call/i);
+  assert.match(rescue, /Codex default \(Recommended\)/);
+  assert.match(rescue, /`Codex default` means leave that flag unset/i);
+  assert.match(rescue, /Never mark `danger-full-access` as recommended/i);
+  assert.match(rescue, /Never add `--sandbox danger-full-access` unless the user explicitly asked for it or picked it/i);
   assert.match(rescue, /Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort/i);
   assert.match(rescue, /If they ask for `spark`, map it to `gpt-5\.3-codex-spark`/i);
   assert.match(rescue, /If the request includes `--resume`, do not ask whether to continue/i);
@@ -126,6 +137,10 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /Leave `--resume` and `--fresh` in the forwarded request/i);
   assert.match(agent, /--resume/);
   assert.match(agent, /--fresh/);
+  assert.match(agent, /^description:.*cannot ask the user questions.*AskUserQuestion.*--model \/ --effort \/ --sandbox/m);
+  assert.match(agent, /If the forwarded request includes `--sandbox <read-only\|workspace-write\|danger-full-access>`, pass it through unchanged/i);
+  assert.match(agent, /default to a write-capable Codex run by adding `--write`/i);
+  assert.match(agent, /Never choose `--sandbox danger-full-access` yourself/i);
   assert.match(agent, /thin forwarding wrapper/i);
   assert.match(agent, /prefer foreground for a small, clearly bounded rescue request/i);
   assert.match(agent, /If the user did not explicitly choose `--background` or `--wait` and the task looks complicated, open-ended, multi-step, or likely to keep Codex running for a long time, prefer background execution/i);
@@ -150,12 +165,16 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /Map `spark` to `--model gpt-5\.3-codex-spark`/i);
   assert.match(runtimeSkill, /If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only/i);
   assert.match(runtimeSkill, /Strip it before calling `task`/i);
-  assert.match(runtimeSkill, /`--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`/i);
+  assert.match(runtimeSkill, /`--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`/i);
+  assert.match(runtimeSkill, /`--sandbox`: accepted values are `read-only`, `workspace-write`, `danger-full-access`/i);
+  assert.match(runtimeSkill, /Never pick `--sandbox danger-full-access` on your own/i);
   assert.match(runtimeSkill, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
   assert.match(runtimeSkill, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
   assert.match(readme, /`codex:codex-rescue` subagent/i);
   assert.match(readme, /if you do not pass `--model` or `--effort`, Codex chooses its own defaults/i);
   assert.match(readme, /--model gpt-5\.4-mini --effort medium/i);
+  assert.match(readme, /--sandbox danger-full-access/);
+  assert.match(readme, /`sandbox_mode` in `config\.toml` does not apply to plugin runs/i);
   assert.match(readme, /`spark`, the plugin maps that to `gpt-5\.3-codex-spark`/i);
   assert.match(readme, /continue a previous Codex task/i);
   assert.match(readme, /### `\/codex:setup`/);

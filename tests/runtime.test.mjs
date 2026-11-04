@@ -784,6 +784,163 @@ test("task forwards model selection and reasoning effort to app-server turn/star
   assert.equal(fakeState.lastTurnStart.effort, "low");
 });
 
+function setupTaskRepo(behavior) {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, behavior);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const readState = () => JSON.parse(fs.readFileSync(statePath, "utf8"));
+  return { repo, binDir, readState };
+}
+
+test("task defaults to a read-only sandbox and --write selects workspace-write", () => {
+  const { repo, binDir, readState } = setupTaskRepo();
+
+  const readOnly = run("node", [SCRIPT, "task", "diagnose the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(readOnly.status, 0, readOnly.stderr);
+  assert.equal(readState().lastThreadStart.sandbox, "read-only");
+  assert.equal(readState().lastThreadStart.approvalPolicy, "never");
+  assert.equal(readState().lastThreadStart.config, null);
+
+  const writable = run("node", [SCRIPT, "task", "--write", "fix the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(writable.status, 0, writable.stderr);
+  assert.equal(readState().lastThreadStart.sandbox, "workspace-write");
+});
+
+test("task accepts the max reasoning effort that current Codex configs use", () => {
+  const { repo, binDir, readState } = setupTaskRepo();
+
+  const result = run("node", [SCRIPT, "task", "--effort", "max", "diagnose the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(readState().lastTurnStart.effort, "max");
+});
+
+test("task --sandbox danger-full-access reaches thread/start and thread/resume", () => {
+  const { repo, binDir, readState } = setupTaskRepo();
+
+  const fresh = run("node", [SCRIPT, "task", "--sandbox", "danger-full-access", "install the missing toolchain"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(fresh.status, 0, fresh.stderr);
+  assert.equal(readState().lastThreadStart.sandbox, "danger-full-access");
+  assert.equal(readState().lastTurnStart.prompt, "install the missing toolchain");
+
+  const resumed = run("node", [SCRIPT, "task", "--resume-last", "--sandbox=danger-full-access", "keep going"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(resumed.status, 0, resumed.stderr);
+  assert.equal(readState().lastThreadResume.sandbox, "danger-full-access");
+  assert.equal(readState().lastTurnStart.prompt, "keep going");
+});
+
+test("task --write does not downgrade an explicit --sandbox danger-full-access", () => {
+  const { repo, binDir, readState } = setupTaskRepo();
+
+  const result = run("node", [SCRIPT, "task", "--write", "--sandbox", "danger-full-access", "fix it"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(readState().lastThreadStart.sandbox, "danger-full-access");
+});
+
+test("task rejects contradictory or unknown sandbox modes before starting Codex", () => {
+  const { repo, binDir } = setupTaskRepo();
+
+  const contradictory = run("node", [SCRIPT, "task", "--write", "--sandbox", "read-only", "fix it"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.notEqual(contradictory.status, 0);
+  assert.match(contradictory.stderr, /Choose either --write or --sandbox read-only/);
+
+  const unknown = run("node", [SCRIPT, "task", "--sandbox", "yolo", "fix it"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.notEqual(unknown.status, 0);
+  assert.match(unknown.stderr, /Unsupported sandbox mode "yolo"/);
+});
+
+test("task --background carries the sandbox mode through to the detached worker", () => {
+  const { repo, binDir, readState } = setupTaskRepo();
+
+  const launched = run(
+    "node",
+    [SCRIPT, "task", "--background", "--json", "--sandbox", "danger-full-access", "investigate the failing test"],
+    {
+      cwd: repo,
+      env: buildEnv(binDir)
+    }
+  );
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+
+  const waited = run("node", [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "15000", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(waited.status, 0, waited.stderr);
+  assert.equal(JSON.parse(waited.stdout).job.status, "completed");
+  assert.equal(readState().lastThreadStart.sandbox, "danger-full-access");
+});
+
+test("review and adversarial review forward --model and --effort", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0];\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0].id;\n");
+
+  const review = run("node", [SCRIPT, "review", "--model", "spark", "--effort", "high"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(review.status, 0, review.stderr);
+  let fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastThreadStart.model, "gpt-5.3-codex-spark");
+  assert.equal(fakeState.lastThreadStart.sandbox, "read-only");
+  assert.deepEqual(fakeState.lastThreadStart.config, { model_reasoning_effort: "high" });
+
+  const adversarial = run("node", [SCRIPT, "adversarial-review", "--effort", "xhigh", "question the retry design"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(adversarial.status, 0, adversarial.stderr);
+  fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastThreadStart.sandbox, "read-only");
+  assert.equal(fakeState.lastTurnStart.effort, "xhigh");
+  assert.match(fakeState.lastTurnStart.prompt, /question the retry design/);
+  assert.doesNotMatch(fakeState.lastTurnStart.prompt, /--effort/);
+
+  const invalid = run("node", [SCRIPT, "review", "--effort", "extreme"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.notEqual(invalid.status, 0);
+  assert.match(invalid.stderr, /Unsupported reasoning effort "extreme"/);
+});
+
 test("task logs reasoning summaries and assistant messages to the job log", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

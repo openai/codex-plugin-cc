@@ -59,6 +59,20 @@ function cleanCodexStderr(stderr) {
     .join("\n");
 }
 
+/**
+ * Thread-level config overrides. Only emitted when something is set so request
+ * shapes stay unchanged for callers that rely on the user's config.toml.
+ * @returns {{ config?: { [key: string]: string } }}
+ */
+function buildConfigOverrides(options = {}) {
+  /** @type {{ [key: string]: string }} */
+  const config = {};
+  if (options.effort) {
+    config.model_reasoning_effort = options.effort;
+  }
+  return Object.keys(config).length > 0 ? { config } : {};
+}
+
 /** @returns {ThreadStartParams} */
 function buildThreadParams(cwd, options = {}) {
   return {
@@ -66,6 +80,7 @@ function buildThreadParams(cwd, options = {}) {
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
     sandbox: options.sandbox ?? "read-only",
+    ...buildConfigOverrides(options),
     serviceName: SERVICE_NAME,
     ephemeral: options.ephemeral ?? true
   };
@@ -78,7 +93,8 @@ function buildResumeParams(threadId, cwd, options = {}) {
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
-    sandbox: options.sandbox ?? "read-only"
+    sandbox: options.sandbox ?? "read-only",
+    ...buildConfigOverrides(options)
   };
 }
 
@@ -1009,6 +1025,8 @@ export async function runAppServerReview(cwd, options = {}) {
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
     const thread = await startThread(client, cwd, {
       model: options.model,
+      // review/start has no per-turn effort field, so pin it on the thread config.
+      effort: options.effort,
       sandbox: "read-only",
       ephemeral: true,
       threadName: options.threadName

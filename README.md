@@ -86,7 +86,7 @@ Use it when you want:
 - a review of your current uncommitted changes
 - a review of your branch compared to a base branch like `main`
 
-Use `--base <ref>` for branch review. It also supports `--wait` and `--background`. It is not steerable and does not take custom focus text. Use [`/codex:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
+Use `--base <ref>` for branch review. It also supports `--wait`, `--background`, `--model <model|spark>`, and `--effort <none|minimal|low|medium|high|xhigh|max>`. It is not steerable and does not take custom focus text. Use [`/codex:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
 
 Examples:
 
@@ -94,6 +94,7 @@ Examples:
 /codex:review
 /codex:review --base main
 /codex:review --background
+/codex:review --effort high
 ```
 
 This command is read-only and will not perform any changes. When run in the background you can use [`/codex:status`](#codexstatus) to check on the progress and [`/codex:cancel`](#codexcancel) to cancel the ongoing task.
@@ -105,7 +106,7 @@ Runs a **steerable** review that questions the chosen implementation and design.
 It can be used to pressure-test assumptions, tradeoffs, failure modes, and whether a different approach would have been safer or simpler.
 
 It uses the same review target selection as `/codex:review`, including `--base <ref>` for branch review.
-It also supports `--wait` and `--background`. Unlike `/codex:review`, it can take extra focus text after the flags.
+It also supports `--wait`, `--background`, `--model`, and `--effort`. Unlike `/codex:review`, it can take extra focus text after the flags.
 
 Use it when you want:
 
@@ -137,7 +138,9 @@ Use it when you want Codex to:
 > [!NOTE]
 > Depending on the task and the model you choose these tasks might take a long time and it's generally recommended to force the task to be in the background or move the agent to the background.
 
-It supports `--background`, `--wait`, `--resume`, and `--fresh`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo.
+It supports `--background`, `--wait`, `--resume`, `--fresh`, `--model`, `--effort`, and `--sandbox`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo.
+
+Before handing off, Claude asks once (in a single prompt) for anything you did not already specify: whether to continue the previous thread, the Codex model, the reasoning effort, and the sandbox mode. This also applies when you just ask Claude in plain words to delegate to Codex. Say "use the defaults" to skip the model, effort, and sandbox questions.
 
 Examples:
 
@@ -147,6 +150,8 @@ Examples:
 /codex:rescue --resume apply the top fix from the last run
 /codex:rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
 /codex:rescue --model spark fix the issue quickly
+/codex:rescue --sandbox read-only explain why the cache is never invalidated
+/codex:rescue --sandbox danger-full-access install the missing toolchain and rerun the build
 /codex:rescue --background investigate the regression
 ```
 
@@ -160,6 +165,8 @@ Ask Codex to redesign the database connection to be more resilient.
 
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
+- `--sandbox` accepts `read-only`, `workspace-write`, or `danger-full-access`. Rescue runs default to `workspace-write` unless the request is read-only in nature. Codex never asks for approval inside the plugin, so the sandbox is the only guard rail: `danger-full-access` lets Codex touch files outside the repo and use the network without any confirmation, so only choose it for tasks you trust.
+- the sandbox mode is set by the plugin on every run, so `sandbox_mode` in `config.toml` does not apply to plugin runs; model and reasoning effort still fall back to your config
 - follow-up rescue requests can continue the latest Codex task in the repo
 
 ### `/codex:transfer`

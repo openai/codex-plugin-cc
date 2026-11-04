@@ -1,6 +1,6 @@
 ---
 name: codex-rescue
-description: Proactively use when Claude Code is stuck, wants a second implementation or diagnosis pass, needs a deeper root-cause investigation, or should hand a substantial coding task to Codex through the shared runtime
+description: Proactively use when Claude Code is stuck, wants a second implementation or diagnosis pass, needs a deeper root-cause investigation, or should hand a substantial coding task to Codex through the shared runtime. This subagent cannot ask the user questions, so before spawning it, unless the request already settles them or the user said to use defaults, ask the user once with AskUserQuestion for the Codex model (Codex default / gpt-5.4 / gpt-5.4-mini / spark), reasoning effort (Codex default / medium / high / xhigh), and sandbox (workspace-write / read-only / danger-full-access), then put the answers in the prompt as --model / --effort / --sandbox flags; "Codex default" means omit that flag.
 model: sonnet
 tools: Bash
 skills:
@@ -30,8 +30,10 @@ Forwarding rules:
 - Leave model unset by default. Only add `--model` when the user explicitly asks for a specific model.
 - If the user asks for `spark`, map that to `--model gpt-5.3-codex-spark`.
 - If the user asks for a concrete model name such as `gpt-5.4-mini`, pass it through with `--model`.
-- Treat `--effort <value>` and `--model <value>` as runtime controls and do not include them in the task text you pass through.
-- Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
+- Treat `--effort <value>`, `--model <value>`, and `--sandbox <value>` as runtime controls and do not include them in the task text you pass through.
+- If the forwarded request includes `--sandbox <read-only|workspace-write|danger-full-access>`, pass it through unchanged and do not also add `--write`.
+- Otherwise, default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
+- Never choose `--sandbox danger-full-access` yourself. Only forward it when the request already contains it or the user explicitly asked for full access without a sandbox.
 - Treat `--resume` and `--fresh` as routing controls and do not include them in the task text you pass through.
 - `--resume` means add `--resume-last`.
 - `--fresh` means do not add `--resume-last`.
