@@ -173,9 +173,12 @@ Examples:
 ```bash
 /codex:transfer
 /codex:transfer --source ~/.claude/projects/-Users-me-repo/<session-id>.jsonl
+/codex:transfer --refresh
 ```
 
 The plugin's existing `SessionStart` hook supplies the current transcript path automatically; `--source` is available as a manual override. The transfer uses Codex's external-agent session importer, so it follows the same conversion rules as importing Claude history in the Codex App and creates visible turns that can be continued in the App or TUI. The source must be under `~/.claude/projects`, and older Codex versions that do not expose session import must be upgraded before using this command.
+
+Codex imports each Claude transcript only once. If the session was already transferred (by this command or by importing Claude history in the Codex App), `/codex:transfer` prints the existing thread instead and says whether later turns are missing from it. `--refresh` removes the earlier import record from `$CODEX_HOME/external_agent_session_imports.json` (a backup is written next to it) and imports the current transcript into a new Codex thread; the earlier thread is left unchanged.
 
 ### `/codex:status`
 

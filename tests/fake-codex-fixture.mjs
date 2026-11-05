@@ -368,16 +368,34 @@ rl.on("line", (line) => {
           throw new Error("missing external session migration");
         }
         const sourcePath = fs.realpathSync(session.path);
+        const sessionResults = (successes, failures) => ({
+          importId: "import_" + message.id,
+          itemTypeResults: [{ itemType: "SESSIONS", successes, failures }]
+        });
+        if (BEHAVIOR === "external-import-reports-failure") {
+          send({ id: message.id, result: { importId: "import_" + message.id } });
+          send({
+            method: "externalAgentConfig/import/completed",
+            params: sessionResults([], [{
+              itemType: "SESSIONS",
+              errorType: null,
+              subErrorType: null,
+              failureStage: "import",
+              message: "unsupported transcript record",
+              cwd: session.cwd,
+              source: sourcePath
+            }])
+          });
+          break;
+        }
         const contents = fs.readFileSync(sourcePath, "utf8");
         const contentSha256 = crypto.createHash("sha256").update(contents).digest("hex");
         const ledger = loadImportLedger();
-        let record = ledger.records.find(
-          (candidate) => candidate.source_path === sourcePath && candidate.content_sha256 === contentSha256
-        );
-        let thread;
-        if (record) {
-          thread = ensureThread(state, record.imported_thread_id);
-        } else {
+        // Like Codex 0.166: a source path that is already in the ledger is skipped, even when
+        // its content changed, and the completion reports neither a success nor a failure.
+        let record = ledger.records.find((candidate) => candidate.source_path === sourcePath);
+        let thread = null;
+        if (!record) {
           const records = contents.split(/\\r?\\n/).filter(Boolean).map((line) => JSON.parse(line));
           const title = records.find((entry) => entry.type === "custom-title")?.customTitle || null;
           const messages = records
@@ -399,8 +417,19 @@ rl.on("line", (line) => {
           saveState(state);
           saveImportLedger(ledger);
         }
-        send({ id: message.id, result: {} });
-        send({ method: "externalAgentConfig/import/completed", params: {} });
+        if (BEHAVIOR === "external-import-legacy-live") {
+          // Older Codex versions complete without structured results, and the live Claude
+          // transcript keeps growing after Codex has hashed it.
+          fs.appendFileSync(sourcePath, JSON.stringify({ type: "user", message: { role: "user", content: "late turn" } }) + "\\n");
+          send({ id: message.id, result: {} });
+          send({ method: "externalAgentConfig/import/completed", params: {} });
+          break;
+        }
+        const successes = thread
+          ? [{ itemType: "SESSIONS", cwd: session.cwd, source: sourcePath, target: thread.id, title: thread.name }]
+          : [];
+        send({ id: message.id, result: { importId: "import_" + message.id } });
+        send({ method: "externalAgentConfig/import/completed", params: sessionResults(successes, []) });
         break;
       }
 
