@@ -84,6 +84,10 @@ rl.on('line', (line) => {
   } else reply({});
 });
 `);
+  // Same Windows wrapper as fake-codex-fixture.mjs: spawn with shell: true resolves codex.cmd.
+  if (process.platform === "win32") {
+    fs.writeFileSync(path.join(bin, "codex.cmd"), `@echo off\r\nnode "%~dp0codex" %*\r\n`, "utf8");
+  }
   const env = {
     ...process.env,
     PATH: `${bin}${path.delimiter}${process.env.PATH}`,
