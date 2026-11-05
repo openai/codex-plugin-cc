@@ -103,7 +103,7 @@ export function clearBrokerSession(cwd) {
   }
 }
 
-async function isBrokerEndpointReady(endpoint) {
+export async function isBrokerEndpointReady(endpoint) {
   if (!endpoint) {
     return false;
   }
@@ -117,18 +117,21 @@ async function isBrokerEndpointReady(endpoint) {
 function removeStaleBrokerLock(lockFile) {
   try {
     const text = fs.readFileSync(lockFile, "utf8");
+    let owner = null;
+    try {
+      owner = JSON.parse(text);
+    } catch {
+      // Exclusive creation and the owner write are separate steps, so a process that
+      // dies between them leaves an empty or partial file. Fall through to the age check.
+    }
     let stale = false;
-    if (text) {
-      const owner = JSON.parse(text);
-      if (Number.isInteger(owner.pid) && owner.pid > 0) {
-        try {
-          process.kill(owner.pid, 0);
-        } catch (error) {
-          stale = error.code === "ESRCH";
-        }
+    if (Number.isInteger(owner?.pid) && owner.pid > 0) {
+      try {
+        process.kill(owner.pid, 0);
+      } catch (error) {
+        stale = error.code === "ESRCH";
       }
     } else {
-      // A process may die between exclusive creation and writing its PID.
       stale = Date.now() - fs.statSync(lockFile).mtimeMs > 30000;
     }
     if (stale && fs.readFileSync(lockFile, "utf8") === text) {
@@ -138,6 +141,17 @@ function removeStaleBrokerLock(lockFile) {
     if (error.code !== "ENOENT") {
       throw error;
     }
+  }
+}
+
+function releaseBrokerLock(lockFile, owner) {
+  // Only remove a lock we still own; another process may have reclaimed it.
+  try {
+    if (JSON.parse(fs.readFileSync(lockFile, "utf8")).token === owner.token) {
+      fs.unlinkSync(lockFile);
+    }
+  } catch {
+    // Already removed or replaced by a reclaiming process.
   }
 }
 
@@ -172,9 +186,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
   try {
     return await startBrokerSession(cwd, options);
   } finally {
-    if (JSON.parse(fs.readFileSync(lockFile, "utf8")).token === owner.token) {
-      fs.unlinkSync(lockFile);
-    }
+    releaseBrokerLock(lockFile, owner);
   }
 }
 

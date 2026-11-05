@@ -126,11 +126,14 @@ async function main() {
     if (shuttingDown) return;
     shuttingDown = true;
     clearTimeout(idleTimer);
+    // Stop admitting clients before the app-server close, which can take seconds.
+    // A client admitted while draining would initialize fine, then fail its first request.
+    const closed = new Promise((resolve) => server.close(resolve));
     for (const socket of sockets) {
       socket.end();
     }
     await appClient.close().catch(() => {});
-    await new Promise((resolve) => server.close(resolve));
+    await closed;
     if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
       fs.unlinkSync(listenTarget.path);
     }

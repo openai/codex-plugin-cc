@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 
 import { makeTempDir, writeExecutable } from "./helpers.mjs";
+import { CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { ensureBrokerSession, sendBrokerShutdown } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
@@ -67,7 +68,10 @@ const fs = require('node:fs');
 const readline = require('node:readline');
 fs.appendFileSync(process.env.TEST_STARTS, process.pid + '\\n');
 const send = (message) => process.stdout.write(JSON.stringify(message) + '\\n');
-readline.createInterface({ input: process.stdin }).on('line', (line) => {
+if (process.env.TEST_SLOW_EXIT) process.on('SIGTERM', () => {});
+const rl = readline.createInterface({ input: process.stdin });
+if (process.env.TEST_SLOW_EXIT) rl.on('close', () => setTimeout(() => process.exit(0), 800));
+rl.on('line', (line) => {
   const m = JSON.parse(line);
   if (m.id === undefined) return;
   const reply = (result) => send({ id: m.id, result });
@@ -192,4 +196,45 @@ test("startup recovers a lock left by a process that exited", { timeout: 6000 },
   const session = await f.start();
   assert.ok(alive(session.pid));
   assert.equal(fs.existsSync(path.join(stateDir, "broker.json.lock")), false);
+});
+
+test("startup recovers a lock whose owner write was cut short", { timeout: 6000 }, async (t) => {
+  const f = await fixture(t);
+  const stateDir = resolveStateDir(f.root);
+  const lockFile = path.join(stateDir, "broker.json.lock");
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(lockFile, '{"pid":12');
+  const old = new Date(Date.now() - 60000);
+  fs.utimesSync(lockFile, old, old);
+  const session = await f.start();
+  assert.ok(alive(session.pid));
+  assert.equal(fs.existsSync(lockFile), false);
+});
+
+test("a broker draining after idle expiry stops admitting clients", { timeout: 6000 }, async (t) => {
+  const f = await fixture(t);
+  f.env.TEST_SLOW_EXIT = "1";
+  const session = await f.start();
+  const client = connect(session.endpoint);
+  await client.request("initialize");
+  client.socket.destroy();
+  // Idle expiry has fired; the fake app-server holds the broker open for ~800ms more.
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  assert.ok(alive(session.pid), "broker is still draining");
+  const late = connect(session.endpoint);
+  const outcome = await new Promise((resolve) => {
+    late.socket.on("connect", () => resolve("connected"));
+    late.socket.on("error", () => resolve("refused"));
+  });
+  late.socket.destroy();
+  assert.equal(outcome, "refused");
+});
+
+test("reuse-existing callers recover when the saved broker expired while idle", { timeout: 6000 }, async (t) => {
+  const f = await fixture(t);
+  const session = await f.start();
+  await waitFor(() => !alive(session.pid), 1500);
+  const client = await CodexAppServerClient.connect(f.root, { env: f.env, reuseExistingBroker: true });
+  t.after(() => client.close());
+  assert.equal(client.transport, "direct");
 });
