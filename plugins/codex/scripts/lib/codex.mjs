@@ -1169,7 +1169,7 @@ export async function importExternalAgentSession(cwd, options = {}) {
       emitProgress(options.onProgress, "Importing Claude session into Codex.", "transferring");
       let completion;
       try {
-        completion = await requestExternalAgentSessionImport(client, externalAgentSessionMigration(options.sourcePath, cwd));
+        completion = await requestExternalAgentSessionImport(client, externalAgentSessionMigration(canonicalSource, cwd));
       } catch (error) {
         if (error?.rpcCode === -32601) {
           throw new Error(
