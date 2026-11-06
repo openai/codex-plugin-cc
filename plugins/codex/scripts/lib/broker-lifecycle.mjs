@@ -273,6 +273,17 @@ async function startBrokerSession(cwd, options) {
   return session;
 }
 
+function removeIfPresent(file) {
+  // A draining broker removes its own pid file and socket concurrently with a replacement.
+  try {
+    fs.unlinkSync(file);
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      throw error;
+    }
+  }
+}
+
 export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null }) {
   if (Number.isFinite(pid) && killProcess) {
     try {
@@ -282,19 +293,19 @@ export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessi
     }
   }
 
-  if (pidFile && fs.existsSync(pidFile)) {
-    fs.unlinkSync(pidFile);
+  if (pidFile) {
+    removeIfPresent(pidFile);
   }
 
-  if (logFile && fs.existsSync(logFile)) {
-    fs.unlinkSync(logFile);
+  if (logFile) {
+    removeIfPresent(logFile);
   }
 
   if (endpoint) {
     try {
       const target = parseBrokerEndpoint(endpoint);
-      if (target.kind === "unix" && fs.existsSync(target.path)) {
-        fs.unlinkSync(target.path);
+      if (target.kind === "unix") {
+        removeIfPresent(target.path);
       }
     } catch {
       // Ignore malformed or already-removed broker endpoints during teardown.

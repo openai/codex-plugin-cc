@@ -3,7 +3,7 @@ import net from "node:net";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 import { makeTempDir, writeExecutable } from "./helpers.mjs";
 import { CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
@@ -238,7 +238,7 @@ test("startup recovers when a reclaimer died holding the reclaim guard", { timeo
   assert.equal(fs.existsSync(`${lockFile}.reclaim`), false);
 });
 
-test("startup recovers a lock owned by an exited zombie process", { timeout: 6000, skip: !fs.existsSync("/proc/self/stat") }, async (t) => {
+test("startup recovers a lock owned by an exited zombie process", { timeout: 6000, skip: !fs.existsSync("/proc/self/stat") || spawnSync("perl", ["-e", "1"]).error !== undefined }, async (t) => {
   const f = await fixture(t);
   // perl forks a child that exits at once, then sleeps without wait(), leaving a zombie.
   const parent = spawn("perl", ["-e", '$| = 1; my $p = fork; exit 0 unless $p; print "$p\\n"; sleep 30'], { stdio: ["ignore", "pipe", "ignore"] });

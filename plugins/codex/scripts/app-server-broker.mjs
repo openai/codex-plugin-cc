@@ -146,11 +146,12 @@ async function main() {
     }
     await appClient.close().catch(() => {});
     await closed;
-    if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
-      fs.unlinkSync(listenTarget.path);
+    // A replacement broker's teardown may already have removed these.
+    if (listenTarget.kind === "unix") {
+      fs.rmSync(listenTarget.path, { force: true });
     }
-    if (pidFile && fs.existsSync(pidFile)) {
-      fs.unlinkSync(pidFile);
+    if (pidFile) {
+      fs.rmSync(pidFile, { force: true });
     }
   }
 
