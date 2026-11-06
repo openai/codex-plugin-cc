@@ -658,14 +658,13 @@ function sourceContentSha256(sourcePath) {
   return crypto.createHash("sha256").update(fs.readFileSync(sourcePath)).digest("hex");
 }
 
-function importedThreadIdForSource(sourcePath) {
+function importedThreadIdForSource(sourcePath, contentSha256) {
   const ledgerPath = path.join(resolveCodexHome(), "external_agent_session_imports.json");
   if (!fs.existsSync(ledgerPath)) {
     return null;
   }
   const ledger = readJsonFile(ledgerPath);
   const canonicalSource = fs.realpathSync(sourcePath);
-  const contentSha256 = sourceContentSha256(canonicalSource);
   const records = Array.isArray(ledger?.records) ? ledger.records : [];
   const match = records
     .filter(
@@ -703,6 +702,7 @@ async function requestExternalAgentSessionImport(client, params) {
   let timeout = null;
   let resolveCompleted;
   let rejectCompleted;
+  /** @type {Promise<Extract<AppServerNotification, { method: "externalAgentConfig/import/completed" }>["params"]>} */
   const completed = new Promise((resolve, reject) => {
     resolveCompleted = resolve;
     rejectCompleted = reject;
@@ -711,7 +711,7 @@ async function requestExternalAgentSessionImport(client, params) {
 
   client.setNotificationHandler((message) => {
     if (message.method === EXTERNAL_AGENT_IMPORT_COMPLETED) {
-      resolveCompleted();
+      resolveCompleted(message.params);
       return;
     }
     previousHandler?.(message);
@@ -722,7 +722,7 @@ async function requestExternalAgentSessionImport(client, params) {
 
   try {
     await client.request("externalAgentConfig/import", params);
-    await completed;
+    return await completed;
   } finally {
     clearTimeout(timeout);
     client.setNotificationHandler(previousHandler ?? null);
@@ -1066,8 +1066,12 @@ export async function importExternalAgentSession(cwd, options = {}) {
 
   return withDirectAppServer(cwd, async (client) => {
     emitProgress(options.onProgress, "Importing Claude session into Codex.", "transferring");
+    const sourcePath = fs.realpathSync(options.sourcePath);
+    // Claude can append to its transcript while the native import is running.
+    const contentSha256 = sourceContentSha256(sourcePath);
+    let completed;
     try {
-      await requestExternalAgentSessionImport(client, externalAgentSessionMigration(options.sourcePath, cwd));
+      completed = await requestExternalAgentSessionImport(client, externalAgentSessionMigration(sourcePath, cwd));
     } catch (error) {
       if (error?.rpcCode === -32601) {
         throw new Error(
@@ -1077,7 +1081,16 @@ export async function importExternalAgentSession(cwd, options = {}) {
       }
       throw error;
     }
-    const threadId = importedThreadIdForSource(options.sourcePath);
+    const sessionResult = completed?.itemTypeResults?.find((result) => result.itemType === "SESSIONS");
+    const failure = sessionResult?.failures?.find((result) => result.source == null || result.source === sourcePath);
+    if (failure) {
+      throw new Error(`Codex failed to import the Claude session: ${failure.message}`);
+    }
+    const imported = sessionResult?.successes?.find((result) => result.source === sourcePath);
+    // An explicit result must not be replaced by a previous import's ledger entry.
+    const threadId = Array.isArray(completed?.itemTypeResults)
+      ? (typeof imported?.target === "string" && imported.target.trim() ? imported.target : null)
+      : importedThreadIdForSource(sourcePath, contentSha256);
     if (!threadId) {
       const stderr = cleanCodexStderr(client.stderr);
       throw new Error(

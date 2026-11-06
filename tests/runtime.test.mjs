@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import crypto from "node:crypto";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -243,6 +244,48 @@ test("transfer delegates the current Claude session directly to native import", 
     ["Initial request", "Initial answer", "/codex:transfer"]
   );
 });
+
+for (const behavior of ["external-import-legacy-appends", "external-import-modern-appends", "external-import-modern-fails", "external-import-modern-fails-without-source", "external-import-modern-empty"]) {
+  test(`transfer handles ${behavior} without trusting a stale transcript hash`, () => {
+    const home = makeTempDir();
+    const repo = path.join(home, "repo");
+    const binDir = makeTempDir();
+    const projectDir = path.join(home, ".claude", "projects", "-repo");
+    const sourcePath = path.join(projectDir, "session.jsonl");
+    fs.mkdirSync(repo, { recursive: true });
+    fs.mkdirSync(projectDir, { recursive: true });
+    installFakeCodex(binDir, behavior);
+    initGitRepo(repo);
+    const original = `${JSON.stringify({ type: "user", cwd: repo, message: { role: "user", content: "Preserve this request." } })}\n`;
+    fs.writeFileSync(sourcePath, original);
+    const failedImport = behavior === "external-import-modern-empty" || behavior.startsWith("external-import-modern-fails");
+    if (failedImport) {
+      const codexHome = path.join(home, ".codex");
+      fs.mkdirSync(codexHome, { recursive: true });
+      fs.writeFileSync(path.join(codexHome, "external_agent_session_imports.json"), JSON.stringify({ records: [{
+        source_path: fs.realpathSync(sourcePath),
+        content_sha256: crypto.createHash("sha256").update(original).digest("hex"),
+        imported_thread_id: "thr_stale"
+      }] }));
+    }
+
+    const result = run("node", [SCRIPT, "transfer", "--source", sourcePath, "--json"], {
+      cwd: repo,
+      env: { ...buildEnv(binDir), HOME: home, CODEX_HOME: path.join(home, ".codex") }
+    });
+
+    if (failedImport) {
+      // A native failure must win even when a matching ledger record exists.
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, behavior === "external-import-modern-empty"
+        ? /did not record an imported thread/ : /Native session import failed/);
+    } else {
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(JSON.parse(result.stdout).threadId, "thr_1");
+      assert.ok(fs.readFileSync(sourcePath, "utf8").length > original.length);
+    }
+  });
+}
 
 test("transfer reports an actionable upgrade error when native import is unsupported", () => {
   const home = makeTempDir();

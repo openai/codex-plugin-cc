@@ -368,6 +368,24 @@ rl.on("line", (line) => {
           throw new Error("missing external session migration");
         }
         const sourcePath = fs.realpathSync(session.path);
+        if (["external-import-modern-fails", "external-import-modern-fails-without-source", "external-import-modern-empty"].includes(BEHAVIOR)) {
+          const importId = "transfer-import-id";
+          send({ id: message.id, result: { importId } });
+          send({ method: "externalAgentConfig/import/completed", params: {
+            importId,
+            itemTypeResults: [{ itemType: "SESSIONS", successes: [],
+              failures: BEHAVIOR === "external-import-modern-empty" ? [] : [{
+                itemType: "SESSIONS",
+                source: BEHAVIOR === "external-import-modern-fails-without-source" ? null : sourcePath,
+                message: "Native session import failed"
+              }]
+            }]
+          } });
+          break;
+        }
+        if (BEHAVIOR === "external-import-modern-appends") {
+          fs.appendFileSync(sourcePath, JSON.stringify({ type: "progress" }) + "\\n");
+        }
         const contents = fs.readFileSync(sourcePath, "utf8");
         const contentSha256 = crypto.createHash("sha256").update(contents).digest("hex");
         const ledger = loadImportLedger();
@@ -399,8 +417,19 @@ rl.on("line", (line) => {
           saveState(state);
           saveImportLedger(ledger);
         }
-        send({ id: message.id, result: {} });
-        send({ method: "externalAgentConfig/import/completed", params: {} });
+        if (BEHAVIOR === "external-import-legacy-appends" || BEHAVIOR === "external-import-modern-appends") {
+          fs.appendFileSync(sourcePath, JSON.stringify({ type: "progress" }) + "\\n");
+        }
+        const importId = "transfer-import-id";
+        const modern = BEHAVIOR === "external-import-modern-appends";
+        send({ id: message.id, result: modern ? { importId } : {} });
+        send({ method: "externalAgentConfig/import/completed", params: modern ? {
+          importId,
+          itemTypeResults: [{ itemType: "SESSIONS",
+            successes: [{ itemType: "SESSIONS", source: sourcePath, target: thread.id }],
+            failures: []
+          }]
+        } : {} });
         break;
       }
 
