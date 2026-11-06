@@ -101,9 +101,21 @@ async function main() {
 
   function routeNotification(message) {
     // A disconnected caller must not make its running turn eligible for shutdown.
-    const turnKey = `${message.params?.threadId}:${message.params?.turn?.id}`;
+    const turnKey = `${message.params?.threadId}:${message.params?.turn?.id ?? message.params?.turnId}`;
     if (message.method === "turn/started") activeTurns.add(turnKey);
     if (message.method === "turn/completed") activeTurns.delete(turnKey);
+    if (
+      message.method === "item/completed" &&
+      message.params?.item?.type === "agentMessage" &&
+      message.params.item.phase === "final_answer"
+    ) {
+      // lib/codex.mjs completes a turn from its final answer when turn/completed never
+      // arrives, so a final answer ends the turn here too. Same grace as the client's.
+      setTimeout(() => {
+        activeTurns.delete(turnKey);
+        updateIdleTimer();
+      }, 250).unref();
+    }
     updateIdleTimer();
     const target = activeRequestSocket ?? activeStreamSocket;
     if (!target) {

@@ -24,7 +24,15 @@ async function waitFor(predicate, timeoutMs = 3000) {
 }
 
 function alive(pid) {
-  try { process.kill(pid, 0); return true; } catch { return false; }
+  try { process.kill(pid, 0); } catch { return false; }
+  // Without a reaping init (some containers) an exited process lingers as a zombie
+  // that still answers kill(pid, 0).
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3) !== "Z";
+  } catch {
+    return true;
+  }
 }
 
 function connect(endpoint) {
@@ -78,7 +86,8 @@ rl.on('line', (line) => {
   if (m.method === 'turn/start') {
     reply({ turn: { id: 'turn_1' } });
     send({ method: 'turn/started', params: { threadId: 'thr_1', turn: { id: 'turn_1' } } });
-    setTimeout(() => send({ method: 'turn/completed', params: { threadId: 'thr_1', turn: { id: 'turn_1' } } }), 700);
+    if (process.env.TEST_INFERRED) setTimeout(() => send({ method: 'item/completed', params: { threadId: 'thr_1', turnId: 'turn_1', item: { type: 'agentMessage', id: 'm1', phase: 'final_answer', text: 'done' } } }), 100);
+    else setTimeout(() => send({ method: 'turn/completed', params: { threadId: 'thr_1', turn: { id: 'turn_1' } } }), 700);
   } else if (m.method === 'test/slow') {
     setTimeout(() => reply({ done: true }), 700);
   } else reply({});
@@ -135,6 +144,16 @@ test("disconnecting a client does not expire an active turn", { timeout: 6000 },
   await new Promise((resolve) => setTimeout(resolve, 400));
   assert.ok(alive(session.pid), "turn outlives both the socket and idle timeout");
   await waitFor(() => !alive(session.pid), 1800);
+});
+
+test("a turn finished by its final answer alone does not pin the broker", { timeout: 6000 }, async (t) => {
+  const f = await fixture(t);
+  f.env.TEST_INFERRED = "1";
+  const session = await f.start();
+  const client = connect(session.endpoint);
+  await client.request("turn/start", { threadId: "thr_1" });
+  client.socket.destroy();
+  await waitFor(() => !alive(session.pid), 1500);
 });
 
 test("disconnecting a client does not expire an in-flight RPC", { timeout: 6000 }, async (t) => {
@@ -213,6 +232,20 @@ test("startup recovers a lock whose owner write was cut short", { timeout: 6000 
   const session = await f.start();
   assert.ok(alive(session.pid));
   assert.equal(fs.existsSync(lockFile), false);
+});
+
+test("startup recovers when a reclaimer died holding the reclaim guard", { timeout: 6000 }, async (t) => {
+  const f = await fixture(t);
+  const stateDir = resolveStateDir(f.root);
+  const lockFile = path.join(stateDir, "broker.json.lock");
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: 2 ** 22 + 1, token: "dead-owner" }));
+  fs.writeFileSync(`${lockFile}.reclaim`, "");
+  const old = new Date(Date.now() - 60000);
+  fs.utimesSync(`${lockFile}.reclaim`, old, old);
+  const session = await f.start();
+  assert.ok(alive(session.pid));
+  assert.equal(fs.existsSync(`${lockFile}.reclaim`), false);
 });
 
 test("a broker draining after idle expiry stops admitting clients", { timeout: 6000 }, async (t) => {

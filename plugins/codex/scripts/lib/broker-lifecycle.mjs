@@ -115,6 +115,26 @@ export async function isBrokerEndpointReady(endpoint) {
 }
 
 function removeStaleBrokerLock(lockFile) {
+  // Reclaimers serialize on a guard so a descheduled one cannot unlink a lock that
+  // another reclaimer already replaced. A stale lock's owner is dead (or never finished
+  // writing), so only reclaimers ever unlink it.
+  const guard = `${lockFile}.reclaim`;
+  try {
+    fs.closeSync(fs.openSync(guard, "wx"));
+  } catch (error) {
+    if (error.code !== "EEXIST") {
+      throw error;
+    }
+    try {
+      // A reclaimer that died holding the guard must not block recovery forever.
+      if (Date.now() - fs.statSync(guard).mtimeMs > 10000) {
+        fs.unlinkSync(guard);
+      }
+    } catch {
+      // Released by its holder in the meantime.
+    }
+    return;
+  }
   try {
     const text = fs.readFileSync(lockFile, "utf8");
     let owner = null;
@@ -134,12 +154,18 @@ function removeStaleBrokerLock(lockFile) {
     } else {
       stale = Date.now() - fs.statSync(lockFile).mtimeMs > 30000;
     }
-    if (stale && fs.readFileSync(lockFile, "utf8") === text) {
+    if (stale) {
       fs.unlinkSync(lockFile);
     }
   } catch (error) {
     if (error.code !== "ENOENT") {
       throw error;
+    }
+  } finally {
+    try {
+      fs.unlinkSync(guard);
+    } catch {
+      // Already removed.
     }
   }
 }
