@@ -9,7 +9,7 @@ import { makeTempDir, writeExecutable } from "./helpers.mjs";
 import { CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { ensureBrokerSession, sendBrokerShutdown } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
-import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import { isProcessAlive, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const LIFECYCLE_URL = new URL("../plugins/codex/scripts/lib/broker-lifecycle.mjs", import.meta.url).href;
@@ -23,17 +23,7 @@ async function waitFor(predicate, timeoutMs = 3000) {
   assert.fail("Timed out waiting for broker lifecycle transition");
 }
 
-function alive(pid) {
-  try { process.kill(pid, 0); } catch { return false; }
-  // Without a reaping init (some containers) an exited process lingers as a zombie
-  // that still answers kill(pid, 0).
-  try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    return stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3) !== "Z";
-  } catch {
-    return true;
-  }
-}
+const alive = isProcessAlive;
 
 function connect(endpoint) {
   const socket = net.createConnection({ path: parseBrokerEndpoint(endpoint).path });
@@ -246,6 +236,21 @@ test("startup recovers when a reclaimer died holding the reclaim guard", { timeo
   const session = await f.start();
   assert.ok(alive(session.pid));
   assert.equal(fs.existsSync(`${lockFile}.reclaim`), false);
+});
+
+test("startup recovers a lock owned by an exited zombie process", { timeout: 6000, skip: !fs.existsSync("/proc/self/stat") }, async (t) => {
+  const f = await fixture(t);
+  // perl forks a child that exits at once, then sleeps without wait(), leaving a zombie.
+  const parent = spawn("perl", ["-e", '$| = 1; my $p = fork; exit 0 unless $p; print "$p\\n"; sleep 30'], { stdio: ["ignore", "pipe", "ignore"] });
+  t.after(() => parent.kill());
+  const pid = await new Promise((resolve) => parent.stdout.once("data", (c) => resolve(Number(String(c).trim()))));
+  await waitFor(() => fs.readFileSync(`/proc/${pid}/stat`, "utf8").split(") ")[1][0] === "Z");
+  assert.equal(isProcessAlive(pid), false, "zombie counts as exited");
+  const stateDir = resolveStateDir(f.root);
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "broker.json.lock"), JSON.stringify({ pid, token: "zombie-owner" }));
+  const session = await f.start();
+  assert.ok(alive(session.pid));
 });
 
 test("a broker draining after idle expiry stops admitting clients", { timeout: 6000 }, async (t) => {

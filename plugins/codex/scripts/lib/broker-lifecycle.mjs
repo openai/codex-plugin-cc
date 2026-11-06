@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
+import { isProcessAlive } from "./process.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
@@ -146,11 +147,7 @@ function removeStaleBrokerLock(lockFile) {
     }
     let stale = false;
     if (Number.isInteger(owner?.pid) && owner.pid > 0) {
-      try {
-        process.kill(owner.pid, 0);
-      } catch (error) {
-        stale = error.code === "ESRCH";
-      }
+      stale = !isProcessAlive(owner.pid);
     } else {
       stale = Date.now() - fs.statSync(lockFile).mtimeMs > 30000;
     }

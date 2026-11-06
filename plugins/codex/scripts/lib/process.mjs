@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import process from "node:process";
 
@@ -52,6 +53,23 @@ export function binaryAvailable(command, versionArgs = ["--version"], options = 
 
 function looksLikeMissingProcessMessage(text) {
   return /not found|no running instance|cannot find|does not exist|no such process/i.test(text);
+}
+
+export function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    // EPERM means the process exists but belongs to someone else.
+    return error.code !== "ESRCH";
+  }
+  // Without a reaping init (some containers) an exited process lingers as a zombie
+  // that still answers kill(pid, 0).
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat[stat.lastIndexOf(")") + 2] !== "Z";
+  } catch {
+    return true;
+  }
 }
 
 export function terminateProcessTree(pid, options = {}) {
