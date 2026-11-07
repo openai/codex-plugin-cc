@@ -8,7 +8,7 @@ test("runCommand allows output larger than Node's default maxBuffer", () => {
   const result = runCommand(process.execPath, [
     "-e",
     `process.stdout.write("x".repeat(${outputBytes}))`
-  ]);
+  ], { shell: false });
 
   assert.equal(result.error, null);
   assert.equal(result.status, 0);
@@ -19,7 +19,7 @@ test("runCommand preserves an explicit maxBuffer override", () => {
   const result = runCommand(
     process.execPath,
     ["-e", `process.stdout.write("x".repeat(${2 * 1024}))`],
-    { maxBuffer: 1024 }
+    { maxBuffer: 1024, shell: false }
   );
 
   assert.equal(result.error?.code, "ENOBUFS");
@@ -83,7 +83,7 @@ for (const [stream, character] of [["stdout", "é"], ["stderr", "😀"]]) {
     const result = runCommand(process.execPath, [
       "-e",
       `process.${stream}.write(${JSON.stringify(character)}.repeat(600000))`
-    ]);
+    ], { shell: false });
     assert.equal(result.status, 0);
     assert.equal(result.error, null);
     assert.equal(result[stream], text);
