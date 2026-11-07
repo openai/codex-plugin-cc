@@ -658,22 +658,36 @@ function sourceContentSha256(sourcePath) {
   return crypto.createHash("sha256").update(fs.readFileSync(sourcePath)).digest("hex");
 }
 
-function importedThreadIdForSource(sourcePath, contentSha256) {
+function sessionImportRecordsForSource(sourcePath) {
   const ledgerPath = path.join(resolveCodexHome(), "external_agent_session_imports.json");
   if (!fs.existsSync(ledgerPath)) {
-    return null;
+    return [];
   }
   const ledger = readJsonFile(ledgerPath);
   const canonicalSource = fs.realpathSync(sourcePath);
   const records = Array.isArray(ledger?.records) ? ledger.records : [];
-  const match = records
-    .filter(
-      (record) =>
-        record?.source_path === canonicalSource &&
-        record?.content_sha256 === contentSha256 &&
-        typeof record?.imported_thread_id === "string"
-    )
-    .at(-1);
+  return records.filter(
+    (record) =>
+      record?.source_path === canonicalSource &&
+      typeof record?.content_sha256 === "string" && record.content_sha256.length > 0 &&
+      typeof record?.imported_thread_id === "string" && record.imported_thread_id.trim()
+  );
+}
+
+function importedThreadIdForSource(sourcePath, previousRecords) {
+  const records = sessionImportRecordsForSource(sourcePath);
+  const recordKey = (record) => JSON.stringify([record.content_sha256, record.imported_thread_id]);
+  const previousKeys = new Set(previousRecords.map(recordKey));
+  const newThreadIds = new Set(records
+    .filter((record) => !previousKeys.has(recordKey(record)))
+    .map((record) => record.imported_thread_id));
+  // Legacy notifications lack a target; prefer this invocation's additions.
+  if (newThreadIds.size > 0) {
+    return newThreadIds.size === 1 ? [...newThreadIds][0] : null;
+  }
+  // Native deduplication may reuse an existing record for unchanged content.
+  const contentSha256 = sourceContentSha256(sourcePath);
+  const match = records.filter((record) => record.content_sha256 === contentSha256).at(-1);
   return match?.imported_thread_id ?? null;
 }
 
@@ -1067,8 +1081,7 @@ export async function importExternalAgentSession(cwd, options = {}) {
   return withDirectAppServer(cwd, async (client) => {
     emitProgress(options.onProgress, "Importing Claude session into Codex.", "transferring");
     const sourcePath = fs.realpathSync(options.sourcePath);
-    // Claude can append to its transcript while the native import is running.
-    const contentSha256 = sourceContentSha256(sourcePath);
+    const previousRecords = sessionImportRecordsForSource(sourcePath);
     let completed;
     try {
       completed = await requestExternalAgentSessionImport(client, externalAgentSessionMigration(sourcePath, cwd));
@@ -1090,7 +1103,7 @@ export async function importExternalAgentSession(cwd, options = {}) {
     // An explicit result must not be replaced by a previous import's ledger entry.
     const threadId = Array.isArray(completed?.itemTypeResults)
       ? (typeof imported?.target === "string" && imported.target.trim() ? imported.target : null)
-      : importedThreadIdForSource(sourcePath, contentSha256);
+      : importedThreadIdForSource(sourcePath, previousRecords);
     if (!threadId) {
       const stderr = cleanCodexStderr(client.stderr);
       throw new Error(

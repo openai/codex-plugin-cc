@@ -245,7 +245,7 @@ test("transfer delegates the current Claude session directly to native import", 
   );
 });
 
-for (const behavior of ["external-import-legacy-appends", "external-import-modern-appends", "external-import-modern-fails", "external-import-modern-fails-without-source", "external-import-modern-empty"]) {
+for (const behavior of ["external-import-legacy-appends", "external-import-modern-appends", "external-import-modern-fails", "external-import-modern-fails-without-source", "external-import-modern-empty", "external-import-legacy-ambiguous"]) {
   test(`transfer handles ${behavior} without trusting a stale transcript hash`, () => {
     const home = makeTempDir();
     const repo = path.join(home, "repo");
@@ -258,8 +258,8 @@ for (const behavior of ["external-import-legacy-appends", "external-import-moder
     initGitRepo(repo);
     const original = `${JSON.stringify({ type: "user", cwd: repo, message: { role: "user", content: "Preserve this request." } })}\n`;
     fs.writeFileSync(sourcePath, original);
-    const failedImport = behavior === "external-import-modern-empty" || behavior.startsWith("external-import-modern-fails");
-    if (failedImport) {
+    const failedImport = behavior === "external-import-modern-empty" || behavior.startsWith("external-import-modern-fails") || behavior === "external-import-legacy-ambiguous";
+    if (failedImport && behavior !== "external-import-legacy-ambiguous") {
       const codexHome = path.join(home, ".codex");
       fs.mkdirSync(codexHome, { recursive: true });
       fs.writeFileSync(path.join(codexHome, "external_agent_session_imports.json"), JSON.stringify({ records: [{
@@ -277,7 +277,7 @@ for (const behavior of ["external-import-legacy-appends", "external-import-moder
     if (failedImport) {
       // A native failure must win even when a matching ledger record exists.
       assert.notEqual(result.status, 0);
-      assert.match(result.stderr, behavior === "external-import-modern-empty"
+      assert.match(result.stderr, behavior === "external-import-modern-empty" || behavior === "external-import-legacy-ambiguous"
         ? /did not record an imported thread/ : /Native session import failed/);
     } else {
       assert.equal(result.status, 0, result.stderr);
@@ -286,6 +286,37 @@ for (const behavior of ["external-import-legacy-appends", "external-import-moder
     }
   });
 }
+
+test("transfer returns the new legacy import when the transcript grows before the importer reads it", () => {
+  const home = makeTempDir();
+  const repo = path.join(home, "repo");
+  const binDir = makeTempDir();
+  const projectDir = path.join(home, ".claude", "projects", "-repo");
+  const sourcePath = path.join(projectDir, "session.jsonl");
+  fs.mkdirSync(repo, { recursive: true });
+  fs.mkdirSync(projectDir, { recursive: true });
+  initGitRepo(repo);
+  installFakeCodex(binDir);
+  fs.writeFileSync(sourcePath, `${JSON.stringify({ type: "user", cwd: repo, message: { role: "user", content: "Preserve the latest history." } })}\n`);
+  const transfer = () => run("node", [SCRIPT, "transfer", "--source", sourcePath, "--json"], {
+    cwd: repo,
+    env: { ...buildEnv(binDir), HOME: home, CODEX_HOME: path.join(home, ".codex") }
+  });
+  for (const expectedThread of ["thr_1", "thr_2"]) {
+    if (expectedThread === "thr_2") {
+      installFakeCodex(binDir, "external-import-legacy-preread-appends");
+    }
+    const result = transfer();
+    assert.equal(result.status, 0, result.stderr);
+    const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+    assert.equal(state.lastExternalAgentImport.threadId, expectedThread);
+    assert.equal(JSON.parse(result.stdout).threadId, expectedThread);
+  }
+  installFakeCodex(binDir);
+  const deduplicated = transfer();
+  assert.equal(deduplicated.status, 0, deduplicated.stderr);
+  assert.equal(JSON.parse(deduplicated.stdout).threadId, "thr_2");
+});
 
 test("transfer reports an actionable upgrade error when native import is unsupported", () => {
   const home = makeTempDir();

@@ -383,7 +383,7 @@ rl.on("line", (line) => {
           } });
           break;
         }
-        if (BEHAVIOR === "external-import-modern-appends") {
+        if (BEHAVIOR === "external-import-modern-appends" || BEHAVIOR === "external-import-legacy-preread-appends") {
           fs.appendFileSync(sourcePath, JSON.stringify({ type: "progress" }) + "\\n");
         }
         const contents = fs.readFileSync(sourcePath, "utf8");
@@ -414,6 +414,15 @@ rl.on("line", (line) => {
             source_modified_at: null
           };
           ledger.records.push(record);
+          saveState(state);
+          saveImportLedger(ledger);
+        }
+        if (BEHAVIOR === "external-import-legacy-ambiguous") {
+          const concurrentThread = nextThread(state, session.cwd, false);
+          ledger.records.push({ ...record,
+            content_sha256: crypto.createHash("sha256").update(contents + "concurrent import").digest("hex"),
+            imported_thread_id: concurrentThread.id
+          });
           saveState(state);
           saveImportLedger(ledger);
         }
