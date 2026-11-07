@@ -5,14 +5,6 @@ Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex
 This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
 they already have.
 
-<video src="./docs/plugin-demo.webm" controls muted playsinline autoplay></video>
-
-## What You Get
-
-- `/codex:review` for a normal read-only Codex review
-- `/codex:adversarial-review` for a steerable challenge review
-- `/codex:rescue`, `/codex:transfer`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work, hand off sessions, and manage background jobs
-
 ## Requirements
 
 - **ChatGPT subscription (incl. Free) or OpenAI API key.**
@@ -172,10 +164,20 @@ Examples:
 
 ```bash
 /codex:transfer
-/codex:transfer --source ~/.claude/projects/-Users-me-repo/<session-id>.jsonl
+/codex:transfer --source ~/.claude/projects/<project-directory>/<claude-session-id>.jsonl
 ```
 
 The plugin's existing `SessionStart` hook supplies the current transcript path automatically; `--source` is available as a manual override. The transfer uses Codex's external-agent session importer, so it follows the same conversion rules as importing Claude history in the Codex App and creates visible turns that can be continued in the App or TUI. The source must be under `~/.claude/projects`, and older Codex versions that do not expose session import must be upgraded before using this command.
+
+After a successful transfer, run the printed command in a terminal:
+
+```bash
+codex resume <codex-session-id>
+```
+
+Use the Codex session ID returned by that transfer, not the Claude session ID in the source filename. A transcript can grow during import, so an ID from an earlier transfer may lack the latest history. When Codex supplies per-item import results, a failed import or a result without a matching success is reported as an error rather than replaced with an older thread.
+
+For older Codex versions without per-item results, the plugin checks records added for the source during the import, or an exact current-content match when Codex reuses an existing import. Multiple new thread IDs are treated as ambiguous. Avoid parallel transfers of the same source with these versions; if the result cannot be resolved, update Codex and retry instead of choosing a thread from the import ledger manually.
 
 ### `/codex:status`
 
@@ -287,7 +289,7 @@ Check out the Codex docs for more [configuration options](https://developers.ope
 
 ### Moving The Work Over To Codex
 
-Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/codex:result` or `/codex:status` or by selecting it from the list.
+Delegated tasks and any [stop gate](#enabling-review-gate) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/codex:result` or `/codex:status` or by selecting it from the list.
 
 This way you can review the Codex work or continue the work there.
 
