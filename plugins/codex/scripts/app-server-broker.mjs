@@ -71,8 +71,6 @@ async function main() {
   let activeStreamThreadIds = null;
   const sockets = new Set();
   const activeTurns = new Set();
-  const pendingCollaborations = new Map();
-  const finalAnswered = new Map();
   let pendingRequests = 0;
   let idleTimer = null;
   let shuttingDown = false;
@@ -91,16 +89,6 @@ async function main() {
     }, idleTimeoutMs);
   }
 
-  function settleFinalAnswer(turnKey, threadId) {
-    if (pendingCollaborations.get(threadId)?.size) return;
-    setTimeout(() => {
-      if (pendingCollaborations.get(threadId)?.size || !finalAnswered.has(turnKey)) return;
-      finalAnswered.delete(turnKey);
-      activeTurns.delete(turnKey);
-      updateIdleTimer();
-    }, 250).unref();
-  }
-
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
       activeRequestSocket = null;
@@ -113,45 +101,9 @@ async function main() {
 
   function routeNotification(message) {
     // A disconnected caller must not make its running turn eligible for shutdown.
-    const turnKey = `${message.params?.threadId}:${message.params?.turn?.id ?? message.params?.turnId}`;
-    const threadId = message.params?.threadId;
-    if (message.method === "turn/started") {
-      activeTurns.add(turnKey);
-      pendingCollaborations.delete(threadId);
-    }
-    if (message.method === "turn/completed") {
-      activeTurns.delete(turnKey);
-      finalAnswered.delete(turnKey);
-      // Collaborations belong to the turn that started them; an interrupted turn may never
-      // have seen them complete, and a resumed thread must not inherit them.
-      pendingCollaborations.delete(threadId);
-    }
-    // lib/codex.mjs completes a turn from its final answer when turn/completed never
-    // arrives, once the thread's collaborations drain. Mirror that so such a turn does not
-    // pin the broker, and an unfinished collaboration is not cut off by idle expiry.
-    const item = message.params?.item;
-    if (item?.type === "collabAgentToolCall") {
-      const pending = pendingCollaborations.get(threadId) ?? new Set();
-      if (message.method === "item/started" || item.status === "inProgress") {
-        pending.add(item.id);
-      } else if (message.method === "item/completed") {
-        pending.delete(item.id);
-      }
-      if (pending.size) {
-        pendingCollaborations.set(threadId, pending);
-      } else {
-        pendingCollaborations.delete(threadId);
-      }
-      if (message.method === "item/completed") {
-        for (const [key, owner] of finalAnswered) {
-          if (owner === threadId) settleFinalAnswer(key, owner);
-        }
-      }
-    }
-    if (message.method === "item/completed" && item?.type === "agentMessage" && item.phase === "final_answer") {
-      finalAnswered.set(turnKey, threadId);
-      settleFinalAnswer(turnKey, threadId);
-    }
+    const turnKey = `${message.params?.threadId}:${message.params?.turn?.id}`;
+    if (message.method === "turn/started") activeTurns.add(turnKey);
+    if (message.method === "turn/completed") activeTurns.delete(turnKey);
     updateIdleTimer();
     const target = activeRequestSocket ?? activeStreamSocket;
     if (!target) {
@@ -174,20 +126,16 @@ async function main() {
     if (shuttingDown) return;
     shuttingDown = true;
     clearTimeout(idleTimer);
-    // Stop admitting clients before the app-server close, which can take seconds.
-    // A client admitted while draining would initialize fine, then fail its first request.
-    const closed = new Promise((resolve) => server.close(resolve));
     for (const socket of sockets) {
       socket.end();
     }
     await appClient.close().catch(() => {});
-    await closed;
-    // A replacement broker's teardown may already have removed these.
-    if (listenTarget.kind === "unix") {
-      fs.rmSync(listenTarget.path, { force: true });
+    await new Promise((resolve) => server.close(resolve));
+    if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
+      fs.unlinkSync(listenTarget.path);
     }
-    if (pidFile) {
-      fs.rmSync(pidFile, { force: true });
+    if (pidFile && fs.existsSync(pidFile)) {
+      fs.unlinkSync(pidFile);
     }
   }
 
@@ -260,19 +208,30 @@ async function main() {
           continue;
         }
 
-        const isStreaming = STREAMING_METHODS.has(message.method);
-        if (!allowInterruptDuringActiveStream) {
-          activeRequestSocket = socket;
+        if (allowInterruptDuringActiveStream) {
+          pendingRequests += 1;
+          try {
+            const result = await appClient.request(message.method, message.params ?? {});
+            send(socket, { id: message.id, result });
+          } catch (error) {
+            send(socket, {
+              id: message.id,
+              error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
+            });
+          } finally {
+            pendingRequests -= 1;
+            updateIdleTimer();
+          }
+          continue;
         }
+
+        const isStreaming = STREAMING_METHODS.has(message.method);
+        activeRequestSocket = socket;
         pendingRequests += 1;
 
         try {
           const result = await appClient.request(message.method, message.params ?? {});
           send(socket, { id: message.id, result });
-          // Interrupts share request bookkeeping without taking stream ownership.
-          if (allowInterruptDuringActiveStream) {
-            continue;
-          }
           if (isStreaming) {
             activeStreamSocket = socket;
             activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
@@ -285,9 +244,6 @@ async function main() {
             id: message.id,
             error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
           });
-          if (allowInterruptDuringActiveStream) {
-            continue;
-          }
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
           }

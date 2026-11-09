@@ -5,9 +5,7 @@ import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { randomUUID } from "node:crypto";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { isProcessAlive } from "./process.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
@@ -42,22 +40,19 @@ export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
   return false;
 }
 
-export async function sendBrokerShutdown(endpoint, { timeoutMs = 1000 } = {}) {
+export async function sendBrokerShutdown(endpoint) {
   await new Promise((resolve) => {
     const socket = connectToEndpoint(endpoint);
-    const finish = () => {
-      clearTimeout(timer);
-      socket.destroy();
-      resolve();
-    };
-    const timer = setTimeout(finish, timeoutMs);
     socket.setEncoding("utf8");
     socket.on("connect", () => {
       socket.write(`${JSON.stringify({ id: 1, method: "broker/shutdown", params: {} })}\n`);
     });
-    socket.on("data", finish);
-    socket.on("error", finish);
-    socket.on("close", finish);
+    socket.on("data", () => {
+      socket.end();
+      resolve();
+    });
+    socket.on("error", resolve);
+    socket.on("close", resolve);
   });
 }
 
@@ -104,14 +99,6 @@ export function clearBrokerSession(cwd) {
   }
 }
 
-export function clearBrokerSessionIfCurrent(cwd, endpoint) {
-  // A replacement may have published its own state since the caller loaded this one.
-  const current = loadBrokerSession(cwd);
-  if (!current || current.endpoint === endpoint) {
-    clearBrokerSession(cwd);
-  }
-}
-
 export async function isBrokerEndpointReady(endpoint) {
   if (!endpoint) {
     return false;
@@ -123,124 +110,7 @@ export async function isBrokerEndpointReady(endpoint) {
   }
 }
 
-function readLockOwner(file) {
-  const text = fs.readFileSync(file, "utf8");
-  try {
-    return { text, owner: JSON.parse(text) };
-  } catch {
-    // Exclusive creation and the owner write are separate steps, so a process that
-    // dies between them leaves an empty or partial file.
-    return { text, owner: null };
-  }
-}
-
-function isLockStale(file, owner, maxAgeMs) {
-  if (Number.isInteger(owner?.pid) && owner.pid > 0) {
-    return !isProcessAlive(owner.pid);
-  }
-  return Date.now() - fs.statSync(file).mtimeMs > maxAgeMs;
-}
-
-function unlinkIfUnchanged(file, text) {
-  // Tokens are unique per acquisition, so unchanged text means the same acquisition.
-  if (fs.readFileSync(file, "utf8") === text) {
-    fs.unlinkSync(file);
-  }
-}
-
-function removeStaleBrokerLock(lockFile, guardOwner) {
-  // Reclaimers serialize on a guard so two of them cannot both act on the same stale lock.
-  // The guard is judged by its owner's liveness like the lock is, never by age alone,
-  // so a slow but live reclaimer is not revoked.
-  const guard = `${lockFile}.reclaim`;
-  try {
-    fs.writeFileSync(guard, JSON.stringify(guardOwner), { flag: "wx" });
-  } catch (error) {
-    if (error.code !== "EEXIST") {
-      throw error;
-    }
-    try {
-      const held = readLockOwner(guard);
-      if (isLockStale(guard, held.owner, 10000)) {
-        unlinkIfUnchanged(guard, held.text);
-      }
-    } catch (guardError) {
-      if (guardError.code !== "ENOENT") {
-        throw guardError;
-      }
-    }
-    return;
-  }
-  try {
-    const held = readLockOwner(lockFile);
-    if (isLockStale(lockFile, held.owner, 30000)) {
-      unlinkIfUnchanged(lockFile, held.text);
-    }
-  } catch (error) {
-    if (error.code !== "ENOENT") {
-      throw error;
-    }
-  } finally {
-    try {
-      unlinkIfUnchanged(guard, JSON.stringify(guardOwner));
-    } catch {
-      // Already removed.
-    }
-  }
-}
-
-function releaseBrokerLock(lockFile, owner) {
-  // Only remove a lock we still own; another process may have reclaimed it.
-  try {
-    if (JSON.parse(fs.readFileSync(lockFile, "utf8")).token === owner.token) {
-      fs.unlinkSync(lockFile);
-    }
-  } catch {
-    // Already removed or replaced by a reclaiming process.
-  }
-}
-
-export async function withBrokerLock(cwd, options, fn) {
-  // Serialize broker startup, state publication and teardown across processes.
-  // Otherwise simultaneous first commands each leave a detached broker behind, and a
-  // session-end cleanup can erase a replacement's state.
-  const stateFile = resolveBrokerStateFile(cwd);
-  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
-  const lockFile = `${stateFile}.lock`;
-  const owner = { pid: process.pid, token: randomUUID() };
-  const deadline = Date.now() + (options.timeoutMs ?? 2000) + 3000;
-  while (true) {
-    try {
-      const fd = fs.openSync(lockFile, "wx");
-      try {
-        fs.writeFileSync(fd, JSON.stringify(owner));
-      } finally {
-        fs.closeSync(fd);
-      }
-      break;
-    } catch (error) {
-      if (error.code !== "EEXIST") {
-        throw error;
-      }
-      removeStaleBrokerLock(lockFile, { pid: process.pid, token: randomUUID() });
-      if (Date.now() >= deadline) {
-        throw new Error("Timed out waiting for Codex broker startup lock.");
-      }
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-  }
-  try {
-    return await fn();
-  } finally {
-    releaseBrokerLock(lockFile, owner);
-  }
-}
-
-export function ensureBrokerSession(cwd, options = {}) {
-  return withBrokerLock(cwd, options, () => startBrokerSession(cwd, options));
-}
-
-async function startBrokerSession(cwd, options) {
+export async function ensureBrokerSession(cwd, options = {}) {
   const existing = loadBrokerSession(cwd);
   if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
     return existing;
@@ -300,17 +170,6 @@ async function startBrokerSession(cwd, options) {
   return session;
 }
 
-function removeIfPresent(file) {
-  // A draining broker removes its own pid file and socket concurrently with a replacement.
-  try {
-    fs.unlinkSync(file);
-  } catch (error) {
-    if (error.code !== "ENOENT") {
-      throw error;
-    }
-  }
-}
-
 export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null }) {
   if (Number.isFinite(pid) && killProcess) {
     try {
@@ -320,19 +179,19 @@ export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessi
     }
   }
 
-  if (pidFile) {
-    removeIfPresent(pidFile);
+  if (pidFile && fs.existsSync(pidFile)) {
+    fs.unlinkSync(pidFile);
   }
 
-  if (logFile) {
-    removeIfPresent(logFile);
+  if (logFile && fs.existsSync(logFile)) {
+    fs.unlinkSync(logFile);
   }
 
   if (endpoint) {
     try {
       const target = parseBrokerEndpoint(endpoint);
-      if (target.kind === "unix") {
-        removeIfPresent(target.path);
+      if (target.kind === "unix" && fs.existsSync(target.path)) {
+        fs.unlinkSync(target.path);
       }
     } catch {
       // Ignore malformed or already-removed broker endpoints during teardown.

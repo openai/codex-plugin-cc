@@ -6,13 +6,12 @@ import process from "node:process";
 import { terminateProcessTree } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
-  clearBrokerSessionIfCurrent,
+  clearBrokerSession,
   LOG_FILE_ENV,
   loadBrokerSession,
   PID_FILE_ENV,
   sendBrokerShutdown,
-  teardownBrokerSession,
-  withBrokerLock
+  teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
 import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
@@ -103,29 +102,15 @@ async function handleSessionEnd(input) {
   }
 
   cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
-  // Closing the listener lets a replacement start while this broker drains. Teardown
-  // runs under the startup lock and clears saved state only if it is still this broker's.
-  const cleanup = () => {
-    teardownBrokerSession({
-      endpoint: brokerEndpoint,
-      pidFile,
-      logFile,
-      sessionDir,
-      pid,
-      killProcess: terminateProcessTree
-    });
-    clearBrokerSessionIfCurrent(cwd, brokerEndpoint);
-  };
-  try {
-    await withBrokerLock(cwd, {}, cleanup);
-  } catch (error) {
-    // A starter that holds the lock too long must not leave this session's broker behind.
-    // The conditional clear still protects a replacement's state.
-    if (!/Timed out waiting for Codex broker startup lock/.test(error.message)) {
-      throw error;
-    }
-    cleanup();
-  }
+  teardownBrokerSession({
+    endpoint: brokerEndpoint,
+    pidFile,
+    logFile,
+    sessionDir,
+    pid,
+    killProcess: terminateProcessTree
+  });
+  clearBrokerSession(cwd);
 }
 
 async function main() {
