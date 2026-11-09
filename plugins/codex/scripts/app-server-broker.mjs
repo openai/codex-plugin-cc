@@ -114,11 +114,17 @@ async function main() {
   function routeNotification(message) {
     // A disconnected caller must not make its running turn eligible for shutdown.
     const turnKey = `${message.params?.threadId}:${message.params?.turn?.id ?? message.params?.turnId}`;
-    if (message.method === "turn/started") activeTurns.add(turnKey);
     const threadId = message.params?.threadId;
+    if (message.method === "turn/started") {
+      activeTurns.add(turnKey);
+      pendingCollaborations.delete(threadId);
+    }
     if (message.method === "turn/completed") {
       activeTurns.delete(turnKey);
       finalAnswered.delete(turnKey);
+      // Collaborations belong to the turn that started them; an interrupted turn may never
+      // have seen them complete, and a resumed thread must not inherit them.
+      pendingCollaborations.delete(threadId);
     }
     // lib/codex.mjs completes a turn from its final answer when turn/completed never
     // arrives, once the thread's collaborations drain. Mirror that so such a turn does not

@@ -76,7 +76,12 @@ rl.on('line', (line) => {
   if (m.method === 'turn/start') {
     reply({ turn: { id: 'turn_1' } });
     send({ method: 'turn/started', params: { threadId: 'thr_1', turn: { id: 'turn_1' } } });
-    if (process.env.TEST_COLLAB) {
+    if (m.params && m.params.mode === 'interrupted') {
+      send({ method: 'item/started', params: { threadId: 'thr_1', turnId: 'turn_1', item: { type: 'collabAgentToolCall', id: 'c1', status: 'inProgress' } } });
+      setTimeout(() => send({ method: 'turn/completed', params: { threadId: 'thr_1', turn: { id: 'turn_1', status: 'interrupted' } } }), 100);
+    } else if (m.params && m.params.mode === 'final-only') {
+      setTimeout(() => send({ method: 'item/completed', params: { threadId: 'thr_1', turnId: 'turn_1', item: { type: 'agentMessage', id: 'm2', phase: 'final_answer', text: 'done' } } }), 100);
+    } else if (process.env.TEST_COLLAB) {
       send({ method: 'item/started', params: { threadId: 'thr_1', turnId: 'turn_1', item: { type: 'collabAgentToolCall', id: 'c1', status: 'inProgress' } } });
       setTimeout(() => send({ method: 'item/completed', params: { threadId: 'thr_1', turnId: 'turn_1', item: { type: 'agentMessage', id: 'm1', phase: 'final_answer', text: 'done' } } }), 100);
       setTimeout(() => send({ method: 'item/completed', params: { threadId: 'thr_1', turnId: 'turn_1', item: { type: 'collabAgentToolCall', id: 'c1', status: 'completed' } } }), 900);
@@ -162,6 +167,17 @@ test("a final answer does not release the broker while a collaboration is still 
   await new Promise((resolve) => setTimeout(resolve, 700));
   assert.ok(alive(childPid), "app-server stays up while the collaboration runs");
   assert.ok(alive(session.pid), "broker stays up while the collaboration runs");
+  await waitFor(() => !alive(session.pid), 2500);
+});
+
+test("a resumed thread does not inherit an interrupted turn's collaboration", { timeout: 8000 }, async (t) => {
+  const f = await fixture(t);
+  const session = await f.start();
+  const client = connect(session.endpoint);
+  await client.request("turn/start", { threadId: "thr_1", mode: "interrupted" });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  await client.request("turn/start", { threadId: "thr_1", mode: "final-only" });
+  client.socket.destroy();
   await waitFor(() => !alive(session.pid), 2500);
 });
 
