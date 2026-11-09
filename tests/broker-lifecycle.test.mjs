@@ -89,6 +89,7 @@ rl.on('line', (line) => {
     } else if (process.env.TEST_INFERRED) setTimeout(() => send({ method: 'item/completed', params: { threadId: 'thr_1', turnId: 'turn_1', item: { type: 'agentMessage', id: 'm1', phase: 'final_answer', text: 'done' } } }), 100);
     else setTimeout(() => send({ method: 'turn/completed', params: { threadId: 'thr_1', turn: { id: 'turn_1' } } }), 700);
   } else if (m.method === 'test/slow') {
+    fs.writeFileSync(process.env.TEST_SLOW_SEEN, '1');
     setTimeout(() => reply({ done: true }), 700);
   } else reply({});
 });
@@ -101,6 +102,7 @@ rl.on('line', (line) => {
     ...process.env,
     PATH: `${bin}${path.delimiter}${process.env.PATH}`,
     TEST_STARTS: path.join(root, "starts"),
+    TEST_SLOW_SEEN: path.join(root, "slow-seen"),
     CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS: "200"
   };
   const sessions = [];
@@ -187,8 +189,8 @@ test("disconnecting a client does not expire an in-flight RPC", { timeout: 6000 
   const session = await f.start();
   const client = connect(session.endpoint);
   client.request("test/slow");
-  await new Promise((resolve) => client.socket.write("", resolve));
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  // The app-server seeing the request proves the broker has registered it as pending.
+  await waitFor(() => fs.existsSync(f.env.TEST_SLOW_SEEN), 2000);
   client.socket.destroy();
   await new Promise((resolve) => setTimeout(resolve, 400));
   assert.ok(alive(session.pid), "pending request outlives idle timeout");
