@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
@@ -349,7 +350,7 @@ test("session-end hook still tears down its broker when the startup lock is held
   const lockFile = path.join(resolveStateDir(f.root), "broker.json.lock");
   fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, token: "busy-starter" }));
   t.after(() => fs.rmSync(lockFile, { force: true }));
-  const hook = new URL("../plugins/codex/scripts/session-lifecycle-hook.mjs", import.meta.url).pathname;
+  const hook = fileURLToPath(new URL("../plugins/codex/scripts/session-lifecycle-hook.mjs", import.meta.url));
   const child = spawn(process.execPath, [hook, "SessionEnd"], { cwd: f.root, env: f.env, stdio: ["pipe", "ignore", "pipe"] });
   child.stdin.end(JSON.stringify({ hook_event_name: "SessionEnd", cwd: f.root, session_id: "s1" }));
   let stderr = "";
