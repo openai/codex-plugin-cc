@@ -2,9 +2,73 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 
 import { collectReviewContext, resolveReviewTarget } from "../plugins/codex/scripts/lib/git.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+
+for (const [mode, options] of [["inline", {}], ["lightweight", { maxInlineFiles: 0 }]]) {
+  test(`branch review keeps one commit snapshot when HEAD and base change during ${mode} collection`, (t) => {
+    const cwd = makeTempDir();
+    const git = (args) => {
+      const result = run("git", args, { cwd, shell: false });
+      assert.equal(result.status, 0, result.stderr);
+      return result.stdout.trim();
+    };
+    initGitRepo(cwd);
+    fs.writeFileSync(path.join(cwd, "base.js"), "export const base = true;\n");
+    git(["add", "."]);
+    git(["commit", "-m", "base"]);
+    git(["checkout", "-b", "feature/reviewed"]);
+    fs.writeFileSync(path.join(cwd, "reviewed.js"), "export const value = 'REVIEWED_CHANGE';\n");
+    git(["add", "."]);
+    git(["commit", "-m", "reviewed change"]);
+    git(["checkout", "-b", "feature/other"]);
+    fs.writeFileSync(path.join(cwd, "other.js"), "export const value = 'OTHER_BRANCH_CHANGE';\n");
+    git(["add", "."]);
+    git(["commit", "-m", "other branch change"]);
+    git(["checkout", "feature/reviewed"]);
+
+    const spawnSync = childProcess.spawnSync;
+    let switched = false;
+    t.mock.method(childProcess, "spawnSync", (command, args, commandOptions) => {
+      const result = spawnSync(command, args, commandOptions);
+      if (!switched && command === "git" && args[0] === "diff" && args[1] === "--name-only") {
+        switched = true;
+        const checkout = spawnSync("git", ["checkout", "feature/other"], {
+          cwd, encoding: "utf8", shell: false, windowsHide: true
+        });
+        assert.equal(checkout.status, 0, checkout.stderr);
+        const updateBase = spawnSync("git", ["update-ref", "refs/heads/main", "HEAD"], {
+          cwd, encoding: "utf8", shell: false, windowsHide: true
+        });
+        assert.equal(updateBase.status, 0, updateBase.stderr);
+      }
+      return result;
+    });
+    syncBuiltinESMExports();
+    t.after(() => {
+      t.mock.restoreAll();
+      syncBuiltinESMExports();
+    });
+
+    const context = collectReviewContext(cwd, { mode: "branch", baseRef: "main" }, options);
+
+    assert.equal(switched, true);
+    assert.equal(git(["branch", "--show-current"]), "feature/other");
+    assert.deepEqual(context.changedFiles, ["reviewed.js"]);
+    assert.equal(git(["diff", "--name-only", context.comparison.reviewRange]), "reviewed.js");
+    assert.equal(context.branch, "feature/reviewed");
+    assert.match(context.summary, /Reviewing branch feature\/reviewed /);
+    assert.doesNotMatch(context.content, /other branch change|other\.js|OTHER_BRANCH_CHANGE/);
+    if (mode === "inline") {
+      assert.match(context.content, /REVIEWED_CHANGE/);
+    } else {
+      assert.ok(context.collectionGuidance.includes(context.comparison.commitRange));
+    }
+  });
+}
 
 test("resolveReviewTarget prefers working tree when repo is dirty", () => {
   const cwd = makeTempDir();

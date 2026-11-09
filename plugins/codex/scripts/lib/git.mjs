@@ -67,11 +67,13 @@ function measureCombinedGitOutputBytes(cwd, argSets, maxBytes) {
 }
 
 function buildBranchComparison(cwd, baseRef) {
-  const mergeBase = gitChecked(cwd, ["merge-base", "HEAD", baseRef]).stdout.trim();
+  const headCommit = gitChecked(cwd, ["rev-parse", "--verify", "HEAD"]).stdout.trim();
+  const baseRevision = gitChecked(cwd, ["rev-parse", "--verify", "--end-of-options", baseRef]).stdout.trim();
+  const mergeBase = gitChecked(cwd, ["merge-base", headCommit, baseRevision]).stdout.trim();
   return {
     mergeBase,
-    commitRange: `${mergeBase}..HEAD`,
-    reviewRange: `${baseRef}...HEAD`
+    commitRange: `${mergeBase}..${headCommit}`,
+    reviewRange: `${baseRevision}...${headCommit}`
   };
 }
 
@@ -262,7 +264,7 @@ function collectWorkingTreeContext(cwd, state, options = {}) {
 function collectBranchContext(cwd, baseRef, options = {}) {
   const includeDiff = options.includeDiff !== false;
   const comparison = options.comparison ?? buildBranchComparison(cwd, baseRef);
-  const currentBranch = getCurrentBranch(cwd);
+  const currentBranch = options.currentBranch ?? getCurrentBranch(cwd);
   const changedFiles = gitChecked(cwd, ["diff", "--name-only", comparison.commitRange]).stdout.trim().split("\n").filter(Boolean);
   const logOutput = gitChecked(cwd, ["log", "--oneline", "--decorate", comparison.commitRange]).stdout.trim();
   const diffStat = gitChecked(cwd, ["diff", "--stat", comparison.commitRange]).stdout.trim();
@@ -294,7 +296,10 @@ function buildAdversarialCollectionGuidance(options = {}) {
     return "Use the repository context below as primary evidence.";
   }
 
-  return "The repository context below is a lightweight summary. Inspect the target diff yourself with read-only git commands before finalizing findings.";
+  const pinnedRange = options.comparison
+    ? ` For this branch review, use the pinned commit range ${options.comparison.commitRange}.`
+    : "";
+  return `The repository context below is a lightweight summary. Inspect the target diff yourself with read-only git commands before finalizing findings.${pinnedRange}`;
 }
 
 export function collectReviewContext(cwd, target, options = {}) {
@@ -330,7 +335,7 @@ export function collectReviewContext(cwd, target, options = {}) {
       maxInlineDiffBytes
     );
     includeDiff = options.includeDiff ?? (fileCount <= maxInlineFiles && diffBytes <= maxInlineDiffBytes);
-    details = collectBranchContext(repoRoot, target.baseRef, { includeDiff, comparison });
+    details = collectBranchContext(repoRoot, target.baseRef, { includeDiff, comparison, currentBranch });
   }
 
   return {
@@ -341,7 +346,7 @@ export function collectReviewContext(cwd, target, options = {}) {
     fileCount: details.changedFiles.length,
     diffBytes,
     inputMode: includeDiff ? "inline-diff" : "self-collect",
-    collectionGuidance: buildAdversarialCollectionGuidance({ includeDiff }),
+    collectionGuidance: buildAdversarialCollectionGuidance({ includeDiff, comparison: details.comparison }),
     ...details
   };
 }
