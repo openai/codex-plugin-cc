@@ -104,6 +104,14 @@ export function clearBrokerSession(cwd) {
   }
 }
 
+export function clearBrokerSessionIfCurrent(cwd, endpoint) {
+  // A replacement may have published its own state since the caller loaded this one.
+  const current = loadBrokerSession(cwd);
+  if (!current || current.endpoint === endpoint) {
+    clearBrokerSession(cwd);
+  }
+}
+
 export async function isBrokerEndpointReady(endpoint) {
   if (!endpoint) {
     return false;
@@ -115,44 +123,58 @@ export async function isBrokerEndpointReady(endpoint) {
   }
 }
 
-function removeStaleBrokerLock(lockFile) {
-  // Reclaimers serialize on a guard so a descheduled one cannot unlink a lock that
-  // another reclaimer already replaced. A stale lock's owner is dead (or never finished
-  // writing), so only reclaimers ever unlink it.
+function readLockOwner(file) {
+  const text = fs.readFileSync(file, "utf8");
+  try {
+    return { text, owner: JSON.parse(text) };
+  } catch {
+    // Exclusive creation and the owner write are separate steps, so a process that
+    // dies between them leaves an empty or partial file.
+    return { text, owner: null };
+  }
+}
+
+function isLockStale(file, owner, maxAgeMs) {
+  if (Number.isInteger(owner?.pid) && owner.pid > 0) {
+    return !isProcessAlive(owner.pid);
+  }
+  return Date.now() - fs.statSync(file).mtimeMs > maxAgeMs;
+}
+
+function unlinkIfUnchanged(file, text) {
+  // Tokens are unique per acquisition, so unchanged text means the same acquisition.
+  if (fs.readFileSync(file, "utf8") === text) {
+    fs.unlinkSync(file);
+  }
+}
+
+function removeStaleBrokerLock(lockFile, guardOwner) {
+  // Reclaimers serialize on a guard so two of them cannot both act on the same stale lock.
+  // The guard is judged by its owner's liveness like the lock is, never by age alone,
+  // so a slow but live reclaimer is not revoked.
   const guard = `${lockFile}.reclaim`;
   try {
-    fs.closeSync(fs.openSync(guard, "wx"));
+    fs.writeFileSync(guard, JSON.stringify(guardOwner), { flag: "wx" });
   } catch (error) {
     if (error.code !== "EEXIST") {
       throw error;
     }
     try {
-      // A reclaimer that died holding the guard must not block recovery forever.
-      if (Date.now() - fs.statSync(guard).mtimeMs > 10000) {
-        fs.unlinkSync(guard);
+      const held = readLockOwner(guard);
+      if (isLockStale(guard, held.owner, 10000)) {
+        unlinkIfUnchanged(guard, held.text);
       }
-    } catch {
-      // Released by its holder in the meantime.
+    } catch (guardError) {
+      if (guardError.code !== "ENOENT") {
+        throw guardError;
+      }
     }
     return;
   }
   try {
-    const text = fs.readFileSync(lockFile, "utf8");
-    let owner = null;
-    try {
-      owner = JSON.parse(text);
-    } catch {
-      // Exclusive creation and the owner write are separate steps, so a process that
-      // dies between them leaves an empty or partial file. Fall through to the age check.
-    }
-    let stale = false;
-    if (Number.isInteger(owner?.pid) && owner.pid > 0) {
-      stale = !isProcessAlive(owner.pid);
-    } else {
-      stale = Date.now() - fs.statSync(lockFile).mtimeMs > 30000;
-    }
-    if (stale) {
-      fs.unlinkSync(lockFile);
+    const held = readLockOwner(lockFile);
+    if (isLockStale(lockFile, held.owner, 30000)) {
+      unlinkIfUnchanged(lockFile, held.text);
     }
   } catch (error) {
     if (error.code !== "ENOENT") {
@@ -160,7 +182,7 @@ function removeStaleBrokerLock(lockFile) {
     }
   } finally {
     try {
-      fs.unlinkSync(guard);
+      unlinkIfUnchanged(guard, JSON.stringify(guardOwner));
     } catch {
       // Already removed.
     }
@@ -178,9 +200,10 @@ function releaseBrokerLock(lockFile, owner) {
   }
 }
 
-export async function ensureBrokerSession(cwd, options = {}) {
-  // Serialize the readiness check, spawn and state publication across processes.
-  // Otherwise simultaneous first commands each leave a detached broker behind.
+export async function withBrokerLock(cwd, options, fn) {
+  // Serialize broker startup, state publication and teardown across processes.
+  // Otherwise simultaneous first commands each leave a detached broker behind, and a
+  // session-end cleanup can erase a replacement's state.
   const stateFile = resolveBrokerStateFile(cwd);
   fs.mkdirSync(path.dirname(stateFile), { recursive: true });
   const lockFile = `${stateFile}.lock`;
@@ -199,7 +222,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
       if (error.code !== "EEXIST") {
         throw error;
       }
-      removeStaleBrokerLock(lockFile);
+      removeStaleBrokerLock(lockFile, { pid: process.pid, token: randomUUID() });
       if (Date.now() >= deadline) {
         throw new Error("Timed out waiting for Codex broker startup lock.");
       }
@@ -207,10 +230,14 @@ export async function ensureBrokerSession(cwd, options = {}) {
     }
   }
   try {
-    return await startBrokerSession(cwd, options);
+    return await fn();
   } finally {
     releaseBrokerLock(lockFile, owner);
   }
+}
+
+export function ensureBrokerSession(cwd, options = {}) {
+  return withBrokerLock(cwd, options, () => startBrokerSession(cwd, options));
 }
 
 async function startBrokerSession(cwd, options) {

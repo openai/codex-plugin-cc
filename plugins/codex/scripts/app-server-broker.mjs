@@ -71,6 +71,8 @@ async function main() {
   let activeStreamThreadIds = null;
   const sockets = new Set();
   const activeTurns = new Set();
+  const pendingCollaborations = new Map();
+  const finalAnswered = new Map();
   let pendingRequests = 0;
   let idleTimer = null;
   let shuttingDown = false;
@@ -89,6 +91,16 @@ async function main() {
     }, idleTimeoutMs);
   }
 
+  function settleFinalAnswer(turnKey, threadId) {
+    if (pendingCollaborations.get(threadId)?.size) return;
+    setTimeout(() => {
+      if (pendingCollaborations.get(threadId)?.size || !finalAnswered.has(turnKey)) return;
+      finalAnswered.delete(turnKey);
+      activeTurns.delete(turnKey);
+      updateIdleTimer();
+    }, 250).unref();
+  }
+
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
       activeRequestSocket = null;
@@ -103,18 +115,32 @@ async function main() {
     // A disconnected caller must not make its running turn eligible for shutdown.
     const turnKey = `${message.params?.threadId}:${message.params?.turn?.id ?? message.params?.turnId}`;
     if (message.method === "turn/started") activeTurns.add(turnKey);
-    if (message.method === "turn/completed") activeTurns.delete(turnKey);
-    if (
-      message.method === "item/completed" &&
-      message.params?.item?.type === "agentMessage" &&
-      message.params.item.phase === "final_answer"
-    ) {
-      // lib/codex.mjs completes a turn from its final answer when turn/completed never
-      // arrives, so a final answer ends the turn here too. Same grace as the client's.
-      setTimeout(() => {
-        activeTurns.delete(turnKey);
-        updateIdleTimer();
-      }, 250).unref();
+    const threadId = message.params?.threadId;
+    if (message.method === "turn/completed") {
+      activeTurns.delete(turnKey);
+      finalAnswered.delete(turnKey);
+    }
+    // lib/codex.mjs completes a turn from its final answer when turn/completed never
+    // arrives, once the thread's collaborations drain. Mirror that so such a turn does not
+    // pin the broker, and an unfinished collaboration is not cut off by idle expiry.
+    const item = message.params?.item;
+    if (item?.type === "collabAgentToolCall") {
+      const pending = pendingCollaborations.get(threadId) ?? new Set();
+      if (message.method === "item/started" || item.status === "inProgress") {
+        pending.add(item.id);
+      } else if (message.method === "item/completed") {
+        pending.delete(item.id);
+      }
+      pendingCollaborations.set(threadId, pending);
+      if (message.method === "item/completed") {
+        for (const [key, owner] of finalAnswered) {
+          if (owner === threadId) settleFinalAnswer(key, owner);
+        }
+      }
+    }
+    if (message.method === "item/completed" && item?.type === "agentMessage" && item.phase === "final_answer") {
+      finalAnswered.set(turnKey, threadId);
+      settleFinalAnswer(turnKey, threadId);
     }
     updateIdleTimer();
     const target = activeRequestSocket ?? activeStreamSocket;

@@ -6,12 +6,13 @@ import process from "node:process";
 import { terminateProcessTree } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
-  clearBrokerSession,
+  clearBrokerSessionIfCurrent,
   LOG_FILE_ENV,
   loadBrokerSession,
   PID_FILE_ENV,
   sendBrokerShutdown,
-  teardownBrokerSession
+  teardownBrokerSession,
+  withBrokerLock
 } from "./lib/broker-lifecycle.mjs";
 import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
@@ -102,15 +103,19 @@ async function handleSessionEnd(input) {
   }
 
   cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
-  teardownBrokerSession({
-    endpoint: brokerEndpoint,
-    pidFile,
-    logFile,
-    sessionDir,
-    pid,
-    killProcess: terminateProcessTree
+  // Closing the listener lets a replacement start while this broker drains. Teardown
+  // runs under the startup lock and clears saved state only if it is still this broker's.
+  await withBrokerLock(cwd, {}, () => {
+    teardownBrokerSession({
+      endpoint: brokerEndpoint,
+      pidFile,
+      logFile,
+      sessionDir,
+      pid,
+      killProcess: terminateProcessTree
+    });
+    clearBrokerSessionIfCurrent(cwd, brokerEndpoint);
   });
-  clearBrokerSession(cwd);
 }
 
 async function main() {

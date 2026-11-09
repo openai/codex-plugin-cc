@@ -7,7 +7,7 @@ import { spawn, spawnSync } from "node:child_process";
 
 import { makeTempDir, writeExecutable } from "./helpers.mjs";
 import { CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
-import { ensureBrokerSession, sendBrokerShutdown, teardownBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { clearBrokerSessionIfCurrent, ensureBrokerSession, loadBrokerSession, saveBrokerSession, sendBrokerShutdown, teardownBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 import { isProcessAlive, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
@@ -76,7 +76,11 @@ rl.on('line', (line) => {
   if (m.method === 'turn/start') {
     reply({ turn: { id: 'turn_1' } });
     send({ method: 'turn/started', params: { threadId: 'thr_1', turn: { id: 'turn_1' } } });
-    if (process.env.TEST_INFERRED) setTimeout(() => send({ method: 'item/completed', params: { threadId: 'thr_1', turnId: 'turn_1', item: { type: 'agentMessage', id: 'm1', phase: 'final_answer', text: 'done' } } }), 100);
+    if (process.env.TEST_COLLAB) {
+      send({ method: 'item/started', params: { threadId: 'thr_1', turnId: 'turn_1', item: { type: 'collabAgentToolCall', id: 'c1', status: 'inProgress' } } });
+      setTimeout(() => send({ method: 'item/completed', params: { threadId: 'thr_1', turnId: 'turn_1', item: { type: 'agentMessage', id: 'm1', phase: 'final_answer', text: 'done' } } }), 100);
+      setTimeout(() => send({ method: 'item/completed', params: { threadId: 'thr_1', turnId: 'turn_1', item: { type: 'collabAgentToolCall', id: 'c1', status: 'completed' } } }), 900);
+    } else if (process.env.TEST_INFERRED) setTimeout(() => send({ method: 'item/completed', params: { threadId: 'thr_1', turnId: 'turn_1', item: { type: 'agentMessage', id: 'm1', phase: 'final_answer', text: 'done' } } }), 100);
     else setTimeout(() => send({ method: 'turn/completed', params: { threadId: 'thr_1', turn: { id: 'turn_1' } } }), 700);
   } else if (m.method === 'test/slow') {
     setTimeout(() => reply({ done: true }), 700);
@@ -144,6 +148,21 @@ test("a turn finished by its final answer alone does not pin the broker", { time
   await client.request("turn/start", { threadId: "thr_1" });
   client.socket.destroy();
   await waitFor(() => !alive(session.pid), 1500);
+});
+
+test("a final answer does not release the broker while a collaboration is still running", { timeout: 6000 }, async (t) => {
+  const f = await fixture(t);
+  f.env.TEST_COLLAB = "1";
+  const session = await f.start();
+  const client = connect(session.endpoint);
+  await client.request("turn/start", { threadId: "thr_1" });
+  const childPid = Number(fs.readFileSync(f.env.TEST_STARTS, "utf8").trim());
+  client.socket.destroy();
+  // Final answer at ~100ms, collaboration completes at ~900ms; idle timeout is 200ms.
+  await new Promise((resolve) => setTimeout(resolve, 700));
+  assert.ok(alive(childPid), "app-server stays up while the collaboration runs");
+  assert.ok(alive(session.pid), "broker stays up while the collaboration runs");
+  await waitFor(() => !alive(session.pid), 2500);
 });
 
 test("disconnecting a client does not expire an in-flight RPC", { timeout: 6000 }, async (t) => {
@@ -287,12 +306,37 @@ test("startup recovers when a reclaimer died holding the reclaim guard", { timeo
   const lockFile = path.join(stateDir, "broker.json.lock");
   fs.mkdirSync(stateDir, { recursive: true });
   fs.writeFileSync(lockFile, JSON.stringify({ pid: 2 ** 22 + 1, token: "dead-owner" }));
-  fs.writeFileSync(`${lockFile}.reclaim`, "");
-  const old = new Date(Date.now() - 60000);
-  fs.utimesSync(`${lockFile}.reclaim`, old, old);
+  fs.writeFileSync(`${lockFile}.reclaim`, JSON.stringify({ pid: 2 ** 22 + 2, token: "dead-reclaimer" }));
   const session = await f.start();
   assert.ok(alive(session.pid));
   assert.equal(fs.existsSync(`${lockFile}.reclaim`), false);
+});
+
+test("a live reclaimer is not revoked however long it holds the guard", { timeout: 8000 }, async (t) => {
+  const f = await fixture(t);
+  const stateDir = resolveStateDir(f.root);
+  const lockFile = path.join(stateDir, "broker.json.lock");
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: 2 ** 22 + 1, token: "dead-owner" }));
+  const guard = JSON.stringify({ pid: process.pid, token: "slow-reclaimer" });
+  fs.writeFileSync(`${lockFile}.reclaim`, guard);
+  const old = new Date(Date.now() - 60000);
+  fs.utimesSync(`${lockFile}.reclaim`, old, old);
+  await assert.rejects(ensureBrokerSession(f.root, { env: f.env, timeoutMs: 50 }), /Timed out waiting/);
+  assert.equal(fs.readFileSync(`${lockFile}.reclaim`, "utf8"), guard, "guard untouched");
+  assert.equal(fs.existsSync(lockFile), true, "stale lock left for the live reclaimer");
+});
+
+test("session-end cleanup keeps a replacement broker's saved state", () => {
+  const root = makeTempDir();
+  const replacement = { endpoint: "unix:/tmp/replacement.sock", pidFile: null, logFile: null, sessionDir: null, pid: 1 };
+  saveBrokerSession(root, replacement);
+  clearBrokerSessionIfCurrent(root, "unix:/tmp/old.sock");
+  assert.deepEqual(loadBrokerSession(root), replacement);
+  clearBrokerSessionIfCurrent(root, replacement.endpoint);
+  assert.equal(loadBrokerSession(root), null);
+  fs.rmSync(resolveStateDir(root), { recursive: true, force: true });
+  fs.rmSync(root, { recursive: true, force: true });
 });
 
 test("startup recovers a lock owned by an exited zombie process", { timeout: 6000, skip: !fs.existsSync("/proc/self/stat") || spawnSync("perl", ["-e", "1"]).error !== undefined }, async (t) => {
