@@ -327,6 +327,23 @@ test("a live reclaimer is not revoked however long it holds the guard", { timeou
   assert.equal(fs.existsSync(lockFile), true, "stale lock left for the live reclaimer");
 });
 
+test("session-end hook still tears down its broker when the startup lock is held", { timeout: 15000 }, async (t) => {
+  const f = await fixture(t);
+  const session = await f.start();
+  const lockFile = path.join(resolveStateDir(f.root), "broker.json.lock");
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, token: "busy-starter" }));
+  t.after(() => fs.rmSync(lockFile, { force: true }));
+  const hook = new URL("../plugins/codex/scripts/session-lifecycle-hook.mjs", import.meta.url).pathname;
+  const child = spawn(process.execPath, [hook, "SessionEnd"], { cwd: f.root, env: f.env, stdio: ["pipe", "ignore", "pipe"] });
+  child.stdin.end(JSON.stringify({ hook_event_name: "SessionEnd", cwd: f.root, session_id: "s1" }));
+  let stderr = "";
+  child.stderr.on("data", (c) => { stderr += c; });
+  const code = await new Promise((resolve) => child.on("exit", resolve));
+  assert.equal(code, 0, stderr);
+  assert.equal(alive(session.pid), false);
+  assert.equal(loadBrokerSession(f.root), null);
+});
+
 test("session-end cleanup keeps a replacement broker's saved state", () => {
   const root = makeTempDir();
   const replacement = { endpoint: "unix:/tmp/replacement.sock", pidFile: null, logFile: null, sessionDir: null, pid: 1 };

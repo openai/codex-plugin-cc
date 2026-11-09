@@ -131,7 +131,11 @@ async function main() {
       } else if (message.method === "item/completed") {
         pending.delete(item.id);
       }
-      pendingCollaborations.set(threadId, pending);
+      if (pending.size) {
+        pendingCollaborations.set(threadId, pending);
+      } else {
+        pendingCollaborations.delete(threadId);
+      }
       if (message.method === "item/completed") {
         for (const [key, owner] of finalAnswered) {
           if (owner === threadId) settleFinalAnswer(key, owner);

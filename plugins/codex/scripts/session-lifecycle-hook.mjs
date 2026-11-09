@@ -105,7 +105,7 @@ async function handleSessionEnd(input) {
   cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
   // Closing the listener lets a replacement start while this broker drains. Teardown
   // runs under the startup lock and clears saved state only if it is still this broker's.
-  await withBrokerLock(cwd, {}, () => {
+  const cleanup = () => {
     teardownBrokerSession({
       endpoint: brokerEndpoint,
       pidFile,
@@ -115,7 +115,17 @@ async function handleSessionEnd(input) {
       killProcess: terminateProcessTree
     });
     clearBrokerSessionIfCurrent(cwd, brokerEndpoint);
-  });
+  };
+  try {
+    await withBrokerLock(cwd, {}, cleanup);
+  } catch (error) {
+    // A starter that holds the lock too long must not leave this session's broker behind.
+    // The conditional clear still protects a replacement's state.
+    if (!/Timed out waiting for Codex broker startup lock/.test(error.message)) {
+      throw error;
+    }
+    cleanup();
+  }
 }
 
 async function main() {
