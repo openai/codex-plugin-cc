@@ -7,7 +7,7 @@ import { spawn, spawnSync } from "node:child_process";
 
 import { makeTempDir, writeExecutable } from "./helpers.mjs";
 import { CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
-import { ensureBrokerSession, sendBrokerShutdown } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { ensureBrokerSession, sendBrokerShutdown, teardownBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 import { isProcessAlive, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
@@ -197,6 +197,63 @@ test("shutdown is bounded when a broker accepts a connection but never replies",
     fs.rmSync(root, { recursive: true, force: true });
   });
   await sendBrokerShutdown(endpoint, { timeoutMs: 100 });
+});
+
+for (const file of ["pidFile", "logFile"]) {
+  test(`replacement teardown tolerates concurrent removal of its ${file}`, (t) => {
+    const root = makeTempDir();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const target = path.join(root, file);
+    fs.writeFileSync(target, "old broker");
+    const unlink = fs.unlinkSync;
+    let raced = false;
+    t.mock.method(fs, "unlinkSync", (candidate) => {
+      if (candidate === target && !raced) {
+        raced = true;
+        // The draining broker removes the file just before replacement teardown does.
+        unlink(candidate);
+      }
+      return unlink(candidate);
+    });
+
+    assert.doesNotThrow(() => teardownBrokerSession({ [file]: target }));
+    assert.equal(raced, true, "exercise removal at the unlink boundary");
+    assert.equal(fs.existsSync(target), false);
+  });
+}
+
+test("draining broker tolerates replacement teardown removing its pid file", { timeout: 6000 }, async (t) => {
+  const f = await fixture(t);
+  const hook = path.join(f.root, "cleanup-race.cjs");
+  const marker = path.join(f.root, "cleanup-raced");
+  // Inject the race inside the real detached broker, without timing sleeps or production hooks.
+  fs.writeFileSync(hook, `
+const fs = require('node:fs');
+const path = require('node:path');
+if (path.basename(process.argv[1] || '') === 'app-server-broker.mjs') {
+  const unlink = fs.unlinkSync;
+  for (const method of ['unlinkSync', 'rmSync']) {
+    const remove = fs[method];
+    fs[method] = function(file, ...args) {
+      if (path.basename(String(file)) === 'broker.pid' && !fs.existsSync(${JSON.stringify(marker)})) {
+        unlink(file);
+        fs.writeFileSync(${JSON.stringify(marker)}, 'removed by replacement');
+      }
+      return remove.call(this, file, ...args);
+    };
+  }
+}
+`);
+  f.env.NODE_OPTIONS = `${f.env.NODE_OPTIONS ?? ""} --require ${JSON.stringify(hook)}`;
+  const session = await f.start();
+  const client = connect(session.endpoint);
+  t.after(() => client.socket.destroy());
+  await client.request("broker/shutdown");
+  await waitFor(() => !alive(session.pid));
+
+  assert.equal(fs.readFileSync(marker, "utf8"), "removed by replacement");
+  assert.doesNotMatch(fs.readFileSync(session.logFile, "utf8"), /ENOENT/);
+  assert.equal(fs.existsSync(session.pidFile), false);
 });
 
 test("startup recovers a lock left by a process that exited", { timeout: 6000 }, async (t) => {
