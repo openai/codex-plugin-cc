@@ -44,6 +44,26 @@ test("setup reports ready when fake codex is installed and authenticated", () =>
   assert.equal(payload.sessionRuntime.mode, "direct");
 });
 
+test("Windows setup and tasks use the .cmd shim when SHELL is PowerShell", { skip: process.platform !== "win32" }, () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  fs.writeFileSync(path.join(binDir, "codex.ps1"), "throw 'PowerShell shim must not run'\r\n");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const env = { ...buildEnv(binDir), SHELL: "powershell.exe" };
+
+  const setup = run("node", [SCRIPT, "setup", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  assert.equal(JSON.parse(setup.stdout).codex.available, true);
+
+  const task = run("node", [SCRIPT, "task", "check Windows shim"], { cwd: repo, env });
+  assert.equal(task.status, 0, task.stderr);
+  assert.match(task.stdout, /Handled the requested task/);
+});
+
 test("setup is ready without npm when Codex is already installed and authenticated", () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);

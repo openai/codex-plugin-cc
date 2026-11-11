@@ -309,6 +309,8 @@ That means:
 - it uses the same local authentication state
 - it uses the same repository checkout and machine-local environment
 
+On Windows, the plugin runs npm's `codex.cmd` shim through the Windows command shell. This works when PowerShell script execution policy blocks `codex.ps1`; no policy change is needed. Run `/codex:setup` to check the CLI and app server.
+
 ### Will it use the same Codex config I already have?
 
 Yes. If you already use Codex, the plugin picks up the same [configuration](#common-configurations).

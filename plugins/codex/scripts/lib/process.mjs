@@ -9,7 +9,9 @@ export function runCommand(command, args = [], options = {}) {
     input: options.input,
     maxBuffer: options.maxBuffer,
     stdio: options.stdio ?? "pipe",
-    shell: options.shell ?? (process.platform === "win32" ? (process.env.SHELL || true) : false),
+    // Windows npm shims are .cmd files. Let Node use the Windows command shell
+    // rather than SHELL, which may point to PowerShell and select codex.ps1.
+    shell: options.shell ?? (process.platform === "win32"),
     windowsHide: true
   });
 
