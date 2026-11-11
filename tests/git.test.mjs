@@ -24,7 +24,9 @@ for (const [mode, options] of [["inline", {}], ["lightweight", { maxInlineFiles:
     fs.writeFileSync(path.join(cwd, "reviewed.js"), "export const value = 'REVIEWED_CHANGE';\n");
     git(["add", "."]);
     git(["commit", "-m", "reviewed change"]);
+    const reviewedHead = git(["rev-parse", "HEAD"]);
     git(["checkout", "-b", "feature/other"]);
+    fs.writeFileSync(path.join(cwd, "reviewed.js"), "export const value = 'OTHER_BRANCH_CONTEXT';\n");
     fs.writeFileSync(path.join(cwd, "other.js"), "export const value = 'OTHER_BRANCH_CHANGE';\n");
     git(["add", "."]);
     git(["commit", "-m", "other branch change"]);
@@ -61,14 +63,49 @@ for (const [mode, options] of [["inline", {}], ["lightweight", { maxInlineFiles:
     assert.equal(git(["diff", "--name-only", context.comparison.reviewRange]), "reviewed.js");
     assert.equal(context.branch, "feature/reviewed");
     assert.match(context.summary, /Reviewing branch feature\/reviewed /);
-    assert.doesNotMatch(context.content, /other branch change|other\.js|OTHER_BRANCH_CHANGE/);
+    assert.doesNotMatch(context.content, /other branch change|other\.js|OTHER_BRANCH_CHANGE|OTHER_BRANCH_CONTEXT/);
+    assert.match(fs.readFileSync(path.join(cwd, "reviewed.js"), "utf8"), /OTHER_BRANCH_CONTEXT/);
     if (mode === "inline") {
       assert.match(context.content, /REVIEWED_CHANGE/);
     } else {
       assert.ok(context.collectionGuidance.includes(context.comparison.commitRange));
+      assert.ok(context.collectionGuidance.includes(`git show ${reviewedHead}:<path>`));
+      assert.equal(context.comparison.headCommit, reviewedHead);
+      assert.match(git(["show", `${context.comparison.headCommit}:reviewed.js`]), /REVIEWED_CHANGE/);
+      assert.doesNotMatch(git(["show", `${context.comparison.headCommit}:reviewed.js`]), /OTHER_BRANCH_CONTEXT/);
     }
   });
 }
+
+test("branch review peels annotated base tags to commit snapshots", () => {
+  const cwd = makeTempDir();
+  const git = (args) => {
+    const result = run("git", args, { cwd, shell: false });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('base');\n");
+  git(["add", "."]);
+  git(["commit", "-m", "base"]);
+  const baseCommit = git(["rev-parse", "HEAD"]);
+  git(["tag", "-a", "review-base", "-m", "annotated base"]);
+  const tagObject = git(["rev-parse", "review-base"]);
+  assert.notEqual(tagObject, baseCommit);
+  assert.equal(git(["cat-file", "-t", tagObject]), "tag");
+  git(["checkout", "-b", "feature/reviewed"]);
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('reviewed');\n");
+  git(["add", "."]);
+  git(["commit", "-m", "reviewed change"]);
+  const headCommit = git(["rev-parse", "HEAD"]);
+
+  const context = collectReviewContext(cwd, { mode: "branch", baseRef: "review-base" }, { maxInlineFiles: 0 });
+
+  assert.equal(context.comparison.reviewRange, `${baseCommit}...${headCommit}`);
+  assert.equal(context.comparison.commitRange, `${baseCommit}..${headCommit}`);
+  assert.equal(git(["cat-file", "-t", context.comparison.reviewRange.split("...")[0]]), "commit");
+  assert.equal(git(["diff", "--name-only", context.comparison.reviewRange]), "app.js");
+});
 
 test("resolveReviewTarget prefers working tree when repo is dirty", () => {
   const cwd = makeTempDir();

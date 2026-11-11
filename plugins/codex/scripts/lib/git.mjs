@@ -67,13 +67,14 @@ function measureCombinedGitOutputBytes(cwd, argSets, maxBytes) {
 }
 
 function buildBranchComparison(cwd, baseRef) {
-  const headCommit = gitChecked(cwd, ["rev-parse", "--verify", "HEAD"]).stdout.trim();
-  const baseRevision = gitChecked(cwd, ["rev-parse", "--verify", "--end-of-options", baseRef]).stdout.trim();
-  const mergeBase = gitChecked(cwd, ["merge-base", headCommit, baseRevision]).stdout.trim();
+  const headCommit = gitChecked(cwd, ["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"]).stdout.trim();
+  const baseCommit = gitChecked(cwd, ["rev-parse", "--verify", "--end-of-options", `${baseRef}^{commit}`]).stdout.trim();
+  const mergeBase = gitChecked(cwd, ["merge-base", headCommit, baseCommit]).stdout.trim();
   return {
+    headCommit,
     mergeBase,
     commitRange: `${mergeBase}..${headCommit}`,
-    reviewRange: `${baseRevision}...${headCommit}`
+    reviewRange: `${baseCommit}...${headCommit}`
   };
 }
 
@@ -297,7 +298,7 @@ function buildAdversarialCollectionGuidance(options = {}) {
   }
 
   const pinnedRange = options.comparison
-    ? ` For this branch review, use the pinned commit range ${options.comparison.commitRange}.`
+    ? ` For this branch review, use the pinned commit range ${options.comparison.commitRange}. Read surrounding file content with \`git show ${options.comparison.headCommit}:<path>\`; the working tree may belong to a different branch.`
     : "";
   return `The repository context below is a lightweight summary. Inspect the target diff yourself with read-only git commands before finalizing findings.${pinnedRange}`;
 }
