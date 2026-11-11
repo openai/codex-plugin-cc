@@ -65,14 +65,13 @@ for (const [mode, options] of [["inline", {}], ["lightweight", { maxInlineFiles:
     assert.match(context.summary, /Reviewing branch feature\/reviewed /);
     assert.doesNotMatch(context.content, /other branch change|other\.js|OTHER_BRANCH_CHANGE|OTHER_BRANCH_CONTEXT/);
     assert.match(fs.readFileSync(path.join(cwd, "reviewed.js"), "utf8"), /OTHER_BRANCH_CONTEXT/);
+    assert.ok(context.collectionGuidance.includes(context.comparison.commitRange));
+    assert.ok(context.collectionGuidance.includes(`git show ${reviewedHead}:<path>`));
+    assert.equal(context.comparison.headCommit, reviewedHead);
+    assert.match(git(["show", `${context.comparison.headCommit}:reviewed.js`]), /REVIEWED_CHANGE/);
+    assert.doesNotMatch(git(["show", `${context.comparison.headCommit}:reviewed.js`]), /OTHER_BRANCH_CONTEXT/);
     if (mode === "inline") {
       assert.match(context.content, /REVIEWED_CHANGE/);
-    } else {
-      assert.ok(context.collectionGuidance.includes(context.comparison.commitRange));
-      assert.ok(context.collectionGuidance.includes(`git show ${reviewedHead}:<path>`));
-      assert.equal(context.comparison.headCommit, reviewedHead);
-      assert.match(git(["show", `${context.comparison.headCommit}:reviewed.js`]), /REVIEWED_CHANGE/);
-      assert.doesNotMatch(git(["show", `${context.comparison.headCommit}:reviewed.js`]), /OTHER_BRANCH_CONTEXT/);
     }
   });
 }

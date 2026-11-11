@@ -293,13 +293,13 @@ function collectBranchContext(cwd, baseRef, options = {}) {
 }
 
 function buildAdversarialCollectionGuidance(options = {}) {
-  if (options.includeDiff !== false) {
-    return "Use the repository context below as primary evidence.";
-  }
-
   const pinnedRange = options.comparison
     ? ` For this branch review, use the pinned commit range ${options.comparison.commitRange}. Read surrounding file content with \`git show ${options.comparison.headCommit}:<path>\`; the working tree may belong to a different branch.`
     : "";
+  if (options.includeDiff !== false) {
+    return `Use the repository context below as primary evidence.${pinnedRange}`;
+  }
+
   return `The repository context below is a lightweight summary. Inspect the target diff yourself with read-only git commands before finalizing findings.${pinnedRange}`;
 }
 
