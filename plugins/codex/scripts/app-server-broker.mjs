@@ -74,6 +74,7 @@ async function main() {
   const activeTurns = new Set();
   const pendingCollaborations = new Map();
   const finalAnswered = new Map();
+  const settleTimers = new Map();
   let pendingRequests = 0;
   let idleTimer = null;
   let shuttingDown = false;
@@ -92,14 +93,24 @@ async function main() {
     }, idleTimeoutMs);
   }
 
+  function cancelSettle(turnKey) {
+    clearTimeout(settleTimers.get(turnKey));
+    settleTimers.delete(turnKey);
+  }
+
+  // One timer per turn: a collaboration that drains again restarts the grace period.
   function settleFinalAnswer(turnKey, threadId) {
+    cancelSettle(turnKey);
     if (pendingCollaborations.get(threadId)?.size) return;
-    setTimeout(() => {
+    const timer = setTimeout(() => {
+      settleTimers.delete(turnKey);
       if (pendingCollaborations.get(threadId)?.size || !finalAnswered.has(turnKey)) return;
       finalAnswered.delete(turnKey);
       activeTurns.delete(turnKey);
       updateIdleTimer();
-    }, 250).unref();
+    }, 250);
+    timer.unref();
+    settleTimers.set(turnKey, timer);
   }
 
   function clearSocketOwnership(socket) {
@@ -123,6 +134,7 @@ async function main() {
     if (message.method === "turn/completed") {
       activeTurns.delete(turnKey);
       finalAnswered.delete(turnKey);
+      cancelSettle(turnKey);
       // Collaborations belong to the turn that started them; an interrupted turn may never
       // have seen them complete, and a resumed thread must not inherit them.
       pendingCollaborations.delete(threadId);

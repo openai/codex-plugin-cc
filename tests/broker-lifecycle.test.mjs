@@ -70,7 +70,7 @@ if (process.env.TEST_SLOW_EXIT) process.on('SIGTERM', () => {});
 const rl = readline.createInterface({ input: process.stdin });
 if (process.env.TEST_SLOW_EXIT) rl.on('close', () => setTimeout(() => process.exit(0), 800));
 const finalAnswer = { method: 'item/completed', params: { threadId: 'thr_1', turnId: 'turn_1', item: { type: 'agentMessage', id: 'm1', phase: 'final_answer', text: 'done' } } };
-const collab = (method, status) => ({ method, params: { threadId: 'thr_1', turnId: 'turn_1', item: { type: 'collabAgentToolCall', id: 'c1', status } } });
+const collab = (method, status, id = 'c1') => ({ method, params: { threadId: 'thr_1', turnId: 'turn_1', item: { type: 'collabAgentToolCall', id, status } } });
 rl.on('line', (line) => {
   const m = JSON.parse(line);
   if (m.id === undefined) return;
@@ -83,6 +83,14 @@ rl.on('line', (line) => {
       setTimeout(() => send({ method: 'turn/completed', params: { threadId: 'thr_1', turn: { id: 'turn_1', status: 'interrupted' } } }), 100);
     } else if (m.params.mode === 'final-only') {
       setTimeout(() => send(finalAnswer), 100);
+    } else if (m.params.mode === 'final-with-repeated-drains') {
+      send(collab('item/started', 'inProgress'));
+      setTimeout(() => send(finalAnswer), 50);
+      setTimeout(() => send(collab('item/completed', 'completed')), 100);
+      setTimeout(() => send(collab('item/started', 'inProgress', 'c2')), 150);
+      setTimeout(() => send(collab('item/completed', 'completed', 'c2')), 200);
+      setTimeout(() => send(collab('item/started', 'inProgress', 'c3')), 400);
+      setTimeout(() => send(collab('item/completed', 'completed', 'c3')), 1100);
     } else if (m.params.mode === 'final-with-collab') {
       send(collab('item/started', 'inProgress'));
       setTimeout(() => send(finalAnswer), 100);
@@ -190,6 +198,20 @@ test("a final answer does not release the broker while a collaboration is still 
   await new Promise((resolve) => setTimeout(resolve, 700));
   assert.ok(alive(childPid), "app-server stays up while the collaboration runs");
   assert.ok(alive(session.pid), "broker stays up while the collaboration runs");
+  await waitFor(() => !alive(session.pid), 2500);
+});
+
+test("repeated collaboration drains share one grace timer, so a later collaboration keeps the turn open", { timeout: 6000 }, async (t) => {
+  const f = await fixture(t);
+  const session = await f.start();
+  const client = connect(session.endpoint);
+  await client.request("turn/start", { threadId: "thr_1", mode: "final-with-repeated-drains" });
+  const childPid = Number(fs.readFileSync(f.env.TEST_STARTS, "utf8").trim());
+  client.socket.destroy();
+  // The first drain's timer would fire at ~350ms and release the turn before the third
+  // collaboration starts at 400ms; the 200ms idle timeout would then close the app-server.
+  await new Promise((resolve) => setTimeout(resolve, 900));
+  assert.ok(alive(childPid), "app-server stays up while the third collaboration runs");
   await waitFor(() => !alive(session.pid), 2500);
 });
 
