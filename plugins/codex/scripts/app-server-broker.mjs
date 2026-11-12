@@ -8,6 +8,7 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
+import { clearBrokerSessionIfCurrent } from "./lib/broker-lifecycle.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 
@@ -70,6 +71,47 @@ async function main() {
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
   const sockets = new Set();
+  const activeTurns = new Set();
+  const pendingCollaborations = new Map();
+  const finalAnswered = new Map();
+  const settleTimers = new Map();
+  let pendingRequests = 0;
+  let idleTimer = null;
+  let shuttingDown = false;
+  const configuredIdleMs = Number(process.env.CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS);
+  const idleTimeoutMs = Number.isFinite(configuredIdleMs) && configuredIdleMs > 0 ? configuredIdleMs : 60000;
+
+  function updateIdleTimer() {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+    if (shuttingDown || sockets.size || pendingRequests || activeTurns.size) return;
+    idleTimer = setTimeout(() => {
+      shutdown(server).then(() => process.exit(0)).catch((error) => {
+        process.stderr.write(`${error.message}\n`);
+        process.exit(1);
+      });
+    }, idleTimeoutMs);
+  }
+
+  function cancelSettle(turnKey) {
+    clearTimeout(settleTimers.get(turnKey));
+    settleTimers.delete(turnKey);
+  }
+
+  // One timer per turn: a collaboration that drains again restarts the grace period.
+  function settleFinalAnswer(turnKey, threadId) {
+    cancelSettle(turnKey);
+    if (pendingCollaborations.get(threadId)?.size) return;
+    const timer = setTimeout(() => {
+      settleTimers.delete(turnKey);
+      if (pendingCollaborations.get(threadId)?.size || !finalAnswered.has(turnKey)) return;
+      finalAnswered.delete(turnKey);
+      activeTurns.delete(turnKey);
+      updateIdleTimer();
+    }, 250);
+    timer.unref();
+    settleTimers.set(turnKey, timer);
+  }
 
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
@@ -82,6 +124,48 @@ async function main() {
   }
 
   function routeNotification(message) {
+    // A disconnected caller must not make its running turn eligible for shutdown.
+    const turnKey = `${message.params?.threadId}:${message.params?.turn?.id ?? message.params?.turnId}`;
+    const threadId = message.params?.threadId;
+    if (message.method === "turn/started") {
+      activeTurns.add(turnKey);
+      pendingCollaborations.delete(threadId);
+    }
+    if (message.method === "turn/completed") {
+      activeTurns.delete(turnKey);
+      finalAnswered.delete(turnKey);
+      cancelSettle(turnKey);
+      // Collaborations belong to the turn that started them; an interrupted turn may never
+      // have seen them complete, and a resumed thread must not inherit them.
+      pendingCollaborations.delete(threadId);
+    }
+    // lib/codex.mjs completes a turn from its final answer when turn/completed never
+    // arrives, once the thread's collaborations drain. Mirror that so such a turn does not
+    // pin the broker, and an unfinished collaboration is not cut off by idle expiry.
+    const item = message.params?.item;
+    if (item?.type === "collabAgentToolCall") {
+      const pending = pendingCollaborations.get(threadId) ?? new Set();
+      if (message.method === "item/started" || item.status === "inProgress") {
+        pending.add(item.id);
+      } else if (message.method === "item/completed") {
+        pending.delete(item.id);
+      }
+      if (pending.size) {
+        pendingCollaborations.set(threadId, pending);
+      } else {
+        pendingCollaborations.delete(threadId);
+      }
+      if (message.method === "item/completed") {
+        for (const [key, owner] of finalAnswered) {
+          if (owner === threadId) settleFinalAnswer(key, owner);
+        }
+      }
+    }
+    if (message.method === "item/completed" && item?.type === "agentMessage" && item.phase === "final_answer") {
+      finalAnswered.set(turnKey, threadId);
+      settleFinalAnswer(turnKey, threadId);
+    }
+    updateIdleTimer();
     const target = activeRequestSocket ?? activeStreamSocket;
     if (!target) {
       return;
@@ -100,23 +184,33 @@ async function main() {
   }
 
   async function shutdown(server) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    clearTimeout(idleTimer);
+    // Stop admitting clients before the app-server close, which can take seconds.
+    // A client admitted while draining would initialize fine, then fail its first request.
+    const closed = new Promise((resolve) => server.close(resolve));
     for (const socket of sockets) {
       socket.end();
     }
     await appClient.close().catch(() => {});
-    await new Promise((resolve) => server.close(resolve));
-    if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
-      fs.unlinkSync(listenTarget.path);
+    await closed;
+    // A replacement broker's teardown may already have removed these.
+    if (listenTarget.kind === "unix") {
+      fs.rmSync(listenTarget.path, { force: true });
     }
-    if (pidFile && fs.existsSync(pidFile)) {
-      fs.unlinkSync(pidFile);
+    if (pidFile) {
+      fs.rmSync(pidFile, { force: true });
     }
+    // The saved pid would otherwise outlive this process, and SessionEnd signals it.
+    clearBrokerSessionIfCurrent(cwd, endpoint);
   }
 
   appClient.setNotificationHandler(routeNotification);
 
   const server = net.createServer((socket) => {
     sockets.add(socket);
+    updateIdleTimer();
     socket.setEncoding("utf8");
     let buffer = "";
 
@@ -181,25 +275,19 @@ async function main() {
           continue;
         }
 
-        if (allowInterruptDuringActiveStream) {
-          try {
-            const result = await appClient.request(message.method, message.params ?? {});
-            send(socket, { id: message.id, result });
-          } catch (error) {
-            send(socket, {
-              id: message.id,
-              error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
-            });
-          }
-          continue;
-        }
-
         const isStreaming = STREAMING_METHODS.has(message.method);
-        activeRequestSocket = socket;
+        if (!allowInterruptDuringActiveStream) {
+          activeRequestSocket = socket;
+        }
+        pendingRequests += 1;
 
         try {
           const result = await appClient.request(message.method, message.params ?? {});
           send(socket, { id: message.id, result });
+          // Interrupts share request bookkeeping without taking stream ownership.
+          if (allowInterruptDuringActiveStream) {
+            continue;
+          }
           if (isStreaming) {
             activeStreamSocket = socket;
             activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
@@ -212,12 +300,18 @@ async function main() {
             id: message.id,
             error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
           });
+          if (allowInterruptDuringActiveStream) {
+            continue;
+          }
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
           }
           if (activeStreamSocket === socket && !isStreaming) {
             activeStreamSocket = null;
           }
+        } finally {
+          pendingRequests -= 1;
+          updateIdleTimer();
         }
       }
     });
@@ -225,11 +319,13 @@ async function main() {
     socket.on("close", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      updateIdleTimer();
     });
 
     socket.on("error", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      updateIdleTimer();
     });
   });
 
@@ -243,7 +339,7 @@ async function main() {
     process.exit(0);
   });
 
-  server.listen(listenTarget.path);
+  server.listen(listenTarget.path, updateIdleTimer);
 }
 
 main().catch((error) => {
