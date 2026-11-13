@@ -425,7 +425,7 @@ function recordItem(state, item, lifecycle, threadId = null) {
       text: item.text ?? ""
     });
     if (item.text) {
-      if (!threadId || threadId === state.threadId) {
+      if ((!threadId || threadId === state.threadId) && item.delivery !== "async") {
         state.lastAgentMessage = item.text;
         if (lifecycle === "completed" && item.phase === "final_answer") {
           state.finalAnswerSeen = true;
@@ -437,7 +437,7 @@ function recordItem(state, item, lifecycle, threadId = null) {
         emitLogEvent(state.onProgress, {
           message: sourceLabel ? `Subagent ${sourceLabel}: ${shorten(item.text, 96)}` : `Assistant message captured: ${shorten(item.text, 96)}`,
           stderrMessage: null,
-          phase: item.phase === "final_answer" ? "finalizing" : null,
+          phase: item.phase === "final_answer" && item.delivery !== "async" ? "finalizing" : null,
           logTitle: sourceLabel ? `Subagent ${sourceLabel} message` : "Assistant message",
           logBody: item.text
         });

@@ -854,6 +854,26 @@ test("task waits for the main thread to complete before returning the final resu
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
+for (const behavior of ["with-async-question", "with-async-message"]) {
+  test(`task waits for the final result after ${behavior}`, () => {
+    const repo = makeTempDir();
+    const binDir = makeTempDir();
+    installFakeCodex(binDir, behavior);
+    initGitRepo(repo);
+    fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+    run("git", ["add", "README.md"], { cwd: repo });
+    run("git", ["commit", "-m", "init"], { cwd: repo });
+
+    const result = run("node", [SCRIPT, "task", "challenge the current design"], {
+      cwd: repo,
+      env: buildEnv(binDir)
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  });
+}
+
 test("task ignores later subagent messages when choosing the final returned output", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
