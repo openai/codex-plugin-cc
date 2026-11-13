@@ -66,8 +66,9 @@ function measureCombinedGitOutputBytes(cwd, argSets, maxBytes) {
   return totalBytes;
 }
 
-function buildBranchComparison(cwd, baseRef) {
-  const headCommit = gitChecked(cwd, ["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"]).stdout.trim();
+function buildBranchComparison(cwd, baseRef, currentBranch = "HEAD") {
+  const headRef = currentBranch === "HEAD" ? "HEAD" : `refs/heads/${currentBranch}`;
+  const headCommit = gitChecked(cwd, ["rev-parse", "--verify", "--end-of-options", `${headRef}^{commit}`]).stdout.trim();
   const baseCommit = gitChecked(cwd, ["rev-parse", "--verify", "--end-of-options", `${baseRef}^{commit}`]).stdout.trim();
   const mergeBase = gitChecked(cwd, ["merge-base", headCommit, baseCommit]).stdout.trim();
   return {
@@ -264,8 +265,8 @@ function collectWorkingTreeContext(cwd, state, options = {}) {
 
 function collectBranchContext(cwd, baseRef, options = {}) {
   const includeDiff = options.includeDiff !== false;
-  const comparison = options.comparison ?? buildBranchComparison(cwd, baseRef);
   const currentBranch = options.currentBranch ?? getCurrentBranch(cwd);
+  const comparison = options.comparison ?? buildBranchComparison(cwd, baseRef, currentBranch);
   const changedFiles = gitChecked(cwd, ["diff", "--name-only", comparison.commitRange]).stdout.trim().split("\n").filter(Boolean);
   const logOutput = gitChecked(cwd, ["log", "--oneline", "--decorate", comparison.commitRange]).stdout.trim();
   const diffStat = gitChecked(cwd, ["diff", "--stat", comparison.commitRange]).stdout.trim();
@@ -328,7 +329,7 @@ export function collectReviewContext(cwd, target, options = {}) {
         diffBytes <= maxInlineDiffBytes);
     details = collectWorkingTreeContext(repoRoot, state, { includeDiff });
   } else {
-    const comparison = buildBranchComparison(repoRoot, target.baseRef);
+    const comparison = buildBranchComparison(repoRoot, target.baseRef, currentBranch);
     const fileCount = gitChecked(repoRoot, ["diff", "--name-only", comparison.commitRange]).stdout.trim().split("\n").filter(Boolean).length;
     diffBytes = measureGitOutputBytes(
       repoRoot,
