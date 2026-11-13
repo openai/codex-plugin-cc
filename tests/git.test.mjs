@@ -2,9 +2,122 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 
 import { collectReviewContext, resolveReviewTarget } from "../plugins/codex/scripts/lib/git.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+
+for (const [mode, options] of [["inline", {}], ["lightweight", { maxInlineFiles: 0 }]]) {
+  for (const switchPoint of ["after comparison", "after branch label"]) {
+    test(`branch review keeps one commit snapshot during ${mode} collection ${switchPoint}`, (t) => {
+      const cwd = makeTempDir();
+      const git = (args) => {
+        const result = run("git", args, { cwd, shell: false });
+        assert.equal(result.status, 0, result.stderr);
+        return result.stdout.trim();
+      };
+      initGitRepo(cwd);
+      fs.writeFileSync(path.join(cwd, "base.js"), "export const base = true;\n");
+      git(["add", "."]);
+      git(["commit", "-m", "base"]);
+      git(["checkout", "-b", "feature/reviewed"]);
+      fs.writeFileSync(path.join(cwd, "reviewed.js"), "export const value = 'REVIEWED_CHANGE';\n");
+      git(["add", "."]);
+      git(["commit", "-m", "reviewed change"]);
+      const reviewedHead = git(["rev-parse", "HEAD"]);
+      git(["checkout", "-b", "feature/other"]);
+      fs.writeFileSync(path.join(cwd, "reviewed.js"), "export const value = 'OTHER_BRANCH_CONTEXT';\n");
+      fs.writeFileSync(path.join(cwd, "other.js"), "export const value = 'OTHER_BRANCH_CHANGE';\n");
+      git(["add", "."]);
+      git(["commit", "-m", "other branch change"]);
+      git(["checkout", "feature/reviewed"]);
+      git(["tag", "feature/reviewed", "feature/other"]);
+
+      const spawnSync = childProcess.spawnSync;
+      let switched = false;
+      t.mock.method(childProcess, "spawnSync", (command, args, commandOptions) => {
+        const result = spawnSync(command, args, commandOptions);
+        if (!switched && command === "git" && (switchPoint === "after comparison"
+          ? args[0] === "diff" && args[1] === "--name-only"
+          : args[0] === "branch" && args[1] === "--show-current")) {
+          switched = true;
+          const checkout = spawnSync("git", ["checkout", "feature/other"], {
+            cwd, encoding: "utf8", shell: false, windowsHide: true
+          });
+          assert.equal(checkout.status, 0, checkout.stderr);
+          if (switchPoint === "after comparison") {
+            const updateBase = spawnSync("git", ["update-ref", "refs/heads/main", "HEAD"], {
+              cwd, encoding: "utf8", shell: false, windowsHide: true
+            });
+            assert.equal(updateBase.status, 0, updateBase.stderr);
+          }
+        }
+        return result;
+      });
+      syncBuiltinESMExports();
+      t.after(() => {
+        t.mock.restoreAll();
+        syncBuiltinESMExports();
+      });
+
+      const context = collectReviewContext(cwd, { mode: "branch", baseRef: "main" }, options);
+
+      assert.equal(switched, true);
+      assert.equal(git(["branch", "--show-current"]), "feature/other");
+      assert.deepEqual(context.changedFiles, ["reviewed.js"]);
+      assert.equal(git(["diff", "--name-only", context.comparison.reviewRange]), "reviewed.js");
+      assert.equal(context.branch, "feature/reviewed");
+      assert.match(context.summary, /Reviewing branch feature\/reviewed /);
+      assert.doesNotMatch(context.content, /other branch change|other\.js|OTHER_BRANCH_CHANGE|OTHER_BRANCH_CONTEXT/);
+      assert.match(fs.readFileSync(path.join(cwd, "reviewed.js"), "utf8"), /OTHER_BRANCH_CONTEXT/);
+      assert.ok(context.collectionGuidance.includes(context.comparison.commitRange));
+      assert.ok(context.collectionGuidance.includes(`git show ${reviewedHead}:<path>`));
+      assert.equal(context.comparison.headCommit, reviewedHead);
+      assert.match(git(["show", `${context.comparison.headCommit}:reviewed.js`]), /REVIEWED_CHANGE/);
+      assert.doesNotMatch(git(["show", `${context.comparison.headCommit}:reviewed.js`]), /OTHER_BRANCH_CONTEXT/);
+      if (mode === "inline") {
+        assert.match(context.content, /REVIEWED_CHANGE/);
+      }
+    });
+  }
+}
+
+for (const detached of [false, true]) {
+  test(`branch review peels annotated base tags to commit snapshots (${detached ? "detached" : "attached"})`, () => {
+    const cwd = makeTempDir();
+    const git = (args) => {
+      const result = run("git", args, { cwd, shell: false });
+      assert.equal(result.status, 0, result.stderr);
+      return result.stdout.trim();
+    };
+    initGitRepo(cwd);
+    fs.writeFileSync(path.join(cwd, "app.js"), "console.log('base');\n");
+    git(["add", "."]);
+    git(["commit", "-m", "base"]);
+    const baseCommit = git(["rev-parse", "HEAD"]);
+    git(["tag", "-a", "review-base", "-m", "annotated base"]);
+    const tagObject = git(["rev-parse", "review-base"]);
+    assert.notEqual(tagObject, baseCommit);
+    assert.equal(git(["cat-file", "-t", tagObject]), "tag");
+    git(["checkout", "-b", "feature/reviewed"]);
+    fs.writeFileSync(path.join(cwd, "app.js"), "console.log('reviewed');\n");
+    git(["add", "."]);
+    git(["commit", "-m", "reviewed change"]);
+    const headCommit = git(["rev-parse", "HEAD"]);
+    if (detached) git(["checkout", "--detach", headCommit]);
+
+    const context = collectReviewContext(cwd, { mode: "branch", baseRef: "review-base" }, { maxInlineFiles: 0 });
+
+    assert.equal(context.branch, detached ? "HEAD" : "feature/reviewed");
+    assert.equal(context.comparison.headCommit, headCommit);
+    assert.equal(context.comparison.reviewRange, `${baseCommit}...${headCommit}`);
+    assert.equal(context.comparison.commitRange, `${baseCommit}..${headCommit}`);
+    assert.equal(git(["cat-file", "-t", context.comparison.reviewRange.split("...")[0]]), "commit");
+    assert.equal(git(["diff", "--name-only", context.comparison.reviewRange]), "app.js");
+  });
+
+}
 
 test("resolveReviewTarget prefers working tree when repo is dirty", () => {
   const cwd = makeTempDir();
