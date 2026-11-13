@@ -458,6 +458,30 @@ rl.on("line", (line) => {
           ? structuredReviewPayload(prompt)
           : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
 
+        if (BEHAVIOR === "with-async-question" || BEHAVIOR === "with-async-message") {
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+          send({
+            method: "item/completed",
+            params: {
+              threadId: thread.id,
+              turnId,
+              item: {
+                type: "agentMessage",
+                id: "async_" + turnId,
+                text: "Still working; which option do you prefer?",
+                phase: "final_answer",
+                delivery: "async",
+                questions: BEHAVIOR === "with-async-question" ? [{ title: "Which option?", options: null }] : null
+              }
+            }
+          });
+          setTimeout(() => {
+            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "final_" + turnId, text: payload, phase: "final_answer" } } });
+            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+          }, 700);
+          break;
+        }
+
         if (
           BEHAVIOR === "with-subagent" ||
           BEHAVIOR === "with-late-subagent-message" ||
