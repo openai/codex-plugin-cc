@@ -91,6 +91,12 @@ rl.on('line', (line) => {
       setTimeout(() => send(collab('item/completed', 'completed', 'c2')), 200);
       setTimeout(() => send(collab('item/started', 'inProgress', 'c3')), 400);
       setTimeout(() => send(collab('item/completed', 'completed', 'c3')), 1100);
+    } else if (m.params.mode === 'final-with-subagent') {
+      send({ method: 'turn/started', params: { threadId: 'thr_2', turn: { id: 'turn_2' } } });
+      setTimeout(() => send(finalAnswer), 50);
+      setTimeout(() => send({ method: 'turn/completed', params: { threadId: 'thr_2', turn: { id: 'turn_2' } } }), 500);
+      setTimeout(() => send(collab('item/started', 'inProgress')), 600);
+      setTimeout(() => send(collab('item/completed', 'completed')), 1300);
     } else if (m.params.mode === 'final-with-collab') {
       send(collab('item/started', 'inProgress'));
       setTimeout(() => send(finalAnswer), 100);
@@ -212,6 +218,20 @@ test("repeated collaboration drains share one grace timer, so a later collaborat
   // collaboration starts at 400ms; the 200ms idle timeout would then close the app-server.
   await new Promise((resolve) => setTimeout(resolve, 900));
   assert.ok(alive(childPid), "app-server stays up while the third collaboration runs");
+  await waitFor(() => !alive(session.pid), 2500);
+});
+
+test("a final answer does not release the parent turn while a subagent turn is active", { timeout: 6000 }, async (t) => {
+  const f = await fixture(t);
+  const session = await f.start();
+  const client = connect(session.endpoint);
+  await client.request("turn/start", { threadId: "thr_1", mode: "final-with-subagent" });
+  const childPid = Number(fs.readFileSync(f.env.TEST_STARTS, "utf8").trim());
+  client.socket.destroy();
+  // The subagent finishes at 500ms and the parent starts a collaboration at 600ms; if the
+  // parent was retired at its final answer, idle expiry closes the app-server near 700ms.
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  assert.ok(alive(childPid), "app-server stays up while the parent's collaboration runs");
   await waitFor(() => !alive(session.pid), 2500);
 });
 

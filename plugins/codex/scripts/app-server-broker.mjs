@@ -98,13 +98,18 @@ async function main() {
     settleTimers.delete(turnKey);
   }
 
-  // One timer per turn: a collaboration that drains again restarts the grace period.
+  // A turn on another thread is a subagent; the parent stays active until it drains.
+  function waitingOnWork(turnKey, threadId) {
+    return Boolean(pendingCollaborations.get(threadId)?.size) || [...activeTurns].some((key) => key !== turnKey);
+  }
+
+  // One timer per turn: a collaboration or subagent that drains again restarts the grace period.
   function settleFinalAnswer(turnKey, threadId) {
     cancelSettle(turnKey);
-    if (pendingCollaborations.get(threadId)?.size) return;
+    if (waitingOnWork(turnKey, threadId)) return;
     const timer = setTimeout(() => {
       settleTimers.delete(turnKey);
-      if (pendingCollaborations.get(threadId)?.size || !finalAnswered.has(turnKey)) return;
+      if (waitingOnWork(turnKey, threadId) || !finalAnswered.has(turnKey)) return;
       finalAnswered.delete(turnKey);
       activeTurns.delete(turnKey);
       updateIdleTimer();
@@ -135,6 +140,7 @@ async function main() {
       activeTurns.delete(turnKey);
       finalAnswered.delete(turnKey);
       cancelSettle(turnKey);
+      for (const [key, owner] of finalAnswered) settleFinalAnswer(key, owner);
       // Collaborations belong to the turn that started them; an interrupted turn may never
       // have seen them complete, and a resumed thread must not inherit them.
       pendingCollaborations.delete(threadId);
