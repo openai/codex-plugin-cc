@@ -74,6 +74,13 @@ One simple first run is:
 
 ## Usage
 
+Commands in a workspace reuse a shared Codex app-server. It shuts down after
+60 seconds without connected clients, pending requests, or running turns, so
+completed conversations can be archived from Codex even if Claude Code's session
+cleanup did not run. Later commands start another server and can resume saved
+conversations. Set `CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS` to a positive number
+of milliseconds to change this idle interval.
+
 ### `/codex:review`
 
 Runs a normal Codex review on your current work. It gives you the same quality of code review as running `/review` inside Codex directly.

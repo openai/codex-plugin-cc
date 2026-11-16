@@ -93,13 +93,18 @@ export function saveBrokerSession(cwd, session) {
 }
 
 export function clearBrokerSession(cwd) {
-  const stateFile = resolveBrokerStateFile(cwd);
-  if (fs.existsSync(stateFile)) {
-    fs.unlinkSync(stateFile);
+  // An exiting broker and a SessionEnd cleanup can both clear the same state.
+  fs.rmSync(resolveBrokerStateFile(cwd), { force: true });
+}
+
+export function clearBrokerSessionIfCurrent(cwd, endpoint) {
+  // A replacement may have published its own state since this broker started.
+  if (loadBrokerSession(cwd)?.endpoint === endpoint) {
+    clearBrokerSession(cwd);
   }
 }
 
-async function isBrokerEndpointReady(endpoint) {
+export async function isBrokerEndpointReady(endpoint) {
   if (!endpoint) {
     return false;
   }
@@ -179,19 +184,20 @@ export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessi
     }
   }
 
-  if (pidFile && fs.existsSync(pidFile)) {
-    fs.unlinkSync(pidFile);
+  // A draining broker removes its own pid file and socket concurrently with a replacement.
+  if (pidFile) {
+    fs.rmSync(pidFile, { force: true });
   }
 
-  if (logFile && fs.existsSync(logFile)) {
-    fs.unlinkSync(logFile);
+  if (logFile) {
+    fs.rmSync(logFile, { force: true });
   }
 
   if (endpoint) {
     try {
       const target = parseBrokerEndpoint(endpoint);
-      if (target.kind === "unix" && fs.existsSync(target.path)) {
-        fs.unlinkSync(target.path);
+      if (target.kind === "unix") {
+        fs.rmSync(target.path, { force: true });
       }
     } catch {
       // Ignore malformed or already-removed broker endpoints during teardown.
