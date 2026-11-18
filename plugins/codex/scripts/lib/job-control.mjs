@@ -46,9 +46,7 @@ function getJobTypeLabel(job) {
   return "job";
 }
 
-function stripLogPrefix(line) {
-  return line.replace(/^\[[^\]]+\]\s*/, "").trim();
-}
+const LOG_ENTRY_PATTERN = /^\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\]\s+(.*)$/;
 
 function isProgressBlockTitle(line) {
   return (
@@ -59,18 +57,53 @@ function isProgressBlockTitle(line) {
 }
 
 export function readJobProgressPreview(logFile, maxLines = DEFAULT_MAX_PROGRESS_LINES) {
-  if (!logFile || !fs.existsSync(logFile)) {
+  if (!logFile || !fs.existsSync(logFile) || maxLines <= 0) {
     return [];
   }
 
-  const lines = fs
-    .readFileSync(logFile, "utf8")
-    .split(/\r?\n/)
-    .map((line) => line.trimEnd())
-    .filter(Boolean)
-    .filter((line) => line.startsWith("["))
-    .map(stripLogPrefix)
-    .filter((line) => line && !isProgressBlockTitle(line));
+  const lines = [];
+  let previousLineBlank = false;
+  let blockTimestamp = null;
+  let lastTimestamp = "";
+
+  for (const rawLine of fs.readFileSync(logFile, "utf8").split(/\r?\n/)) {
+    const trimmedLine = rawLine.trimEnd();
+    if (!trimmedLine) {
+      previousLineBlank = true;
+      continue;
+    }
+
+    const match = trimmedLine.match(LOG_ENTRY_PATTERN);
+    const wasBlankBefore = previousLineBlank;
+    previousLineBlank = false;
+    if (!match) {
+      continue;
+    }
+
+    const [, timestamp, content] = match;
+    const entry = content.trim();
+    if (!entry) {
+      continue;
+    }
+
+    if (blockTimestamp !== null && timestamp < blockTimestamp) {
+      continue;
+    }
+
+    if (isProgressBlockTitle(entry)) {
+      if (wasBlankBefore && timestamp >= lastTimestamp) {
+        blockTimestamp = timestamp;
+        lastTimestamp = timestamp;
+      }
+      continue;
+    }
+
+    blockTimestamp = null;
+    if (timestamp > lastTimestamp) {
+      lastTimestamp = timestamp;
+    }
+    lines.push(entry);
+  }
 
   return lines.slice(-maxLines);
 }
