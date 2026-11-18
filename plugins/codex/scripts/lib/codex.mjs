@@ -123,12 +123,19 @@ function extractTurnId(message) {
   return null;
 }
 
+/** @param {ThreadItem[]} fileChanges */
 function collectTouchedFiles(fileChanges) {
   const paths = new Set();
   for (const fileChange of fileChanges) {
+    if (fileChange.type !== "fileChange" || fileChange.status !== "completed") {
+      continue;
+    }
     for (const change of fileChange.changes ?? []) {
       if (change.path) {
         paths.add(change.path);
+      }
+      if (change.kind?.type === "update" && change.kind.move_path) {
+        paths.add(change.kind.move_path);
       }
     }
   }
