@@ -46,9 +46,7 @@ function getJobTypeLabel(job) {
   return "job";
 }
 
-function stripLogPrefix(line) {
-  return line.replace(/^\[[^\]]+\]\s*/, "").trim();
-}
+const LOG_ENTRY_PATTERN = /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\]\s+(.*)$/;
 
 function isProgressBlockTitle(line) {
   return (
@@ -59,18 +57,27 @@ function isProgressBlockTitle(line) {
 }
 
 export function readJobProgressPreview(logFile, maxLines = DEFAULT_MAX_PROGRESS_LINES) {
-  if (!logFile || !fs.existsSync(logFile)) {
+  if (!logFile || !fs.existsSync(logFile) || maxLines <= 0) {
     return [];
   }
 
-  const lines = fs
-    .readFileSync(logFile, "utf8")
-    .split(/\r?\n/)
-    .map((line) => line.trimEnd())
-    .filter(Boolean)
-    .filter((line) => line.startsWith("["))
-    .map(stripLogPrefix)
-    .filter((line) => line && !isProgressBlockTitle(line));
+  const lines = [];
+  for (const rawLine of fs.readFileSync(logFile, "utf8").split(/\r?\n/)) {
+    const match = rawLine.trimEnd().match(LOG_ENTRY_PATTERN);
+    if (!match) {
+      continue;
+    }
+    const entry = match[1].trim();
+    if (!entry) {
+      continue;
+    }
+    if (entry === "Final output") {
+      break;
+    }
+    if (!isProgressBlockTitle(entry)) {
+      lines.push(entry);
+    }
+  }
 
   return lines.slice(-maxLines);
 }
