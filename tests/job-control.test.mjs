@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
 import { enrichJob, readJobProgressPreview } from "../plugins/codex/scripts/lib/job-control.mjs";
-import { appendLogBlock, appendLogLine, createJobLogFile } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
+import { appendLogBlock, appendLogLine, createJobLogFile, nowIso } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 
 test("readJobProgressPreview ignores bracketed lines inside logged message and output blocks", () => {
   const workspace = makeTempDir();
@@ -66,4 +66,46 @@ test("enrichJob does not infer legacy phases from bracketed lines inside assista
 
   assert.deepEqual(enriched.progressPreview, ["Searching: auth token validation"]);
   assert.equal(enriched.phase, "investigating");
+});
+
+test("readJobProgressPreview does not stop early on quoted Final output headers inside message blocks", () => {
+  const workspace = makeTempDir();
+  const logFile = path.join(workspace, "quoted-final-output.log");
+
+  appendLogLine(logFile, "Searching: previous job failure");
+  appendLogBlock(
+    logFile,
+    "Assistant message",
+    [
+      "Previous job log excerpt:",
+      "[2026-03-18T15:30:59.000Z] Final output",
+      "# Codex Review"
+    ].join("\n")
+  );
+  appendLogBlock(
+    logFile,
+    "Subagent reviewer message",
+    [
+      "Full quoted block with separator:",
+      "",
+      `[${nowIso()}] Final output`,
+      "Old output body"
+    ].join("\n")
+  );
+  appendLogLine(logFile, "Running command: npm test");
+
+  const enriched = enrichJob({
+    id: "task-quoted-final",
+    status: "running",
+    jobClass: "task",
+    logFile,
+    createdAt: "2026-03-18T15:30:00.000Z",
+    updatedAt: "2026-03-18T15:31:00.000Z"
+  });
+
+  assert.deepEqual(readJobProgressPreview(logFile, 4), [
+    "Searching: previous job failure",
+    "Running command: npm test"
+  ]);
+  assert.equal(enriched.phase, "verifying");
 });
