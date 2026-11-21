@@ -7,7 +7,13 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
-import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import {
+  clearBrokerSession,
+  loadBrokerSession,
+  saveBrokerSession,
+  sendBrokerShutdown,
+  teardownBrokerSession
+} from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -15,6 +21,27 @@ const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
+
+let previousPluginDataDir;
+
+test.beforeEach(() => {
+  previousPluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = makeTempDir("codex-plugin-data-");
+});
+
+test.afterEach(async () => {
+  const brokerSession = loadBrokerSession(ROOT);
+  if (brokerSession?.endpoint) {
+    await sendBrokerShutdown(brokerSession.endpoint);
+    teardownBrokerSession(brokerSession);
+    clearBrokerSession(ROOT);
+  }
+  if (previousPluginDataDir == null) {
+    delete process.env.CLAUDE_PLUGIN_DATA;
+  } else {
+    process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
+  }
+});
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   const start = Date.now();
