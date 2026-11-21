@@ -751,6 +751,24 @@ async function resumeThread(client, threadId, cwd, options = {}) {
   return client.request("thread/resume", buildResumeParams(threadId, cwd, options));
 }
 
+async function unsubscribeThread(client, threadId) {
+  if (!threadId || client.closed) {
+    return;
+  }
+  try {
+    await client.request("thread/unsubscribe", { threadId });
+  } catch {
+    // Best-effort cleanup: ignore unsupported-method errors on older Codex CLIs
+    // or closed-connection errors so teardown never masks the invocation result.
+  }
+}
+
+async function unsubscribeThreads(client, threadIds) {
+  for (const threadId of [...new Set(threadIds)].reverse()) {
+    await unsubscribeThread(client, threadId);
+  }
+}
+
 function buildResultStatus(turnState) {
   return turnState.finalTurn?.status === "completed" ? 0 : 1;
 }
@@ -1014,44 +1032,54 @@ export async function runAppServerReview(cwd, options = {}) {
       threadName: options.threadName
     });
     const sourceThreadId = thread.thread.id;
+    const threadsToUnsubscribe = new Set([sourceThreadId]);
     emitProgress(options.onProgress, `Thread ready (${sourceThreadId}).`, "starting", {
       threadId: sourceThreadId
     });
     const delivery = options.delivery ?? "inline";
 
-    const turnState = await captureTurn(
-      client,
-      sourceThreadId,
-      () =>
-        client.request("review/start", {
-          threadId: sourceThreadId,
-          delivery,
-          target: options.target
-        }),
-      {
-        onProgress: options.onProgress,
-        onResponse(response, state) {
-          if (response.reviewThreadId) {
-            state.threadIds.add(response.reviewThreadId);
-            if (delivery === "detached") {
-              state.threadId = response.reviewThreadId;
+    try {
+      const turnState = await captureTurn(
+        client,
+        sourceThreadId,
+        () =>
+          client.request("review/start", {
+            threadId: sourceThreadId,
+            delivery,
+            target: options.target
+          }),
+        {
+          onProgress: options.onProgress,
+          onResponse(response, state) {
+            if (response.reviewThreadId) {
+              state.threadIds.add(response.reviewThreadId);
+              threadsToUnsubscribe.add(response.reviewThreadId);
+              if (delivery === "detached") {
+                state.threadId = response.reviewThreadId;
+              }
             }
           }
         }
-      }
-    );
+      );
 
-    return {
-      status: buildResultStatus(turnState),
-      threadId: turnState.threadId,
-      sourceThreadId,
-      turnId: turnState.turnId,
-      reviewText: turnState.reviewText,
-      reasoningSummary: turnState.reasoningSummary,
-      turn: turnState.finalTurn,
-      error: turnState.error,
-      stderr: cleanCodexStderr(client.stderr)
-    };
+      for (const trackedThreadId of turnState.threadIds) {
+        threadsToUnsubscribe.add(trackedThreadId);
+      }
+
+      return {
+        status: buildResultStatus(turnState),
+        threadId: turnState.threadId,
+        sourceThreadId,
+        turnId: turnState.turnId,
+        reviewText: turnState.reviewText,
+        reasoningSummary: turnState.reasoningSummary,
+        turn: turnState.finalTurn,
+        error: turnState.error,
+        stderr: cleanCodexStderr(client.stderr)
+      };
+    } finally {
+      await unsubscribeThreads(client, threadsToUnsubscribe);
+    }
   });
 }
 
@@ -1120,42 +1148,52 @@ export async function runAppServerTurn(cwd, options = {}) {
       threadId = response.thread.id;
     }
 
-    emitProgress(options.onProgress, `Thread ready (${threadId}).`, "starting", {
-      threadId
-    });
+    const threadsToUnsubscribe = new Set([threadId]);
 
-    const prompt = options.prompt?.trim() || options.defaultPrompt || "";
-    if (!prompt) {
-      throw new Error("A prompt is required for this Codex run.");
+    try {
+      emitProgress(options.onProgress, `Thread ready (${threadId}).`, "starting", {
+        threadId
+      });
+
+      const prompt = options.prompt?.trim() || options.defaultPrompt || "";
+      if (!prompt) {
+        throw new Error("A prompt is required for this Codex run.");
+      }
+
+      const turnState = await captureTurn(
+        client,
+        threadId,
+        () =>
+          client.request("turn/start", {
+            threadId,
+            input: buildTurnInput(prompt),
+            model: options.model ?? null,
+            effort: options.effort ?? null,
+            outputSchema: options.outputSchema ?? null
+          }),
+        { onProgress: options.onProgress }
+      );
+
+      for (const trackedThreadId of turnState.threadIds) {
+        threadsToUnsubscribe.add(trackedThreadId);
+      }
+
+      return {
+        status: buildResultStatus(turnState),
+        threadId,
+        turnId: turnState.turnId,
+        finalMessage: turnState.lastAgentMessage,
+        reasoningSummary: turnState.reasoningSummary,
+        turn: turnState.finalTurn,
+        error: turnState.error,
+        stderr: cleanCodexStderr(client.stderr),
+        fileChanges: turnState.fileChanges,
+        touchedFiles: collectTouchedFiles(turnState.fileChanges),
+        commandExecutions: turnState.commandExecutions
+      };
+    } finally {
+      await unsubscribeThreads(client, threadsToUnsubscribe);
     }
-
-    const turnState = await captureTurn(
-      client,
-      threadId,
-      () =>
-        client.request("turn/start", {
-          threadId,
-          input: buildTurnInput(prompt),
-          model: options.model ?? null,
-          effort: options.effort ?? null,
-          outputSchema: options.outputSchema ?? null
-        }),
-      { onProgress: options.onProgress }
-    );
-
-    return {
-      status: buildResultStatus(turnState),
-      threadId,
-      turnId: turnState.turnId,
-      finalMessage: turnState.lastAgentMessage,
-      reasoningSummary: turnState.reasoningSummary,
-      turn: turnState.finalTurn,
-      error: turnState.error,
-      stderr: cleanCodexStderr(client.stderr),
-      fileChanges: turnState.fileChanges,
-      touchedFiles: collectTouchedFiles(turnState.fileChanges),
-      commandExecutions: turnState.commandExecutions
-    };
   });
 }
 

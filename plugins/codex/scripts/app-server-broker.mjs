@@ -10,6 +10,7 @@ import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
+const THREAD_SUBSCRIBING_METHODS = new Set(["thread/start", "thread/resume", "thread/fork"]);
 
 function buildStreamThreadIds(method, params, result) {
   const threadIds = new Set();
@@ -69,7 +70,68 @@ async function main() {
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
+  let shuttingDown = false;
   const sockets = new Set();
+  const socketThreads = new Map();
+
+  function trackSocketThread(socket, threadId) {
+    if (!threadId) {
+      return;
+    }
+    if (shuttingDown || socket.destroyed || !sockets.has(socket)) {
+      if (!shuttingDown && !isThreadTrackedByOtherSocket(threadId, socket) && !appClient.closed) {
+        void appClient.request("thread/unsubscribe", { threadId }).catch(() => {});
+      }
+      return;
+    }
+    let tracked = socketThreads.get(socket);
+    if (!tracked) {
+      tracked = new Set();
+      socketThreads.set(socket, tracked);
+    }
+    tracked.add(threadId);
+  }
+
+  function untrackSocketThread(socket, threadId) {
+    if (!threadId) {
+      return;
+    }
+    const tracked = socketThreads.get(socket);
+    if (!tracked) {
+      return;
+    }
+    tracked.delete(threadId);
+    if (tracked.size === 0) {
+      socketThreads.delete(socket);
+    }
+  }
+
+  function isThreadTrackedByOtherSocket(threadId, excludedSocket) {
+    for (const [otherSocket, tracked] of socketThreads.entries()) {
+      if (otherSocket !== excludedSocket && tracked.has(threadId)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function releaseSocketThreads(socket) {
+    const tracked = socketThreads.get(socket);
+    if (!tracked || tracked.size === 0) {
+      socketThreads.delete(socket);
+      return;
+    }
+    socketThreads.delete(socket);
+    if (shuttingDown || appClient.closed) {
+      return;
+    }
+    for (const threadId of [...tracked].reverse()) {
+      if (isThreadTrackedByOtherSocket(threadId, socket)) {
+        continue;
+      }
+      void appClient.request("thread/unsubscribe", { threadId }).catch(() => {});
+    }
+  }
 
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
@@ -86,6 +148,9 @@ async function main() {
     if (!target) {
       return;
     }
+    if (message.method === "thread/started" && message.params?.thread?.id) {
+      trackSocketThread(target, message.params.thread.id);
+    }
     send(target, message);
     if (message.method === "turn/completed" && activeStreamSocket === target) {
       const threadId = message.params?.threadId ?? null;
@@ -100,6 +165,8 @@ async function main() {
   }
 
   async function shutdown(server) {
+    shuttingDown = true;
+    socketThreads.clear();
     for (const socket of sockets) {
       socket.end();
     }
@@ -199,6 +266,13 @@ async function main() {
 
         try {
           const result = await appClient.request(message.method, message.params ?? {});
+          if (THREAD_SUBSCRIBING_METHODS.has(message.method) && result?.thread?.id) {
+            trackSocketThread(socket, result.thread.id);
+          } else if (message.method === "review/start" && result?.reviewThreadId) {
+            trackSocketThread(socket, result.reviewThreadId);
+          } else if (message.method === "thread/unsubscribe" && message.params?.threadId) {
+            untrackSocketThread(socket, message.params.threadId);
+          }
           send(socket, { id: message.id, result });
           if (isStreaming) {
             activeStreamSocket = socket;
@@ -208,6 +282,9 @@ async function main() {
             activeRequestSocket = null;
           }
         } catch (error) {
+          if (message.method === "thread/unsubscribe" && message.params?.threadId && error?.rpcCode === -32601) {
+            untrackSocketThread(socket, message.params.threadId);
+          }
           send(socket, {
             id: message.id,
             error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
@@ -225,11 +302,13 @@ async function main() {
     socket.on("close", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      releaseSocketThreads(socket);
     });
 
     socket.on("error", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      releaseSocketThreads(socket);
     });
   });
 
