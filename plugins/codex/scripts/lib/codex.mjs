@@ -883,24 +883,37 @@ async function getCodexAuthStatusFromClient(client, cwd) {
   }
 }
 
-export function getCodexAvailability(cwd) {
-  const versionStatus = binaryAvailable("codex", ["--version"], { cwd });
+export function getCodexAvailability(cwd, options = {}) {
+  const versionStatus = binaryAvailable("codex", ["--version"], { cwd, ...options });
   if (!versionStatus.available) {
     return versionStatus;
   }
 
-  const appServerStatus = binaryAvailable("codex", ["app-server", "--help"], { cwd });
+  const appServerStatus = binaryAvailable("codex", ["app-server", "--help"], { cwd, ...options });
   if (!appServerStatus.available) {
     return {
       available: false,
+      reason: appServerStatus.reason,
       detail: `${versionStatus.detail}; advanced runtime unavailable: ${appServerStatus.detail}`
     };
   }
 
   return {
     available: true,
+    reason: "ok",
     detail: `${versionStatus.detail}; advanced runtime available`
   };
+}
+
+export function formatCodexUnavailableError(availability) {
+  if (availability?.reason === "policy-rejected") {
+    const detail = availability.detail ? ` (${availability.detail})` : "";
+    return (
+      `Codex CLI launch was blocked by the shell execution policy rather than missing from PATH${detail}. ` +
+      "Use a policy-compatible Windows shell such as Command Prompt (`cmd.exe`) or Git Bash, or invoke `codex.cmd` directly instead of `codex.ps1`, without weakening your PowerShell execution policy."
+    );
+  }
+  return "Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.";
 }
 
 export function getSessionRuntimeStatus(env = process.env, cwd = process.cwd()) {
@@ -1002,7 +1015,7 @@ export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
 export async function runAppServerReview(cwd, options = {}) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
-    throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
+    throw new Error(formatCodexUnavailableError(availability));
   }
 
   return withAppServer(cwd, async (client) => {
@@ -1058,7 +1071,7 @@ export async function runAppServerReview(cwd, options = {}) {
 export async function importExternalAgentSession(cwd, options = {}) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
-    throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
+    throw new Error(formatCodexUnavailableError(availability));
   }
   if (!options.sourcePath) {
     throw new Error("A Claude session source path is required.");
@@ -1095,7 +1108,7 @@ export async function importExternalAgentSession(cwd, options = {}) {
 export async function runAppServerTurn(cwd, options = {}) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
-    throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
+    throw new Error(formatCodexUnavailableError(availability));
   }
 
   return withAppServer(cwd, async (client) => {
@@ -1162,7 +1175,7 @@ export async function runAppServerTurn(cwd, options = {}) {
 export async function findLatestTaskThread(cwd) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
-    throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
+    throw new Error(formatCodexUnavailableError(availability));
   }
 
   return withAppServer(cwd, async (client) => {

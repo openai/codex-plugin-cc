@@ -1,5 +1,74 @@
 import { spawnSync } from "node:child_process";
+import path from "node:path";
 import process from "node:process";
+
+function readEnvCaseInsensitive(env, targetName) {
+  if (!env || typeof env !== "object") {
+    return "";
+  }
+  if (typeof env[targetName] === "string" && env[targetName].trim()) {
+    return env[targetName].trim();
+  }
+  const lowerTarget = targetName.toLowerCase();
+  for (const [key, value] of Object.entries(env)) {
+    if (key.toLowerCase() === lowerTarget && typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return "";
+}
+
+export function isPowerShellPath(shellValue) {
+  if (typeof shellValue !== "string") {
+    return false;
+  }
+  const normalized = shellValue.trim().replace(/^["']+|["']+$/g, "");
+  if (!normalized) {
+    return false;
+  }
+  const baseName = normalized.split(/[\\/]/).pop() ?? "";
+  return /^(powershell|pwsh)(\.exe)?$/i.test(baseName);
+}
+
+export function resolveWindowsShell(env = process.env) {
+  const configuredShell = readEnvCaseInsensitive(env, "SHELL");
+  if (configuredShell && !isPowerShellPath(configuredShell)) {
+    return configuredShell;
+  }
+
+  const comSpec = readEnvCaseInsensitive(env, "ComSpec");
+  if (comSpec && !isPowerShellPath(comSpec)) {
+    return comSpec;
+  }
+
+  const systemRoot = readEnvCaseInsensitive(env, "SystemRoot") || readEnvCaseInsensitive(env, "windir");
+  if (systemRoot) {
+    return path.win32.join(systemRoot, "System32", "cmd.exe");
+  }
+
+  return "cmd.exe";
+}
+
+export function resolveCommandShell(options = {}) {
+  if (options.shell !== undefined) {
+    return options.shell;
+  }
+  const platform = options.platform ?? process.platform;
+  if (platform !== "win32") {
+    return false;
+  }
+  return resolveWindowsShell(options.env ?? process.env);
+}
+
+export function isShellPolicyRejection(text) {
+  const value = String(text ?? "");
+  return (
+    /PSSecurityException/i.test(value) ||
+    /cannot\s+be\s+loaded\s+because\s+running\s+scripts\s+is\s+disabled/i.test(value) ||
+    /about_Execution_Policies/i.test(value) ||
+    (/UnauthorizedAccess/i.test(value) && /\.ps1\b|execution\s+polic|running\s+scripts/i.test(value))
+  );
+}
 
 export function runCommand(command, args = [], options = {}) {
   const result = spawnSync(command, args, {
@@ -9,7 +78,7 @@ export function runCommand(command, args = [], options = {}) {
     input: options.input,
     maxBuffer: options.maxBuffer,
     stdio: options.stdio ?? "pipe",
-    shell: options.shell ?? (process.platform === "win32" ? (process.env.SHELL || true) : false),
+    shell: resolveCommandShell(options),
     windowsHide: true
   });
 
@@ -36,18 +105,28 @@ export function runCommandChecked(command, args = [], options = {}) {
 }
 
 export function binaryAvailable(command, versionArgs = ["--version"], options = {}) {
-  const result = runCommand(command, versionArgs, options);
+  const runCommandImpl = options.runCommandImpl ?? runCommand;
+  const result = runCommandImpl(command, versionArgs, options);
   if (result.error && /** @type {NodeJS.ErrnoException} */ (result.error).code === "ENOENT") {
-    return { available: false, detail: "not found" };
+    return { available: false, reason: "not-found", detail: "not found" };
   }
   if (result.error) {
-    return { available: false, detail: result.error.message };
+    const detail = result.error.message;
+    return {
+      available: false,
+      reason: isShellPolicyRejection(detail) ? "policy-rejected" : "error",
+      detail
+    };
   }
   if (result.status !== 0) {
     const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.status}`;
-    return { available: false, detail };
+    return {
+      available: false,
+      reason: isShellPolicyRejection(detail) ? "policy-rejected" : "error",
+      detail
+    };
   }
-  return { available: true, detail: result.stdout.trim() || result.stderr.trim() || "ok" };
+  return { available: true, reason: "ok", detail: result.stdout.trim() || result.stderr.trim() || "ok" };
 }
 
 function looksLikeMissingProcessMessage(text) {

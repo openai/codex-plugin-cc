@@ -44,6 +44,31 @@ test("setup reports ready when fake codex is installed and authenticated", () =>
   assert.equal(payload.sessionRuntime.mode, "direct");
 });
 
+test(
+  "setup succeeds on Windows when SHELL points to PowerShell and codex.ps1 sits beside codex.cmd",
+  { skip: process.platform !== "win32" },
+  () => {
+    const binDir = makeTempDir();
+    installFakeCodex(binDir);
+    fs.writeFileSync(path.join(binDir, "codex.ps1"), "Write-Output \"should-not-run-ps1\"\n");
+
+    const result = run("node", [SCRIPT, "setup", "--json"], {
+      cwd: ROOT,
+      env: {
+        ...buildEnv(binDir),
+        SHELL: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+      }
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const payload = JSON.parse(result.stdout);
+    assert.equal(payload.ready, true);
+    assert.equal(payload.codex.available, true);
+    assert.equal(payload.codex.reason, "ok");
+    assert.equal(payload.auth.loggedIn, true);
+  }
+);
+
 test("setup is ready without npm when Codex is already installed and authenticated", () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
