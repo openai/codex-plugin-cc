@@ -5,7 +5,20 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
-import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import {
+  resolveJobFile,
+  resolveJobLogFile,
+  resolveStateDir,
+  resolveStateFile,
+  resolveStateRoot,
+  saveState
+} from "../plugins/codex/scripts/lib/state.mjs";
+
+test("resolveStateRoot uses CLAUDE_PLUGIN_DATA/state when provided and temp fallback otherwise", () => {
+  const pluginDataDir = makeTempDir();
+  assert.equal(resolveStateRoot({ CLAUDE_PLUGIN_DATA: pluginDataDir }), path.join(pluginDataDir, "state"));
+  assert.equal(resolveStateRoot({}), path.join(os.tmpdir(), "codex-companion"));
+});
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();

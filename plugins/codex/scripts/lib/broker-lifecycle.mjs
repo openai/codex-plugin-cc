@@ -6,11 +6,14 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { resolveStateDir } from "./state.mjs";
+import { resolveStateRoot } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
 const BROKER_STATE_FILE = "broker.json";
+const BROKER_LOCK_DIR = "broker.lock";
+const DEFAULT_BROKER_STARTUP_TIMEOUT_MS = 20_000;
+const BROKER_LOCK_POLL_MS = 50;
 
 export function createBrokerSessionDir(prefix = "cxc-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -69,12 +72,20 @@ export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile
   return child;
 }
 
-function resolveBrokerStateFile(cwd) {
-  return path.join(resolveStateDir(cwd), BROKER_STATE_FILE);
+function resolveBrokerStateDir(env = process.env) {
+  return resolveStateRoot(env);
 }
 
-export function loadBrokerSession(cwd) {
-  const stateFile = resolveBrokerStateFile(cwd);
+function resolveBrokerStateFile(env = process.env) {
+  return path.join(resolveBrokerStateDir(env), BROKER_STATE_FILE);
+}
+
+function resolveBrokerLockDir(env = process.env) {
+  return path.join(resolveBrokerStateDir(env), BROKER_LOCK_DIR);
+}
+
+export function loadBrokerSession(_cwd, env = process.env) {
+  const stateFile = resolveBrokerStateFile(env);
   if (!fs.existsSync(stateFile)) {
     return null;
   }
@@ -86,16 +97,23 @@ export function loadBrokerSession(cwd) {
   }
 }
 
-export function saveBrokerSession(cwd, session) {
-  const stateDir = resolveStateDir(cwd);
+export function saveBrokerSession(_cwd, session, env = process.env) {
+  const stateDir = resolveBrokerStateDir(env);
+  const stateFile = resolveBrokerStateFile(env);
   fs.mkdirSync(stateDir, { recursive: true });
-  fs.writeFileSync(resolveBrokerStateFile(cwd), `${JSON.stringify(session, null, 2)}\n`, "utf8");
+  const tempFile = `${stateFile}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tempFile, `${JSON.stringify(session, null, 2)}\n`, "utf8");
+  fs.renameSync(tempFile, stateFile);
 }
 
-export function clearBrokerSession(cwd) {
-  const stateFile = resolveBrokerStateFile(cwd);
-  if (fs.existsSync(stateFile)) {
+export function clearBrokerSession(_cwd, env = process.env) {
+  const stateFile = resolveBrokerStateFile(env);
+  try {
     fs.unlinkSync(stateFile);
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
   }
 }
 
@@ -110,64 +128,131 @@ async function isBrokerEndpointReady(endpoint) {
   }
 }
 
+function releaseBrokerLock(lockDir) {
+  try {
+    fs.rmSync(lockDir, { recursive: true, force: true });
+  } catch {
+    // Ignore missing or already-removed lock directories.
+  }
+}
+
+async function acquireBrokerLock(cwd, env, timeoutMs) {
+  const stateDir = resolveBrokerStateDir(env);
+  const lockDir = resolveBrokerLockDir(env);
+  const staleLockMs = Math.max(timeoutMs, 30_000);
+  fs.mkdirSync(stateDir, { recursive: true });
+
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      fs.mkdirSync(lockDir);
+      return { acquired: true, lockDir, session: null };
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw error;
+      }
+    }
+
+    const existing = loadBrokerSession(cwd, env);
+    if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
+      return { acquired: false, lockDir, session: existing };
+    }
+
+    try {
+      const stats = fs.statSync(lockDir);
+      if (Date.now() - stats.mtimeMs > staleLockMs) {
+        releaseBrokerLock(lockDir);
+        continue;
+      }
+    } catch {
+      continue;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, BROKER_LOCK_POLL_MS));
+  }
+
+  const existing = loadBrokerSession(cwd, env);
+  if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
+    return { acquired: false, lockDir, session: existing };
+  }
+  return { acquired: false, lockDir, session: null };
+}
+
 export async function ensureBrokerSession(cwd, options = {}) {
-  const existing = loadBrokerSession(cwd);
+  const env = options.env ?? process.env;
+  const timeoutMs = options.timeoutMs ?? DEFAULT_BROKER_STARTUP_TIMEOUT_MS;
+
+  const existing = loadBrokerSession(cwd, env);
   if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
     return existing;
   }
 
-  if (existing) {
-    teardownBrokerSession({
-      endpoint: existing.endpoint ?? null,
-      pidFile: existing.pidFile ?? null,
-      logFile: existing.logFile ?? null,
-      sessionDir: existing.sessionDir ?? null,
-      pid: existing.pid ?? null,
-      killProcess: options.killProcess ?? null
-    });
-    clearBrokerSession(cwd);
+  const lock = await acquireBrokerLock(cwd, env, timeoutMs);
+  if (!lock.acquired) {
+    return lock.session;
   }
 
-  const sessionDir = createBrokerSessionDir();
-  const endpointFactory = options.createBrokerEndpoint ?? createBrokerEndpoint;
-  const endpoint = endpointFactory(sessionDir, options.platform);
-  const pidFile = path.join(sessionDir, "broker.pid");
-  const logFile = path.join(sessionDir, "broker.log");
-  const scriptPath =
-    options.scriptPath ??
-    fileURLToPath(new URL("../app-server-broker.mjs", import.meta.url));
+  try {
+    const lockedExisting = loadBrokerSession(cwd, env);
+    if (lockedExisting && (await isBrokerEndpointReady(lockedExisting.endpoint))) {
+      return lockedExisting;
+    }
 
-  const child = spawnBrokerProcess({
-    scriptPath,
-    cwd,
-    endpoint,
-    pidFile,
-    logFile,
-    env: options.env ?? process.env
-  });
+    if (lockedExisting) {
+      teardownBrokerSession({
+        endpoint: lockedExisting.endpoint ?? null,
+        pidFile: lockedExisting.pidFile ?? null,
+        logFile: lockedExisting.logFile ?? null,
+        sessionDir: lockedExisting.sessionDir ?? null,
+        pid: lockedExisting.pid ?? null,
+        killProcess: options.killProcess ?? null
+      });
+      clearBrokerSession(cwd, env);
+    }
 
-  const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
-  if (!ready) {
-    teardownBrokerSession({
+    const sessionDir = createBrokerSessionDir();
+    const endpointFactory = options.createBrokerEndpoint ?? createBrokerEndpoint;
+    const endpoint = endpointFactory(sessionDir, options.platform);
+    const pidFile = path.join(sessionDir, "broker.pid");
+    const logFile = path.join(sessionDir, "broker.log");
+    const scriptPath =
+      options.scriptPath ??
+      fileURLToPath(new URL("../app-server-broker.mjs", import.meta.url));
+
+    const child = spawnBrokerProcess({
+      scriptPath,
+      cwd,
+      endpoint,
+      pidFile,
+      logFile,
+      env
+    });
+
+    const ready = await waitForBrokerEndpoint(endpoint, timeoutMs);
+    if (!ready) {
+      teardownBrokerSession({
+        endpoint,
+        pidFile,
+        logFile,
+        sessionDir,
+        pid: child.pid ?? null,
+        killProcess: options.killProcess ?? null
+      });
+      return null;
+    }
+
+    const session = {
       endpoint,
       pidFile,
       logFile,
       sessionDir,
-      pid: child.pid ?? null,
-      killProcess: options.killProcess ?? null
-    });
-    return null;
+      pid: child.pid ?? null
+    };
+    saveBrokerSession(cwd, session, env);
+    return session;
+  } finally {
+    releaseBrokerLock(lock.lockDir);
   }
-
-  const session = {
-    endpoint,
-    pidFile,
-    logFile,
-    sessionDir,
-    pid: child.pid ?? null
-  };
-  saveBrokerSession(cwd, session);
-  return session;
 }
 
 export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null }) {
@@ -180,11 +265,19 @@ export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessi
   }
 
   if (pidFile && fs.existsSync(pidFile)) {
-    fs.unlinkSync(pidFile);
+    try {
+      fs.unlinkSync(pidFile);
+    } catch {
+      // Ignore busy or already-removed pid files during teardown.
+    }
   }
 
   if (logFile && fs.existsSync(logFile)) {
-    fs.unlinkSync(logFile);
+    try {
+      fs.unlinkSync(logFile);
+    } catch {
+      // Ignore busy or already-removed log files during teardown.
+    }
   }
 
   if (endpoint) {
