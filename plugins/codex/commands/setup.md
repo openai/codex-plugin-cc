@@ -28,7 +28,7 @@ npm install -g @openai/codex
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" setup --json $ARGUMENTS
 ```
 
-If Codex is already installed or npm is unavailable:
+If Codex is already installed, blocked by shell execution policy (`codex.reason === "policy-rejected"`), or npm is unavailable:
 - Do not ask about installation.
 
 Output rules:

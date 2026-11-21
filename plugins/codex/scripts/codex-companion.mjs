@@ -11,6 +11,7 @@ import {
     buildPersistentTaskThreadName,
     DEFAULT_CONTINUE_PROMPT,
     findLatestTaskThread,
+    formatCodexUnavailableError,
     getCodexAuthStatus,
     getCodexAvailability,
     getSessionRuntimeStatus,
@@ -189,7 +190,13 @@ async function buildSetupReport(cwd, actionsTaken = []) {
 
   const nextSteps = [];
   if (!codexStatus.available) {
-    nextSteps.push("Install Codex with `npm install -g @openai/codex`.");
+    if (codexStatus.reason === "policy-rejected") {
+      nextSteps.push(
+        "Codex CLI launch was blocked by the shell execution policy (`codex.ps1`). Use a policy-compatible Windows shell (`cmd.exe` or Git Bash) or invoke `codex.cmd` directly without weakening your execution policy."
+      );
+    } else {
+      nextSteps.push("Install Codex with `npm install -g @openai/codex`.");
+    }
   }
   if (codexStatus.available && !authStatus.loggedIn && authStatus.requiresOpenaiAuth) {
     nextSteps.push("Run `!codex login`.");
@@ -252,7 +259,7 @@ function buildAdversarialReviewPrompt(context, focusText) {
 function ensureCodexAvailable(cwd) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
-    throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
+    throw new Error(formatCodexUnavailableError(availability));
   }
 }
 

@@ -59,6 +59,9 @@ If Codex is installed but not logged in yet, run:
 !codex login
 ```
 
+> [!NOTE]
+> On Windows, when `SHELL` points to PowerShell (`powershell.exe` or `pwsh.exe`), the plugin launches Codex through `cmd.exe` so Windows resolves the `codex.cmd` shim instead of `codex.ps1`. You do not need to weaken your PowerShell execution policy.
+
 After install, you should see:
 
 - the slash commands listed below
