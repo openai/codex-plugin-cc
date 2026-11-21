@@ -19,10 +19,27 @@ const readline = require("node:readline");
 
 	function loadState() {
 	  if (!fs.existsSync(STATE_PATH)) {
-	    return { nextThreadId: 1, nextTurnId: 1, appServerStarts: 0, threads: [], capabilities: null, lastInterrupt: null };
+	    return { nextThreadId: 1, nextTurnId: 1, appServerStarts: 0, threads: [], loadedThreads: [], unsubscribedThreads: [], capabilities: null, lastInterrupt: null };
 	  }
-	  return JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
+	  const parsed = JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
+	  if (!Array.isArray(parsed.loadedThreads)) {
+	    parsed.loadedThreads = [];
+	  }
+	  if (!Array.isArray(parsed.unsubscribedThreads)) {
+	    parsed.unsubscribedThreads = [];
+	  }
+	  return parsed;
 	}
+
+function markThreadLoaded(state, threadId) {
+  if (!threadId) {
+    return;
+  }
+  if (!state.loadedThreads.includes(threadId)) {
+    state.loadedThreads.push(threadId);
+    saveState(state);
+  }
+}
 
 function saveState(state) {
   fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
@@ -313,6 +330,7 @@ rl.on("line", (line) => {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
         const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
+        markThreadLoaded(state, thread.id);
         send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
         break;
@@ -346,8 +364,25 @@ rl.on("line", (line) => {
         }
         const thread = ensureThread(state, message.params.threadId);
         thread.updatedAt = now();
+        markThreadLoaded(state, thread.id);
         saveState(state);
         send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        break;
+      }
+
+      case "thread/unsubscribe": {
+        if (BEHAVIOR === "unsubscribe-unsupported") {
+          send({ id: message.id, error: { code: -32601, message: "Unsupported method: thread/unsubscribe" } });
+          break;
+        }
+        const threadId = message.params && message.params.threadId;
+        const wasLoaded = state.loadedThreads.includes(threadId);
+        state.loadedThreads = state.loadedThreads.filter((candidate) => candidate !== threadId);
+        if (threadId) {
+          state.unsubscribedThreads.push(threadId);
+        }
+        saveState(state);
+        send({ id: message.id, result: { status: wasLoaded ? "unsubscribed" : "notLoaded" } });
         break;
       }
 
@@ -409,6 +444,7 @@ rl.on("line", (line) => {
         let reviewThread = thread;
         if (message.params.delivery === "detached") {
           reviewThread = nextThread(state, thread.cwd, true);
+          markThreadLoaded(state, reviewThread.id);
           send({ method: "thread/started", params: { thread: { id: reviewThread.id } } });
         }
         const turnId = nextTurnId(state);
@@ -464,6 +500,7 @@ rl.on("line", (line) => {
           BEHAVIOR === "with-subagent-no-main-turn-completed"
         ) {
           const subThread = nextThread(state, thread.cwd, true);
+          markThreadLoaded(state, subThread.id);
           const subThreadRecord = ensureThread(state, subThread.id);
           subThreadRecord.name = "design-challenger";
           saveState(state);
