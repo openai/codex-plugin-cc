@@ -872,6 +872,27 @@ test("task ignores later subagent messages when choosing the final returned outp
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
+test("task without subagents waits for turn/completed after its final answer", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "with-delayed-turn-completed");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  // Direct app-server child, so exiting early kills the turn as it does in a real run.
+  const result = run("node", [SCRIPT, "task", "challenge the current design"], {
+    cwd: repo,
+    env: { ...buildEnv(binDir), CODEX_COMPANION_APP_SERVER_ENDPOINT: "unix:/nonexistent/direct" }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.turnCompletedSent, true);
+});
+
 test("task can finish after subagent work even if the parent turn/completed event is missing", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

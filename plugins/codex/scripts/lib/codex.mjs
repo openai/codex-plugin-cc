@@ -21,6 +21,7 @@
  *   finalTurn: Turn | null,
  *   completed: boolean,
  *   finalAnswerSeen: boolean,
+ *   subagentWorkSeen: boolean,
  *   pendingCollaborations: Set<string>,
  *   activeSubagentTurns: Set<string>,
  *   completionTimer: ReturnType<typeof setTimeout> | null,
@@ -322,6 +323,7 @@ function createTurnCaptureState(threadId, options = {}) {
     finalTurn: null,
     completed: false,
     finalAnswerSeen: false,
+    subagentWorkSeen: false,
     pendingCollaborations: new Set(),
     activeSubagentTurns: new Set(),
     completionTimer: null,
@@ -370,8 +372,11 @@ function completeTurn(state, turn = null, options = {}) {
   state.resolveCompletion(state);
 }
 
+// Fallback for a parent turn/completed that never arrives after subagent work
+// (see the with-subagent-no-main-turn-completed test). A turn without subagents
+// always ends with turn/completed, so it waits for that instead of guessing.
 function scheduleInferredCompletion(state) {
-  if (state.completed || state.finalTurn || !state.finalAnswerSeen) {
+  if (state.completed || state.finalTurn || !state.finalAnswerSeen || !state.subagentWorkSeen) {
     return;
   }
 
@@ -406,6 +411,7 @@ function belongsToTurn(state, message) {
 function recordItem(state, item, lifecycle, threadId = null) {
   if (item.type === "collabAgentToolCall") {
     if (!threadId || threadId === state.threadId) {
+      state.subagentWorkSeen = true;
       if (lifecycle === "started" || item.status === "inProgress") {
         state.pendingCollaborations.add(item.id);
       } else if (lifecycle === "completed") {
