@@ -698,6 +698,50 @@ test("session start hook exports the Claude session id, transcript path, and plu
   );
 });
 
+test("session start hook replaces duplicate exports and stays idempotent", () => {
+  const repo = makeTempDir();
+  const envFile = path.join(repo, "claude-env.sh");
+  const unrelated = "# keep this comment\nexport OTHER='untouched'\n\nexport CODEX_COMPANION_SESSION_ID_SUFFIX='keep'\n";
+  const oldExports = "export CODEX_COMPANION_SESSION_ID='old'\nexport CODEX_COMPANION_TRANSCRIPT_PATH='/tmp/old'\nexport CLAUDE_PLUGIN_DATA='/tmp/old-data'\n";
+  fs.writeFileSync(envFile, oldExports + unrelated + oldExports, "utf8");
+
+  for (let index = 0; index < 3; index += 1) {
+    const result = run(process.execPath, [SESSION_HOOK, "SessionStart"], {
+      cwd: repo,
+      env: { PATH: process.env.PATH, CLAUDE_ENV_FILE: envFile, CLAUDE_PLUGIN_DATA: "/tmp/latest-data" },
+      input: JSON.stringify({ session_id: "latest", transcript_path: "/tmp/latest" })
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(
+      fs.readFileSync(envFile, "utf8"),
+      unrelated + "export CODEX_COMPANION_SESSION_ID='latest'\nexport CODEX_COMPANION_TRANSCRIPT_PATH='/tmp/latest'\nexport CLAUDE_PLUGIN_DATA='/tmp/latest-data'\n"
+    );
+  }
+});
+
+test("session start hook preserves existing exports for empty values and separates unterminated lines", () => {
+  const repo = makeTempDir();
+  const envFile = path.join(repo, "claude-env.sh");
+  const original = "export CODEX_COMPANION_SESSION_ID='previous'\nexport OTHER='untouched'";
+  fs.writeFileSync(envFile, original, "utf8");
+  for (const sessionId of ["", null]) {
+    const result = run(process.execPath, [SESSION_HOOK, "SessionStart"], {
+      cwd: repo,
+      env: { PATH: process.env.PATH, CLAUDE_ENV_FILE: envFile, CLAUDE_PLUGIN_DATA: "" },
+      input: JSON.stringify({ session_id: sessionId, transcript_path: "" })
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.readFileSync(envFile, "utf8"), original);
+  }
+  const result = run(process.execPath, [SESSION_HOOK, "SessionStart"], {
+    cwd: repo,
+    env: { PATH: process.env.PATH, CLAUDE_ENV_FILE: envFile, CLAUDE_PLUGIN_DATA: "" },
+    input: JSON.stringify({ transcript_path: "/tmp/latest" })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.readFileSync(envFile, "utf8"), original + "\nexport CODEX_COMPANION_TRANSCRIPT_PATH='/tmp/latest'\n");
+});
+
 test("write task output focuses on the Codex result without generic follow-up hints", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

@@ -36,7 +36,14 @@ function appendEnvVar(name, value) {
   if (!process.env.CLAUDE_ENV_FILE || value == null || value === "") {
     return;
   }
-  fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `export ${name}=${shellEscape(value)}\n`, "utf8");
+  const envFile = process.env.CLAUDE_ENV_FILE;
+  const contents = fs.existsSync(envFile) ? fs.readFileSync(envFile, "utf8") : "";
+  const remaining = contents
+    .split("\n")
+    .filter((line) => !line.startsWith(`export ${name}=`))
+    .join("\n");
+  const separator = remaining && !remaining.endsWith("\n") ? "\n" : "";
+  fs.writeFileSync(envFile, `${remaining}${separator}export ${name}=${shellEscape(value)}\n`, "utf8");
 }
 
 function cleanupSessionJobs(cwd, sessionId) {
