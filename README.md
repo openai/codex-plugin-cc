@@ -314,6 +314,10 @@ Syntax errors and unsupported mutations of managed variables (such as `unset`, `
 `+=`, bare assignments, redirected exports, builtin/command wrappers, or writes in parent-shell compounds/functions)
 stop the hook before any file write. Whole quoted or expanded export arguments are also
 rejected when their target cannot be established from ordinary assignment nodes.
+Parent-shell assignment builtins (`printf`, `read`, `readarray`, `mapfile`, `getopts`, `let`),
+opaque dispatchers (`eval`, `source`, `.`), and quoted/expanded command names are outside
+the editable format. Managed arithmetic and array-element writes are rejected as well;
+child-shell data commands remain supported.
 Environment files are parsed as text, never executed by the hook.
 
 If the environment file changes while the parser is running, the hook retries against the

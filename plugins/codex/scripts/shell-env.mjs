@@ -3,13 +3,26 @@ import runtimeWasm from "web-tree-sitter/web-tree-sitter.wasm";
 import bashWasm from "tree-sitter-bash/tree-sitter-bash.wasm";
 
 let language;
+const PARENT_MUTATING_COMMANDS = new Set([
+  "export", "unset", "builtin", "command", "printf", "read", "readarray", "mapfile",
+  "getopts", "let", "eval", "source", "."
+]);
+const ARITHMETIC_ASSIGNMENTS = new Set([
+  "=", "+=", "-=", "*=", "/=", "%=", "**=", "<<=", ">>=", "&=", "^=", "|="
+]);
 
 function unsupportedExport() {
-  return new Error("Cannot update CLAUDE_ENV_FILE: unsupported assignment to a managed variable; file left unchanged.");
+  return new Error("Cannot update CLAUDE_ENV_FILE: unsupported shell mutation or export form; file left unchanged.");
+}
+
+function targetName(node) {
+  if (node?.type === "variable_name") return node.text;
+  if (node?.type === "subscript") return node.childForFieldName("name")?.text;
+  return undefined;
 }
 
 function assignmentName(node) {
-  return node.childForFieldName("name")?.text;
+  return targetName(node.childForFieldName("name"));
 }
 
 function declarationTouchesManaged(command, updates) {
@@ -26,12 +39,19 @@ function containsManagedWrite(node, updates) {
     return false;
   }
   if (node.type === "variable_assignment" && updates.has(assignmentName(node))) return true;
+  const operator = node.childForFieldName("operator")?.text;
+  if (node.type === "binary_expression" && ARITHMETIC_ASSIGNMENTS.has(operator) &&
+    updates.has(targetName(node.childForFieldName("left")))) return true;
+  if (["unary_expression", "postfix_expression"].includes(node.type) && ["++", "--"].includes(operator) &&
+    updates.has(targetName(node.namedChildren[0]))) return true;
   if (node.type === "declaration_command" && declarationTouchesManaged(node, updates)) return true;
   if (node.type === "unset_command" && node.namedChildren.some((argument) =>
     updates.has(argument.text.replace(/^(['"])([A-Za-z_][A-Za-z0-9_]*)\1$/, "$2")))) return true;
-  // Wrappers can execute mutating builtins; do not interpret their argument lists.
-  // Negated export/unset builtins are also represented as ordinary commands.
-  if (node.type === "command" && ["export", "unset", "builtin", "command"].includes(node.childForFieldName("name")?.text)) return true;
+  if (node.type === "command") {
+    const name = node.childForFieldName("name")?.text;
+    // Do not interpret builtin arguments, printf formats, or opaque command-name quoting.
+    if (!name || !/^(?:[A-Za-z0-9_./-]+|:)$/.test(name) || PARENT_MUTATING_COMMANDS.has(name)) return true;
+  }
   return node.namedChildren.some((child) => containsManagedWrite(child, updates));
 }
 
@@ -92,6 +112,12 @@ export async function updateShellExports(contents, entries, shellEscape) {
       }
       const command = statement;
       const argumentsList = command.namedChildren;
+      for (const argument of argumentsList) {
+        for (const field of ["name", "value"]) {
+          const expression = argument.childForFieldName(field);
+          if (expression && containsManagedWrite(expression, updates)) throw unsupportedExport();
+        }
+      }
       const touchesManaged = declarationTouchesManaged(command, updates);
       if (command.firstChild?.type !== "export" || argumentsList.some((argument) =>
         argument.type !== "variable_assignment" && argument.type !== "variable_name")) {
@@ -108,7 +134,8 @@ export async function updateShellExports(contents, entries, shellEscape) {
         if (!updates.has(name)) {
           continue;
         }
-        if (argument.children.find((child) => !child.isNamed)?.type !== "=") {
+        if (argument.childForFieldName("name")?.type !== "variable_name" ||
+          argument.children.find((child) => !child.isNamed)?.type !== "=") {
           throw unsupportedExport();
         }
         const duplicate = seen.has(name);
