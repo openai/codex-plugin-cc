@@ -291,6 +291,40 @@ Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also 
 
 This way you can review the Codex work or continue the work there.
 
+## Developing the SessionStart hook
+
+The checked-in `plugins/codex/scripts/session-lifecycle-hook.mjs` is generated. Edit
+`session-lifecycle-hook.source.mjs` and `shell-env.mjs` in the same directory, then run:
+
+```bash
+npm ci --ignore-scripts
+npm run build:session-hook
+npm test
+```
+
+The bundle embeds pinned Tree-sitter and Bash WebAssembly parsers, including their MIT
+licences. Build-only `fflate` compression uses fixed metadata for reproducible output
+across Node versions and platforms. Installed plugins need no npm dependencies or separate WebAssembly files.
+`npm test` checks that the bundle matches its sources before running tests.
+
+Environment updates replace ordinary parent-shell exports in place and preserve nested
+commands and literal data. Duplicate commands in general shell programs become no-ops
+to preserve command status; files containing only the hook's literal exports compact fully.
+Syntax errors and unsupported mutations of managed variables (such as `unset`, `export -n`,
+`+=`, bare assignments, redirected exports, builtin/command wrappers, or writes in parent-shell compounds/functions)
+stop the hook before any file write. Whole quoted or expanded export arguments are also
+rejected when their target cannot be established from ordinary assignment nodes.
+Parent-shell assignment builtins (`printf`, `read`, `readarray`, `mapfile`, `getopts`, `let`),
+opaque dispatchers (`eval`, `source`, `.`), and quoted/expanded command names are outside
+the editable format. Managed arithmetic and array-element writes are rejected as well;
+child-shell data commands remain supported.
+Environment files are parsed as text, never executed by the hook.
+
+If the environment file changes while the parser is running, the hook retries against the
+new text and refuses to overwrite a file that keeps changing. This reconciles observed
+changes across asynchronous parsing; it is not an atomic update protocol for other writers
+that do not coordinate with the hook.
+
 ## FAQ
 
 ### Do I need a separate Codex account for this plugin?

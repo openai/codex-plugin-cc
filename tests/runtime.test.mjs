@@ -698,6 +698,133 @@ test("session start hook exports the Claude session id, transcript path, and plu
   );
 });
 
+test("session start hook replaces duplicate exports and stays idempotent", () => {
+  const repo = makeTempDir();
+  const envFile = path.join(repo, "claude-env.sh");
+  const unrelated = "# keep this comment\nexport OTHER='untouched'\n\nexport CODEX_COMPANION_SESSION_ID_SUFFIX='keep'\n";
+  const oldExports = "export CODEX_COMPANION_SESSION_ID='old'\nexport CODEX_COMPANION_TRANSCRIPT_PATH='/tmp/old'\nexport CLAUDE_PLUGIN_DATA='/tmp/old-data'\n";
+  fs.writeFileSync(envFile, oldExports + unrelated + oldExports, "utf8");
+
+  for (let index = 0; index < 3; index += 1) {
+    const result = run(process.execPath, [SESSION_HOOK, "SessionStart"], {
+      cwd: repo,
+      env: { PATH: process.env.PATH, CLAUDE_ENV_FILE: envFile, CLAUDE_PLUGIN_DATA: "/tmp/latest-data" },
+      input: JSON.stringify({ session_id: "latest", transcript_path: "/tmp/latest" })
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(
+      fs.readFileSync(envFile, "utf8"),
+      "export CODEX_COMPANION_SESSION_ID='latest'\nexport CODEX_COMPANION_TRANSCRIPT_PATH='/tmp/latest'\nexport CLAUDE_PLUGIN_DATA='/tmp/latest-data'\n" + unrelated + ":\n:\n:\n"
+    );
+  }
+});
+
+test("session start hook deduplicates complete multiline quoted exports", { skip: process.platform === "win32" }, () => {
+  const repo = makeTempDir();
+  const envFile = path.join(repo, "claude-env.sh");
+  const unrelated = "export OTHER='keep\nexport CODEX_COMPANION_SESSION_ID=embedded\nthis value'\n";
+  const pluginDataDir = path.join(repo, "plugin's\nexport CODEX_COMPANION_SESSION_ID=embedded\ndata");
+  const transcriptPath = path.join(repo, "caller's\ntranscript.jsonl");
+  fs.mkdirSync(pluginDataDir);
+  fs.writeFileSync(transcriptPath, "", "utf8");
+  fs.writeFileSync(envFile, unrelated, "utf8");
+
+  const start = (sessionId, transcript, pluginData) => {
+    const result = run(process.execPath, [SESSION_HOOK, "SessionStart"], {
+      cwd: repo,
+      env: { PATH: process.env.PATH, CLAUDE_ENV_FILE: envFile, CLAUDE_PLUGIN_DATA: pluginData },
+      input: JSON.stringify({ session_id: sessionId, transcript_path: transcript })
+    });
+    assert.equal(result.status, 0, result.stderr);
+    if (process.platform !== "win32") {
+      const sourced = run("/bin/sh", [
+        "-c",
+        '. "$1"; [ "$CODEX_COMPANION_SESSION_ID" = "$2" ] && [ "$CODEX_COMPANION_TRANSCRIPT_PATH" = "$3" ] && [ "$CLAUDE_PLUGIN_DATA" = "$4" ] && [ "$OTHER" = "$5" ]',
+        "verify", envFile, sessionId, transcript, pluginData,
+        "keep\nexport CODEX_COMPANION_SESSION_ID=embedded\nthis value"
+      ], { cwd: repo, env: { PATH: process.env.PATH } });
+      assert.equal(sourced.status, 0, sourced.stderr);
+    }
+    return fs.readFileSync(envFile, "utf8");
+  };
+
+  const first = start("test's\nsession", transcriptPath, pluginDataDir);
+  assert.equal(start("test's\nsession", transcriptPath, pluginDataDir), first);
+  fs.writeFileSync(envFile, first + first, "utf8");
+  assert.equal(start("test's\nsession", transcriptPath, pluginDataDir), first + unrelated + ":\n:\n:\n");
+  const latest = start("latest\nsession", transcriptPath + "\nlatest", pluginDataDir + "\nlatest");
+  assert.equal(latest.startsWith(unrelated), true);
+  assert.equal(latest.endsWith(unrelated + ":\n:\n:\n"), true);
+  assert.equal(start("latest\nsession", transcriptPath + "\nlatest", pluginDataDir + "\nlatest"), latest);
+});
+
+test("session start hook preserves export-looking lines inside double-quoted values", { skip: process.platform === "win32" }, () => {
+  const repo = makeTempDir();
+  const envFile = path.join(repo, "claude-env.sh");
+  const embedded = "export CODEX_COMPANION_SESSION_ID='example'";
+  for (const prefix of ["first", 'first \\"quote\\"', "first\\\ncontinued"]) {
+    const unrelated = `# another hook's export file\nexport OTHER="${prefix}\n${embedded}\nlast"\n`;
+    fs.writeFileSync(envFile, unrelated, "utf8");
+    for (let index = 0; index < 3; index += 1) {
+      const result = run(process.execPath, [SESSION_HOOK, "SessionStart"], {
+        cwd: repo,
+        env: { PATH: process.env.PATH, CLAUDE_ENV_FILE: envFile, CLAUDE_PLUGIN_DATA: "/tmp/data" },
+        input: JSON.stringify({ session_id: "latest", transcript_path: "/tmp/transcript" })
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(fs.readFileSync(envFile, "utf8"), unrelated + "export CODEX_COMPANION_SESSION_ID='latest'\nexport CODEX_COMPANION_TRANSCRIPT_PATH='/tmp/transcript'\nexport CLAUDE_PLUGIN_DATA='/tmp/data'\n");
+      const expected = prefix.replace(/\\"/g, '"').replace(/\\\n/g, "") + `\n${embedded}\nlast`;
+      const sourced = run("/bin/sh", ["-c", '. "$1"; [ "$OTHER" = "$2" ] && [ "$CODEX_COMPANION_SESSION_ID" = latest ]', "verify", envFile, expected], {
+        cwd: repo, env: { PATH: process.env.PATH }
+      });
+      assert.equal(sourced.status, 0, sourced.stderr);
+    }
+  }
+});
+
+test("session start hook replaces exports in place before dependent assignments", { skip: process.platform === "win32" }, () => {
+  const repo = makeTempDir();
+  const envFile = path.join(repo, "claude-env.sh");
+  const dependent = 'export CACHE_DIR="$CLAUDE_PLUGIN_DATA/cache"\n';
+  fs.writeFileSync(envFile, "export CLAUDE_PLUGIN_DATA='/tmp/data'\n" + dependent + "export CLAUDE_PLUGIN_DATA='/tmp/stale'\n", "utf8");
+  for (const data of ["/tmp/data", "/tmp/latest", "/tmp/latest"]) {
+    const result = run(process.execPath, [SESSION_HOOK, "SessionStart"], {
+      cwd: repo,
+      env: { PATH: process.env.PATH, CLAUDE_ENV_FILE: envFile, CLAUDE_PLUGIN_DATA: data },
+      input: JSON.stringify({ session_id: "", transcript_path: "" })
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const sourced = run("/bin/sh", ["-c", '. "$1"; [ "$CACHE_DIR" = "$2/cache" ] && [ "$CLAUDE_PLUGIN_DATA" = "$2" ]', "verify", envFile, data], {
+      cwd: repo, env: { PATH: process.env.PATH }
+    });
+    assert.equal(sourced.status, 0, sourced.stderr);
+    assert.equal(fs.readFileSync(envFile, "utf8"), `export CLAUDE_PLUGIN_DATA='${data}'\n` + dependent + ":\n");
+  }
+});
+
+test("session start hook preserves existing exports for empty values and separates unterminated lines", () => {
+  const repo = makeTempDir();
+  const envFile = path.join(repo, "claude-env.sh");
+  const original = "export CODEX_COMPANION_SESSION_ID='previous'\nexport OTHER='untouched'";
+  fs.writeFileSync(envFile, original, "utf8");
+  for (const sessionId of ["", null]) {
+    const result = run(process.execPath, [SESSION_HOOK, "SessionStart"], {
+      cwd: repo,
+      env: { PATH: process.env.PATH, CLAUDE_ENV_FILE: envFile, CLAUDE_PLUGIN_DATA: "" },
+      input: JSON.stringify({ session_id: sessionId, transcript_path: "" })
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.readFileSync(envFile, "utf8"), original);
+  }
+  const result = run(process.execPath, [SESSION_HOOK, "SessionStart"], {
+    cwd: repo,
+    env: { PATH: process.env.PATH, CLAUDE_ENV_FILE: envFile, CLAUDE_PLUGIN_DATA: "" },
+    input: JSON.stringify({ transcript_path: "/tmp/latest" })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.readFileSync(envFile, "utf8"), original + "\nexport CODEX_COMPANION_TRANSCRIPT_PATH='/tmp/latest'\n");
+});
+
 test("write task output focuses on the Codex result without generic follow-up hints", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
