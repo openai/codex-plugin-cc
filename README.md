@@ -311,10 +311,15 @@ Environment updates replace ordinary parent-shell exports in place and preserve 
 commands and literal data. Duplicate commands in general shell programs become no-ops
 to preserve command status; files containing only the hook's literal exports compact fully.
 Syntax errors and unsupported mutations of managed variables (such as `unset`, `export -n`,
-`+=`, bare assignments, redirected exports, or writes in parent-shell compounds/functions)
+`+=`, bare assignments, redirected exports, builtin/command wrappers, or writes in parent-shell compounds/functions)
 stop the hook before any file write. Whole quoted or expanded export arguments are also
 rejected when their target cannot be established from ordinary assignment nodes.
 Environment files are parsed as text, never executed by the hook.
+
+If the environment file changes while the parser is running, the hook retries against the
+new text and refuses to overwrite a file that keeps changing. This reconciles observed
+changes across asynchronous parsing; it is not an atomic update protocol for other writers
+that do not coordinate with the hook.
 
 ## FAQ
 

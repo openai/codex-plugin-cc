@@ -29,8 +29,9 @@ function containsManagedWrite(node, updates) {
   if (node.type === "declaration_command" && declarationTouchesManaged(node, updates)) return true;
   if (node.type === "unset_command" && node.namedChildren.some((argument) =>
     updates.has(argument.text.replace(/^(['"])([A-Za-z_][A-Za-z0-9_]*)\1$/, "$2")))) return true;
-  // The grammar represents negated export/unset builtins as ordinary commands.
-  if (node.type === "command" && ["export", "unset"].includes(node.childForFieldName("name")?.text)) return true;
+  // Wrappers can execute mutating builtins; do not interpret their argument lists.
+  // Negated export/unset builtins are also represented as ordinary commands.
+  if (node.type === "command" && ["export", "unset", "builtin", "command"].includes(node.childForFieldName("name")?.text)) return true;
   return node.namedChildren.some((child) => containsManagedWrite(child, updates));
 }
 

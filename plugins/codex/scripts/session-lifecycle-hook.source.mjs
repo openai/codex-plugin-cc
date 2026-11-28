@@ -78,11 +78,20 @@ async function handleSessionStart(input) {
     return;
   }
   const { updateShellExports } = await import("./shell-env.mjs");
-  const contents = fs.existsSync(envFile) ? fs.readFileSync(envFile, "utf8") : "";
-  const updated = await updateShellExports(contents, entries, shellEscape);
-  if (updated !== contents) {
-    fs.writeFileSync(envFile, updated, "utf8");
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const contents = fs.existsSync(envFile) ? fs.readFileSync(envFile, "utf8") : "";
+    const updated = await updateShellExports(contents, entries, shellEscape);
+    const current = fs.existsSync(envFile) ? fs.readFileSync(envFile, "utf8") : "";
+    if (current !== contents) {
+      continue;
+    }
+    // Reconcile changes across parsing's await; this synchronous recheck/write is not an interprocess CAS.
+    if (updated !== contents) {
+      fs.writeFileSync(envFile, updated, "utf8");
+    }
+    return;
   }
+  throw new Error("Cannot update CLAUDE_ENV_FILE: file changed during every parse attempt; hook wrote nothing.");
 }
 
 async function handleSessionEnd(input) {
