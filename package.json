@@ -13,10 +13,15 @@
     "check-version": "node scripts/bump-version.mjs --check",
     "prebuild": "mkdir -p plugins/codex/.generated/app-server-types && codex app-server generate-ts --out plugins/codex/.generated/app-server-types",
     "build": "tsc -p tsconfig.app-server.json",
-    "test": "node --test tests/*.test.mjs"
+    "build:session-hook": "node scripts/build-session-hook.mjs",
+    "check:session-hook": "node scripts/build-session-hook.mjs --check",
+    "test": "npm run check:session-hook && node --test tests/*.test.mjs"
   },
   "devDependencies": {
     "@types/node": "^25.5.0",
-    "typescript": "^6.0.2"
+    "esbuild": "0.28.2",
+    "tree-sitter-bash": "0.25.1",
+    "typescript": "^6.0.2",
+    "web-tree-sitter": "0.27.2"
   }
 }

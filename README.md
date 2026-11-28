@@ -291,6 +291,26 @@ Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also 
 
 This way you can review the Codex work or continue the work there.
 
+## Developing the SessionStart hook
+
+The checked-in `plugins/codex/scripts/session-lifecycle-hook.mjs` is generated. Edit
+`session-lifecycle-hook.source.mjs` and `shell-env.mjs` in the same directory, then run:
+
+```bash
+npm ci --ignore-scripts
+npm run build:session-hook
+npm test
+```
+
+The bundle embeds pinned Tree-sitter and Bash WebAssembly parsers, including their MIT
+licences. Installed plugins need no npm dependencies or separate WebAssembly files.
+`npm test` checks that the bundle matches its sources before running tests.
+
+Environment updates replace ordinary parent-shell exports in place and preserve nested
+commands and literal data. Syntax errors and unsupported writes to managed variables
+(such as `export -n`, `+=`, or bare assignments) stop the hook before any file write.
+Environment files are parsed as text, never executed by the hook.
+
 ## FAQ
 
 ### Do I need a separate Codex account for this plugin?
