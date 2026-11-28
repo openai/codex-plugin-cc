@@ -12,6 +12,28 @@ function assignmentName(node) {
   return node.childForFieldName("name")?.text;
 }
 
+function declarationTouchesManaged(command, updates) {
+  return command.namedChildren.some((argument) => {
+    if (argument.type === "variable_assignment") return updates.has(assignmentName(argument));
+    if (argument.type === "variable_name") return updates.has(argument.text);
+    // Quoted/expanded whole arguments can hide the variable name. Never evaluate them.
+    return !(argument.type === "word" && /^-[A-Za-z-]+$/.test(argument.text));
+  });
+}
+
+function containsManagedWrite(node, updates) {
+  if (node.nextSibling?.type === "&" || ["command_substitution", "process_substitution", "subshell"].includes(node.type)) {
+    return false;
+  }
+  if (node.type === "variable_assignment" && updates.has(assignmentName(node))) return true;
+  if (node.type === "declaration_command" && declarationTouchesManaged(node, updates)) return true;
+  if (node.type === "unset_command" && node.namedChildren.some((argument) =>
+    updates.has(argument.text.replace(/^(['"])([A-Za-z_][A-Za-z0-9_]*)\1$/, "$2")))) return true;
+  // The grammar represents negated export/unset builtins as ordinary commands.
+  if (node.type === "command" && ["export", "unset"].includes(node.childForFieldName("name")?.text)) return true;
+  return node.namedChildren.some((child) => containsManagedWrite(child, updates));
+}
+
 function onlyGeneratedExports(root, updates) {
   // In the hook's literal-only files every command succeeds, so duplicates need no no-op.
   // Other shell programs retain a ':' statement to preserve observable command status.
@@ -63,27 +85,13 @@ export async function updateShellExports(contents, entries, shellEscape) {
       if (statement.nextSibling?.type === "&") {
         continue;
       }
-      const command = statement.type === "redirected_statement"
-        ? statement.childForFieldName("body") : statement;
-      if (!command) continue;
-      if (command.type === "unset_command" && command.namedChildren.some((argument) => {
-        const name = argument.text.replace(/^(['"])([A-Za-z_][A-Za-z0-9_]*)\1$/, "$2");
-        return updates.has(name);
-      })) {
-        throw unsupportedExport();
-      }
-      if (command.type === "variable_assignment" || command.type === "variable_assignments") {
-        const assignments = command.type === "variable_assignment" ? [command] : command.namedChildren;
-        if (assignments.some((argument) => updates.has(assignmentName(argument)))) {
-          throw unsupportedExport();
-        }
-      }
-      if (command.type !== "declaration_command") {
+      if (statement.type !== "declaration_command") {
+        if (containsManagedWrite(statement, updates)) throw unsupportedExport();
         continue;
       }
+      const command = statement;
       const argumentsList = command.namedChildren;
-      const touchesManaged = argumentsList.some((argument) =>
-        updates.has(argument.type === "variable_assignment" ? assignmentName(argument) : argument.text));
+      const touchesManaged = declarationTouchesManaged(command, updates);
       if (command.firstChild?.type !== "export" || argumentsList.some((argument) =>
         argument.type !== "variable_assignment" && argument.type !== "variable_name")) {
         if (touchesManaged) throw unsupportedExport();
@@ -112,8 +120,8 @@ export async function updateShellExports(contents, entries, shellEscape) {
         seen.add(name);
       }
       if (removed > 0 && removed === command.namedChildCount) {
-        // Retain success status and redirections in scripts that contain other shell commands.
-        const remove = statement === command && compactDuplicates;
+        // Retain success status in scripts that contain other shell commands.
+        const remove = compactDuplicates;
         edits.push({
           start: command.startIndex,
           end: remove ? commandRemovalEnd(contents, command) : command.endIndex,

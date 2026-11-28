@@ -107,8 +107,13 @@ for (const [name, nested] of [
   ["function", `set_inner() {\nexport ${SESSION_NAME}='inner'\n}\nexport OTHER='keep'\n`],
   ["command substitution", `export OTHER=$(\nexport ${SESSION_NAME}='inner'\nprintf keep\n)\n`]
 ]) {
-  test(`SessionStart leaves ${name} exports scoped and updates the top-level export`, POSIX, (t) => {
+  const parentWrites = name !== "command substitution";
+  test(`SessionStart ${parentWrites ? "rejects possible parent-shell" : "preserves child-shell"} exports in a ${name}`, POSIX, (t) => {
     const file = fixture(t, nested + `export ${SESSION_NAME}='old'\n`);
+    if (parentWrites) {
+      assertRejectedStart(file);
+      return;
+    }
     const first = start(file);
     assert.equal(first.includes(nested), true, "nested shell commands must remain byte-for-byte intact");
     assertSource(file, { [SESSION_NAME]: "latest", OTHER: "keep" });
@@ -188,21 +193,11 @@ test("SessionStart rejects plain non-export assignments to updated variables", P
   assertRejectedStart(file);
 });
 
-test("SessionStart updates redirected exports and preserves duplicate redirections", POSIX, (t) => {
+test("SessionStart rejects redirected managed exports without changing redirections", POSIX, (t) => {
   for (const firstRedirect of ["", " >/dev/null"]) {
     const original = `export ${SESSION_NAME}='old'${firstRedirect}\nexport OTHER='keep'\nexport ${SESSION_NAME}='stale' >/dev/null\n`;
     const file = fixture(t, original);
-    let first;
-    for (let index = 0; index < 3; index += 1) {
-      const updated = start(file);
-      assertSource(file, { [SESSION_NAME]: "latest", OTHER: "keep" });
-      assert.equal(updated.includes("export OTHER='keep'\n"), true);
-      assert.equal((updated.match(/>\/dev\/null/g) ?? []).length, firstRedirect ? 2 : 1, "duplicate redirections must retain their shell side effects");
-      if (index === 0) first = updated;
-      else assert.equal(updated, first);
-    }
-    start(file, "changed");
-    assertSource(file, { [SESSION_NAME]: "changed", OTHER: "keep" });
+    assertRejectedStart(file);
   }
 });
 
