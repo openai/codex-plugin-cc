@@ -68,9 +68,14 @@ function appendEnvVar(name, value) {
     }
   }
   lines.push(contents.slice(lineStart));
-  const remaining = lines.filter((line) => !line.startsWith(`export ${name}=`)).join("");
+  const exportLine = `export ${name}=${shellEscape(value)}\n`;
+  const firstIndex = lines.findIndex((line) => line.startsWith(`export ${name}=`));
+  if (firstIndex !== -1) {
+    lines[firstIndex] = exportLine;
+  }
+  const remaining = lines.filter((line, index) => index === firstIndex || !line.startsWith(`export ${name}=`)).join("");
   const separator = remaining && !remaining.endsWith("\n") ? "\n" : "";
-  fs.writeFileSync(envFile, `${remaining}${separator}export ${name}=${shellEscape(value)}\n`, "utf8");
+  fs.writeFileSync(envFile, firstIndex === -1 ? `${remaining}${separator}${exportLine}` : remaining, "utf8");
 }
 
 function cleanupSessionJobs(cwd, sessionId) {
