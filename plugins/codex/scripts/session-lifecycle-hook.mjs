@@ -38,10 +38,11 @@ function appendEnvVar(name, value) {
   }
   const envFile = process.env.CLAUDE_ENV_FILE;
   const contents = fs.existsSync(envFile) ? fs.readFileSync(envFile, "utf8") : "";
-  const remaining = contents
-    .split("\n")
-    .filter((line) => !line.startsWith(`export ${name}=`))
-    .join("\n");
+  // Match whole shellEscape assignments so quoted newlines stay with their export.
+  const remaining = contents.replace(
+    /^export ([A-Za-z_][A-Za-z0-9_]*)='(?:[^']|'"'"')*'(?:\r?\n|$)/gm,
+    (assignment, variable) => variable === name ? "" : assignment
+  );
   const separator = remaining && !remaining.endsWith("\n") ? "\n" : "";
   fs.writeFileSync(envFile, `${remaining}${separator}export ${name}=${shellEscape(value)}\n`, "utf8");
 }

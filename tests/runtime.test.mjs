@@ -719,6 +719,44 @@ test("session start hook replaces duplicate exports and stays idempotent", () =>
   }
 });
 
+test("session start hook deduplicates complete multiline quoted exports", { skip: process.platform === "win32" }, () => {
+  const repo = makeTempDir();
+  const envFile = path.join(repo, "claude-env.sh");
+  const unrelated = "export OTHER='keep\nexport CODEX_COMPANION_SESSION_ID=embedded\nthis value'\n";
+  const pluginDataDir = path.join(repo, "plugin's\nexport CODEX_COMPANION_SESSION_ID=embedded\ndata");
+  const transcriptPath = path.join(repo, "caller's\ntranscript.jsonl");
+  fs.mkdirSync(pluginDataDir);
+  fs.writeFileSync(transcriptPath, "", "utf8");
+  fs.writeFileSync(envFile, unrelated, "utf8");
+
+  const start = (sessionId, transcript, pluginData) => {
+    const result = run(process.execPath, [SESSION_HOOK, "SessionStart"], {
+      cwd: repo,
+      env: { PATH: process.env.PATH, CLAUDE_ENV_FILE: envFile, CLAUDE_PLUGIN_DATA: pluginData },
+      input: JSON.stringify({ session_id: sessionId, transcript_path: transcript })
+    });
+    assert.equal(result.status, 0, result.stderr);
+    if (process.platform !== "win32") {
+      const sourced = run("/bin/sh", [
+        "-c",
+        '. "$1"; [ "$CODEX_COMPANION_SESSION_ID" = "$2" ] && [ "$CODEX_COMPANION_TRANSCRIPT_PATH" = "$3" ] && [ "$CLAUDE_PLUGIN_DATA" = "$4" ] && [ "$OTHER" = "$5" ]',
+        "verify", envFile, sessionId, transcript, pluginData,
+        "keep\nexport CODEX_COMPANION_SESSION_ID=embedded\nthis value"
+      ], { cwd: repo, env: { PATH: process.env.PATH } });
+      assert.equal(sourced.status, 0, sourced.stderr);
+    }
+    return fs.readFileSync(envFile, "utf8");
+  };
+
+  const first = start("test's\nsession", transcriptPath, pluginDataDir);
+  assert.equal(start("test's\nsession", transcriptPath, pluginDataDir), first);
+  fs.writeFileSync(envFile, first + first, "utf8");
+  assert.equal(start("test's\nsession", transcriptPath, pluginDataDir), unrelated + first);
+  const latest = start("latest\nsession", transcriptPath + "\nlatest", pluginDataDir + "\nlatest");
+  assert.equal(latest.startsWith(unrelated + unrelated), true);
+  assert.equal(start("latest\nsession", transcriptPath + "\nlatest", pluginDataDir + "\nlatest"), latest);
+});
+
 test("session start hook preserves existing exports for empty values and separates unterminated lines", () => {
   const repo = makeTempDir();
   const envFile = path.join(repo, "claude-env.sh");
