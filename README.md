@@ -303,12 +303,15 @@ npm test
 ```
 
 The bundle embeds pinned Tree-sitter and Bash WebAssembly parsers, including their MIT
-licences. Installed plugins need no npm dependencies or separate WebAssembly files.
+licences. Build-only `fflate` compression uses fixed metadata for reproducible output
+across Node versions and platforms. Installed plugins need no npm dependencies or separate WebAssembly files.
 `npm test` checks that the bundle matches its sources before running tests.
 
 Environment updates replace ordinary parent-shell exports in place and preserve nested
-commands and literal data. Syntax errors and unsupported writes to managed variables
-(such as `export -n`, `+=`, or bare assignments) stop the hook before any file write.
+commands and literal data. Duplicate commands in general shell programs become no-ops
+to preserve command status; files containing only the hook's literal exports compact fully.
+Syntax errors and unsupported mutations of managed variables (such as `unset`, `export -n`,
+`+=`, or bare assignments) stop the hook before any file write.
 Environment files are parsed as text, never executed by the hook.
 
 ## FAQ

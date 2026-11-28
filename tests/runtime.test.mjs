@@ -714,7 +714,7 @@ test("session start hook replaces duplicate exports and stays idempotent", () =>
     assert.equal(result.status, 0, result.stderr);
     assert.equal(
       fs.readFileSync(envFile, "utf8"),
-      "export CODEX_COMPANION_SESSION_ID='latest'\nexport CODEX_COMPANION_TRANSCRIPT_PATH='/tmp/latest'\nexport CLAUDE_PLUGIN_DATA='/tmp/latest-data'\n" + unrelated
+      "export CODEX_COMPANION_SESSION_ID='latest'\nexport CODEX_COMPANION_TRANSCRIPT_PATH='/tmp/latest'\nexport CLAUDE_PLUGIN_DATA='/tmp/latest-data'\n" + unrelated + ":\n:\n:\n"
     );
   }
 });
@@ -751,10 +751,10 @@ test("session start hook deduplicates complete multiline quoted exports", { skip
   const first = start("test's\nsession", transcriptPath, pluginDataDir);
   assert.equal(start("test's\nsession", transcriptPath, pluginDataDir), first);
   fs.writeFileSync(envFile, first + first, "utf8");
-  assert.equal(start("test's\nsession", transcriptPath, pluginDataDir), first + unrelated);
+  assert.equal(start("test's\nsession", transcriptPath, pluginDataDir), first + unrelated + ":\n:\n:\n");
   const latest = start("latest\nsession", transcriptPath + "\nlatest", pluginDataDir + "\nlatest");
   assert.equal(latest.startsWith(unrelated), true);
-  assert.equal(latest.endsWith(unrelated), true);
+  assert.equal(latest.endsWith(unrelated + ":\n:\n:\n"), true);
   assert.equal(start("latest\nsession", transcriptPath + "\nlatest", pluginDataDir + "\nlatest"), latest);
 });
 
@@ -798,7 +798,7 @@ test("session start hook replaces exports in place before dependent assignments"
       cwd: repo, env: { PATH: process.env.PATH }
     });
     assert.equal(sourced.status, 0, sourced.stderr);
-    assert.equal(fs.readFileSync(envFile, "utf8"), `export CLAUDE_PLUGIN_DATA='${data}'\n` + dependent);
+    assert.equal(fs.readFileSync(envFile, "utf8"), `export CLAUDE_PLUGIN_DATA='${data}'\n` + dependent + ":\n");
   }
 });
 

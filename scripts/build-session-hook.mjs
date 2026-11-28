@@ -1,8 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { gzipSync } from "node:zlib";
 import { build } from "esbuild";
+import { gzipSync } from "fflate";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const output = path.join(root, "plugins/codex/scripts/session-lifecycle-hook.mjs");
@@ -27,7 +27,11 @@ const result = await build({
     name: "embedded-wasm",
     setup(build) {
       build.onLoad({ filter: /\.wasm$/ }, ({ path: wasmPath }) => {
-        const encoded = gzipSync(fs.readFileSync(wasmPath), { level: 9 }).toString("base64");
+        // Pin both the compressor and timestamp; native zlib output varies between Node versions.
+        const compressed = gzipSync(fs.readFileSync(wasmPath), { level: 9, mtime: 0 });
+        // RFC 1952: OS=255 means unknown, making this header independent of the build host.
+        compressed[9] = 255;
+        const encoded = Buffer.from(compressed).toString("base64");
         return {
           loader: "js",
           contents: `import { gunzipSync } from 'node:zlib'; export default gunzipSync(Buffer.from('${encoded}', 'base64'));`

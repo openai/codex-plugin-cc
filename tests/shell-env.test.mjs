@@ -123,7 +123,7 @@ test("SessionStart collapses preexisting standalone duplicates and remains stabl
   const duplicate = `export ${SESSION_NAME}='old'\n`;
   const file = fixture(t, duplicate + "export OTHER='keep'\n" + duplicate.repeat(3));
   const first = start(file);
-  assert.equal(first, `export ${SESSION_NAME}='latest'\nexport OTHER='keep'\n`);
+  assert.equal(first, `export ${SESSION_NAME}='latest'\nexport OTHER='keep'\n:\n:\n:\n`);
   assertSource(file, { [SESSION_NAME]: "latest", OTHER: "keep" });
   assert.equal(start(file), first);
 });
@@ -133,7 +133,7 @@ test("SessionStart preserves Unicode around and within edited exports", POSIX, (
   const after = "export AFTER='naïve 🔬'\n";
   const file = fixture(t, before + `export ${SESSION_NAME}='old 🚀'\n` + after + `export ${SESSION_NAME}='duplicate 🌙'\n`);
   const first = start(file, "latest 🌠 café");
-  assert.equal(first, before + `export ${SESSION_NAME}='latest 🌠 café'\n` + after);
+  assert.equal(first, before + `export ${SESSION_NAME}='latest 🌠 café'\n` + after + ":\n");
   assertSource(file, { [SESSION_NAME]: "latest 🌠 café", OTHER: "🌍 café", AFTER: "naïve 🔬" });
   assert.equal(start(file, "latest 🌠 café"), first);
 });

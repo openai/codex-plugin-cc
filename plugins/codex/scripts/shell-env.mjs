@@ -12,6 +12,16 @@ function assignmentName(node) {
   return node.childForFieldName("name")?.text;
 }
 
+function onlyGeneratedExports(root, updates) {
+  // In the hook's literal-only files every command succeeds, so duplicates need no no-op.
+  // Other shell programs retain a ':' statement to preserve observable command status.
+  return root.children.every((node) => node.type === "comment" || (
+    node.type === "declaration_command" && node.namedChildCount === 1 &&
+    updates.has(assignmentName(node.namedChildren[0])) &&
+    /^export [A-Za-z_][A-Za-z0-9_]*='(?:[^']|'"'"')*'$/.test(node.text)
+  ));
+}
+
 async function createParser() {
   if (!language) {
     await Parser.init({ wasmBinary: runtimeWasm });
@@ -47,6 +57,7 @@ export async function updateShellExports(contents, entries, shellEscape) {
   let tree;
   try {
     tree = parseChecked(parser, contents);
+    const compactDuplicates = onlyGeneratedExports(tree.rootNode, updates);
     for (const statement of tree.rootNode.namedChildren) {
       // Background commands execute in a child shell, including redirected commands.
       if (statement.nextSibling?.type === "&") {
@@ -55,6 +66,12 @@ export async function updateShellExports(contents, entries, shellEscape) {
       const command = statement.type === "redirected_statement"
         ? statement.childForFieldName("body") : statement;
       if (!command) continue;
+      if (command.type === "unset_command" && command.namedChildren.some((argument) => {
+        const name = argument.text.replace(/^(['"])([A-Za-z_][A-Za-z0-9_]*)\1$/, "$2");
+        return updates.has(name);
+      })) {
+        throw unsupportedExport();
+      }
       if (command.type === "variable_assignment" || command.type === "variable_assignments") {
         const assignments = command.type === "variable_assignment" ? [command] : command.namedChildren;
         if (assignments.some((argument) => updates.has(assignmentName(argument)))) {
@@ -95,11 +112,12 @@ export async function updateShellExports(contents, entries, shellEscape) {
         seen.add(name);
       }
       if (removed > 0 && removed === command.namedChildCount) {
-        // A no-op keeps redirection side effects without turning an empty export into env output.
+        // Retain success status and redirections in scripts that contain other shell commands.
+        const remove = statement === command && compactDuplicates;
         edits.push({
           start: command.startIndex,
-          end: statement === command ? commandRemovalEnd(contents, command) : command.endIndex,
-          text: statement === command ? "" : ":"
+          end: remove ? commandRemovalEnd(contents, command) : command.endIndex,
+          text: remove ? "" : ":"
         });
       } else {
         edits.push(...commandEdits);
