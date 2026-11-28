@@ -38,11 +38,37 @@ function appendEnvVar(name, value) {
   }
   const envFile = process.env.CLAUDE_ENV_FILE;
   const contents = fs.existsSync(envFile) ? fs.readFileSync(envFile, "utf8") : "";
-  // Match whole shellEscape assignments so quoted newlines stay with their export.
-  const remaining = contents.replace(
-    /^export ([A-Za-z_][A-Za-z0-9_]*)='(?:[^']|'"'"')*'(?:\r?\n|$)/gm,
-    (assignment, variable) => variable === name ? "" : assignment
-  );
+  const lines = [];
+  let lineStart = 0;
+  let quote = null;
+  // Split at unquoted, unescaped newlines, preserving complete quoted values.
+  for (let index = 0; index < contents.length; index += 1) {
+    const character = contents[index];
+    if (character === "\\" && quote !== "'") {
+      index += 1;
+      continue;
+    }
+    if (quote) {
+      if (character === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      continue;
+    }
+    if (character === "#" && (index === lineStart || /\s/.test(contents[index - 1]))) {
+      const newline = contents.indexOf("\n", index);
+      index = newline === -1 ? contents.length : newline;
+    }
+    if (contents[index] === "\n") {
+      lines.push(contents.slice(lineStart, index + 1));
+      lineStart = index + 1;
+    }
+  }
+  lines.push(contents.slice(lineStart));
+  const remaining = lines.filter((line) => !line.startsWith(`export ${name}=`)).join("");
   const separator = remaining && !remaining.endsWith("\n") ? "\n" : "";
   fs.writeFileSync(envFile, `${remaining}${separator}export ${name}=${shellEscape(value)}\n`, "utf8");
 }

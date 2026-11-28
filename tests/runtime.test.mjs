@@ -757,6 +757,30 @@ test("session start hook deduplicates complete multiline quoted exports", { skip
   assert.equal(start("latest\nsession", transcriptPath + "\nlatest", pluginDataDir + "\nlatest"), latest);
 });
 
+test("session start hook preserves export-looking lines inside double-quoted values", { skip: process.platform === "win32" }, () => {
+  const repo = makeTempDir();
+  const envFile = path.join(repo, "claude-env.sh");
+  const embedded = "export CODEX_COMPANION_SESSION_ID='example'";
+  for (const prefix of ["first", 'first \\"quote\\"', "first\\\ncontinued"]) {
+    const unrelated = `# another hook's export file\nexport OTHER="${prefix}\n${embedded}\nlast"\n`;
+    fs.writeFileSync(envFile, unrelated, "utf8");
+    for (let index = 0; index < 3; index += 1) {
+      const result = run(process.execPath, [SESSION_HOOK, "SessionStart"], {
+        cwd: repo,
+        env: { PATH: process.env.PATH, CLAUDE_ENV_FILE: envFile, CLAUDE_PLUGIN_DATA: "/tmp/data" },
+        input: JSON.stringify({ session_id: "latest", transcript_path: "/tmp/transcript" })
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(fs.readFileSync(envFile, "utf8"), unrelated + "export CODEX_COMPANION_SESSION_ID='latest'\nexport CODEX_COMPANION_TRANSCRIPT_PATH='/tmp/transcript'\nexport CLAUDE_PLUGIN_DATA='/tmp/data'\n");
+      const expected = prefix.replace(/\\"/g, '"').replace(/\\\n/g, "") + `\n${embedded}\nlast`;
+      const sourced = run("/bin/sh", ["-c", '. "$1"; [ "$OTHER" = "$2" ] && [ "$CODEX_COMPANION_SESSION_ID" = latest ]', "verify", envFile, expected], {
+        cwd: repo, env: { PATH: process.env.PATH }
+      });
+      assert.equal(sourced.status, 0, sourced.stderr);
+    }
+  }
+});
+
 test("session start hook preserves existing exports for empty values and separates unterminated lines", () => {
   const repo = makeTempDir();
   const envFile = path.join(repo, "claude-env.sh");
